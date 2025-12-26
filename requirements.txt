@@ -1,0 +1,22 @@
+fastapi
+uvicorn[standard]
+
+pydantic
+SQLAlchemy>=2.0
+greenlet
+
+# Database drivers (your DatabaseManager supports MSSQL + MySQL)
+pyodbc
+aioodbc
+pymysql
+aiomysql
+
+# Video / frames
+opencv-python
+numpy
+
+# async utilities (used in model.py)
+asyncstdlib
+
+# optional but useful
+python-dotenv
