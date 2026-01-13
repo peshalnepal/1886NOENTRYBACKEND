@@ -7,23 +7,6 @@ from typing import AsyncGenerator, Optional,Literal,Tuple
 from domain.events import ChannelEvent
 
 
-class ChannelConfig(ABC):
-    """
-    Abstract base class for channel-specific configurations. This serves as a
-    marker interface for all concrete channel config implementations.
-    """
-
-    channel_id: str
-    camera_uuid: Optional[uuid.UUID]
-    rtsp_url: str
-    enabled: bool
-    sample_fps: float
-    decode_backend: Literal["gstreamer", "opencv"]
-    resize: Optional[Tuple[int, int]]
-    reconnect_base_ms: int
-    reconnect_max_ms: int
-    emit_format: Literal["raw", "jpeg"]
-    jpeg_quality: int
 
 
 

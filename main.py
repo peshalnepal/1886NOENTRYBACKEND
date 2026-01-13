@@ -9,6 +9,7 @@ from core.config import DEBUG
 from core.database import db_manager, async_engine
 from application.services.manager import Manager  # adjust if your path is different
 import logging
+from application.models.yolo_config import YoloModelConfig
 logging.basicConfig(level=logging.INFO)
 
 SessionLocal = async_sessionmaker(async_engine, expire_on_commit=False)
@@ -30,14 +31,12 @@ async def lifespan(app: FastAPI):
 
     # Create singleton manager (sessionmaker is callable -> returns new AsyncSession)
     app.state.manager = Manager(session_factory=SessionLocal)
-
+    
     # Create and start a pipeline once
     pipeline = await app.state.manager.create_pipeline()
     await pipeline.start()
     app.state.pipeline = pipeline
-
     yield
-
     # Shutdown
     try:
         if hasattr(app.state, "pipeline") and app.state.pipeline:
@@ -57,10 +56,6 @@ async def add_cache_control_headers(request, call_next):
     response.headers["Expires"] = "0"
     return response
 
-
-# ✅ CORS (pick ONE option)
-
-# OPTION A: easiest dev mode (works with frontend on different port):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

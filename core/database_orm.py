@@ -184,7 +184,8 @@ class Camera(Base):
 
     rtsp_url = Column(String(2048), nullable=False)
     is_enabled = Column(Boolean, default=True)
-
+    is_detection_enabled=Column(Boolean, default=True)
+    is_notification_enabled=Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 

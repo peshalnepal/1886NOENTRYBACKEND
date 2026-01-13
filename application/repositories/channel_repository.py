@@ -2,6 +2,7 @@
 
 import uuid
 from typing import Any, Dict, Optional, Tuple, Union
+from fastapi.encoders import jsonable_encoder
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,7 +63,8 @@ class ChannelRepository:
         cam_uuid = d.get("camera_uuid") or d.get("camera_id")  # support both names
         rtsp_url = d.get("rtsp_url")
         enabled = d.get("enabled", True)
-
+        detection_enabled=d.get("detection_enabled", True)
+        notification_enabled=d.get("notification_enabled", True)
         if not rtsp_url:
             raise ValueError("channel_config.rtsp_url is required")
 
@@ -73,7 +75,8 @@ class ChannelRepository:
             # update camera from config
             cam.rtsp_url = rtsp_url
             cam.is_enabled = bool(enabled)
-
+            cam.is_detection_enabled=bool(detection_enabled)
+            cam.is_notification_enabled=bool(notification_enabled)
             # optional extra fields (only if provided)
             if camera_code is not None:
                 cam.camera_code = camera_code
@@ -97,6 +100,8 @@ class ChannelRepository:
                 name=name,
                 location=location,
                 is_enabled=bool(enabled),
+                is_detection_enabled=bool(detection_enabled),
+                is_notification_enabled=bool(notification_enabled)
             )
             db.add(cam)
             try:
@@ -179,12 +184,15 @@ class ChannelRepository:
     def _to_dict(self, obj: ChannelConfigLike) -> Dict[str, Any]:
         # Pydantic BaseModel
         if hasattr(obj, "model_dump"):
-            return obj.model_dump()
+            return obj.model_dump(mode="json", exclude_none=True)
         # dict-like
         if isinstance(obj, dict):
-            return dict(obj)
+            return jsonable_encoder(dict(obj), exclude_none=True)
         # last resort: attributes
-        return {k: getattr(obj, k) for k in dir(obj) if not k.startswith("_")}
+        return jsonable_encoder(
+            {k: getattr(obj, k) for k in dir(obj) if not k.startswith("_")},
+            exclude_none=True
+        )
 
     def _extract_timezone(self, d: Dict[str, Any], fallback: Optional[str]) -> Optional[str]:
         # if someday you add timezone into config, this will auto-pick it up
@@ -199,11 +207,21 @@ class ChannelRepository:
 
         # Remove camera-table fields / identity fields from config JSON
         for k in (
-            "is_enabled",
+            "camera_uuid",
+            "camera_id",
+            "channel_id",
+            "rtsp_url",
+            "enabled",
+            "detection_enabled",
+            "notification_enabled",
             "user_id",
             "camera_code",
             "name",
+            "location",
             "timezone",
+            "is_enabled",
+            "is_detection_enabled",
+            "is_notification_enabled",
         ):
             cfg.pop(k, None)
 
@@ -217,6 +235,7 @@ class ChannelRepository:
         configuration: Dict[str, Any],
         timezone: Optional[str],
     ) -> ChannelConfiguration:
+        configuration = jsonable_encoder(configuration, exclude_none=True)
         stmt = select(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid)
         row = (await db.execute(stmt)).scalar_one_or_none()
 

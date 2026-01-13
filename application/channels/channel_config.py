@@ -2,7 +2,7 @@ from typing import Optional, Literal, Tuple
 import uuid
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from domain.channel import ChannelConfig
+from dto import ChannelConfig
 
 
 class VideoChannelConfig(BaseModel, ChannelConfig):
@@ -21,8 +21,10 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
     camera_uuid: Optional[uuid.UUID] = Field(default=None, description="Existing camera UUID if updating.")
     rtsp_url: Optional[str] = Field(default=None, description="Required when creating a new camera.")
 
-    # enable/sampling
     enabled: bool = Field(default=True)
+    detection_enabled:bool = Field(default=True)
+    notification_enabled:bool = Field(default=True)
+    
     sample_fps: float = Field(default=5.0, ge=0.1, description="Frames/sec to publish as RTSPEvent")
 
     # decoding strategy (Jetson: prefer gstreamer)

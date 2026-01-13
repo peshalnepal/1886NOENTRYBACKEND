@@ -1,0 +1,23 @@
+# -------------------------
+# Virtual environments
+# -------------------------
+.venv/
+venv/
+.venv_trt/
+venv_trt/
+env/
+ENV/
+.ENV/
+.venv*/
+*venv*/
+pythonenv*/
+
+# -------------------------
+# Python cache / compiled
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+

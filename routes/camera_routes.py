@@ -1,49 +1,32 @@
-
 import asyncio
 import time
 import uuid
-from typing import Any, AsyncGenerator, Optional, Tuple,Literal
-import logging 
+from typing import AsyncGenerator, Optional, Tuple, Literal
+import logging
 import cv2
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from sqlalchemy.ext.asyncio import AsyncSession
 from dependencies import get_manager
-from application.channels.channel import VideoChannel
 from application.channels.channel_config import VideoChannelConfig
-from application.repositories.channel_repository import ChannelRepository
-from application.repositories.pipeline_repository import PipelineRepository
 from application.services.manager import Manager
+from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent
+from utils import render_frame_with_overlays
 
 logger = logging.getLogger(__name__)
-
-async def get_db() -> AsyncSession:
-    """
-    Replace with your own AsyncSession dependency.
-    Example:
-      async with async_session() as db: yield db
-    """
-    raise NotImplementedError
-
-
 
 # -----------------------
 # DTOs
 # -----------------------
 
-class CameraCreateRequest(BaseModel):
-    rtsp_url: str = Field(..., description="RTSP URL")
-    enabled: bool = Field(default=True)
-
-
 class CameraUpdateRequest(BaseModel):
-    # camera fields (what frontend might edit)
     rtsp_url: Optional[str] = None
     enabled: Optional[bool] = None
+    detection_enabled: Optional[bool] = None
+    notification_enabled: Optional[bool] = None
 
-    # optional overrides to config knobs (keep optional)
     sample_fps: Optional[float] = None
     decode_backend: Optional[str] = None  # "gstreamer" | "opencv"
     resize: Optional[Tuple[int, int]] = None
@@ -53,12 +36,25 @@ class CameraUpdateRequest(BaseModel):
     jpeg_quality: Optional[int] = None
 
 
-# -----------------------
-# Router
-# -----------------------
+class CameraCreateRequest(BaseModel):
+    rtsp_url: str = Field(..., description="RTSP URL")
+    enabled: bool = True
+    detection_enabled: bool = True
+    notification_enabled: bool = True
+
+    sample_fps: Optional[float] = None
+    decode_backend: Optional[Literal["gstreamer", "opencv"]] = None
+    resize: Optional[Tuple[int, int]] = None
+    emit_format: Optional[Literal["raw", "jpeg"]] = None
+    jpeg_quality: Optional[int] = None
+
 
 router = APIRouter()
 
+
+# -----------------------
+# Utils
+# -----------------------
 
 def _make_mjpeg_part(jpeg_bytes: bytes) -> bytes:
     return (
@@ -70,11 +66,6 @@ def _make_mjpeg_part(jpeg_bytes: bytes) -> bytes:
 
 
 def _event_to_jpeg(ev) -> Optional[bytes]:
-    """
-    RTSPEvent -> jpeg bytes.
-    - if ev.encoded exists (emit_format=jpeg), use it
-    - else encode raw frame with cv2.imencode
-    """
     enc = getattr(ev, "encoded", None)
     fmt = getattr(ev, "format", None)
     if enc is not None and fmt == "jpeg":
@@ -91,20 +82,26 @@ def _event_to_jpeg(ev) -> Optional[bytes]:
 
 
 async def get_current_user_id() -> int:
+    # replace with real auth
     return 1
 
 
-class CameraCreateRequest(BaseModel):
-    rtsp_url: str
-    enabled: bool = True
+def _auto_defaults(num_active: int) -> dict:
+    if num_active <= 2:
+        return dict(sample_fps=10.0, resize=(640, 360), emit_format="jpeg", jpeg_quality=65, decode_backend="gstreamer")
+    if num_active <= 4:
+        return dict(sample_fps=7.0, resize=(640, 360), emit_format="jpeg", jpeg_quality=60, decode_backend="gstreamer")
+    return dict(sample_fps=5.0, resize=(640, 360), emit_format="jpeg", jpeg_quality=55, decode_backend="gstreamer")
 
-    # optional overrides (client can omit all)
-    sample_fps: float = 5.0
-    decode_backend: Literal["gstreamer", "opencv"] = "gstreamer"
-    resize: Optional[Tuple[int, int]] = None
-    emit_format: Literal["raw", "jpeg"] = "raw"
-    jpeg_quality: int = 80
 
+def _choose(v, fallback):
+    return fallback if v is None else v
+
+
+# -----------------------
+# Routes
+# -----------------------
+from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent
 
 @router.post("/cameras", response_class=JSONResponse)
 async def add_camera(
@@ -113,60 +110,54 @@ async def add_camera(
     manager: Manager = Depends(get_manager),
     user_id: int = Depends(get_current_user_id),
 ):
-    """
-    Frontend sends: rtsp_url (+enabled optional).
-
-    Server:
-      - Upserts camera + channel config in DB
-      - Hot-adds channel if pipeline is active
-      - Returns camera_uuid, camera_code, rtsp_url, enabled, pipeline_id, channel_id, config defaults
-    """
-
-    # 1) Resolve pipeline id: query param wins, else active pipeline
-    pid: Optional[uuid.UUID] = pipeline_id
-    if pid is None:
-        active = await manager.get_activepipeline()
+    # resolve pid and active count safely
+    active = await manager.get_activepipeline()
+    if pipeline_id is None:
         if active is None:
             raise HTTPException(status_code=409, detail="No active pipeline. Provide pipeline_id.")
         pid = active.pipeline_id
+        num_active = len(active.list_channel_ids()) if hasattr(active, "list_channel_ids") else 0
+    else:
+        pid = pipeline_id
+        # if not active pipeline, num_active=0
+        num_active = len(active.list_channel_ids()) if (active and hasattr(active, "list_channel_ids")) else 0
 
-    # 2) Build API input config (defaults are in model)
-    cfg_in = VideoChannelConfig(
-        rtsp_url=payload.rtsp_url,
-        enabled=payload.enabled,
-        sample_fps=payload.sample_fps,
-        decode_backend=payload.decode_backend,
-        resize=payload.resize,
-        emit_format=payload.emit_format,
-        jpeg_quality=payload.jpeg_quality,
-    )
+    auto = _auto_defaults(num_active)
 
-    result= await manager.update_pipeline(
+    cfg = {
+        "rtsp_url": payload.rtsp_url,
+        "enabled": payload.enabled,
+        "detection_enabled": payload.detection_enabled,
+        "notification_enabled": payload.notification_enabled,
+        "sample_fps": payload.sample_fps or auto["sample_fps"],
+        "decode_backend": payload.decode_backend or auto["decode_backend"],
+        "resize": payload.resize or auto["resize"],
+        "emit_format": payload.emit_format or auto["emit_format"],
+        "jpeg_quality": payload.jpeg_quality or auto["jpeg_quality"],
+    }
+
+    ev = ChannelCreateEvent(configs=cfg)
+
+    result = await manager.update_pipeline(
         pipeline_id=pid,
-        channel_configs=[cfg_in],  # must be a list
+        channel_events=[ev],
         user_id=user_id,
         camera_code_prefix="cam",
-        replace_runtime=False,
     )
 
-    if result is None:
-        raise HTTPException(status_code=404, detail="Pipeline not found or invalid pipeline_id.")
+    if result is None or not result.cameras:
+        raise HTTPException(status_code=404, detail="Pipeline not found or camera create failed.")
 
-    if not result.cameras:
-        raise HTTPException(status_code=500, detail="Camera upsert succeeded but no camera returned.")
-
-    cam = result.cameras[0]  # we submitted one config => one camera in same order
-
-    # 4) Return required info (+ config applied)
+    cam = result.cameras[0]
     return {
         "pipeline_id": str(result.pipeline_id),
         "active_in_memory": bool(result.active_in_memory),
         "camera_uuid": str(cam.camera_uuid),
-        "channel_id": cam.channel_id,          # recommended: str(camera_uuid)
+        "channel_id": cam.channel_id,
         "rtsp_url": cam.rtsp_url,
         "enabled": bool(cam.enabled),
-
-        # helpful for frontend/debug (optional)
+        "detection_enabled": bool(cam.detection_enabled),
+        "notification_enabled": bool(cam.notification_enabled),
         "config": {
             "sample_fps": cam.sample_fps,
             "decode_backend": cam.decode_backend,
@@ -175,128 +166,82 @@ async def add_camera(
             "jpeg_quality": cam.jpeg_quality,
         },
     }
-
-
-
 @router.put("/cameras/{camera_uuid}", response_class=JSONResponse)
 async def edit_camera(
-    pipeline_id: uuid.UUID,
     camera_uuid: uuid.UUID,
     payload: CameraUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-    manager:Manager=Depends(get_manager)
+    pipeline_id: uuid.UUID = Query(...),
+    manager: Manager = Depends(get_manager),
+    user_id: int = Depends(get_current_user_id),
 ):
-    """
-    Edit camera:
-      - updates Camera table (rtsp_url / enabled)
-      - updates ChannelConfiguration (optional knobs)
-      - ensures membership to pipeline_id
-    If pipeline is active, swaps the runtime channel (remove + add with updated config).
-    """
-    pipe_repo = PipelineRepository()
-    chan_repo = ChannelRepository()
+    patch = payload.model_dump(exclude_unset=True, exclude_none=True)
+    if not patch:
+        raise HTTPException(status_code=400, detail="No fields to update.")
 
-    if not await pipe_repo.pipeline_exists(db, pipeline_id):
-        raise HTTPException(status_code=404, detail="Pipeline not found")
+    ev = ChannelEditEvent(channel_id=camera_uuid, configs=patch)
 
-    full = await chan_repo.get_camera_full(db, camera_uuid=camera_uuid)
-    if not full:
-        raise HTTPException(status_code=404, detail="Camera not found")
-    cam, chan_cfg, _existing_pid = full
-
-    # Reconstruct config from DB (configuration JSON + required camera fields)
-    data: dict[str, Any] = {}
-    if chan_cfg and getattr(chan_cfg, "configuration", None):
-        data.update(chan_cfg.configuration)
-
-    # must exist
-    data["camera_uuid"] = cam.camera_uuid
-    data["rtsp_url"] = payload.rtsp_url if payload.rtsp_url is not None else cam.rtsp_url
-    data["enabled"] = payload.enabled if payload.enabled is not None else bool(cam.is_enabled)
-
-    # keep channel_id stable (needed for runtime remove)
-    data.setdefault("channel_id", getattr(cam, "camera_code", None) or str(cam.camera_uuid))
-
-    # overlay optional tuning if provided
-    for k in (
-        "sample_fps",
-        "decode_backend",
-        "resize",
-        "reconnect_base_ms",
-        "reconnect_max_ms",
-        "emit_format",
-        "jpeg_quality",
-    ):
-        v = getattr(payload, k)
-        if v is not None:
-            data[k] = v
-
-    # validate
     try:
-        cfg = VideoChannelConfig(**data)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Invalid channel config: {e}")
+        result = await manager.update_pipeline(
+            pipeline_id=pipeline_id,
+            channel_events=[ev],
+            user_id=user_id,
+            camera_code_prefix="cam",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
-    await chan_repo.upsert_camera_from_channel_config(
-        db,
-        pipeline_id=pipeline_id,
-        channel_config=cfg,  # update flow (camera_uuid present)
-    )
-    await db.commit()
+    if result is None or not result.cameras:
+        raise HTTPException(status_code=404, detail="Pipeline/camera not found")
 
-    # runtime swap if active
-    if getattr(manager, "_active_id", None) == pipeline_id and getattr(manager, "_active_pipeline", None) is not None:
-        active = manager._active_pipeline
-        await active.start()
-        await active.remove_channel(cfg.channel_id)
-        await active.add_channel(VideoChannel(config=cfg))
-
+    cam = result.cameras[0]
     return {
+        "pipeline_id": str(result.pipeline_id),
+        "active_in_memory": bool(result.active_in_memory),
         "camera_uuid": str(cam.camera_uuid),
-        "rtsp_url": data["rtsp_url"],
-        "enabled": bool(data["enabled"]),
-        "pipeline_id": str(pipeline_id),
-        "channel_id": cfg.channel_id,
+        "channel_id": cam.channel_id,
+        "rtsp_url": cam.rtsp_url,
+        "enabled": bool(cam.enabled),
+        "detection_enabled": bool(cam.detection_enabled),
+        "notification_enabled": bool(cam.notification_enabled),
     }
-
 @router.delete("/cameras/{camera_uuid}", response_class=JSONResponse)
 async def delete_camera(
     camera_uuid: uuid.UUID,
+    pipeline_id: Optional[uuid.UUID] = Query(default=None),
     manager: Manager = Depends(get_manager),
 ):
-    # if pipeline_id not provided, use active 
-    logger.info("#####################################333")
-    logger.info(camera_uuid)
-
-    pipeline_id=None
     if pipeline_id is None:
         active = await manager.get_activepipeline()
-        pipeline_id = getattr(active, "id", None) or getattr(active, "pipeline_id", None)
+        pipeline_id = getattr(active, "pipeline_id", None) if active else None
         if pipeline_id is None:
             raise HTTPException(status_code=409, detail="No active pipeline. Provide pipeline_id.")
-    logger.info(pipeline_id)
 
-    ok = await manager.remove_camera_from_pipeline(pipeline_id=pipeline_id, camera_uuid=camera_uuid)
-    logger.info("#####################################333")
+    ev = ChannelRemoveEvent(channel_id=camera_uuid)
+
+    result = await manager.update_pipeline(
+        pipeline_id=pipeline_id,
+        channel_events=[ev],
+        user_id=None,
+        camera_code_prefix="cam",
+    )
+
     return {
-        "deleted": bool(ok),
+        "deleted": True,
         "camera_uuid": str(camera_uuid),
-        "channel_id": str(camera_uuid),  # ✅ runtime channel id
+        "channel_id": str(camera_uuid),
         "pipeline_id": str(pipeline_id),
+        "active_in_memory": bool(result.active_in_memory) if result else False,
     }
-    
+
+
 @router.get("/cameras/{camera_uuid}/snapshot.jpg")
 async def snapshot_jpg(
     pipeline_id: uuid.UUID,
     camera_uuid: uuid.UUID,
     request: Request,
     timeout_s: float = Query(2.0, ge=0.1, le=10.0),
-    manager:Manager=Depends(get_manager)
+    manager: Manager = Depends(get_manager),
 ):
-    """
-    One-shot snapshot: waits for the next frame from ModelPipeline.stream().
-    """
-
     pipeline = await manager.get_pipeline(pipeline_id)
     if pipeline is None:
         raise HTTPException(status_code=404, detail="Pipeline not found")
@@ -324,16 +269,19 @@ async def snapshot_jpg(
 async def stream_mjpeg(
     camera_uuid: str,
     manager: Manager = Depends(get_manager),
-    fps: float = Query(10.0, ge=0.1, le=60.0),
+    fps: float = Query(5.0, ge=0.1, le=60.0),
+    overlay: bool = Query(True),
 ):
     pipeline = await manager.get_activepipeline()
     if pipeline is None:
         raise HTTPException(status_code=409, detail="No active pipeline running")
 
-    # optional: validate camera exists in runtime
     if hasattr(pipeline, "list_channel_ids"):
         if str(camera_uuid) not in set(pipeline.list_channel_ids()):
             raise HTTPException(status_code=404, detail="Camera not active in pipeline runtime")
+
+    if overlay and fps > 3.0:
+        fps = 3.0
 
     frame_interval = 1.0 / float(fps)
     last_sent = 0.0
@@ -341,15 +289,16 @@ async def stream_mjpeg(
     async def gen() -> AsyncGenerator[bytes, None]:
         nonlocal last_sent
         try:
-            async for ev in pipeline.stream(str(camera_uuid)):
+            async for ev, det in pipeline.stream_with_detections(str(camera_uuid)):
                 now = time.time()
+                if last_sent and (now - last_sent) < frame_interval:
+                    await asyncio.sleep(frame_interval - (now - last_sent))
 
-                # throttle output to requested fps
-                dt = now - last_sent
-                if last_sent and dt < frame_interval:
-                    await asyncio.sleep(frame_interval - dt)
+                if overlay:
+                    jpeg = render_frame_with_overlays(ev, det)
+                else:
+                    jpeg = _event_to_jpeg(ev)
 
-                jpeg = _event_to_jpeg(ev)
                 if jpeg is None:
                     continue
 
@@ -357,14 +306,10 @@ async def stream_mjpeg(
                 yield _make_mjpeg_part(jpeg)
 
         except asyncio.CancelledError:
-            # client disconnected
             return
 
     return StreamingResponse(
         gen(),
         media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-        },
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"},
     )

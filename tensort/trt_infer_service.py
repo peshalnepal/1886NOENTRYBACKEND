@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""
+TensorRT YOLOv8 (det + pose) HTTP service for Jetson.
+- Runs on port 8081
+- Accepts multipart form-data with 'image' file.
+- Optional form fields: camera_uuid, frame_ts_ms, frame_seq, channel_id, model_id
+- Returns JSON shaped like your DetectionsProducedEvent + PoseResult.
+
+Assumptions about engine outputs (common YOLOv8 TRT exports):
+- Detection engine output: (1, 4 + nc, N) with xywh + class scores
+- Pose engine output:     (1, 4 + 1 + k*3, N) with xywh + score + keypoints (x,y,conf)
+You may need to tweak parse() if your engine outputs differ.
+"""
+
+import os
+import time
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import cv2
+from flask import Flask, jsonify, request
+
+# TensorRT + PyCUDA (typically available in JetPack system python)
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit  # noqa: F401
+
+
+# -----------------------------
+# Utils: letterbox + NMS
+# -----------------------------
+def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+    """Resize+pad to square, returns (img_lb, scale, (pad_w, pad_h))."""
+    h, w = img.shape[:2]
+    r = min(new_shape / h, new_shape / w)
+    nh, nw = int(round(h * r)), int(round(w * r))
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+    pad_w = new_shape - nw
+    pad_h = new_shape - nh
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+
+    out = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return out, r, (left, top)
+
+
+def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk: int = 300) -> List[int]:
+    """Simple NMS. boxes: (M,4) xyxy, scores:(M,)"""
+    if len(boxes) == 0:
+        return []
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0 and len(keep) < topk:
+        i = order[0]
+        keep.append(int(i))
+        if order.size == 1:
+            break
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        w = np.maximum(0.0, xx2 - xx1 + 1)
+        h = np.maximum(0.0, yy2 - yy1 + 1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
+
+        inds = np.where(iou <= iou_thr)[0]
+        order = order[inds + 1]
+    return keep
+
+
+def clamp_xyxy(x1, y1, x2, y2, W, H):
+    x1 = int(max(0, min(x1, W - 1)))
+    y1 = int(max(0, min(y1, H - 1)))
+    x2 = int(max(0, min(x2, W - 1)))
+    y2 = int(max(0, min(y2, H - 1)))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return x1, y1, x2, y2
+
+
+# -----------------------------
+# TensorRT engine wrapper
+# -----------------------------
+class TRTEngine:
+    def __init__(self, engine_path: str):
+        if not os.path.exists(engine_path):
+            raise FileNotFoundError(engine_path)
+
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+
+        self.context = self.engine.create_execution_context()
+
+        # Bindings
+        self.bindings = []
+        self.host_mem = []
+        self.device_mem = []
+        self.binding_names = []
+        self.input_index = None
+        self.output_indices = []
+
+        for i in range(self.engine.num_bindings):
+            name = self.engine.get_binding_name(i)
+            self.binding_names.append(name)
+
+            dtype = trt.nptype(self.engine.get_binding_dtype(i))
+
+            shape = self.engine.get_binding_shape(i)
+            # If dynamic, you must set it before allocating; here we assume fixed (common on Jetson exports)
+            if -1 in tuple(shape):
+                raise RuntimeError(f"Dynamic shape binding found ({name}): {shape}. Export a fixed-shape engine.")
+
+            size = int(np.prod(shape))
+            host = cuda.pagelocked_empty(size, dtype)
+            dev = cuda.mem_alloc(host.nbytes)
+
+            self.host_mem.append(host)
+            self.device_mem.append(dev)
+            self.bindings.append(int(dev))
+
+            if self.engine.binding_is_input(i):
+                self.input_index = i
+                self.input_shape = tuple(shape)  # e.g. (1,3,640,640)
+            else:
+                self.output_indices.append(i)
+
+        if self.input_index is None:
+            raise RuntimeError("No input binding found.")
+
+        self.stream = cuda.Stream()
+
+    def infer(self, input_chw: np.ndarray) -> List[np.ndarray]:
+        """input_chw: float32 array shape == input_shape"""
+        if input_chw.shape != self.input_shape:
+            raise ValueError(f"Expected input {self.input_shape}, got {input_chw.shape}")
+
+        # copy input to host
+        np.copyto(self.host_mem[self.input_index], input_chw.ravel())
+
+        # H2D
+        cuda.memcpy_htod_async(self.device_mem[self.input_index], self.host_mem[self.input_index], self.stream)
+
+        # execute
+        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+
+        # D2H for outputs
+        outs = []
+        for oi in self.output_indices:
+            cuda.memcpy_dtoh_async(self.host_mem[oi], self.device_mem[oi], self.stream)
+        self.stream.synchronize()
+
+        for oi in self.output_indices:
+            shape = tuple(self.engine.get_binding_shape(oi))
+            out = np.array(self.host_mem[oi], copy=True).reshape(shape)
+            outs.append(out)
+        return outs
+
+
+# -----------------------------
+# YOLOv8 parsers (det + pose)
+# -----------------------------
+COCO_NAMES = {
+    0: "person",
+    2: "car",
+}
+
+class YoloV8DetTRT:
+    def __init__(self, engine_path: str, imgsz: int = 640, conf: float = 0.25, iou: float = 0.45, allowed=("person", "car")):
+        self.trt = TRTEngine(engine_path)
+        self.imgsz = imgsz
+        self.conf = conf
+        self.iou = iou
+        self.allowed = set(allowed)
+
+    def run(self, bgr: np.ndarray) -> List[Dict]:
+        H0, W0 = bgr.shape[:2]
+        img_lb, r, (padx, pady) = letterbox_bgr(bgr, self.imgsz)
+
+        # BGR->RGB, normalize, CHW
+        rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
+        x = rgb.astype(np.float32) / 255.0
+        x = np.transpose(x, (2, 0, 1))[None, ...]  # (1,3,S,S)
+
+        outs = self.trt.infer(x)
+        pred = outs[0]  # assume first output
+        # common shapes: (1, 84, N) or (1, N, 84)
+        if pred.ndim != 3:
+            raise RuntimeError(f"Unexpected det output shape: {pred.shape}")
+        if pred.shape[1] < pred.shape[2]:
+            # (1, C, N)
+            p = pred[0]
+        else:
+            # (1, N, C) -> transpose to (C,N)
+            p = pred[0].T
+
+        C, N = p.shape
+        nc = C - 4
+        boxes_xywh = p[0:4, :]  # (4,N)
+        cls_scores = p[4:4+nc, :]  # (nc,N)
+
+        cls_id = np.argmax(cls_scores, axis=0)
+        score = cls_scores[cls_id, np.arange(N)]
+
+        keep = score >= self.conf
+        cls_id = cls_id[keep]
+        score = score[keep]
+        boxes_xywh = boxes_xywh[:, keep]
+
+        # filter allowed labels (COCO mapping)
+        labels = [COCO_NAMES.get(int(i), str(int(i))) for i in cls_id]
+        allowed_mask = np.array([lab in self.allowed for lab in labels], dtype=bool)
+        cls_id = cls_id[allowed_mask]
+        score = score[allowed_mask]
+        boxes_xywh = boxes_xywh[:, allowed_mask]
+        labels = [COCO_NAMES.get(int(i), str(int(i))) for i in cls_id]
+
+        if boxes_xywh.size == 0:
+            return []
+
+        # xywh -> xyxy in letterboxed coords
+        x_c, y_c, w, h = boxes_xywh
+        x1 = x_c - w / 2
+        y1 = y_c - h / 2
+        x2 = x_c + w / 2
+        y2 = y_c + h / 2
+        boxes = np.stack([x1, y1, x2, y2], axis=1)
+
+        # NMS
+        keep_idx = nms_xyxy(boxes, score, self.iou)
+        out = []
+        for i in keep_idx:
+            bx = boxes[i]
+            # de-letterbox back to original image coords
+            bx0 = (bx - np.array([padx, pady, padx, pady], dtype=np.float32)) / max(r, 1e-9)
+            x1, y1, x2, y2 = clamp_xyxy(bx0[0], bx0[1], bx0[2], bx0[3], W0, H0)
+            out.append({
+                "cls_name": labels[i],
+                "conf": float(score[i]),
+                "box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+            })
+        return out
+
+
+class YoloV8PoseTRT:
+    def __init__(self, engine_path: str, imgsz: int = 640, conf: float = 0.25, iou: float = 0.45, kpts: int = 17):
+        self.trt = TRTEngine(engine_path)
+        self.imgsz = imgsz
+        self.conf = conf
+        self.iou = iou
+        self.kpts = kpts  # COCO=17
+
+    def run(self, bgr: np.ndarray) -> Tuple[List[Dict], Optional[Dict]]:
+        H0, W0 = bgr.shape[:2]
+        img_lb, r, (padx, pady) = letterbox_bgr(bgr, self.imgsz)
+
+        rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
+        x = rgb.astype(np.float32) / 255.0
+        x = np.transpose(x, (2, 0, 1))[None, ...]
+
+        outs = self.trt.infer(x)
+        pred = outs[0]
+        if pred.ndim != 3:
+            raise RuntimeError(f"Unexpected pose output shape: {pred.shape}")
+        if pred.shape[1] < pred.shape[2]:
+            p = pred[0]  # (C,N)
+        else:
+            p = pred[0].T
+
+        C, N = p.shape
+        expected_min = 4 + 1 + self.kpts * 3
+        if C < expected_min:
+            raise RuntimeError(f"Pose output channels too small: C={C}, expected>={expected_min}")
+
+        boxes_xywh = p[0:4, :]
+        score = p[4, :]  # (N,)
+        kps = p[5:5 + self.kpts * 3, :]  # (k*3, N)
+
+        keep = score >= self.conf
+        score = score[keep]
+        boxes_xywh = boxes_xywh[:, keep]
+        kps = kps[:, keep]
+
+        if boxes_xywh.size == 0:
+            return [], None
+
+        x_c, y_c, w, h = boxes_xywh
+        x1 = x_c - w / 2
+        y1 = y_c - h / 2
+        x2 = x_c + w / 2
+        y2 = y_c + h / 2
+        boxes = np.stack([x1, y1, x2, y2], axis=1)
+
+        keep_idx = nms_xyxy(boxes, score, self.iou)
+        det_items = []
+        skeletons = []
+
+        for i in keep_idx:
+            bx = boxes[i]
+            bx0 = (bx - np.array([padx, pady, padx, pady], dtype=np.float32)) / max(r, 1e-9)
+            x1o, y1o, x2o, y2o = clamp_xyxy(bx0[0], bx0[1], bx0[2], bx0[3], W0, H0)
+
+            # keypoints: (k*3,) => (k,3) [x,y,conf] in letterboxed coords
+            pts = kps[:, i].reshape(self.kpts, 3)
+            kp_list = []
+            for (kx, ky, kc) in pts:
+                # de-letterbox keypoints to original image coords
+                kx0 = (kx - padx) / max(r, 1e-9)
+                ky0 = (ky - pady) / max(r, 1e-9)
+                kp_list.append({"x": float(kx0), "y": float(ky0), "conf": float(kc)})
+
+            det_items.append({
+                "cls_name": "skeleton",
+                "conf": float(score[i]),
+                "box": {"x1": x1o, "y1": y1o, "x2": x2o, "y2": y2o},
+            })
+            skeletons.append({
+                "conf": float(score[i]),
+                "box": {"x1": x1o, "y1": y1o, "x2": x2o, "y2": y2o},
+                "keypoints": kp_list,
+            })
+
+        pose = {"format": "xy", "skeletons": skeletons} if skeletons else None
+        return det_items, pose
+
+
+# -----------------------------
+# Flask app
+# -----------------------------
+app = Flask(__name__)
+
+DET_ENGINE ="./models/yolov8n.engine"
+POSE_ENGINE = "./models/yolov8n-pose.engine"
+
+IMG_SZ = int(os.getenv("IMG_SZ", "640"))
+CONF = float(os.getenv("CONF", "0.25"))
+IOU = float(os.getenv("IOU", "0.45"))
+
+det_runner = YoloV8DetTRT(DET_ENGINE, imgsz=IMG_SZ, conf=CONF, iou=IOU, allowed=("person", "car"))
+pose_runner = YoloV8PoseTRT(POSE_ENGINE, imgsz=IMG_SZ, conf=CONF, iou=IOU, kpts=17)
+
+
+def _read_image_from_request() -> np.ndarray:
+    if "image" not in request.files:
+        raise ValueError("Missing 'image' file in multipart form-data.")
+    data = request.files["image"].read()
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Failed to decode image bytes.")
+    return img
+
+
+def _meta():
+    # optional fields
+    return {
+        "camera_uuid": request.form.get("camera_uuid", "unknown"),
+        "channel_id": request.form.get("channel_id"),
+        "frame_ts_ms": int(request.form.get("frame_ts_ms", str(int(time.time() * 1000)))),
+        "frame_seq": int(request.form.get("frame_seq", "0")),
+        "model_id": request.form.get("model_id", "yolo-trt"),
+    }
+
+
+@app.route("/v1/detect", methods=["POST"])
+def detect():
+    t0 = time.perf_counter()
+    m = _meta()
+    try:
+        img = _read_image_from_request()
+        dets = det_runner.run(img)
+        ms = int((time.perf_counter() - t0) * 1000)
+        return jsonify({
+            "type": "DetectionsProducedEvent",
+            "channel_id": m["channel_id"],
+            "camera_uuid": m["camera_uuid"],
+            "model_id": m["model_id"],
+            "frame_ts_ms": m["frame_ts_ms"],
+            "frame_seq": m["frame_seq"],
+            "detections": dets,
+            "inference_ms": ms,
+            "pose": None,
+        })
+    except Exception as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        return jsonify({
+            "type": "InferenceFailedEvent",
+            "camera_uuid": m["camera_uuid"],
+            "model_id": m["model_id"],
+            "frame_ts_ms": m["frame_ts_ms"],
+            "frame_seq": m["frame_seq"],
+            "reason": f"{type(e).__name__}: {e} (after {ms} ms)"
+        }), 500
+
+
+@app.route("/v1/pose", methods=["POST"])
+def pose():
+    t0 = time.perf_counter()
+    m = _meta()
+    try:
+        img = _read_image_from_request()
+        dets, pose_obj = pose_runner.run(img)  # dets are "skeleton" items
+        ms = int((time.perf_counter() - t0) * 1000)
+        return jsonify({
+            "type": "DetectionsProducedEvent",
+            "channel_id": m["channel_id"],
+            "camera_uuid": m["camera_uuid"],
+            "model_id": m["model_id"],
+            "frame_ts_ms": m["frame_ts_ms"],
+            "frame_seq": m["frame_seq"],
+            "detections": dets,
+            "inference_ms": ms,
+            "pose": pose_obj,
+        })
+    except Exception as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        return jsonify({
+            "type": "InferenceFailedEvent",
+            "camera_uuid": m["camera_uuid"],
+            "model_id": m["model_id"],
+            "frame_ts_ms": m["frame_ts_ms"],
+            "frame_seq": m["frame_seq"],
+            "reason": f"{type(e).__name__}: {e} (after {ms} ms)"
+        }), 500
+
+
+@app.route("/v1/multitask", methods=["POST"])
+def multitask():
+    t0 = time.perf_counter()
+    m = _meta()
+    try:
+        img = _read_image_from_request()
+
+        dets = det_runner.run(img)
+        # optional optimization: only run pose if "person" exists
+        has_person = any(d.get("cls_name") == "person" for d in dets)
+
+        pose_dets = []
+        pose_obj = None
+        if has_person:
+            pose_dets, pose_obj = pose_runner.run(img)
+
+        ms = int((time.perf_counter() - t0) * 1000)
+        return jsonify({
+            "type": "DetectionsProducedEvent",
+            "channel_id": m["channel_id"],
+            "camera_uuid": m["camera_uuid"],
+            "model_id": m["model_id"],
+            "frame_ts_ms": m["frame_ts_ms"],
+            "frame_seq": m["frame_seq"],
+            "detections": dets + pose_dets,
+            "inference_ms": ms,
+            "pose": pose_obj,
+        })
+    except Exception as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        return jsonify({
+            "type": "InferenceFailedEvent",
+            "camera_uuid": m["camera_uuid"],
+            "model_id": m["model_id"],
+            "frame_ts_ms": m["frame_ts_ms"],
+            "frame_seq": m["frame_seq"],
+            "reason": f"{type(e).__name__}: {e} (after {ms} ms)"
+        }), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8081, threaded=False, use_reloader=False)
+
+

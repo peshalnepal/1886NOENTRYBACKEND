@@ -10,10 +10,19 @@ USER="appuser"
 PASS="AppUser@2025!"
 
 sudo mysql <<SQL
-CREATE DATABASE IF NOT EXISTS \`${DB}\`;
+-- ✅ Remove existing database (drops all tables inside)
+DROP DATABASE IF EXISTS \`${DB}\`;
+
+-- ✅ Recreate fresh database
+CREATE DATABASE \`${DB}\`;
+
+-- ✅ Ensure user exists + has privileges
 CREATE USER IF NOT EXISTS '${USER}'@'%' IDENTIFIED BY '${PASS}';
 GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${USER}'@'%';
 FLUSH PRIVILEGES;
+
+-- (Optional) show confirmation
+SELECT 'Database reset complete' AS status, '${DB}' AS db, '${USER}' AS user;
 SQL
 
-echo "✅ MySQL ready: db=${DB}, user=${USER}"
+echo "✅ MySQL ready (fresh): db=${DB}, user=${USER}"

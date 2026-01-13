@@ -1,21 +1,12 @@
 from __future__ import annotations
-
-from abc import ABC
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
+from pydantic import BaseModel, ConfigDict, Field
 
-from domain.channel import ChannelConfig
-
-
-@dataclass
-class Template:
-    """
-    The platform-agnostic blueprint for an Agent. It holds all
-    user-configurable settings in a generic format. It is abstract and does
-    not know about specific channel implementations.
-    """
+class Template(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
 
     id: UUID
-    configs: ChannelConfig
+    configs: List[Any] = Field(default_factory=list)
 
+    model_cfg: Optional[Any] = Field(default=None, alias="model_config")

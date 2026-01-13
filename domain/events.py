@@ -1,10 +1,10 @@
 # agents/domain/events.py
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Literal
+from typing import Any, Dict, List, Optional, Tuple, Literal,Union
 import uuid
 from pydantic import BaseModel, Field
-
+from dto import ChannelConfig
 logger = logging.getLogger(__name__)
 
 # =========================================================
@@ -68,6 +68,7 @@ class RTSPEvent(ChannelEvent):
     ts_ms: int
     seq: int 
     format: EncodedFormat = "raw"
+    detection_enabled:bool=True
     frame: Any = None  
     frame_shape: Optional[Tuple[int, int, int]] = None 
     encoded: Optional[bytes] = None
@@ -89,14 +90,35 @@ class ChannelDisconnectedEvent(ChannelEvent):
     camera_uuid: str
     reason: str
 
+class ChannelCreateEvent(Event):
+    """
+    Event to Add a Channel.
+    """
+    event_type: Literal["Create_Channel"] = "Create_Channel"
+    configs: Dict[str, Any]
 
+class ChannelRemoveEvent(Event):
+    """
+    Event to Remove a Channel.
+    """
+    event_type: Literal["Remove_Channel"] = "Remove_Channel"
+    channel_id: uuid.UUID
+    
+class ChannelEditEvent(Event):
+    """
+    Event to Edit a Channel.
+    """
+    event_type: Literal["Edit_Channel"] = "Edit_Channel"
+    channel_id: uuid.UUID
+    configs: Dict[str, Any]
+    
 class FrameDroppedEvent(ChannelEvent):
     event_type: str = "FrameDroppedEvent"
     camera_uuid: str
     reason: str
     dropped_count: int = 1
 
-
+VideoChannelEvent=Union[ChannelConnectedEvent,ChannelDisconnectedEvent,ChannelCreateEvent,ChannelRemoveEvent,ChannelEditEvent]
 # =========================================================
 # Detection + Alerts
 # =========================================================
@@ -113,7 +135,38 @@ class DetectionItem(BaseModel):
     conf: float
     box: DetectionBox
 
+class PoseKeypoint(BaseModel):
+    x: float
+    y: float
+    conf: Optional[float] = None
 
+
+class SkeletonItem(BaseModel):
+    conf: float
+    box: DetectionBox
+    keypoints: List[PoseKeypoint] = Field(default_factory=list)
+
+
+class PoseResult(BaseModel):
+    """
+    Pose/skeleton output for a frame.
+    """
+    format: Literal["xy", "xyn"] = "xy"  # pixel coords or normalized coords
+    skeletons: List[SkeletonItem] = Field(default_factory=list)
+
+
+class SkeletonProducedEvent(ChannelEvent):
+    """
+    Dedicated event for pose/skeleton output.
+    Useful if some consumers only care about pose.
+    """
+    event_type: str = "SkeletonProducedEvent"
+    camera_uuid: str
+    model_id: str
+    frame_ts_ms: int
+    frame_seq: int
+    pose: PoseResult
+    
 class DetectionsProducedEvent(ChannelEvent):
     """
     Emitted after inference runs on a specific RTSPEvent frame.
@@ -125,6 +178,8 @@ class DetectionsProducedEvent(ChannelEvent):
     frame_seq: int
     detections: List[DetectionItem] = Field(default_factory=list)
     inference_ms: Optional[int] = None
+    pose: Optional[PoseResult] = None
+
 
 
 class InferenceFailedEvent(ChannelEvent):

@@ -1,4 +1,6 @@
 # agents/application/channels/video_channel.py
+import os
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000|max_delay;2000000"
 
 import asyncio
 import logging
@@ -8,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Deque, Optional, Tuple
 
 import cv2
+import threading
 
 from application.channels.channel_config import VideoChannelConfig
 from domain.channel import Channel
@@ -18,7 +21,7 @@ from domain.events import (
     ChannelDisconnectedEvent,
     FrameDroppedEvent,
 )
-from domain.model import ModelPipeline
+from domain.model_pipeline import ModelPipeline
 logger = logging.getLogger(__name__)
 
 _DONE_SENTINEL = object()
@@ -53,7 +56,7 @@ class VideoChannel(Channel):
         self.config = config
 
         # observer stream queue (yields outward)
-        self._out_q: asyncio.Queue[Any] = asyncio.Queue(maxsize=50)
+        self._out_q: asyncio.Queue[Any] = asyncio.Queue(maxsize=2)
 
         # tasks
         self._capture_task: Optional[asyncio.Task] = None
@@ -69,7 +72,12 @@ class VideoChannel(Channel):
         self._ring: Deque[_FramePacket] = deque(maxlen=self._ring_maxlen())
         # connection coordination (emit loop waits for connection)
         self._connected_evt = asyncio.Event()
+        self._stop_evt = asyncio.Event()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        self._worker_thread: Optional[threading.Thread] = None
+        self._stop_thread_evt = threading.Event()
+        
         logger.info(
             "VideoChannel initialized channel_id=%s camera_uuid=%s backend=%s sample_fps=%.2f ring_maxlen=%d",
             self.config.channel_id,
@@ -111,9 +119,8 @@ class VideoChannel(Channel):
         #     cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
         # else:
         cap = cv2.VideoCapture(self.config.rtsp_url, cv2.CAP_FFMPEG)
-            
 
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
         return cap
 
     # ---------------------------
@@ -137,37 +144,73 @@ class VideoChannel(Channel):
             return None, enc.tobytes()
         return frame, None
     
-    async def _put_latest_event(self, ev: ChannelEvent) -> None:
+    def _put_latest_event(self, ev: ChannelEvent) -> None:
         """
         latest-wins: keep only most recent RTSPEvent in frame queue
         """
         if self._out_q.full():
             try:
                 _ = self._out_q.get_nowait()
+                # Optional: don't use task_done at all unless you call queue.join()
+                # self._out_q.task_done()
             except Exception:
                 pass
+
         try:
             self._out_q.put_nowait(ev)
         except Exception:
-            # if still fails, silently drop
             pass
+        
+    def _push_from_thread(self, ev: Any) -> None:
+        """
+        Called from capture thread.
+        Schedules the actual queue put onto the asyncio loop thread.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(self._put_latest_event, ev)
 
-    # ---------------------------
-    # Capture loop: fills ring buffer + latest pointer
-    # ---------------------------
-    async def _capture_loop(self) -> None:
+    def _start_worker_thread(self) -> None:
+        if self._worker_thread and self._worker_thread.is_alive():
+            return
+
+        self._stop_thread_evt.clear()
+
+        self._worker_thread = threading.Thread(
+            target=self._capture_worker,
+            name=f"VideoChannel-{self.config.channel_id}",
+            daemon=True,  # ensures app can exit even if a thread is stuck
+        )
+        self._worker_thread.start()
+
+   
+    async def stop(self) -> None:
+        self._stop_evt.set()
+        self._stop_thread_evt.set()
+
+        # unblock stream consumer
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._put_latest_event, _DONE_SENTINEL)
+
+        # join thread without blocking event loop
+        t = self._worker_thread
+        if t and t.is_alive():
+            await asyncio.to_thread(t.join, 1.0)
+            
+            
+    def _capture_worker(self) -> None:
         backoff_ms = int(self.config.reconnect_base_ms)
-        while True:
+
+        while not self._stop_thread_evt.is_set():
             cap = None
             try:
-                cap = await asyncio.to_thread(self._open_capture)
+                cap = self._open_capture()
                 if cap is None or not cap.isOpened():
                     raise RuntimeError("Failed to open RTSP stream")
 
-                # Connected
                 self._connected_evt.set()
-                
-                await self._put_latest_event(
+                self._push_from_thread(
                     ChannelConnectedEvent(
                         channel_id=self.config.channel_id,
                         camera_uuid=str(self.config.camera_uuid),
@@ -176,81 +219,76 @@ class VideoChannel(Channel):
                 )
 
                 backoff_ms = int(self.config.reconnect_base_ms)
-                while True:
-                    ok, frame = await asyncio.to_thread(cap.read)
-                    if not ok or frame is None:
-                        raise RuntimeError("Frame read failed")
+
+                sample_fps = float(self.config.sample_fps or 0.0)
+                emit_interval_ms = int(1000 / sample_fps) if sample_fps > 0 else 0
+                last_emit_ms = 0
+
+                while not self._stop_thread_evt.is_set():
+                    ok = cap.grab()
+                    if not ok:
+                        raise RuntimeError("Frame grab failed")
 
                     ts_ms = int(time.time() * 1000)
 
-                    self._seq += 1
-
-                    # build inference payload from latest frame
-                    frame_for_ev = self._maybe_resize(frame)
-                    raw_frame, enc_bytes = self._encode_if_needed(frame_for_ev)
-
-                    if self.config.emit_format == "jpeg" and enc_bytes is None:
-                        await self._safe_emit_drop("jpeg_encode_failed")
+                    if emit_interval_ms and (ts_ms - last_emit_ms) < emit_interval_ms:
                         continue
+                    last_emit_ms = ts_ms
 
-                    h = int(frame_for_ev.shape[0]) if hasattr(frame_for_ev, "shape") else None
-                    w = int(frame_for_ev.shape[1]) if hasattr(frame_for_ev, "shape") else None
+                    ok, frame = cap.retrieve()
+                    if not ok or frame is None:
+                        raise RuntimeError("Frame retrieve failed")
+                    if self.config.resize:
+                        frame_for_ev = self._maybe_resize(frame)   # allocates new
+                    else:
+                        frame_for_ev = frame.copy()                # safe buffer
+
+                    self._seq += 1
                     shape = getattr(frame_for_ev, "shape", None)
+                    h = int(shape[0]) if shape is not None else None
+                    w = int(shape[1]) if shape is not None else None
+                    frame_field, encoded = self._encode_if_needed(frame_for_ev)
+
                     ev = RTSPEvent(
                         channel_id=self.config.channel_id,
                         camera_uuid=str(self.config.camera_uuid),
                         ts_ms=ts_ms,
+                        detection_enabled=getattr(self.config, "detection_enabled", True),
                         seq=self._seq,
                         format=self.config.emit_format,
-                        frame=raw_frame,
+                        frame=frame_field,
                         frame_shape=shape,
-                        encoded=enc_bytes,
+                        encoded=encoded,
                         width=w,
                         height=h,
                         fps_hint=float(self.config.sample_fps),
                     )
-                    try:
-                        await self._put_latest_event(ev)
-                    except:
-                        self._safe_emit_drop("ubable to store the values")
+                    self._push_from_thread(ev)
 
-            except asyncio.CancelledError:
-                raise
-            
             except Exception as e:
-                # Disconnected
                 self._connected_evt.clear()
-                logger.warning(
-                    "VideoChannel disconnected channel_id=%s camera_uuid=%s reason=%s",
-                    self.config.channel_id,
-                    str(self.config.camera_uuid),
-                    str(e),
-                )
-                try:
-                    await self._put_latest_event(
-                        ChannelDisconnectedEvent(
-                            channel_id=self.config.channel_id,
-                            camera_uuid=str(self.config.camera_uuid),
-                            reason=str(e),
-                        )
+                self._push_from_thread(
+                    ChannelDisconnectedEvent(
+                        channel_id=self.config.channel_id,
+                        camera_uuid=str(self.config.camera_uuid),
+                        reason=str(e),
                     )
-                except Exception:
-                    pass
+                )
 
-                # reconnect with bounded backoff
-                await asyncio.sleep(backoff_ms / 1000.0)
+                # bounded backoff
+                time.sleep(backoff_ms / 1000.0)
                 backoff_ms = min(backoff_ms * 2, int(self.config.reconnect_max_ms))
 
             finally:
                 try:
                     if cap is not None:
-                        await asyncio.to_thread(cap.release)
+                        cap.release()
                 except Exception:
                     pass
-                
+     
     async def _safe_emit_drop(self, reason: str, dropped_count: int = 1) -> None:
         try:
-            await self._put_latest_event(
+            self._put_latest_event(
                 FrameDroppedEvent(
                     channel_id=self.config.channel_id,
                     camera_uuid=str(self.config.camera_uuid),
@@ -265,19 +303,15 @@ class VideoChannel(Channel):
     # Channel API
     # ---------------------------
     async def stream(self, event: ChannelEvent) -> AsyncGenerator[ChannelEvent, None]:
-        """
-        Starts capture + emit on first call and yields:
-          - ChannelConnectedEvent / ChannelDisconnectedEvent
-          - RTSPEvent (built from latest frame in ring buffer)
-          - FrameDroppedEvent
-        """
         if not self.config.enabled:
             logger.info("VideoChannel disabled channel_id=%s", self.config.channel_id)
             return
 
-        # start tasks once
-        if self._capture_task is None or self._capture_task.done():
-            self._capture_task = asyncio.create_task(self._capture_loop())
+        # Capture the running loop ONCE (must be done inside async context)
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+
+        self._start_worker_thread()
 
         try:
             while True:
@@ -287,17 +321,13 @@ class VideoChannel(Channel):
                 try:
                     yield item
                 finally:
-                    self._out_q.task_done()
-        finally:
-            # stop tasks if consumer stops
-            if self._capture_task and not self._capture_task.done():
-                self._capture_task.cancel()
-                try:
-                    await self._capture_task
-                except asyncio.CancelledError:
                     pass
+        finally:
+            pass
+
 
     # Optional: expose ring buffer to clip-writer (read-only snapshot)
     async def snapshot_ring(self) -> Tuple[_FramePacket, ...]:
         async with self._frame_lock:
             return tuple(self._ring)
+

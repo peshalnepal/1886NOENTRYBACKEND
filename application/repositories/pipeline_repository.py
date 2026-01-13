@@ -11,7 +11,7 @@ from sqlalchemy.orm import selectinload
 # You said you keep them all in database.py and import via core.database in other files.
 from core.database_orm import Camera, ChannelConfiguration, Pipeline, PipelineCamera
 
-from domain.channel import ChannelConfig
+from dto import ChannelConfig
 
 
 class PipelineRepository:
