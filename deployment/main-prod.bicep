@@ -112,7 +112,8 @@ resource environment 'Microsoft.App/managedEnvironments@2023-05-01' = {
 // ----------------------------
 // MySQL Flexible Server + DB
 // ----------------------------
-var mysqlServerName = toLower('${namePrefix}-mysql-${suffix}')
+var mysqlSuffix = toLower(substring(uniqueString(resourceGroup().id, namePrefix, environmentName, mysqlLocation), 0, 6))
+var mysqlServerName = toLower('${namePrefix}-mysql-${mysqlSuffix}')
 var mysqlFqdn = '${mysqlServerName}.mysql.database.azure.com'
 
 // This is the exact format you are using in .env today
