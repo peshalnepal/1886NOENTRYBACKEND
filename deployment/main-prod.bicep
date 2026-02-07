@@ -16,6 +16,14 @@ param revisionMode string = 'Single' // 'Multiple' for blue/green
 param deployMediaMtx bool = false
 
 // ----------------------------
+// ACR registry auth (FIX: avoid RBAC roleAssignments)
+// ----------------------------
+param acrUsername string ='noentryresourceprod'
+
+@secure()
+param acrPassword string = '6GL4H95PJH91ZrStoAwijfdHCG0Gydldf9cTfa0lez5aWIoFXnvMJQQJ99CBAC1i4TkEqg7NAAACAZCRK4AV'
+
+// ----------------------------
 // App settings (non-secrets)
 // ----------------------------
 param webrtcAdminApiUrl string = ''
@@ -28,23 +36,32 @@ param webrtcAdminDeletePath string = ''
 
 param enableSmtp bool = false
 param smtpUsername string = ''
+
+@secure()
 param smtpPassword string = '' // TEMP (no secrets system for now)
+
 param smtpFrom string = 'no-reply@1886noentry.com'
 
 // ----------------------------
 // MySQL Flexible Server
 // ----------------------------
 param mysqlAdminUser string = 'mysqladmin'
+
+@secure()
 param mysqlAdminPassword string // TEMP (no secrets system for now)
 
 param mysqlDatabaseName string = 'appdb'
 param appDbUser string = 'appuser'
+
+@secure()
 param appDbPassword string // TEMP (no secrets system for now)
 
 // ----------------------------
 // Optional MediaMTX (kept for later)
 // ----------------------------
 param mediamtxApiUser string = 'api'
+
+@secure()
 param mediamtxApiPass string = '' // TEMP (only if deployMediaMtx=true)
 
 // ----------------------------
@@ -88,28 +105,6 @@ resource environment 'Microsoft.App/managedEnvironments@2023-05-01' = {
         sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
       }
     }
-  }
-}
-
-// ----------------------------
-// User-assigned managed identity (for ACR pull)
-// ----------------------------
-resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
-  name: '${namePrefix}-prod-identity'
-  location: location
-}
-
-// Role assignment for ACR Pull
-resource acrPullRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(acr.id, managedIdentity.id, 'ACR Pull')
-  scope: acr
-  properties: {
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-    )
-    principalId: managedIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
   }
 }
 
@@ -180,12 +175,6 @@ resource mysqlDb 'Microsoft.DBforMySQL/flexibleServers/databases@2024-12-30' = {
 resource app 'Microsoft.App/containerApps@2023-05-01' = {
   name: appName
   location: location
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${managedIdentity.id}': {}
-    }
-  }
   properties: {
     managedEnvironmentId: environment.id
     configuration: {
@@ -213,15 +202,23 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
           allowCredentials: true
         }
       }
+
+      // ✅ Registry auth via username/password (no RBAC roleAssignments needed)
+      secrets: [
+        {
+          name: 'acr-password'
+          value: acrPassword
+        }
+      ]
       registries: [
         {
           server: acr.properties.loginServer
-          identity: managedIdentity.id
+          username: acrUsername
+          passwordSecretRef: 'acr-password'
         }
       ]
-      // No secrets block for now
-      secrets: []
     }
+
     template: {
       revisionSuffix: revisionSuffix
       containers: [
@@ -261,7 +258,6 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
   }
 
   dependsOn: [
-    acrPullRole
     mysqlDb
     mysqlFwAzure
     mysqlRequireSecureTransport
