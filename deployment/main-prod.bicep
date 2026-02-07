@@ -11,6 +11,7 @@ param namePrefix string = 'noentry'
 param appImageTag string = 'latest'
 param revisionSuffix string = ''
 param revisionMode string = 'Single' // 'Multiple' for blue/green
+param mysqlLocation string = location
 
 // Feature toggles
 param deployMediaMtx bool = false
@@ -119,7 +120,7 @@ var databaseUrl = 'Driver={MySQL ODBC 8.0 Unicode Driver};Server=${mysqlFqdn};Po
 
 resource mysql 'Microsoft.DBforMySQL/flexibleServers@2024-12-30' = {
   name: mysqlServerName
-  location: location
+  location: mysqlLocation
   sku: {
     name: 'Standard_B1ms'
     tier: 'Burstable'

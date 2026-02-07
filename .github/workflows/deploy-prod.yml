@@ -19,7 +19,7 @@ env:
   AZURE_LOCATION: centralus
   AZURE_KEY_VAULT_NAME: noentry-kv-prod
   PYTHON_VERSION: "3.11"
-
+  MYSQL_LOCATION: canadacentral
 jobs:
   deploy:
     name: Build and Deploy (Production)

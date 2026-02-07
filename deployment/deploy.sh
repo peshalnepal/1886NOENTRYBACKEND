@@ -221,6 +221,7 @@ function deploy_infrastructure() {
       acrName="${AZURE_ACR_NAME}" \
       appImageTag="${IMAGE_TAG}" \
       revisionSuffix="${REV_SUFFIX}" \
+      mysqlLocation="${MYSQL_LOCATION:-canadacentral}" \
       revisionMode="${REVISION_MODE}" \
       namePrefix="${NAME_PREFIX}" \
       appName="${APP_NAME_MAIN}" \
