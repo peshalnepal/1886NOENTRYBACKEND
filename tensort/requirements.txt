@@ -1,0 +1,21 @@
+# Python 3.6 compatible dependencies for Backend/tensort
+#
+# Create env:
+#   python3.6 -m venv .venv-py36
+#   source .venv-py36/bin/activate
+#   pip install --upgrade "pip<22" "setuptools<60" wheel
+#   pip install -r requirements-py36.txt
+
+Flask==2.0.3
+Werkzeug==2.0.3
+Jinja2==3.0.3
+itsdangerous==2.0.1
+click==8.0.4
+
+numpy==1.19.5
+opencv-python==4.6.0.66
+pycuda==2022.2.2
+
+# TensorRT Python bindings are usually installed from JetPack/apt on Jetson.
+# Example:
+#   sudo apt-get install -y python3-libnvinfer

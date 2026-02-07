@@ -9,7 +9,7 @@ from sqlalchemy.orm import selectinload
 
 # Adjust this import to wherever your ORM models live.
 # You said you keep them all in database.py and import via core.database in other files.
-from core.database_orm import Camera, ChannelConfiguration, Pipeline, PipelineCamera
+from core.database_orm import Camera, ChannelConfiguration, Pipeline, PipelineCamera, CameraDevice, Device
 
 from dto import ChannelConfig
 
@@ -79,7 +79,8 @@ class PipelineRepository:
             select(Pipeline)
             .where(Pipeline.id == pipeline_id)
             .options(
-                selectinload(Pipeline.cameras).selectinload(Camera.channel_configuration)
+                selectinload(Pipeline.cameras).selectinload(Camera.channel_configuration),
+                selectinload(Pipeline.cameras).selectinload(Camera.devices),
             )
         )
 

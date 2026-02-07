@@ -3,8 +3,8 @@
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Literal,Union
 import uuid
-from pydantic import BaseModel, Field
-from dto import ChannelConfig
+from pydantic import BaseModel, Field,ConfigDict
+
 logger = logging.getLogger(__name__)
 
 # =========================================================
@@ -21,9 +21,7 @@ class Event(BaseModel):
     """
     event_type: str = "Event"
     payload: Dict[str, Any] = Field(default_factory=dict)
-
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class ChannelEvent(Event):
@@ -83,12 +81,16 @@ class ChannelConnectedEvent(ChannelEvent):
     event_type: str = "ChannelConnectedEvent"
     camera_uuid: str
     rtsp_url: str
+    device_url: Optional[str] = None
+    webrtc_url: Optional[str] = None
+
 
 
 class ChannelDisconnectedEvent(ChannelEvent):
     event_type: str = "ChannelDisconnectedEvent"
     camera_uuid: str
     reason: str
+    device_url: Optional[str] = None  
 
 class ChannelCreateEvent(Event):
     """

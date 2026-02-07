@@ -1,18 +1,23 @@
 # database.py
-import json
 import re
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import (JSON, Boolean, Column, DateTime, Enum, Float,
-                        ForeignKey, Integer, String, Text, TypeDecorator,
-                        UniqueConstraint)
-from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    TypeDecorator,
+    UniqueConstraint,
+)
 from sqlalchemy.ext.mutable import Mutable, MutableDict, MutableList
-from sqlalchemy.orm import declarative_base, relationship, validates
-from sqlalchemy.types import UUID
-import uuid
-from sqlalchemy.types import TypeDecorator, CHAR
+from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.types import CHAR
 from sqlalchemy.dialects.mysql import BINARY
 from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
 
@@ -23,8 +28,10 @@ except Exception:
 
 Base = declarative_base()
 
-from enum import Enum as PythonEnum
 
+# -------------------------
+# GUID (cross-db UUID)
+# -------------------------
 class GUIDType(TypeDecorator):
     """
     Platform-independent GUID type.
@@ -53,10 +60,10 @@ class GUIDType(TypeDecorator):
             value = uuid.UUID(str(value))
 
         if dialect.name == "mysql":
-            return value.bytes  # 16 bytes
+            return value.bytes
         if dialect.name == "postgresql":
             return value
-        return str(value)  # CHAR(36)
+        return str(value)
 
     def process_result_value(self, value, dialect):
         if value is None:
@@ -66,19 +73,18 @@ class GUIDType(TypeDecorator):
         return uuid.UUID(str(value))
 
 
-# Keep your old name so you don't change every Column(...) line
 GUID = GUIDType()
 
 
 def utc_now():
-    """Helper function to get current UTC time with timezone info"""
     return datetime.now(timezone.utc)
 
 
+# -------------------------
+# Deep mutable JSON helpers
+# -------------------------
 class DeepMutableDict(MutableDict):
-
     def __init__(self, *args, **kwargs):
-
         self._root = kwargs.pop("_root", self)
         super().__init__(*args, **kwargs)
 
@@ -95,22 +101,17 @@ class DeepMutableDict(MutableDict):
 
     def update(self, *args, **kwargs):
         for key, value in dict(*args, **kwargs).items():
-            # Use our overridden __setitem__ to process each value
             self[key] = value
 
     @classmethod
     def coerce(cls, key, value):
         if not isinstance(value, cls):
             if isinstance(value, dict):
-                # The coerced object becomes its own root.
                 instance = cls(value)
-                # Recursively convert its children, passing the new instance as the root.
                 instance.update(instance)
                 return instance
-            # Let the base class handle non-dict types (e.g., raise ValueError).
             return Mutable.coerce(key, value)
-        else:
-            return value
+        return value
 
 
 def _recursively_make_mutable(value, root):
@@ -141,6 +142,10 @@ def sanitize_to_snake_case(name: str) -> str:
     s2 = re.sub(r"[^a-zA-Z0-9_]", "", s1)
     return s2.lower()
 
+
+# =========================
+# USER
+# =========================
 class User(Base):
     __tablename__ = "users"
 
@@ -158,24 +163,157 @@ class User(Base):
     email_verified = Column(Boolean, default=False)
 
     # Relationships
-    cameras = relationship("Camera", back_populates="user", cascade="all, delete-orphan")
+    sites = relationship("Site", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
+    devices = relationship("Device", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
+
+    cameras = relationship("Camera", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
+
     notification_emails = relationship(
-        "NotificationEmail", back_populates="user", cascade="all, delete-orphan"
+        "NotificationEmail",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
+# =========================
+# SITE
+# =========================
+class Site(Base):
+    """
+    One user -> many sites
+    One site -> many cameras
+    One site <-> many devices (M:N via SiteDevice)
+
+    IMPORTANT:
+      - deleting a Site deletes Cameras (and their children)
+      - deleting a Site DOES NOT delete Devices (only the site-device link rows)
+    """
+    __tablename__ = "sites"
+
+    site_uuid = Column(GUID, primary_key=True, default=uuid.uuid4, unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    site_code = Column(String(64), nullable=True, index=True)
+    name = Column(String(255), nullable=False)
+    address = Column(String(255), nullable=True)
+    timezone = Column(String(50), nullable=True, default="UTC")
+
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    user = relationship("User", back_populates="sites")
+
+    # Site -> Cameras (delete site => delete cameras)
+    cameras = relationship(
+        "Camera",
+        back_populates="site",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    # Site <-> Devices (M:N)
+    devices = relationship(
+        "Device",
+        secondary="site_devices",
+        back_populates="sites",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "site_code", name="uq_site_user_site_code"),
+    )
+
+
+# =========================
+# DEVICE
+# =========================
+class Device(Base):
+    """
+    A Jetson/edge device. Belongs to a user (not owned by a site directly).
+
+    device_url = base URL for inference API (e.g. http://10.0.0.5:8080)
+
+    - Can be linked to multiple sites (M:N)
+    - Can be linked to multiple cameras (M:N)
+    """
+    __tablename__ = "devices"
+
+    device_uuid = Column(GUID, primary_key=True, default=uuid.uuid4, unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    device_code = Column(String(64), nullable=True, index=True)
+    name = Column(String(255), nullable=True)
+
+    device_url = Column(String(2048), nullable=False)
+    is_enabled = Column(Boolean, default=True)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    user = relationship("User", back_populates="devices")
+
+    # Device <-> Sites (M:N)
+    sites = relationship(
+        "Site",
+        secondary="site_devices",
+        back_populates="devices",
+    )
+
+    # Device <-> Cameras (M:N)
+    cameras = relationship(
+        "Camera",
+        secondary="camera_devices",
+        back_populates="devices",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "device_code", name="uq_device_user_device_code"),
+    )
+
+
+# =========================
+# SITE <-> DEVICE association
+# =========================
+class SiteDevice(Base):
+    """
+    Link table: sites <-> devices (M:N)
+
+    Deleting a site removes these rows (CASCADE) but does NOT delete devices.
+    Deleting a device removes these rows (CASCADE).
+    """
+    __tablename__ = "site_devices"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    site_uuid = Column(GUID, ForeignKey("sites.site_uuid", ondelete="CASCADE"), nullable=False, index=True)
+    device_uuid = Column(GUID, ForeignKey("devices.device_uuid", ondelete="CASCADE"), nullable=False, index=True)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("site_uuid", "device_uuid", name="uq_site_device_pair"),
+    )
+
+
+# =========================
+# CAMERA
+# =========================
 class Camera(Base):
     """
     Camera metadata.
-    Store ownership + RTSP URL + human readable fields here.
 
-    channel configuration lives in ChannelConfiguration (1:1 per camera).
+    - Belongs to ONE site (site_uuid NOT NULL)
+    - Can be linked to MANY devices (M:N) via CameraDevice
+      (so you can assign/reassign which Jetson runs inference)
     """
     __tablename__ = "camera"
 
     id = Column(Integer, primary_key=True, index=True)
 
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    site_uuid = Column(GUID, ForeignKey("sites.site_uuid", ondelete="CASCADE"), nullable=False, index=True)
+
     camera_uuid = Column(GUID, default=uuid.uuid4, unique=True, nullable=False, index=True)
     camera_code = Column(String(64), nullable=False, index=True)
 
@@ -183,46 +321,102 @@ class Camera(Base):
     location = Column(String(255), nullable=True)
 
     rtsp_url = Column(String(2048), nullable=False)
+
+    # WebRTC playback URL (frontend uses this)
+    webrtc_url = Column(String(2048), nullable=True)
+
     is_enabled = Column(Boolean, default=True)
-    is_detection_enabled=Column(Boolean, default=True)
-    is_notification_enabled=Column(Boolean, default=True)
+    is_detection_enabled = Column(Boolean, default=True)
+    is_notification_enabled = Column(Boolean, default=True)
+
+    # ROI (Region of Interest) for detection alerts
+    # Format: {"points": [[x1,y1], [x2,y2], ...], "normalized": true/false}
+    roi = Column(JSONDict, nullable=True)
+
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     user = relationship("User", back_populates="cameras")
+    site = relationship("Site", back_populates="cameras")
+
+    # Camera <-> Devices (M:N)
+    devices = relationship(
+        "Device",
+        secondary="camera_devices",
+        back_populates="cameras",
+    )
 
     channel_configuration = relationship(
         "ChannelConfiguration",
         back_populates="camera",
         uselist=False,
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
     video_records = relationship(
         "VideoRecord",
         back_populates="camera",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
+
     pipelines = relationship(
         "Pipeline",
         secondary="pipeline_cameras",
         back_populates="cameras",
     )
+
     __table_args__ = (
         UniqueConstraint("user_id", "camera_code", name="uq_camera_user_camera_code"),
     )
 
+
+# =========================
+# CAMERA <-> DEVICE association
+# =========================
+class CameraDevice(Base):
+    """
+    Link table: cameras <-> devices (M:N)
+
+    Use this to decide which Jetson device(s) can run inference for a camera.
+
+    Optional: is_primary can mark the currently selected device.
+    (DB cannot easily enforce "only one primary" cross-db; do that in service layer.)
+    """
+    __tablename__ = "camera_devices"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    camera_uuid = Column(GUID, ForeignKey("camera.camera_uuid", ondelete="CASCADE"), nullable=False, index=True)
+    device_uuid = Column(GUID, ForeignKey("devices.device_uuid", ondelete="CASCADE"), nullable=False, index=True)
+
+    is_primary = Column(Boolean, default=False, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("camera_uuid", "device_uuid", name="uq_camera_device_pair"),
+    )
+
+
+# =========================
+# PIPELINE
+# =========================
 class Pipeline(Base):
     __tablename__ = "pipelines"
 
     id = Column(GUID, primary_key=True, default=uuid.uuid4, unique=True, nullable=False, index=True)
+
+    # optional (recommended for future multi-user)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+
     name = Column(String(255), nullable=False, default="default")
     is_active = Column(Boolean, default=True, nullable=False)
 
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
-    # many-to-many via PipelineCamera table
     cameras = relationship(
         "Camera",
         secondary="pipeline_cameras",
@@ -231,10 +425,6 @@ class Pipeline(Base):
 
 
 class PipelineCamera(Base):
-    """
-    Join table as an ORM model.
-    Used as the secondary table for Pipeline <-> Camera.
-    """
     __tablename__ = "pipeline_cameras"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -246,26 +436,27 @@ class PipelineCamera(Base):
 
     __table_args__ = (
         UniqueConstraint("pipeline_id", "camera_uuid", name="uq_pipeline_camera_pair"),
-        # keep this if you want "one camera can be in only one pipeline"
         UniqueConstraint("camera_uuid", name="uq_pipeline_cameras_camera_uuid"),
     )
 
 
-
-
+# =========================
+# CHANNEL CONFIG
+# =========================
 class ChannelConfiguration(Base):
-    """
-    Per-camera pipeline configuration (RTSP ingest config, gstreamer params, sampling, ROI, alerts flags, etc).
-    """
     __tablename__ = "channel_configurations"
 
     id = Column(Integer, primary_key=True, index=True)
 
-    camera_uuid = Column(GUID, ForeignKey("camera.camera_uuid", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    camera_uuid = Column(
+        GUID,
+        ForeignKey("camera.camera_uuid", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
 
-    # Arbitrary config JSON (latency, protocol, drop-on-latency, fps cap, etc.)
     configuration = Column(JSONDict, nullable=True)
-
     timezone = Column(String(50), nullable=True, default="UTC")
 
     created_at = Column(DateTime(timezone=True), default=utc_now)
@@ -274,15 +465,10 @@ class ChannelConfiguration(Base):
     camera = relationship("Camera", back_populates="channel_configuration")
 
 
-
+# =========================
+# VIDEO RECORD
+# =========================
 class VideoRecord(Base):
-    """
-    One recorded clip.
-
-    recording_url: the user-consumable URL (signed URL or public URL)
-    storage_key: blob key / s3 key
-    local_path: where clip was written on edge before upload
-    """
     __tablename__ = "video_record"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -295,6 +481,7 @@ class VideoRecord(Base):
     end_time = Column(DateTime(timezone=True), nullable=True)
     duration = Column(Integer, nullable=True)
     status = Column(String(50), nullable=False)
+
     local_path = Column(String(1024), nullable=True)
     storage_key = Column(String(1024), nullable=True)
     recording_url = Column(String(2048), nullable=True)
@@ -310,6 +497,9 @@ class VideoRecord(Base):
     camera = relationship("Camera", back_populates="video_records")
 
 
+# =========================
+# NOTIFICATION EMAILS
+# =========================
 class NotificationEmail(Base):
     __tablename__ = "notification_emails"
 
@@ -322,6 +512,9 @@ class NotificationEmail(Base):
     user = relationship("User", back_populates="notification_emails")
 
 
+# =========================
+# EMAIL VERIFICATION
+# =========================
 class EmailVerification(Base):
     __tablename__ = "email_verifications"
 
@@ -334,6 +527,9 @@ class EmailVerification(Base):
     additional_data = Column(String(2048), nullable=True)
 
 
+# =========================
+# SYSTEM SETTINGS
+# =========================
 class SystemSettings(Base):
     __tablename__ = "system_settings"
 
@@ -345,6 +541,9 @@ class SystemSettings(Base):
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
+# =========================
+# SIGNUP TEMP DATA
+# =========================
 class SignupTempData(Base):
     __tablename__ = "signup_temp_data"
 

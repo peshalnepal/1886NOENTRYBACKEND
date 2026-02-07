@@ -154,7 +154,7 @@ class DatabaseManager:
 # --- Global Instance and Session Makers ---
 # Create a single instance of the manager.
 # This instance will be created once when the module is first imported.
-db_manager = DatabaseManager(os.getenv("DATABASE_URL", ""))
+db_manager = DatabaseManager(os.getenv("DATABASE_URL", "Driver={MySQL ODBC 8.0 Unicode Driver};Server=127.0.0.1;Port=3306;Database=appdb;User=appuser;Password=AppUser@2025!;Option=3;"))
 async_engine = db_manager.async_engine
 SessionLocal = db_manager.SessionLocal
 AsyncSessionLocal = db_manager.AsyncSessionLocal

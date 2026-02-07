@@ -1,0 +1,59 @@
+name: Deploy 1886NOENTRY (prod)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+
+env:
+  AZURE_SUBSCRIPTION: "Cameras AI"
+  AZURE_RESOURCE_GROUP: 1886noentryresource
+  AZURE_ACR_NAME: noentryresourceprod
+  AZURE_ENVIRONMENT_NAME: noentryresource-prod-environment
+  AZURE_LOCATION: centralus
+  AZURE_KEY_VAULT_NAME: noentry-kv-prod
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  deploy:
+    name: Build and Deploy (Production)
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.app_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_PROD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Make deployment script executable
+        run: chmod +x ./deployment/deploy.sh
+
+      - name: Deploy to Azure Container Apps (Production)
+        id: deploy
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          cd deployment
+          APP_URL=$(./deploy.sh --environment prod)
+
+          echo "app_url=$APP_URL" >> $GITHUB_OUTPUT
+          echo "## Production Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Backend URL**: $APP_URL" >> $GITHUB_STEP_SUMMARY
+          echo "📦 **Container Registry**: ${{ env.AZURE_ACR_NAME }}.azurecr.io" >> $GITHUB_STEP_SUMMARY
+          echo "🌍 **Environment**: Production" >> $GITHUB_STEP_SUMMARY
+          echo "🏷️ **Git SHA**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

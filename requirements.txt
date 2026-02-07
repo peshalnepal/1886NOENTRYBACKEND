@@ -11,4 +11,4 @@ python-dotenv==1.2.1
 redis==7.1.0
 SQLAlchemy==2.0.45
 starlette==0.50.0
-ultralytics==8.3.245 --no-deps
+ultralytics==8.3.245
