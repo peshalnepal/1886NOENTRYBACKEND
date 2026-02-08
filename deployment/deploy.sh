@@ -177,8 +177,7 @@ function build_and_push_image() {
 }
 
 function bootstrap_mysql_db_user() {
-  # Create DB + user (idempotent) like your local script
-  # Requires: az mysql flexible-server execute (rdbms-connect extension)
+  # Requires: rdbms-connect extension
   if ! az extension show -n rdbms-connect >/dev/null 2>&1; then
     write_info "Installing Azure CLI extension: rdbms-connect"
     az extension add -n rdbms-connect >/dev/null
@@ -192,8 +191,8 @@ function bootstrap_mysql_db_user() {
   app_pass_escaped="$(printf "%s" "${APP_DB_PASSWORD}" | sed "s/'/''/g")"
 
   az mysql flexible-server execute \
-    --resource-group "${AZURE_RESOURCE_GROUP}" \
-    --name "${mysql_server_name}" \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    -n "${mysql_server_name}" \
     --admin-user "${MYSQL_ADMIN_USER}" \
     --admin-password "${MYSQL_ADMIN_PASSWORD}" \
     --database-name "${MYSQL_DB_NAME}" \
