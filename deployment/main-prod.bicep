@@ -334,7 +334,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
           ports: [
             { port: 8889, protocol: 'TCP' }
             { port: 8189, protocol: 'UDP' }
-\            { port: 9997, protocol: 'TCP' }
+            { port: 9997, protocol: 'TCP' }
           ]
           resources: {
             requests: {
@@ -366,5 +366,5 @@ output appUrl string = app.properties.configuration.ingress.fqdn
 output mysqlServerName string = mysql.name
 output mysqlHost string = mysqlFqdn
 output mysqlDatabase string = mysqlDatabaseName
-output mediamtxFqdn string = mediamtx?.properties.ipAddress.fqdn ?? ''
+output mediamtxFqdn string = deployMediaMtx ? mediamtx.properties.ipAddress.fqdn : ''
 
