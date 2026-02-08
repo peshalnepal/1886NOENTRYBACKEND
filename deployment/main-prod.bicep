@@ -330,7 +330,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       {
         name: 'mediamtx'
         properties: {
-          image: 'bluenviron/mediamtx:1' // keep QUOTED
+          image: 'bluenviron/mediamtx:latest' // keep QUOTED
           ports: [
             { port: 8889, protocol: 'TCP' }
             { port: 8189, protocol: 'UDP' }
