@@ -265,7 +265,94 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
     mysqlRequireSecureTransport
   ]
 }
+var mediamtxName = '${namePrefix}-mtx-${suffix}'
+var mediamtxDns = '${namePrefix}mtx${suffix}'
 
+var mediamtxYaml = '''
+logLevel: info
+logDestinations: [stdout]
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass: ""
+    ips: []
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
+
+  - user: ${mediamtxApiUser}
+    pass: "${mediamtxApiPass}"
+    ips: []
+    permissions:
+      - action: api
+
+api: yes
+apiAddress: :9997
+apiAllowOrigins: ['*']
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+webrtcAllowOrigins: ['*']
+'''
+
+resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if (deployMediaMtx) {
+  name: mediamtxName
+  location: location
+  properties: {
+    osType: 'Linux'
+    restartPolicy: 'Always'
+    ipAddress: {
+      type: 'Public'
+      dnsNameLabel: mediamtxDns
+      ports: [
+        { port: 8889, protocol: 'TCP' }
+        { port: 8189, protocol: 'UDP' }
+        { port: 8189, protocol: 'TCP' }
+        { port: 9997, protocol: 'TCP' }
+      ]
+    }
+    volumes: [
+      {
+        name: 'cfg'
+        secret: {
+          'mediamtx.yml': base64(mediamtxYaml)
+        }
+      }
+    ]
+    containers: [
+      {
+        name: 'mediamtx'
+        properties: {
+          image: 'bluenviron/mediamtx:1'
+          resources: {
+            requests: {
+              cpu: 1
+              memoryInGB: 1.5
+            }
+          }
+          volumeMounts: [
+            {
+              name: 'cfg'
+              mountPath: '/cfg'
+              readOnly: true
+            }
+          ]
+          command: [
+            '/mediamtx'
+            '/cfg/mediamtx.yml'
+          ]
+        }
+      }
+    ]
+  }
+}
 // ----------------------------
 // Outputs (matches your deploy.sh query)
 // ----------------------------
@@ -273,3 +360,5 @@ output appUrl string = app.properties.configuration.ingress.fqdn
 output mysqlServerName string = mysql.name
 output mysqlHost string = mysqlFqdn
 output mysqlDatabase string = mysqlDatabaseName
+output mediamtxFqdn string =  mediamtx.properties.ipAddress.fqdn
+
