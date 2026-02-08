@@ -190,18 +190,35 @@ function bootstrap_mysql_db_user() {
   local app_pass_escaped
   app_pass_escaped="$(printf "%s" "${APP_DB_PASSWORD}" | sed "s/'/''/g")"
 
+  # get runner public IP
+  RUNNER_IP="$(curl -fsS https://api.ipify.org)"
+  RULE_NAME="gha-bootstrap-${GIT_SHA_SHORT:-run}"
+
+  # allow runner IP
+  az mysql flexible-server firewall-rule create \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --name "${mysql_server_name}" \
+    --rule-name "${RULE_NAME}" \
+    --start-ip-address "${RUNNER_IP}" \
+    --end-ip-address "${RUNNER_IP}" >/dev/null
+
+  # run bootstrap (NO -g here)
   az mysql flexible-server execute \
-    -g "${AZURE_RESOURCE_GROUP}" \
-    -n "${mysql_server_name}" \
+    --name "${mysql_server_name}" \
     --admin-user "${MYSQL_ADMIN_USER}" \
     --admin-password "${MYSQL_ADMIN_PASSWORD}" \
     --database-name "${MYSQL_DB_NAME}" \
     --querytext "CREATE DATABASE IF NOT EXISTS \`${MYSQL_DB_NAME}\`;
-CREATE USER IF NOT EXISTS '${APP_DB_USER}'@'%' IDENTIFIED BY '${app_pass_escaped}';
-ALTER USER '${APP_DB_USER}'@'%' IDENTIFIED BY '${app_pass_escaped}';
-GRANT ALL PRIVILEGES ON \`${MYSQL_DB_NAME}\`.* TO '${APP_DB_USER}'@'%';
-FLUSH PRIVILEGES;" \
-    >/dev/null
+  CREATE USER IF NOT EXISTS '${APP_DB_USER}'@'%' IDENTIFIED BY '${app_pass_escaped}';
+  ALTER USER '${APP_DB_USER}'@'%' IDENTIFIED BY '${app_pass_escaped}';
+  GRANT ALL PRIVILEGES ON \`${MYSQL_DB_NAME}\`.* TO '${APP_DB_USER}'@'%';
+  FLUSH PRIVILEGES;" >/dev/null
+
+  # remove rule after
+  az mysql flexible-server firewall-rule delete \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --name "${mysql_server_name}" \
+    --rule-name "${RULE_NAME}" -y >/dev/null
 
   write_success "MySQL bootstrap complete."
 }
