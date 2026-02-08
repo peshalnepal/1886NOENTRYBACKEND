@@ -339,8 +339,8 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
           ]
           resources: {
             requests: {
-              cpu: json('1')
-              memory: '1.0Gi'
+              cpu: 1
+              memoryInGB: json('1.5')
             }
           }
           volumeMounts: [
