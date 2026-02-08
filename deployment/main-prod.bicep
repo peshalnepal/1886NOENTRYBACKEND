@@ -14,7 +14,7 @@ param revisionMode string = 'Single' // 'Multiple' for blue/green
 param mysqlLocation string = location
 
 // Feature toggles
-param deployMediaMtx bool = false
+param deployMediaMtx bool = true
 
 // ----------------------------
 // ACR registry auth (FIX: avoid RBAC roleAssignments)
@@ -312,10 +312,10 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       type: 'Public'
       dnsNameLabel: mediamtxDns
       ports: [
-        { port: 8889, protocol: 'TCP' }
-        { port: 8189, protocol: 'UDP' }
+        { port: 8889, protocol: 'TCP' } // WebRTC signaling (HTTP)
+        { port: 8189, protocol: 'UDP' } // WebRTC media (UDP)
         { port: 8189, protocol: 'TCP' }
-        { port: 9997, protocol: 'TCP' }
+        { port: 9997, protocol: 'TCP' } // MediaMTX API
       ]
     }
     volumes: [
@@ -330,7 +330,13 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       {
         name: 'mediamtx'
         properties: {
-          image: 'bluenviron/mediamtx:1'
+          image: 'bluenviron/mediamtx:1' // keep QUOTED
+          ports: [
+            { port: 8889, protocol: 'TCP' }
+            { port: 8189, protocol: 'UDP' }
+            { port: 8189, protocol: 'TCP' }
+            { port: 9997, protocol: 'TCP' }
+          ]
           resources: {
             requests: {
               cpu: 1
@@ -353,6 +359,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
     ]
   }
 }
+
 // ----------------------------
 // Outputs (matches your deploy.sh query)
 // ----------------------------
@@ -360,5 +367,5 @@ output appUrl string = app.properties.configuration.ingress.fqdn
 output mysqlServerName string = mysql.name
 output mysqlHost string = mysqlFqdn
 output mysqlDatabase string = mysqlDatabaseName
-output mediamtxFqdn string =  mediamtx.properties.ipAddress.fqdn
+output mediamtxFqdn string = deployMediaMtx ? mediamtx.properties.ipAddress.fqdn : ''
 
