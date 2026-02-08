@@ -176,53 +176,6 @@ function build_and_push_image() {
   write_success "Image pushed: ${ACR_SERVER}/${APP_NAME_MAIN}:${IMAGE_TAG}"
 }
 
-function bootstrap_mysql_db_user() {
-  # Requires: rdbms-connect extension
-  if ! az extension show -n rdbms-connect >/dev/null 2>&1; then
-    write_info "Installing Azure CLI extension: rdbms-connect"
-    az extension add -n rdbms-connect >/dev/null
-  fi
-
-  local mysql_server_name=$1
-  write_info "Bootstrapping MySQL DB/user on server: ${mysql_server_name}"
-
-  # Escape single quotes in password for SQL
-  local app_pass_escaped
-  app_pass_escaped="$(printf "%s" "${APP_DB_PASSWORD}" | sed "s/'/''/g")"
-
-  # get runner public IP
-  RUNNER_IP="$(curl -fsS https://api.ipify.org)"
-  RULE_NAME="gha-bootstrap-${GIT_SHA_SHORT:-run}"
-
-  # allow runner IP
-  az mysql flexible-server firewall-rule create \
-    --resource-group "${AZURE_RESOURCE_GROUP}" \
-    --name "${mysql_server_name}" \
-    --rule-name "${RULE_NAME}" \
-    --start-ip-address "${RUNNER_IP}" \
-    --end-ip-address "${RUNNER_IP}" >/dev/null
-
-  # run bootstrap (NO -g here)
-  az mysql flexible-server execute \
-    --name "${mysql_server_name}" \
-    --admin-user "${MYSQL_ADMIN_USER}" \
-    --admin-password "${MYSQL_ADMIN_PASSWORD}" \
-    --database-name "${MYSQL_DB_NAME}" \
-    --querytext "CREATE DATABASE IF NOT EXISTS \`${MYSQL_DB_NAME}\`;
-  CREATE USER IF NOT EXISTS '${APP_DB_USER}'@'%' IDENTIFIED BY '${app_pass_escaped}';
-  ALTER USER '${APP_DB_USER}'@'%' IDENTIFIED BY '${app_pass_escaped}';
-  GRANT ALL PRIVILEGES ON \`${MYSQL_DB_NAME}\`.* TO '${APP_DB_USER}'@'%';
-  FLUSH PRIVILEGES;" >/dev/null
-
-  # remove rule after
-  az mysql flexible-server firewall-rule delete \
-    --resource-group "${AZURE_RESOURCE_GROUP}" \
-    --name "${mysql_server_name}" \
-    --rule-name "${RULE_NAME}" -y >/dev/null
-
-  write_success "MySQL bootstrap complete."
-}
-
 function deploy_infrastructure() {
   write_info "Fetching ACR credentials for registry auth..."
   local ACR_USER ACR_PASS
@@ -290,6 +243,7 @@ function health_check() {
   write_error "Health check failed for ${health_endpoint}"
   return 1
 }
+
 SHORT_SHA="$(echo "${GITHUB_SHA:-latest}" | cut -c1-12)"
 REV_SUFFIX="sha-${SHORT_SHA}"   # always starts with a letter
 
@@ -315,26 +269,8 @@ function main() {
     exit 1
   fi
 
-  # Read mysql outputs to bootstrap DB user (optional but matches your local script)
-  local mysql_server_name
-  mysql_server_name=$(az deployment group show \
-    -g "${AZURE_RESOURCE_GROUP}" \
-    --name "$(az deployment group list -g "${AZURE_RESOURCE_GROUP}" --query "[-1].name" -o tsv)" \
-    --query "properties.outputs.mysqlServerName.value" -o tsv 2>/dev/null || true)
-
-  # If we couldn't infer it from last deployment name, query using the known naming pattern isn't reliable.
-  # So instead, read it from the deployment we just ran by using its name from deploy_infrastructure call is not available.
-  # We’ll do a safer approach: find the latest deployment that has mysqlServerName output.
-  if [[ -z "${mysql_server_name}" ]]; then
-    mysql_server_name=$(az deployment group list -g "${AZURE_RESOURCE_GROUP}" \
-      --query "[?properties.outputs.mysqlServerName.value != null] | [-1].properties.outputs.mysqlServerName.value" -o tsv 2>/dev/null || true)
-  fi
-
-  if [[ -n "${mysql_server_name}" ]]; then
-    bootstrap_mysql_db_user "${mysql_server_name}"
-  else
-    write_info "Skipping MySQL bootstrap (could not read mysqlServerName output)."
-  fi
+  # NOTE: MySQL bootstrap via `az mysql flexible-server execute` has been REMOVED.
+  # You said you will run migrations later (recommended).
 
   # Final health check
   health_check "${app_fqdn}"
