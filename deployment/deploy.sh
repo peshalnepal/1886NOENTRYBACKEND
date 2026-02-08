@@ -208,6 +208,10 @@ FLUSH PRIVILEGES;" \
 }
 
 function deploy_infrastructure() {
+  write_info "Fetching ACR credentials for registry auth..."
+  local ACR_USER ACR_PASS
+  ACR_USER="$(az acr credential show -n "${AZURE_ACR_NAME}" -g "${AZURE_RESOURCE_GROUP}" --query username -o tsv)"
+  ACR_PASS="$(az acr credential show -n "${AZURE_ACR_NAME}" -g "${AZURE_RESOURCE_GROUP}" --query "passwords[0].value" -o tsv)"
   write_info "Starting Bicep deployment for ${ENVIRONMENT_NAME} environment..."
 
   local app_fqdn
@@ -221,6 +225,8 @@ function deploy_infrastructure() {
       acrName="${AZURE_ACR_NAME}" \
       appImageTag="${IMAGE_TAG}" \
       revisionSuffix="${REV_SUFFIX}" \
+      acrUsername="${ACR_USER}" \
+      acrPassword="${ACR_PASS}" \
       mysqlLocation="${MYSQL_LOCATION:-canadacentral}" \
       revisionMode="${REVISION_MODE}" \
       namePrefix="${NAME_PREFIX}" \

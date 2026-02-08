@@ -19,10 +19,10 @@ param deployMediaMtx bool = false
 // ----------------------------
 // ACR registry auth (FIX: avoid RBAC roleAssignments)
 // ----------------------------
-param acrUsername string ='noentryresourceprod'
+param acrUsername string
 
 @secure()
-param acrPassword string = '6GL4H95PJH91ZrStoAwijfdHCG0Gydldf9cTfa0lez5aWIoFXnvMJQQJ99CBAC1i4TkEqg7NAAACAZCRK4AV'
+param acrPassword string
 
 // ----------------------------
 // App settings (non-secrets)
