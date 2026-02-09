@@ -411,9 +411,10 @@ class Manager:
         self._webrtc = WebRTCGatewayClient()
         self._edge = EdgeInferenceClient()
 
-        # Optional registry
+        self._active_user_id: Optional[int] = None
         self._active_id: Optional[uuid.UUID] = None
         self._active_pipeline: Optional[ModelPipeline] = None
+        self._default_user_id = int(os.getenv("DEFAULT_USER_ID", "1"))
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -424,55 +425,68 @@ class Manager:
         await self._webrtc.close()
         await self._edge.close()
 
-    # ------------------------------------------------------------------
-    # Pipeline handle (DB-backed)
-    # ------------------------------------------------------------------
+    async def create_pipeline(self, user_id: int | None = None) -> ModelPipeline:
+        """
+        Creates (loads) the single active pipeline for this user and populates channels from DB.
+        One user -> one persistent pipeline row (name='default').
+        """
+        uid = int(user_id or self._default_user_id)
 
-    async def create_pipeline(self) -> ModelPipeline:
-        """
-        Creates (loads) the single active pipeline and populates channels from DB.
-        Called by main.py at startup.
-        """
+        # Fast path (no lock)
+        if self._active_pipeline is not None and self._active_id is not None and self._active_user_id == uid:
+            return self._active_pipeline
+
         async with self._lock:
-            if self._active_pipeline is not None:
+            # Double-check inside lock
+            if self._active_pipeline is not None and self._active_id is not None and self._active_user_id == uid:
                 return self._active_pipeline
 
+            # If something exists but for another user (future-proofing)
+            if self._active_pipeline is not None and self._active_user_id is not None and self._active_user_id != uid:
+                try:
+                    await self._active_pipeline.shutdown()
+                except Exception:
+                    logger.warning("Failed to shutdown previous active pipeline", exc_info=True)
+                self._active_pipeline = None
+                self._active_id = None
+                self._active_user_id = None
+
             async with self._session_factory() as db:
-                # 1. Ensure pipeline row exists
-                pipeline_row = await self._repo.upsert_pipeline(db, pipeline_id=None)
-                await db.commit()
+                # 1) Ensure (user_id, name='default') pipeline exists (stable)
+                pipeline_row = await self._repo.upsert_pipeline(
+                    db,
+                    user_id=uid,
+                    pipeline_id=None,
+                    name="default",
+                    is_active=True,
+                )
                 pid = pipeline_row.id
-                logger.info(f"Created/Loaded persistent pipeline: {pid}")
-                
-                # 2. Fetch full structure (cameras + configs + devices)
+                logger.info("Loaded persistent pipeline user_id=%s pipeline_id=%s", uid, pid)
+
+                # 2) Load full pipeline (cameras + devices + configs)
                 full_pl = await self._repo.get_full_pipeline(db, pid)
-                
-                # 3. Construct ModelPipeline
+
+                # 3) Build in-memory handle (Azure side does not ingest RTSP; this is config/runtime helper)
                 mp = ModelPipeline(pipeline_id=pid)
-                
-                # 4. Populate channels
-                if full_pl and full_pl.cameras:
+
+                if full_pl and getattr(full_pl, "cameras", None):
                     for cam in full_pl.cameras:
-                        # Find primary device
                         primary_dev = None
-                        if cam.camera_devices:
-                             # Should be eager loaded now
-                             for cd in cam.camera_devices:
-                                 if cd.is_primary:
-                                      primary_dev = cd.device
-                                      break
-                             if not primary_dev and cam.camera_devices:
-                                  primary_dev = cam.camera_devices[0].device
-                        
-                        d_url = primary_dev.device_url if primary_dev else None
-                        d_uuid = primary_dev.device_uuid if primary_dev else None
-                        
-                        # Parse config json
+                        if getattr(cam, "camera_devices", None):
+                            for cd in cam.camera_devices:
+                                if getattr(cd, "is_primary", False):
+                                    primary_dev = cd.device
+                                    break
+                            if primary_dev is None and cam.camera_devices:
+                                primary_dev = cam.camera_devices[0].device
+
+                        d_url = getattr(primary_dev, "device_url", None) if primary_dev else None
+                        d_uuid = getattr(primary_dev, "device_uuid", None) if primary_dev else None
+
                         cfg_json = {}
-                        if cam.channel_configuration and cam.channel_configuration.configuration:
-                             cfg_json = cam.channel_configuration.configuration
-                        
-                        # Build config
+                        if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None):
+                            cfg_json = cam.channel_configuration.configuration or {}
+
                         runtime_overrides = _runtime_config_overrides(
                             cfg_json,
                             extra_forbidden={"sample_fps", "decode_backend", "request_timeout_s"},
@@ -485,31 +499,26 @@ class Manager:
                             site_uuid=cam.site_uuid,
                             device_uuid=d_uuid,
                             device_url=d_url,
-                            enabled=bool(cam.is_enabled),
-                            
-                            # Standard fields if missing in cfg_json, but cfg_json overrides
+                            enabled=bool(getattr(cam, "is_enabled", True)),
                             sample_fps=float(cfg_json.get("sample_fps", 5.0)),
                             decode_backend=str(cfg_json.get("decode_backend", "gstreamer")),
                             request_timeout_s=float(cfg_json.get("request_timeout_s", 2.0)),
-
-                            # Unpack remaining runtime-safe knobs.
-                            **runtime_overrides
+                            **runtime_overrides,
                         )
-                        
-                        vc = VideoChannel(config=vcc)
-                        await mp.add_channel(vc)
 
-                self._active_id = pid
-                self._active_pipeline = mp
-                return mp
+                        await mp.add_channel(VideoChannel(config=vcc))
+
+                # Commit only after we’ve built the in-memory view (avoids expire-on-commit surprises)
+                await db.commit()
+
+            self._active_user_id = uid
+            self._active_id = pid
+            self._active_pipeline = mp
+            return mp
+
 
     async def get_activepipeline(self) -> ModelPipeline:
-        # Re-use create_pipeline logic for now as it handles the singleton check
         return await self.create_pipeline()
-
-    # ------------------------------------------------------------------
-    # Update pipeline = camera CRUD + external provisioning
-    # ------------------------------------------------------------------
 
     def _patch_to_dict(self, obj: Any) -> Dict[str, Any]:
         if obj is None:

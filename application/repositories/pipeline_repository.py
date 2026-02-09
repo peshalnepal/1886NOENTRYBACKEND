@@ -6,6 +6,7 @@ from typing import List, Optional, Sequence
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import IntegrityError
 
 # Adjust this import to wherever your ORM models live.
 # You said you keep them all in database.py and import via core.database in other files.
@@ -27,43 +28,82 @@ class PipelineRepository:
         stmt = select(Pipeline.id).where(Pipeline.id == pipeline_id)
         row = (await db.execute(stmt)).scalar_one_or_none()
         return row is not None
+    
 
     async def upsert_pipeline(
         self,
         db: AsyncSession,
+        user_id: int,
         pipeline_id: Optional[uuid.UUID] = None,
         *,
         name: str = "default",
         is_active: bool = True,
     ) -> Pipeline:
         """
-        If pipeline_id is None -> create new pipeline and let ORM/DB generate UUID.
-        If pipeline_id provided:
-        - update if exists
-        - else create with that exact id
+        Upsert semantics (stable per-user default):
+        - If pipeline_id is None:
+            -> return existing pipeline for (user_id, name) if present (and update is_active)
+            -> otherwise create a new pipeline with (user_id, name)
+        - If pipeline_id is provided:
+            -> update if exists
+            -> else create with that exact id (and attach to user_id)
         Always flush so pipeline.id is available to caller.
         """
-        if pipeline_id is None:
-            # IMPORTANT: don't set id at all, let default generate it
-            pipeline = Pipeline(name=name, is_active=is_active)
-            db.add(pipeline)
-            await db.flush()          # INSERT happens here
-            return pipeline           # pipeline.id is now populated
+        if user_id is None:
+            raise ValueError("user_id is required for upsert_pipeline()")
 
-        # pipeline_id provided: try fetch
+        if pipeline_id is None:
+            q = (
+                select(Pipeline)
+                .where(Pipeline.user_id == user_id, Pipeline.name == name)
+                .order_by(Pipeline.created_at.asc())
+            )
+            pipeline = (await db.execute(q)).scalars().first()
+
+            if pipeline is not None:
+                pipeline.is_active = bool(is_active)
+                pipeline.name = name
+                await db.flush()
+                return pipeline
+
+            pipeline = Pipeline(user_id=user_id, name=name, is_active=bool(is_active))
+            db.add(pipeline)
+
+            # If you have (user_id, name) UNIQUE constraint, this handles race conditions.
+            try:
+                await db.flush()
+                return pipeline
+            except IntegrityError:
+                # Another concurrent request created it first.
+                await db.rollback()
+                pipeline = (await db.execute(q)).scalars().first()
+                if pipeline is None:
+                    raise
+                pipeline.is_active = bool(is_active)
+                await db.flush()
+                return pipeline
+
         stmt = select(Pipeline).where(Pipeline.id == pipeline_id)
         pipeline = (await db.execute(stmt)).scalar_one_or_none()
 
         if pipeline is None:
-            # create with explicit id
-            pipeline = Pipeline(id=pipeline_id, name=name, is_active=is_active)
+            pipeline = Pipeline(
+                id=pipeline_id,
+                user_id=user_id,
+                name=name,
+                is_active=bool(is_active),
+            )
             db.add(pipeline)
             await db.flush()
             return pipeline
 
-        # update
+        # Safety: prevent cross-user accidental reuse
+        if pipeline.user_id is not None and int(pipeline.user_id) != int(user_id):
+            raise ValueError("pipeline_id belongs to a different user")
+
+        pipeline.user_id = user_id
         pipeline.name = name or pipeline.name
-        pipeline.is_active = is_active
+        pipeline.is_active = bool(is_active)
         await db.flush()
         return pipeline
 
