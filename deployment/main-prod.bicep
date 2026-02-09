@@ -205,8 +205,6 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
           allowCredentials: true
         }
       }
-
-      // ✅ Registry auth via username/password (no RBAC roleAssignments needed)
       secrets: [
         {
           name: 'acr-password'
