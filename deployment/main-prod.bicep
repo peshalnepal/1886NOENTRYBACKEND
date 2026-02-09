@@ -17,9 +17,8 @@ param mysqlLocation string = location
 param deployMediaMtx bool = true
 param createMysqlDatabase bool = false
 
-// ----------------------------
-// ACR registry auth (FIX: avoid RBAC roleAssignments)
-// ----------------------------
+param mediamtxImageRepo string = 'mediamtx'
+param mediamtxImageTag string = '1.16.1'
 param acrUsername string
 
 @secure()
@@ -314,15 +313,25 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
   properties: {
     osType: 'Linux'
     restartPolicy: 'Always'
+
+    imageRegistryCredentials: [
+      {
+        server: acr.properties.loginServer
+        username: acrUsername
+        password: acrPassword
+      }
+    ]
+
     ipAddress: {
       type: 'Public'
       dnsNameLabel: mediamtxDns
       ports: [
-        { port: 8889, protocol: 'TCP' } // WebRTC signaling (HTTP)
-        { port: 8189, protocol: 'UDP' } // WebRTC media (UDP)
-        { port: 9997, protocol: 'TCP' } // MediaMTX API
+        { port: 8889, protocol: 'TCP' }
+        { port: 8189, protocol: 'UDP' }
+        { port: 9997, protocol: 'TCP' }
       ]
     }
+
     volumes: [
       {
         name: 'cfg'
@@ -335,7 +344,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       {
         name: 'mediamtx'
         properties: {
-          image: 'bluenviron/mediamtx:latest' // keep QUOTED
+          image: '${acr.properties.loginServer}/${mediamtxImageRepo}:${mediamtxImageTag}'
           ports: [
             { port: 8889, protocol: 'TCP' }
             { port: 8189, protocol: 'UDP' }
