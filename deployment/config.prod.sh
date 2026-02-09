@@ -37,8 +37,8 @@ SMTP_USERNAME="peshalnepal3@gmail.com"
 # --------------------------
 # WebRTC / MediaMTX settings (non-secret)
 # --------------------------
-WEBRTC_ADMIN_API_URL="http://noentrymtxfdxidm.centralus.azurecontainer.io:9997"
-WEBRTC_PUBLIC_BASE_URL="http://noentrymtxfdxidm.centralus.azurecontainer.io:8889"
+WEBRTC_ADMIN_API_URL="https://noentry-api-prod.blackdesert-c7d73512.centralus.azurecontainerapps.io:9997"
+WEBRTC_PUBLIC_BASE_URL="https://noentry-api-prod.blackdesert-c7d73512.centralus.azurecontainerapps.io:8889"
 WEBRTC_ADMIN_API_KEY=""
 
 WEBRTC_ADMIN_UPSERT_PATH=""
