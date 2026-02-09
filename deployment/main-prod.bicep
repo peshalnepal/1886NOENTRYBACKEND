@@ -289,7 +289,7 @@ authInternalUsers:
       - action: playback
         path:
 
-  - user: ${mediamtxApiUser}
+  - user: "${mediamtxApiUser}"
     pass: "${mediamtxApiPass}"
     ips: []
     permissions:
@@ -305,7 +305,7 @@ webrtcLocalUDPAddress: :8189
 webrtcLocalTCPAddress: ''
 webrtcAllowOrigins: ['*']
 webrtcIPsFromInterfaces: no
-webrtcAdditionalHosts: [noentrymtxfdxidm.centralus.azurecontainer.io]
+webrtcAdditionalHosts: ['noentrymtxfdxidm.centralus.azurecontainer.io']
 '''
 
 resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if (deployMediaMtx) {
