@@ -28,16 +28,17 @@ APP_DB_PASSWORD="ChangeThis_AppPassword_2026!"          # TEMP
 # --------------------------
 # SMTP (optional)
 # --------------------------
-ENABLE_SMTP="false"
-SMTP_USERNAME=""
-SMTP_PASSWORD=""            # TEMP if ENABLE_SMTP=true
-SMTP_FROM="no-reply@1886noentry.com"
+ENABLE_SMTP="true"
+SMTP_USERNAME="peshalnepal3@gmail.com"
+SMTP_PASSWORD="kfco nzvt goqq urzy"            # TEMP if ENABLE_SMTP=true
+SMTP_FROM="peshalnepal3@gmail.com"
+SMTP_USERNAME= "peshalnepal3@gmail.com"
 
 # --------------------------
 # WebRTC / MediaMTX settings (non-secret)
 # --------------------------
-WEBRTC_ADMIN_API_URL="http://127.0.0.1:9997"
-WEBRTC_PUBLIC_BASE_URL="http://localhost:8889"
+WEBRTC_ADMIN_API_URL="https://noentrymtxfdxidm.centralus.azurecontainer.io:9997"
+WEBRTC_PUBLIC_BASE_URL="https://noentrymtxfdxidm.centralus.azurecontainer.io:8889"
 WEBRTC_ADMIN_API_KEY=""
 
 WEBRTC_ADMIN_UPSERT_PATH=""

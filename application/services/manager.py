@@ -109,7 +109,7 @@ class WebRTCGatewayClient:
 
     def __init__(self):
         # Default to MediaMTX API localhost if not set
-        self.admin_api_url = (os.getenv("WEBRTC_ADMIN_API_URL") or "http://127.0.0.1:9997").rstrip("/")
+        self.admin_api_url = (os.getenv("WEBRTC_ADMIN_API_URL") or "https://noentrymtxfdxidm.centralus.azurecontainer.io:9997").rstrip("/")
         
         # Public URL for the frontend to consume (e.g. port 8889 for WebRTC)
         pub_host = os.getenv("PUBLIC_HOST", "localhost")
