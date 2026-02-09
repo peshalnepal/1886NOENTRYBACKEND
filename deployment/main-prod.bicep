@@ -15,6 +15,7 @@ param mysqlLocation string = location
 
 // Feature toggles
 param deployMediaMtx bool = true
+param createMysqlDatabase bool = false
 
 // ----------------------------
 // ACR registry auth (FIX: avoid RBAC roleAssignments)
@@ -163,7 +164,7 @@ resource mysqlRequireSecureTransport 'Microsoft.DBforMySQL/flexibleServers/confi
   }
 }
 
-resource mysqlDb 'Microsoft.DBforMySQL/flexibleServers/databases@2024-12-30' = {
+resource mysqlDb 'Microsoft.DBforMySQL/flexibleServers/databases@2024-12-30' = if (createMysqlDatabase) {
   parent: mysql
   name: mysqlDatabaseName
   properties: {
@@ -171,7 +172,6 @@ resource mysqlDb 'Microsoft.DBforMySQL/flexibleServers/databases@2024-12-30' = {
     collation: 'utf8mb4_unicode_ci'
   }
 }
-
 // ----------------------------
 // Backend API (Container App)
 // ----------------------------
@@ -260,11 +260,16 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
     }
   }
 
-  dependsOn: [
-    mysqlDb
-    mysqlFwAzure
-    mysqlRequireSecureTransport
-  ]
+  dependsOn: createMysqlDatabase
+    ? [
+        mysqlDb
+        mysqlFwAzure
+        mysqlRequireSecureTransport
+      ]
+    : [
+        mysqlFwAzure
+        mysqlRequireSecureTransport
+      ]
 }
 var mediamtxName = '${namePrefix}-mtx-${suffix}'
 var mediamtxDns = '${namePrefix}mtx${suffix}'
