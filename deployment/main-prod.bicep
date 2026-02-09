@@ -20,6 +20,9 @@ param createMysqlDatabase bool = false
 param mediamtxImageRepo string = 'mediamtx'
 param mediamtxImageTag string = '1.16.1'
 param acrUsername string
+param caddyImageRepo string = 'caddy'
+param caddyImageTag string = '2.8.4'
+
 
 @secure()
 param acrPassword string
@@ -268,6 +271,9 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
         mysqlRequireSecureTransport
       ]
 }
+var mediamtxPublicHost = '${mediamtxDns}.${toLower(location)}.azurecontainer.io'
+var proxyHost = (mediamtxHostOverride != '') ? mediamtxHostOverride : mediamtxPublicHost
+
 var mediamtxName = '${namePrefix}-mtx-${suffix}'
 var mediamtxDns = '${namePrefix}mtx${suffix}'
 
@@ -287,7 +293,6 @@ authInternalUsers:
         path:
       - action: playback
         path:
-
   - user: "${mediamtxApiUser}"
     pass: "${mediamtxApiPass}"
     ips: []
@@ -303,8 +308,22 @@ webrtcAddress: :8889
 webrtcLocalUDPAddress: :8189
 webrtcLocalTCPAddress: ''
 webrtcAllowOrigins: ['*']
+
+# Critical for ACI/NAT
 webrtcIPsFromInterfaces: no
-webrtcAdditionalHosts: ['noentrymtxfdxidm.centralus.azurecontainer.io']
+webrtcAdditionalHosts: ['${proxyHost}']
+
+# Helps NAT traversal
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+'''
+
+var caddyfile = $'''
+${proxyHost} {
+  encode gzip
+  reverse_proxy /v3/* 127.0.0.1:9997
+  reverse_proxy 127.0.0.1:8889
+}
 '''
 
 resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if (deployMediaMtx) {
@@ -322,13 +341,14 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       }
     ]
 
+    // Public ports: HTTPS + HTTP (for ACME), and UDP for ICE
     ipAddress: {
       type: 'Public'
       dnsNameLabel: mediamtxDns
       ports: [
-        { port: 8889, protocol: 'TCP' }
-        { port: 8189, protocol: 'UDP' }
-        { port: 9997, protocol: 'TCP' }
+        { port: 80, protocol: 'TCP' }
+        { port: 443, protocol: 'TCP' }
+        { port: 8189, protocol: 'UDP' } // WebRTC ICE/UDP
       ]
     }
 
@@ -339,16 +359,24 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
           'mediamtx.yml': base64(mediamtxYaml)
         }
       }
+      {
+        name: 'caddy'
+        secret: {
+          'Caddyfile': base64(caddyfile)
+        }
+      }
     ]
+
     containers: [
+      // MediaMTX (internal HTTP on 8889/9997, ICE UDP 8189)
       {
         name: 'mediamtx'
         properties: {
           image: '${acr.properties.loginServer}/${mediamtxImageRepo}:${mediamtxImageTag}'
           ports: [
             { port: 8889, protocol: 'TCP' }
-            { port: 8189, protocol: 'UDP' }
             { port: 9997, protocol: 'TCP' }
+            { port: 8189, protocol: 'UDP' }
           ]
           resources: {
             requests: {
@@ -357,15 +385,40 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
             }
           }
           volumeMounts: [
-            {
-              name: 'cfg'
-              mountPath: '/cfg'
-              readOnly: true
-            }
+            { name: 'cfg', mountPath: '/cfg', readOnly: true }
           ]
           command: [
             '/mediamtx'
             '/cfg/mediamtx.yml'
+          ]
+        }
+      }
+
+      // Caddy HTTPS reverse proxy (public 80/443)
+      {
+        name: 'caddy'
+        properties: {
+          image: '${acr.properties.loginServer}/${caddyImageRepo}:${caddyImageTag}'
+          ports: [
+            { port: 80, protocol: 'TCP' }
+            { port: 443, protocol: 'TCP' }
+          ]
+          resources: {
+            requests: {
+              cpu: json('0.25')
+              memoryInGB: json('0.5')
+            }
+          }
+          volumeMounts: [
+            { name: 'caddy', mountPath: '/etc/caddy', readOnly: true }
+          ]
+          command: [
+            'caddy'
+            'run'
+            '--config'
+            '/etc/caddy/Caddyfile'
+            '--adapter'
+            'caddyfile'
           ]
         }
       }
@@ -380,5 +433,5 @@ output appUrl string = app.properties.configuration.ingress.fqdn
 output mysqlServerName string = mysql.name
 output mysqlHost string = mysqlFqdn
 output mysqlDatabase string = mysqlDatabaseName
-output mediamtxFqdn string = deployMediaMtx ? mediamtx.properties.ipAddress.fqdn : ''
-
+output mediamtxFqdn string = deployMediaMtx ? proxyHost : ''
+output mediamtxHttpsBase string = deployMediaMtx ? 'https://${proxyHost}' : ''
