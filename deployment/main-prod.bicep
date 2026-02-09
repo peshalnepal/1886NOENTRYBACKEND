@@ -10,6 +10,13 @@ param namePrefix string = 'noentry'
 
 param appImageTag string = 'latest'
 param revisionSuffix string = ''
+param deployStamp string = utcNow()
+
+var stamp = toLower(replace(replace(replace(deployStamp, ':', ''), 't', '-'), 'z', ''))
+var rsBase = empty(revisionSuffix) ? 'rev' : toLower(revisionSuffix)
+var rsRaw = '${rsBase}-${stamp}'
+var revisionSuffixFinal = substring(rsRaw, 0, min(length(rsRaw), 40))
+
 param revisionMode string = 'Single' // 'Multiple' for blue/green
 param mysqlLocation string = location
 
@@ -223,7 +230,7 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
     }
 
     template: {
-      revisionSuffix: revisionSuffix
+      revisionSuffix: revisionSuffixFinal
       containers: [
         {
           name: 'notentapi'
@@ -408,7 +415,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       {
         name: 'caddy'
         properties: {
-          image: 'caddy:2.8.4'
+          image: '${acr.properties.loginServer}/${caddyImageRepo}:${caddyImageTag}'
           ports: [
             { port: 80, protocol: 'TCP' }
             { port: 443, protocol: 'TCP' }
