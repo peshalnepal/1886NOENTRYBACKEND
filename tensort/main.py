@@ -8,6 +8,9 @@ from typing import Any, Dict
 from flask import Flask, request, jsonify
 
 from channels.channel_config import VideoChannelConfig
+from database import db_manager, AsyncSessionLocal
+from database_orm import CameraConfig
+from sqlalchemy import select
 
 # IMPORTANT:
 # Do NOT import trt_infer / simple_model_pipeline at top-level if they import PyCUDA/TensorRT.
@@ -31,6 +34,11 @@ class PipelineRuntime(object):
 
         # store configs (for PATCH, list, etc.)
         self._cameras = {}  # camera_uuid -> dict(config)
+        
+        # Initialize database tables
+        logger.info("Initializing SQLite database...")
+        if not db_manager.initialize_tables():
+            logger.error("Failed to initialize database tables")
 
         t = threading.Thread(target=self._run_loop, name="pipeline-loop", daemon=True)
         t.start()
@@ -38,6 +46,9 @@ class PipelineRuntime(object):
         # wait for pipeline to be ready
         if not self._ready.wait(30.0):
             raise RuntimeError("Pipeline thread did not start within timeout.")
+        
+        # Restore cameras from database after pipeline is ready
+        self._restore_cameras_from_db()
 
     def _run_loop(self):
         loop = asyncio.new_event_loop()
@@ -72,14 +83,123 @@ class PipelineRuntime(object):
         fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
         return fut.result(timeout=timeout_s)
 
+    # ---------- database operations ----------
+    async def _save_camera_to_db_async(self, camera_uuid: str, cfg_data: Dict[str, Any]):
+        """
+        Save camera configuration to SQLite database (async).
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                # Check if camera already exists
+                result = await session.execute(
+                    select(CameraConfig).filter_by(camera_uuid=camera_uuid)
+                )
+                existing = result.scalar_one_or_none()
+                
+                if existing:
+                    # Update existing camera
+                    existing.rtsp_url = cfg_data.get("rtsp_url", existing.rtsp_url)
+                    existing.config_json = cfg_data
+                    logger.info(f"Updated camera {camera_uuid} in database")
+                else:
+                    # Create new camera
+                    cam_config = CameraConfig(
+                        channel_id=cfg_data.get("channel_id", camera_uuid),
+                        camera_uuid=camera_uuid,
+                        user_id=cfg_data.get("user_id", 1),  # Default user_id
+                        rtsp_url=cfg_data["rtsp_url"],
+                        config_json=cfg_data
+                    )
+                    session.add(cam_config)
+                    logger.info(f"Saved new camera {camera_uuid} to database")
+                
+                await session.commit()
+        except Exception as e:
+            logger.exception(f"Failed to save camera {camera_uuid} to database: {e}")
+    
+    def _save_camera_to_db(self, camera_uuid: str, cfg_data: Dict[str, Any]):
+        """
+        Synchronous wrapper for async database save (runs in event loop).
+        """
+        self._call(self._save_camera_to_db_async(camera_uuid, cfg_data), timeout_s=5.0)
+    
+    async def _delete_camera_from_db_async(self, camera_uuid: str):
+        """
+        Delete camera configuration from SQLite database (async).
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(CameraConfig).filter_by(camera_uuid=camera_uuid)
+                )
+                camera = result.scalar_one_or_none()
+                if camera:
+                    await session.delete(camera)
+                    await session.commit()
+                    logger.info(f"Deleted camera {camera_uuid} from database")
+        except Exception as e:
+            logger.exception(f"Failed to delete camera {camera_uuid} from database: {e}")
+    
+    def _delete_camera_from_db(self, camera_uuid: str):
+        """
+        Synchronous wrapper for async database delete.
+        """
+        self._call(self._delete_camera_from_db_async(camera_uuid), timeout_s=5.0)
+    
+    def _restore_cameras_from_db(self):
+        """
+        Restore all cameras from SQLite database on startup (sync version for init).
+        """
+        try:
+            # Use sync session for startup (before async loop is running heavily)
+            session = db_manager.get_session()
+            try:
+                cameras = session.query(CameraConfig).all()
+                restored_count = 0
+                
+                for cam_config in cameras:
+                    try:
+                        cfg_data = dict(cam_config.config_json)
+                        camera_uuid = cam_config.camera_uuid
+                        
+                        # Ensure required fields are present
+                        cfg_data["camera_uuid"] = camera_uuid
+                        cfg_data["channel_id"] = cam_config.channel_id
+                        cfg_data["rtsp_url"] = cam_config.rtsp_url
+                        
+                        # Store in memory
+                        with self._lock:
+                            self._cameras[camera_uuid] = cfg_data
+                        
+                        # Add to pipeline if enabled
+                        if cfg_data.get("enabled", True):
+                            cfg = VideoChannelConfig(**cfg_data)
+                            self._call(self.pipeline.add_channel(cfg), timeout_s=15.0)
+                            restored_count += 1
+                            logger.info(f"Restored camera {camera_uuid} from database")
+                    except Exception as e:
+                        logger.exception(f"Failed to restore camera {cam_config.camera_uuid}: {e}")
+                
+                if restored_count > 0:
+                    logger.info(f"Successfully restored {restored_count} camera(s) from database")
+                else:
+                    logger.info("No cameras to restore from database")
+            finally:
+                session.close()
+        except Exception as e:
+            logger.exception(f"Failed to restore cameras from database: {e}")
+
     # ---------- camera operations ----------
     def add_camera(self, rtsp_url: str, cfg_patch: Dict[str, Any]) -> Dict[str, Any]:
-        cam_id = str(uuid.uuid4())
+        # Use camera_uuid from patch if provided (from Azure), otherwise generate new
+        cam_id = cfg_patch.get("camera_uuid") or str(uuid.uuid4())
+        if not isinstance(cam_id, str):
+            cam_id = str(cam_id)
 
         # defaults for Jetson inference
         cfg_data = {
             "camera_uuid": cam_id,
-            "channel_id": cam_id,
+            "channel_id": cfg_patch.get("channel_id") or cam_id,
             "rtsp_url": rtsp_url,
             "enabled": True,
             "detection_enabled": True,
@@ -108,9 +228,12 @@ class PipelineRuntime(object):
 
         cfg = VideoChannelConfig(**cfg_data)  # your simple config class should accept these
 
-        # store config
+        # store config in memory
         with self._lock:
             self._cameras[cam_id] = dict(cfg_data)
+        
+        # persist to database
+        self._save_camera_to_db(cam_id, cfg_data)
 
         # add to pipeline (async)
         self._call(self.pipeline.add_channel(cfg), timeout_s=15.0)
@@ -126,6 +249,9 @@ class PipelineRuntime(object):
             existed = camera_uuid in self._cameras
             if existed:
                 del self._cameras[camera_uuid]
+        
+        # delete from database
+        self._delete_camera_from_db(camera_uuid)
 
         # remove from pipeline
         self._call(self.pipeline.remove_channel(camera_uuid), timeout_s=10.0)
@@ -158,6 +284,9 @@ class PipelineRuntime(object):
 
             self._cameras[camera_uuid] = cfg_data
             new_cfg = VideoChannelConfig(**cfg_data)
+        
+        # persist updated config to database
+        self._save_camera_to_db(camera_uuid, cfg_data)
 
         self._call(self.pipeline.add_channel(new_cfg), timeout_s=15.0)
 
@@ -263,6 +392,22 @@ def latest(camera_uuid):
         return jsonify(result)
     except Exception as e:
         logger.exception("latest failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/detection/<camera_uuid>", methods=["GET"])
+def detection(camera_uuid):
+    """
+    Alternative endpoint for Azure backend compatibility.
+    Returns same data as /cameras/<camera_uuid>/latest
+    """
+    try:
+        result = runtime.get_latest(camera_uuid)
+        if result is None:
+            return jsonify({"error": "No detections yet"}), 404
+        return jsonify(result)
+    except Exception as e:
+        logger.exception("detection failed: %s", e)
         return jsonify({"error": str(e)}), 500
 
 

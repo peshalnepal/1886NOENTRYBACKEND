@@ -177,27 +177,29 @@ class SimpleInferencePipeline(object):
     async def add_channel(self, cfg):
         camera_key = str(cfg.camera_uuid)
         new_channel = VideoChannel(cfg)
+
         async with self._lock:
-            old = self._channels.get(camera_key)
-            self._channels[camera_key] = VideoChannel(cfg)
-        if old is not None:
-            await self.remove_channel(camera_key)
-            t = self._channel_tasks.pop(camera_key, None)
-            if t is not None and not t.done():
-                t.cancel()
-                try:
-                    await t
-                except Exception:
-                    pass
+            old_ch = self._channels.pop(camera_key, None)
+            old_task = self._channel_tasks.pop(camera_key, None)
+
+            self._channels[camera_key] = new_channel
+            should_start = self._started and (not self._closing)
+
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
             try:
-                await old.stop()
+                await old_task
             except Exception:
                 pass
-        async with self._lock:
-            self._channels[camera_key] = new_channel
-            if self._started and not self._closing:
-                self._start_channel_task(camera_key)
 
+        if old_ch is not None:
+            try:
+                await old_ch.stop()
+            except Exception:
+                pass
+
+        if should_start:
+            self._start_channel_task(camera_key)
 
     async def remove_channel(self, camera_uuid):
         camera_key = str(camera_uuid)

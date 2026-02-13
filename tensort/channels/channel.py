@@ -119,19 +119,37 @@ class VideoChannel():
         self._stop_thread_evt = threading.Event()
         self._out_q = asyncio.Queue(maxsize=2)
         self._event_queue = None
-
+        
     def _build_gst_pipeline(self, rtsp_url, decoder):
+        lat = int(self.config.gst_latency_ms)
+        proto = self.config.rtsp_transport
+
+        # Good practice: add a leaky queue so slow consumers don't blow up memory
+        q = "queue max-size-buffers=1 leaky=downstream ! "
+
+        if decoder == "nvv4l2decoder":
+            # Jetson HW decode (NVMM) -> nvvidconv to CPU BGRx -> videoconvert to BGR for OpenCV
+            return (
+                "rtspsrc location={url} latency={lat} protocols={proto} ! "
+                + q +
+                "rtph264depay ! "
+                "h264parse config-interval=1 ! "
+                "video/x-h264,stream-format=byte-stream,alignment=au ! "
+                "nvv4l2decoder enable-max-performance=1 ! "
+                "nvvidconv ! video/x-raw,format=BGRx ! "
+                "videoconvert ! video/x-raw,format=BGR ! "
+                "appsink drop=true sync=false max-buffers=1"
+            ).format(url=rtsp_url, lat=lat, proto=proto)
+
+        # CPU fallback decoder (avdec_h264)
         return (
             "rtspsrc location={url} latency={lat} protocols={proto} ! "
-            "rtph264depay ! h264parse ! {dec} ! "
+            + q +
+            "rtph264depay ! h264parse config-interval=1 ! "
+            "{dec} ! "
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=true sync=false max-buffers=1"
-        ).format(
-            url=rtsp_url,
-            lat=int(self.config.gst_latency_ms),
-            proto=self.config.rtsp_transport,
-            dec=decoder,
-        )
+        ).format(url=rtsp_url, lat=lat, proto=proto, dec=decoder)
 
     def _open_capture(self):
         if self.config.decode_backend == "gstreamer":
