@@ -966,6 +966,40 @@ class Manager:
 
         return cameras_out, events_out
 
+    async def cleanup_device_resources(self, db: AsyncSession, *, device_uuid: uuid.UUID) -> None:
+        """
+        Called when a Device is about to be deleted.
+        Finds all cameras on this device and sends DELETE to the edge service.
+        """
+        try:
+            # We need the device itself to get the URL
+            dev = await self._get_device(db, device_uuid)
+            if not dev.device_url:
+                return
+
+            # Find all cameras linked to this device
+            q = (
+                select(Camera)
+                .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
+                .where(CameraDevice.device_uuid == device_uuid)
+            )
+            cameras_on_device = (await db.execute(q)).scalars().all()
+
+            for cam in cameras_on_device:
+                try:
+                    logger.info(f"Cleaning up camera {cam.camera_uuid} from device {device_uuid} before deletion")
+                    await self._edge.delete_camera(
+                        device_url=dev.device_url,
+                        camera_uuid=str(cam.camera_uuid),
+                    )
+                except Exception:
+                    logger.warning(
+                        f"Failed to cleanup camera {cam.camera_uuid} on device {dev.device_uuid}",
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.exception(f"Error during device cleanup for {device_uuid}")
+
     async def _remove_channel(
         self,
         db: AsyncSession,
@@ -987,9 +1021,15 @@ class Manager:
 
             # attempt external cleanup (best-effort)
             try:
-                dev = await self.channel_repo.get_primary_device(db, camera_uuid=cam_uuid)
-                if dev is not None and dev.device_url:
-                    await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid))
+                # NEW: iterate all associated devices, not just primary
+                devices = await self.channel_repo.get_associated_devices(db, camera_uuid=cam_uuid)
+                for dev in devices:
+                    if dev.device_url:
+                        try:
+                            # We don't want one failure to stop others
+                            await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid))
+                        except Exception:
+                            logger.warning(f"Failed removing camera {cam_uuid} from device {dev.device_url}", exc_info=True)
             except Exception:
                 logger.exception("Edge delete failed during camera removal")
 

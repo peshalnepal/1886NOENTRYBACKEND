@@ -247,6 +247,22 @@ class ChannelRepository:
 
         return cam, cam.channel_configuration, pipeline_id
 
+    async def get_associated_devices(
+        self,
+        db: AsyncSession,
+        *,
+        camera_uuid: uuid.UUID,
+    ) -> List[Device]:
+        """
+        Returns ALL devices assigned to this camera (primary or not).
+        """
+        q = (
+            select(Device)
+            .join(CameraDevice, CameraDevice.device_uuid == Device.device_uuid)
+            .where(CameraDevice.camera_uuid == camera_uuid)
+        )
+        return (await db.execute(q)).scalars().all()
+
     async def get_primary_device(
         self,
         db: AsyncSession,

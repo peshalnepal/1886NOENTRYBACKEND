@@ -8,7 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import Device  # adjust import path
-from dependencies import get_db, get_async_db, get_current_user,get_async_db
+from dependencies import get_db, get_async_db, get_current_user, get_manager
+from application.services.manager import Manager
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
@@ -133,8 +134,13 @@ async def delete_device(
     device_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
+    manager: Manager = Depends(get_manager),  # NEW dependency
 ):
     device = await _get_device_or_404(db, user.id, device_uuid)
+    
+    # NEW: cleanup edge resources
+    await manager.cleanup_device_resources(db, device_uuid=device_uuid)
+    
     await db.delete(device)
     await db.commit()
     return None
