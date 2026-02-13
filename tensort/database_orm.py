@@ -26,21 +26,11 @@ class CameraConfig(Base):
     __tablename__ = "camera_configs"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    
-    # Identifiers
     channel_id = Column(String(64), unique=True, nullable=False, index=True)
     camera_uuid = Column(String(64), unique=True, nullable=False, index=True)
     user_id = Column(Integer, nullable=False, index=True)
-    
-    # Camera details
     rtsp_url = Column(Text, nullable=False)
-    
-    # Configuration stored as JSON
-    # This includes: enabled, detection_enabled, notification_enabled,
-    # sample_fps, decode_backend, resize, emit_format, jpeg_quality, etc.
     config_json = Column(JSON, nullable=False, default=dict)
-    
-    # Timestamps
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
     

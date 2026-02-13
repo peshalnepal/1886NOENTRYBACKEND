@@ -5,7 +5,8 @@ import threading
 import uuid
 from typing import Any, Dict
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
+import json
 
 from channels.channel_config import VideoChannelConfig
 from database import db_manager, AsyncSessionLocal
@@ -192,10 +193,12 @@ class PipelineRuntime(object):
     # ---------- camera operations ----------
     def add_camera(self, rtsp_url: str, cfg_patch: Dict[str, Any]) -> Dict[str, Any]:
         # Use camera_uuid from patch if provided (from Azure), otherwise generate new
-        cam_id = cfg_patch.get("camera_uuid") or str(uuid.uuid4())
-        if not isinstance(cam_id, str):
-            cam_id = str(cam_id)
-
+        cam_id = cfg_patch.get("camera_uuid")
+        
+        if not cam_id:
+            raise ValueError("camera_uuid must be provided by backend (do not let Jetson generate IDs)")
+        cam_id = str(cam_id)
+  
         # defaults for Jetson inference
         cfg_data = {
             "camera_uuid": cam_id,
@@ -243,19 +246,21 @@ class PipelineRuntime(object):
             "rtsp_url": rtsp_url,
             "config": self._cameras[cam_id],
         }
-
+        
     def remove_camera(self, camera_uuid: str) -> bool:
         with self._lock:
             existed = camera_uuid in self._cameras
             if existed:
                 del self._cameras[camera_uuid]
-        
-        # delete from database
-        self._delete_camera_from_db(camera_uuid)
 
-        # remove from pipeline
-        self._call(self.pipeline.remove_channel(camera_uuid), timeout_s=10.0)
+        # stop runtime FIRST (prevents “still inferencing after delete” window)
+        if existed:
+            self._call(self.pipeline.remove_channel(camera_uuid), timeout_s=10.0)
+
+        # then delete from database
+        self._delete_camera_from_db(camera_uuid)
         return existed
+
 
     def list_cameras(self):
         with self._lock:
@@ -328,28 +333,36 @@ def health():
 def list_cameras():
     return jsonify({"cameras": runtime.list_cameras()})
 
-
 @app.route("/cameras", methods=["POST"])
 def add_camera():
     body = _json()
+
+    # Accept rtsp_url from either top-level or config
     rtsp_url = body.get("rtsp_url")
+    cfg = body.get("config")
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    if not rtsp_url:
+        rtsp_url = cfg.get("rtsp_url")
+
     if not _require_rtsp(rtsp_url):
         return jsonify({"error": "rtsp_url is required and must start with rtsp://"}), 400
 
-    # optional config overrides
-    patch = body.get("config") or {}
-    if not isinstance(patch, dict):
-        patch = {}
+    # Backward/forward compatibility:
+    # If backend sends camera_uuid at top-level (Azure Manager does), copy it into cfg
+    if "camera_uuid" not in cfg and body.get("camera_uuid"):
+        cfg["camera_uuid"] = body.get("camera_uuid")
 
-    # strongly recommend raw frames for TRT inference
-    if patch.get("emit_format") in ("jpeg", "raw"):
-        pass
-    else:
-        # default raw
-        patch["emit_format"] = "raw"
+    if "channel_id" not in cfg and body.get("channel_id"):
+        cfg["channel_id"] = body.get("channel_id")
+
+    # emit_format default
+    if cfg.get("emit_format") not in ("jpeg", "raw"):
+        cfg["emit_format"] = "raw"
 
     try:
-        out = runtime.add_camera(rtsp_url, patch)
+        out = runtime.add_camera(rtsp_url, cfg)
         return jsonify(out), 201
     except Exception as e:
         logger.exception("add_camera failed: %s", e)
@@ -409,6 +422,86 @@ def detection(camera_uuid):
     except Exception as e:
         logger.exception("detection failed: %s", e)
         return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/cameras/detections/stream", methods=["GET"])
+def stream_all_detections():
+    """
+    SSE endpoint for all detections.
+    """
+    return Response(stream_with_context(_sse_generator()), mimetype="text/event-stream")
+
+
+@app.route("/cameras/<camera_uuid>/detections/stream", methods=["GET"])
+def stream_camera_detections(camera_uuid):
+    """
+    SSE endpoint for specific camera detections.
+    """
+    return Response(stream_with_context(_sse_generator(camera_uuid)), mimetype="text/event-stream")
+
+
+def _sse_generator(target_camera_uuid=None):
+    if runtime.pipeline is None:
+        return
+
+    # Subscribe
+    q_future = asyncio.run_coroutine_threadsafe(
+        runtime.pipeline.broadcaster.subscribe(), 
+        runtime.loop
+    )
+    try:
+        q = q_future.result(timeout=5.0)
+    except Exception:
+        return
+
+    try:
+        while True:
+            # We need to get from queue in a thread-safe way from the async loop
+            # But the queue is in the async loop, and we are in a Flask thread.
+            # We can use run_coroutine_threadsafe to get an item? 
+            # No, that would be very slow for every item.
+            # Better: The queue should be thread-safe?
+            # asyncio.Queue is NOT thread-safe for cross-thread access.
+            #
+            # We need a bridge. 
+            # Or we just use run_coroutine_threadsafe(q.get(), loop)
+            # This is acceptable for SSE scale on Jetson (few clients).
+            
+            fut = asyncio.run_coroutine_threadsafe(q.get(), runtime.loop)
+            try:
+                msg = fut.result(timeout=1.0) # Check every second to allow disconnect check
+            except Exception:
+                # Timeout, send comment/heartbeat to keep alive
+                yield ": keepalive\n\n"
+                continue
+
+            if not isinstance(msg, dict):
+                continue
+
+            # filter if needed
+            if target_camera_uuid:
+                # check msg camera_uuid
+                c_uuid = msg.get("camera_uuid")
+                if str(c_uuid) != str(target_camera_uuid):
+                    continue
+
+            # Yield SSE
+            data_str = json.dumps(msg)
+            yield f"data: {data_str}\n\n"
+
+    except GeneratorExit:
+        # Client disconnected
+        asyncio.run_coroutine_threadsafe(
+            runtime.pipeline.broadcaster.unsubscribe(q), 
+            runtime.loop
+        )
+    except Exception as e:
+        logger.error(f"SSE stream error: {e}")
+        asyncio.run_coroutine_threadsafe(
+            runtime.pipeline.broadcaster.unsubscribe(q), 
+            runtime.loop
+        )
 
 
 if __name__ == "__main__":

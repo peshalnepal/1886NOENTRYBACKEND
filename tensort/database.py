@@ -38,14 +38,12 @@ class DatabaseManager:
             future=True,
         )
 
-        # ✅ Py3.6 + SQLAlchemy 1.4 compatible way (no async_sessionmaker)
         self.AsyncSessionLocal = sessionmaker(
             bind=self.async_engine,
             class_=AsyncSession,
             expire_on_commit=False,
         )
 
-        # Sync engine (sqlite3)
         self.sync_engine = create_engine(
             self.sync_db_url,
             connect_args={"check_same_thread": False},

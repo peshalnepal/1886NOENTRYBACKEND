@@ -19,6 +19,30 @@ logger = logging.getLogger(__name__)
 _DONE = object()
 
 
+class Broadcaster:
+    def __init__(self):
+        self._subscribers = set()
+        self._lock = asyncio.Lock()
+
+    async def subscribe(self):
+        q = asyncio.Queue(maxsize=1000)
+        async with self._lock:
+            self._subscribers.add(q)
+        return q
+
+    async def unsubscribe(self, q):
+        async with self._lock:
+            if q in self._subscribers:
+                self._subscribers.remove(q)
+
+    async def broadcast(self, msg):
+        async with self._lock:
+            for q in list(self._subscribers):
+                try:
+                    q.put_nowait(msg)
+                except asyncio.QueueFull:
+                    pass
+
 class CoalescingBuffer(object):
     def __init__(self, max_pending_keys=1000):
         self._latest = {}  # camera_uuid -> RTSPEvent
@@ -173,6 +197,8 @@ class SimpleInferencePipeline(object):
         self._lock = asyncio.Lock()
         self._inference_task = None
         self._infer_worker = None  # created on start()
+
+        self.broadcaster = Broadcaster()
 
     async def add_channel(self, cfg):
         camera_key = str(cfg.camera_uuid)
@@ -423,6 +449,7 @@ class SimpleInferencePipeline(object):
                 async with self._latest_lock:
                     self._latest[str(rtsp_ev.camera_uuid)] = result
 
+                await self.broadcaster.broadcast(result)
                 await self._put_out(result)
 
         except asyncio.CancelledError:

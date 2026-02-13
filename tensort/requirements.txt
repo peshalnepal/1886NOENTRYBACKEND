@@ -1,21 +1,16 @@
-# Python 3.6 compatible dependencies for Backend/tensort
-#
-# Create env:
-#   python3.6 -m venv .venv-py36
-#   source .venv-py36/bin/activate
-#   pip install --upgrade "pip<22" "setuptools<60" wheel
-#   pip install -r requirements-py36.txt
+# Jetson Nano Tensort Requirements
 
-Flask==2.0.3
-Werkzeug==2.0.3
-Jinja2==3.0.3
-itsdangerous==2.0.1
-click==8.0.4
+# Core dependencies
+Flask==2.3.0
+numpy==1.19.5  # Python 3.6 compatible
+opencv-python==4.5.5.64
 
-numpy==1.19.5
-opencv-python==4.6.0.66
-pycuda==2022.2.2
+# Database (async SQLite)
+SQLAlchemy==2.0.23
+aiosqlite==0.19.0
 
-# TensorRT Python bindings are usually installed from JetPack/apt on Jetson.
-# Example:
-#   sudo apt-get install -y python3-libnvinfer
+# TensorRT (provided by Jetson platform)
+# pycuda (provided by Jetson platform or install separately)
+
+# Optional: for better async support
+greenlet==2.0.2

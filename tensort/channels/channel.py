@@ -119,6 +119,9 @@ class VideoChannel():
         self._stop_thread_evt = threading.Event()
         self._out_q = asyncio.Queue(maxsize=2)
         self._event_queue = None
+        self._cap = None
+        self._stopping = False
+        self._cap_lock = threading.Lock()
         
     def _build_gst_pipeline(self, rtsp_url, decoder):
         lat = int(self.config.gst_latency_ms)
@@ -179,14 +182,31 @@ class VideoChannel():
             return frame
         w, h = self.config.resize
         return cv2.resize(frame, (int(w), int(h)))
-
+    
     def _put_latest(self, ev):
-        if self._out_q.full():
+        # if we're stopping, do not enqueue any new RTSPEvents
+        if getattr(self, "_stopping", False) and ev is not _DONE:
+            return
+
+        # make _DONE sticky: clear queue and insert only _DONE
+        if ev is _DONE:
             try:
-                _ = self._out_q.get_nowait()
+                while True:
+                    self._out_q.get_nowait()
             except Exception:
                 pass
+            try:
+                self._out_q.put_nowait(_DONE)
+            except Exception:
+                pass
+            return
 
+        # normal leaky behavior for frames
+        if self._out_q.full():
+            try:
+                self._out_q.get_nowait()
+            except Exception:
+                pass
         try:
             self._out_q.put_nowait(ev)
         except Exception:
@@ -203,6 +223,8 @@ class VideoChannel():
     def _push_from_thread(self, ev):
         if self._loop is None:
             return
+        if self._stop_thread_evt.is_set():
+            return
         self._loop.call_soon_threadsafe(self._handle_in_loop, ev)
 
     def _worker(self):
@@ -212,6 +234,10 @@ class VideoChannel():
             cap = None
             try:
                 cap = self._open_capture()
+                
+                with self._cap_lock:
+                    self._cap = cap
+
                 if cap is None or not cap.isOpened():
                     raise RuntimeError("Failed to open RTSP stream")
 
@@ -289,13 +315,16 @@ class VideoChannel():
                     )
                 )
 
-                time.sleep(backoff_ms / 1000.0)
+                if self._stop_thread_evt.wait(backoff_ms / 1000.0):
+                    break
                 backoff_ms = min(backoff_ms * 2, int(self.config.reconnect_max_ms))
 
             finally:
                 try:
-                    if cap is not None:
-                        cap.release()
+                    with self._cap_lock:
+                        if self._cap is not None:
+                            self._cap.release()
+                        self._cap = None
                 except Exception:
                     pass
 
@@ -330,16 +359,22 @@ class VideoChannel():
             yield item
 
     async def stop(self):
+        # idempotent
+        if getattr(self, "_stopping", False):
+            return
+        self._stopping = True
+
+        logger.info(f"[{self.camera_uuid}] Stopping channel thread...")
         self._stop_thread_evt.set()
 
-        if self._loop is not None:
+        # Signal stream() to end cleanly (unblocks async consumers)
+        if self._loop:
             self._loop.call_soon_threadsafe(self._put_latest, _DONE)
 
+        # DO NOT call self._cap.release() here (race -> segfault).
+        # Worker thread will exit and release in its finally.
+
         t = self._thread
-        if t is not None and t.is_alive():
-            loop = asyncio.get_event_loop()
-            try:
-                # Python 3.6 friendly
-                await loop.run_in_executor(None, t.join, 1.0)
-            except Exception:
-                pass
+        if t and t.is_alive():
+            # On Py3.6: keep this bounded so delete doesn't hang forever
+            t.join(timeout=6.0)

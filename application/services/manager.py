@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.pipeline_repository import PipelineRepository
 from application.repositories.channel_repository import ChannelRepository
-from core.database_orm import Device, SiteDevice  # used to auto-pick a device
+from core.database_orm import Device, SiteDevice, Camera, CameraDevice  # used to auto-pick a device
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent, VideoChannelEvent
 from domain.model_pipeline import ModelPipeline
 from application.channels.channel_config import VideoChannelConfig
