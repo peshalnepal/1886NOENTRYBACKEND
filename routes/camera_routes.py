@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import uuid
-import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -23,12 +22,6 @@ from core.schemas import (
     CameraWithConfigSchema,
 )  # type: ignore
 from application.services.manager import Manager
-import json
-from fastapi import Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-
-print(f"DEBUG: Loading camera_routes.py from {__file__}", file=sys.stderr)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/cameras", tags=["cameras"])
@@ -37,49 +30,26 @@ router = APIRouter(prefix="/cameras", tags=["cameras"])
 # -------------------------
 # Detection Schemas
 # -------------------------
-class DetectionOut(BaseModel):
-    camera_uuid: str
-    frame_ts_ms: int
-    frame_seq: int
-
-    site_uuid: Optional[str] = None
-    device_uuid: Optional[str] = None
-
-    detections: List[Any] = Field(default_factory=list)
-    pose: Optional[Any] = None
-    inference_ms: Optional[int] = None
-
-
-def _to_detection_out(resp: Any) -> DetectionOut:
-    # resp is ObjDetectResponse dataclass from your ModelPipeline store
-    return DetectionOut(
-        camera_uuid=str(resp.camera_uuid),
-        frame_ts_ms=int(resp.frame_ts_ms),
-        frame_seq=int(resp.frame_seq),
-        site_uuid=str(resp.site_uuid) if resp.site_uuid is not None else None,
-        device_uuid=str(resp.device_uuid) if resp.device_uuid is not None else None,
-        detections=list(resp.detections) if resp.detections is not None else [],
-        pose=resp.pose,
-        inference_ms=int(resp.inference_ms) if resp.inference_ms is not None else None,
-    )
-
 class BoxPx(BaseModel):
     x1: float
     y1: float
     x2: float
     y2: float
 
+
 class BoxNorm(BaseModel):
-    x: float   # 0..1 left
-    y: float   # 0..1 top
-    w: float   # 0..1 width
-    h: float   # 0..1 height
+    x: float  # 0..1 left
+    y: float  # 0..1 top
+    w: float  # 0..1 width
+    h: float  # 0..1 height
+
 
 class DetectionItemOut(BaseModel):
     box: BoxPx
     cls_name: str
     conf: float
     box_norm: Optional[BoxNorm] = None
+
 
 class DetectionOut(BaseModel):
     camera_uuid: str
@@ -114,10 +84,11 @@ def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
     fh = getattr(resp, "frame_h", None)
 
     items: List[DetectionItemOut] = []
-    for d in (list(resp.detections) if resp.detections else []):
+    for d in (list(resp.detections) if getattr(resp, "detections", None) else []):
         box = d.get("box") or {}
         if not all(k in box for k in ("x1", "y1", "x2", "y2")):
             continue
+
         box_px = BoxPx(x1=box["x1"], y1=box["y1"], x2=box["x2"], y2=box["y2"])
         items.append(
             DetectionItemOut(
@@ -132,13 +103,14 @@ def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
         camera_uuid=str(resp.camera_uuid),
         frame_ts_ms=int(resp.frame_ts_ms),
         frame_seq=int(resp.frame_seq),
-        inference_ms=int(resp.inference_ms) if resp.inference_ms is not None else None,
+        inference_ms=int(resp.inference_ms) if getattr(resp, "inference_ms", None) is not None else None,
         model_id=str(getattr(resp, "model_id", None)) if getattr(resp, "model_id", None) is not None else None,
         frame_w=int(fw) if fw is not None else None,
         frame_h=int(fh) if fh is not None else None,
         detections=items,
-        pose=resp.pose,
+        pose=getattr(resp, "pose", None),
     )
+
 
 # -------------------------
 # Cameras
@@ -146,23 +118,29 @@ def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
 @router.get("", response_model=List[CameraSchema])
 async def list_cameras(
     db: AsyncSession = Depends(get_async_db),
-    site_uuid: Optional[uuid.UUID] = None,
+    site_uuid: uuid.UUID = None,  # keep query param; if None -> 422 below
 ):
     """
-    List cameras from Azure DB.
-    Use camera.webrtc_url for playback in the frontend.
+    List cameras from Azure DB for a site.
+    Uses camera.webrtc_url for playback in the frontend.
     """
+    if site_uuid is None:
+        raise HTTPException(status_code=422, detail="site_uuid query param is required")
+
     repo = ChannelRepository()
     cams = await repo.list_cameras(db, site_uuid)
+
     out: List[CameraSchema] = []
     for cam in cams:
-        primary = await repo.get_primary_device(db, camera_uuid=cam.camera_uuid)
+        # New rule: exactly 1 device per camera, but for list we won't hard-fail old data
+        dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=False)
+
         out.append(
             CameraSchema(
                 camera_uuid=cam.camera_uuid,
                 camera_code=cam.camera_code,
                 site_uuid=cam.site_uuid,
-                device_uuid=(primary.device_uuid if primary else None),
+                device_uuid=(dev.device_uuid if dev else None),
                 rtsp_url=cam.rtsp_url,
                 webrtc_url=getattr(cam, "webrtc_url", None),
                 is_enabled=cam.is_enabled,
@@ -187,12 +165,18 @@ async def get_camera(
         raise HTTPException(status_code=404, detail="Camera not found")
 
     cam, cfg, _pid = full
-    primary = await repo.get_primary_device(db, camera_uuid=cam.camera_uuid)
+
+    # New rule: must have exactly 1 device
+    try:
+        dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=True)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
     return CameraWithConfigSchema(
         camera_uuid=cam.camera_uuid,
         camera_code=cam.camera_code,
         site_uuid=cam.site_uuid,
-        device_uuid=(primary.device_uuid if primary else None),
+        device_uuid=dev.device_uuid,
         rtsp_url=cam.rtsp_url,
         webrtc_url=getattr(cam, "webrtc_url", None),
         is_enabled=cam.is_enabled,
@@ -220,11 +204,13 @@ async def get_camera_playback(
     cam, _cfg, _pid = full
     if not getattr(cam, "webrtc_url", None):
         raise HTTPException(status_code=409, detail="WebRTC URL not provisioned yet")
+
     return {"camera_uuid": str(cam.camera_uuid), "webrtc_url": cam.webrtc_url}
 
 
 # -------------------------
-# NEW: Detection endpoints
+# Detection endpoints
+# -------------------------
 @router.get("/{camera_uuid}/detections/latest", response_model=DetectionOut)
 async def get_latest_detection(
     camera_uuid: uuid.UUID,
@@ -233,11 +219,6 @@ async def get_latest_detection(
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
 ):
-    """
-    Latest detection for one camera (from in-memory cache).
-    If refresh=1 and cache empty, pulls once from Jetson and caches it.
-    If normalize=1, includes box_norm (requires frame_w/frame_h).
-    """
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
@@ -265,13 +246,6 @@ async def stream_detections_sse(
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
 ):
-    """
-    SSE stream:
-      event: detection
-      data: {...DetectionOut...}
-
-    normalize=1 includes box_norm (requires frame_w/frame_h).
-    """
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
@@ -283,7 +257,6 @@ async def stream_detections_sse(
     async def gen():
         last = int(after_seq)
 
-        # send latest immediately if newer
         initial = await pipeline.get_latest_detection(cam_key)
         if initial is not None and int(initial.frame_seq) > last:
             last = int(initial.frame_seq)
@@ -318,11 +291,6 @@ async def stream_all_detections_sse(
     normalize: bool = False,
     manager: Manager = Depends(get_manager),
 ):
-    """
-    Global SSE stream for ALL detections from ALL cameras.
-    event: detection
-    data: {...DetectionOut...}
-    """
     pipeline = await manager.get_activepipeline()
     hub = pipeline.detection_hub
 
@@ -334,7 +302,6 @@ async def stream_all_detections_sse(
                     break
 
                 try:
-                    # Wait for a new detection from the hub
                     resp = await asyncio.wait_for(q.get(), timeout=float(timeout_ms) / 1000.0)
                     payload = _resp_to_detection_out(resp, normalize=normalize).model_dump()
                     yield f"event: detection\ndata: {json.dumps(payload)}\n\n"
@@ -352,23 +319,15 @@ async def latest_detections_for_site(
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
 ):
-    """
-    Get latest detections for all cameras in a site in ONE call.
-    Useful for site walls to avoid N HTTP calls.
-    """
     repo = ChannelRepository()
     cams = await repo.list_cameras(db, site_uuid)
-
     pipeline = await manager.get_activepipeline()
 
     out: Dict[str, Optional[Dict[str, Any]]] = {}
     for cam in cams:
         cam_id = str(cam.camera_uuid)
         resp = await pipeline.get_latest_detection(cam_id)
-        out[cam_id] = _to_detection_out(resp).model_dump() if resp is not None else None
-    logger.info("###########################################################################")
-    logger.info(out)
-    logger.info("###########################################################################")
+        out[cam_id] = _resp_to_detection_out(resp, normalize=False).model_dump() if resp is not None else None
 
     return {"site_uuid": str(site_uuid), "latest": out}
 
@@ -383,25 +342,24 @@ async def create_camera(
     manager: Manager = Depends(get_manager),
 ):
     try:
-        logger.info(f"Creating camera with payload: {payload.model_dump()}")
+        data = payload.model_dump(exclude_none=True)
+
+        # New rule: device_uuid is required
+        if not data.get("device_uuid"):
+            raise HTTPException(status_code=422, detail="device_uuid is required (each camera must have a device).")
 
         pipeline = await manager.get_activepipeline()
-        logger.info(f"Got active pipeline: {pipeline.pipeline_id}")
-        logger.info("################### OBTAINED FROM CAMERA ######################")
-        logger.info(payload.model_dump())
-        logger.info("#########################################")
-        
+
         ev = ChannelCreateEvent(
             channel_id=None,
-            configs=payload.model_dump(exclude_none=True),
+            configs=data,
             created_at=datetime.now(timezone.utc),
-        )   
-        
+        )
 
         result = await manager.update_pipeline(
             pipeline.pipeline_id,
             [ev],
-            user_id=payload.user_id,
+            user_id=data.get("user_id"),
             camera_code_prefix="cam",
         )
 
@@ -413,7 +371,7 @@ async def create_camera(
             camera_uuid=cam_out.camera_uuid,
             camera_code=cam_out.camera_code,
             site_uuid=cam_out.site_uuid,
-            device_uuid=cam_out.primary_device_uuid,
+            device_uuid=cam_out.device_uuid,
             rtsp_url=cam_out.rtsp_url,
             webrtc_url=cam_out.webrtc_url,
             is_enabled=cam_out.enabled,
@@ -428,7 +386,7 @@ async def create_camera(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"Error creating camera: {e}")
+        logger.exception("Error creating camera")
         raise HTTPException(status_code=500, detail=f"Failed to create camera: {str(e)}")
 
 
@@ -448,7 +406,6 @@ async def edit_camera(
     )
 
     result = await manager.update_pipeline(pipeline.pipeline_id, [ev])
-
     if not result or not result.cameras:
         raise HTTPException(status_code=500, detail="Failed to edit camera")
 
@@ -457,7 +414,7 @@ async def edit_camera(
         camera_uuid=cam_out.camera_uuid,
         camera_code=cam_out.camera_code,
         site_uuid=cam_out.site_uuid,
-        device_uuid=cam_out.primary_device_uuid,
+        device_uuid=cam_out.device_uuid,
         rtsp_url=cam_out.rtsp_url,
         webrtc_url=cam_out.webrtc_url,
         is_enabled=cam_out.enabled,

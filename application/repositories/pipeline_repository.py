@@ -127,9 +127,6 @@ class PipelineRepository:
         pipeline = (await db.execute(stmt)).scalar_one_or_none()
         if pipeline is None:
             return None
-
-        # Attach computed list so Manager can iterate `pipeline.channel_configurations`
-        # and access `.configuration` on each entry.
         channel_cfgs: List[ChannelConfiguration] = []
         for cam in (pipeline.cameras or []):
             if cam.channel_configuration is not None:
@@ -137,3 +134,30 @@ class PipelineRepository:
 
         setattr(pipeline, "channel_configurations", channel_cfgs)
         return pipeline
+    
+    async def get_pipeline_by_userid(self, db: AsyncSession, user_id: int) -> Optional[Pipeline]:
+        stmt = (
+            select(Pipeline)
+            .where(Pipeline.user_id == int(user_id), Pipeline.name == "default")
+            .options(
+                selectinload(Pipeline.cameras).selectinload(Camera.channel_configuration),
+                selectinload(Pipeline.cameras).selectinload(Camera.devices),
+            )
+            .order_by(Pipeline.created_at.asc())
+        )
+
+        pipeline = (await db.execute(stmt)).scalars().first()
+        if pipeline is None:
+            return None
+
+        channel_cfgs: List[ChannelConfiguration] = []
+        for cam in (pipeline.cameras or []):
+            if cam.channel_configuration is not None:
+                channel_cfgs.append(cam.channel_configuration)
+
+        setattr(pipeline, "channel_configurations", channel_cfgs)
+        return pipeline
+    
+    async def get_default_pipeline_for_user(self, db: AsyncSession, user_id: int) -> Optional[Pipeline]:
+        # just reuse the same loader
+        return await self.get_pipeline_by_userid(db, user_id)

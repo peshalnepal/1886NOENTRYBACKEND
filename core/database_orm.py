@@ -381,24 +381,18 @@ class CameraDevice(Base):
 
     Use this to decide which Jetson device(s) can run inference for a camera.
 
-    Optional: is_primary can mark the currently selected device.
     (DB cannot easily enforce "only one primary" cross-db; do that in service layer.)
     """
     __tablename__ = "camera_devices"
 
     id = Column(Integer, primary_key=True, index=True)
-
     camera_uuid = Column(GUID, ForeignKey("camera.camera_uuid", ondelete="CASCADE"), nullable=False, index=True)
     device_uuid = Column(GUID, ForeignKey("devices.device_uuid", ondelete="CASCADE"), nullable=False, index=True)
-
-    is_primary = Column(Boolean, default=False, nullable=False)
-
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
     __table_args__ = (
-        UniqueConstraint("camera_uuid", "device_uuid", name="uq_camera_device_pair"),
+        UniqueConstraint("camera_uuid", name="uq_camera_one_device"),
     )
-
 
 # =========================
 # PIPELINE
@@ -407,8 +401,6 @@ class Pipeline(Base):
     __tablename__ = "pipelines"
 
     id = Column(GUID, primary_key=True, default=uuid.uuid4, unique=True, nullable=False, index=True)
-
-    # optional (recommended for future multi-user)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
 
     name = Column(String(255), nullable=False, default="default")
@@ -416,7 +408,9 @@ class Pipeline(Base):
 
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
-
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_pipeline_user_name"),
+    )
     cameras = relationship(
         "Camera",
         secondary="pipeline_cameras",

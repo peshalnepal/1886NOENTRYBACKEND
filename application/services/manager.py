@@ -9,12 +9,12 @@ from urllib.parse import quote
 from datetime import datetime, date
 import httpx
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.pipeline_repository import PipelineRepository
 from application.repositories.channel_repository import ChannelRepository
-from core.database_orm import Device, SiteDevice, Camera, CameraDevice  # used to auto-pick a device
+from core.database_orm import Device, Camera, CameraDevice  # ✅ removed SiteDevice
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent, VideoChannelEvent
 from domain.model_pipeline import ModelPipeline
 from application.channels.channel_config import VideoChannelConfig
@@ -25,19 +25,12 @@ logger = logging.getLogger(__name__)
 # API DTOs
 # -------------------------
 def to_jsonable(obj):
-    # UUID -> str
     if isinstance(obj, uuid.UUID):
         return str(obj)
-
-    # datetime/date -> ISO
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
-
-    # pydantic model -> dict
     if isinstance(obj, BaseModel):
         return obj.model_dump(exclude_none=True)
-
-    # dict -> recurse
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
@@ -45,11 +38,8 @@ def to_jsonable(obj):
                 continue
             out[str(k)] = to_jsonable(v)
         return out
-
-    # list/tuple/set -> list
     if isinstance(obj, (list, tuple, set)):
         return [to_jsonable(v) for v in obj]
-
     return obj
     
 class CameraOut(BaseModel):
@@ -67,12 +57,10 @@ class CameraOut(BaseModel):
     configuration: Dict[str, Any] = Field(default_factory=dict)
     timezone: Optional[str] = None
 
-    # assignment (one primary device for inference)
-    primary_device_uuid: Optional[uuid.UUID] = None
-    primary_device_url: Optional[str] = None
+    device_uuid: uuid.UUID
+    device_url: str
 
-    # stored tuning knobs (optional)
-    sample_fps: float = Field(default=5.0, ge=0.1, description="Frames/sec to publish as RTSPEvent on Jetson")
+    sample_fps: float = Field(default=5.0, ge=0.1)
     decode_backend: str = Field(default="gstreamer")
     resize: Optional[Tuple[int, int]] = None
     emit_format: str = Field(default="raw")
@@ -81,7 +69,7 @@ class CameraOut(BaseModel):
 
 class PipelineUpdateResult(BaseModel):
     pipeline_id: uuid.UUID
-    active_in_memory: bool = False  # Azure no longer runs the RTSP ingest pipeline in-memory
+    active_in_memory: bool = False
     cameras: List[CameraOut] = Field(default_factory=list)
     events: List[Dict[str, Any]] = Field(default_factory=list)
 
@@ -360,20 +348,13 @@ RUNTIME_CONFIG_FORBIDDEN_KEYS = {
     "is_enabled",
     "is_detection_enabled",
     "is_notification_enabled",
-    "primary_device_uuid",
-    "device_uuids",
     "user_id",
     "roi",
 }
 
 RUNTIME_CONFIG_ALLOWED_KEYS = set(VideoChannelConfig.model_fields.keys())
 
-
-def _runtime_config_overrides(
-    cfg: Dict[str, Any],
-    *,
-    extra_forbidden: Optional[set] = None,
-) -> Dict[str, Any]:
+def _runtime_config_overrides(cfg: Dict[str, Any], *, extra_forbidden: Optional[set] = None) -> Dict[str, Any]:
     forbidden = set(RUNTIME_CONFIG_FORBIDDEN_KEYS)
     if extra_forbidden:
         forbidden.update(extra_forbidden)
@@ -392,133 +373,32 @@ def _runtime_config_overrides(
 class Manager:
     """
     Azure Manager:
-      - DB is source of truth (Azure SQL/Postgres)
-      - WebRTC gateway provides playback URL (Azure service)
-      - Jetson device provides detections (TensorRT service)
-
-    This manager no longer runs a local RTSP ingest pipeline.
+      - DB is source of truth
+      - WebRTC gateway provides playback URL
+      - Jetson device provides detections
     """
 
     def __init__(self, session_factory: Callable[[], AsyncSession]):
         self._session_factory = session_factory
         self._lock = asyncio.Lock()
 
-        # DB repos
         self._repo = PipelineRepository()
         self.channel_repo = ChannelRepository()
 
-        # External provisioning
         self._webrtc = WebRTCGatewayClient()
         self._edge = EdgeInferenceClient()
 
-        self._active_user_id: Optional[int] = None
-        self._active_id: Optional[uuid.UUID] = None
-        self._active_pipeline: Optional[ModelPipeline] = None
+        self._pipelines_by_user: Dict[int, ModelPipeline] = {}
+        self._pipeline_id_by_user: Dict[int, uuid.UUID] = {}
+
         self._default_user_id = int(os.getenv("DEFAULT_USER_ID", "1"))
 
     async def shutdown(self) -> None:
         async with self._lock:
-            if self._active_pipeline:
-                await self._active_pipeline.shutdown()
-            self._active_pipeline = None
-            self._active_id = None
+            self._pipelines_by_user.clear()
+            self._pipeline_id_by_user.clear()
         await self._webrtc.close()
         await self._edge.close()
-
-    async def create_pipeline(self, user_id: int | None = None) -> ModelPipeline:
-        """
-        Creates (loads) the single active pipeline for this user and populates channels from DB.
-        One user -> one persistent pipeline row (name='default').
-        """
-        uid = int(user_id or self._default_user_id)
-
-        # Fast path (no lock)
-        if self._active_pipeline is not None and self._active_id is not None and self._active_user_id == uid:
-            return self._active_pipeline
-
-        async with self._lock:
-            # Double-check inside lock
-            if self._active_pipeline is not None and self._active_id is not None and self._active_user_id == uid:
-                return self._active_pipeline
-
-            # If something exists but for another user (future-proofing)
-            if self._active_pipeline is not None and self._active_user_id is not None and self._active_user_id != uid:
-                try:
-                    await self._active_pipeline.shutdown()
-                except Exception:
-                    logger.warning("Failed to shutdown previous active pipeline", exc_info=True)
-                self._active_pipeline = None
-                self._active_id = None
-                self._active_user_id = None
-
-            async with self._session_factory() as db:
-                # 1) Ensure (user_id, name='default') pipeline exists (stable)
-                pipeline_row = await self._repo.upsert_pipeline(
-                    db,
-                    user_id=uid,
-                    pipeline_id=None,
-                    name="default",
-                    is_active=True,
-                )
-                pid = pipeline_row.id
-                logger.info("Loaded persistent pipeline user_id=%s pipeline_id=%s", uid, pid)
-
-                # 2) Load full pipeline (cameras + devices + configs)
-                full_pl = await self._repo.get_full_pipeline(db, pid)
-
-                # 3) Build in-memory handle (Azure side does not ingest RTSP; this is config/runtime helper)
-                mp = ModelPipeline(pipeline_id=pid)
-
-                if full_pl and getattr(full_pl, "cameras", None):
-                    for cam in full_pl.cameras:
-                        primary_dev = None
-                        if getattr(cam, "camera_devices", None):
-                            for cd in cam.camera_devices:
-                                if getattr(cd, "is_primary", False):
-                                    primary_dev = cd.device
-                                    break
-                            if primary_dev is None and cam.camera_devices:
-                                primary_dev = cam.camera_devices[0].device
-
-                        d_url = getattr(primary_dev, "device_url", None) if primary_dev else None
-                        d_uuid = getattr(primary_dev, "device_uuid", None) if primary_dev else None
-
-                        cfg_json = {}
-                        if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None):
-                            cfg_json = cam.channel_configuration.configuration or {}
-
-                        runtime_overrides = _runtime_config_overrides(
-                            cfg_json,
-                            extra_forbidden={"sample_fps", "decode_backend", "request_timeout_s"},
-                        )
-
-                        vcc = VideoChannelConfig(
-                            camera_uuid=cam.camera_uuid,
-                            rtsp_url=cam.rtsp_url,
-                            webrtc_url=cam.webrtc_url or "",
-                            site_uuid=cam.site_uuid,
-                            device_uuid=d_uuid,
-                            device_url=d_url,
-                            enabled=bool(getattr(cam, "is_enabled", True)),
-                            sample_fps=float(cfg_json.get("sample_fps", 5.0)),
-                            decode_backend=str(cfg_json.get("decode_backend", "gstreamer")),
-                            request_timeout_s=float(cfg_json.get("request_timeout_s", 2.0)),
-                            **runtime_overrides,
-                        )
-
-                        await mp.add_channel(VideoChannel(config=vcc))
-
-                # Commit only after we’ve built the in-memory view (avoids expire-on-commit surprises)
-                await db.commit()
-
-            self._active_user_id = uid
-            self._active_id = pid
-            self._active_pipeline = mp
-            return mp
-
-
-    async def get_activepipeline(self) -> ModelPipeline:
-        return await self.create_pipeline()
 
     def _patch_to_dict(self, obj: Any) -> Dict[str, Any]:
         if obj is None:
@@ -530,6 +410,7 @@ class Manager:
         else:
             out = {}
 
+        # normalize names
         if "enabled" not in out and "is_enabled" in out:
             out["enabled"] = out["is_enabled"]
         if "detection_enabled" not in out and "is_detection_enabled" in out:
@@ -547,6 +428,137 @@ class Manager:
         except Exception as e:
             raise ValueError(f"Invalid {name}: {v}") from e
 
+    async def _get_device(self, db: AsyncSession, device_uuid: uuid.UUID) -> Device:
+        dev = (await db.execute(select(Device).where(Device.device_uuid == device_uuid))).scalar_one_or_none()
+        if dev is None:
+            raise ValueError(f"Device not found: {device_uuid}")
+        if not getattr(dev, "device_url", None):
+            raise ValueError(f"Device missing device_url: {device_uuid}")
+        return dev
+
+    async def _get_single_camera_device(self, db: AsyncSession, camera_uuid: uuid.UUID, *, required: bool = True) -> Optional[Device]:
+        """
+        Returns the single Device assigned to this camera (enforces exactly one).
+        """
+        q = (
+            select(Device)
+            .join(CameraDevice, CameraDevice.device_uuid == Device.device_uuid)
+            .where(CameraDevice.camera_uuid == camera_uuid)
+        )
+        devices = (await db.execute(q)).scalars().all()
+
+        if len(devices) == 1:
+            dev = devices[0]
+            if not getattr(dev, "device_url", None):
+                raise ValueError(f"Assigned device has no device_url for camera {camera_uuid}")
+            return dev
+
+        if not required and len(devices) == 0:
+            return None
+
+        raise ValueError(f"Camera {camera_uuid} must have exactly 1 device assigned, found {len(devices)}")
+
+    async def _set_single_camera_device(self, db: AsyncSession, camera_uuid: uuid.UUID, device_uuid: uuid.UUID) -> None:
+        """
+        Enforces exactly one device link row in camera_devices.
+        Safe even if old rows exist.
+        """
+        await db.execute(delete(CameraDevice).where(CameraDevice.camera_uuid == camera_uuid))
+        db.add(CameraDevice(camera_uuid=camera_uuid, device_uuid=device_uuid))
+        await db.flush()
+
+    def _edge_payload_from_config(self, *, camera_uuid: str, rtsp_url: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(config or {})
+        payload.update({"camera_uuid": camera_uuid, "rtsp_url": rtsp_url})
+        return payload
+
+
+    async def create_pipeline(self, user_id: int | None = None) -> ModelPipeline:
+        """
+        Creates (loads) the user's default pipeline and builds a config-only ModelPipeline.
+        """
+        uid = int(user_id or self._default_user_id)
+
+        async with self._lock:
+            async with self._session_factory() as db:
+                pipeline_row = await self._repo.upsert_pipeline(
+                    db,
+                    user_id=uid,
+                    pipeline_id=None,
+                    name="default",
+                    is_active=True,
+                )
+                pid = pipeline_row.id
+
+                full_pl = await self._repo.get_full_pipeline(db, pid)
+
+                mp = ModelPipeline(pipeline_id=pid)
+
+                if full_pl and getattr(full_pl, "cameras", None):
+                    for cam in full_pl.cameras:
+                        enabled = bool(getattr(cam, "is_enabled", True))
+                        det_enabled = bool(getattr(cam, "is_detection_enabled", True))
+
+                        devices = list(getattr(cam, "devices", None) or [])
+                        if len(devices) != 1:
+                            if enabled and det_enabled:
+                                raise ValueError(
+                                    f"Camera {cam.camera_uuid} must have exactly 1 device assigned, found {len(devices)}"
+                                )
+                            logger.warning(
+                                "Skipping camera %s (enabled=%s detection=%s) because device count=%s",
+                                cam.camera_uuid, enabled, det_enabled, len(devices)
+                            )
+                            continue
+
+                        device = devices[0]
+                        d_url = getattr(device, "device_url", None)
+                        d_uuid = getattr(device, "device_uuid", None)
+                        if not d_url or not d_uuid:
+                            raise ValueError(f"Camera {cam.camera_uuid} has invalid device assignment.")
+
+                        cfg_json = {}
+                        if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None):
+                            cfg_json = cam.channel_configuration.configuration or {}
+
+                        runtime_overrides = _runtime_config_overrides(
+                            cfg_json,
+                            extra_forbidden={"sample_fps", "decode_backend", "request_timeout_s"},
+                        )
+
+                        vcc = VideoChannelConfig(
+                            camera_uuid=cam.camera_uuid,
+                            rtsp_url=cam.rtsp_url,
+                            webrtc_url=cam.webrtc_url or "",
+                            site_uuid=cam.site_uuid,
+                            device_uuid=d_uuid,
+                            device_url=d_url,
+                            enabled=enabled,
+                            detection_enabled=det_enabled,
+                            notification_enabled=bool(getattr(cam, "is_notification_enabled", True)),
+                            sample_fps=float(cfg_json.get("sample_fps", 5.0)),
+                            decode_backend=str(cfg_json.get("decode_backend", "gstreamer")),
+                            request_timeout_s=float(cfg_json.get("request_timeout_s", 2.0)),
+                            **runtime_overrides,
+                        )
+                        await mp.add_channel(VideoChannel(config=vcc))
+
+                await db.commit()
+
+                self._pipelines_by_user[uid] = mp
+                self._pipeline_id_by_user[uid] = pid
+                return mp
+
+    async def get_activepipeline(self, user_id: int | None = None) -> ModelPipeline:
+        uid = int(user_id or self._default_user_id)
+        mp = self._pipelines_by_user.get(uid)
+        if mp is not None:
+            return mp
+        return await self.create_pipeline(uid)
+
+    # -------------------------
+    # Update pipeline from events
+    # -------------------------
     async def update_pipeline(
         self,
         pipeline_id: Union[str, uuid.UUID],
@@ -557,60 +569,44 @@ class Manager:
     ) -> Optional[PipelineUpdateResult]:
 
         pid = self._as_uuid(pipeline_id, "pipeline_id")
-        
-        # Ensure active pipeline is loaded so we can update in-memory state too
-        active = await self.get_activepipeline()
-        
+        uid = int(user_id or self._default_user_id)
+
+        # do not call create_pipeline while holding lock
+        active = await self.get_activepipeline(uid)
+
         async with self._lock:
             async with self._session_factory() as db:
                 exists = await self._repo.pipeline_exists(db, pid)
-                logger.info(f"Pipeline exists check: {pid} -> {exists}")
                 if not exists:
-                    logger.warning(f"Pipeline {pid} does not exist in DB.")
+                    logger.warning("Pipeline %s does not exist in DB.", pid)
                     return None
-               
+
                 cameras_out: List[CameraOut] = []
                 events_out: List[Dict[str, Any]] = []
 
-                logger.info(f"Processing {len(channel_events or [])} events")
-
                 for ev in (channel_events or []):
-                    try:
-                        et = getattr(ev, "event_type", None)
-                        if et is None and isinstance(ev, dict):
-                            et = ev.get("event_type")
-                        
-                        logger.info(f"Processing event: {ev}, et={et}, type={type(ev)}, dir={dir(ev)}")
-                        logger.info(f"Event dict: {ev.__dict__ if hasattr(ev, '__dict__') else 'no __dict__'}")
+                    et = getattr(ev, "event_type", None)
+                    if et is None and isinstance(ev, dict):
+                        et = ev.get("event_type")
+                    et_norm = str(et or "").lower()
 
-                        if et == "Create_Channel" or str(et).lower() == "create_channel" or isinstance(ev, ChannelCreateEvent):
-                            logger.info("Matched Create_Channel event")
-                            cams, evs = await self._add_channel(db, pid=pid, ev=ev, user_id=user_id, camera_code_prefix=camera_code_prefix)
-                            
-                        elif et == "Edit_Channel" or str(et).lower() == "edit_channel" or isinstance(ev, ChannelEditEvent):
-                            cams, evs = await self._edit_channel(db, pid=pid, ev=ev)
-                        elif et == "Remove_Channel" or str(et).lower() == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
-                            cams, evs = await self._remove_channel(db, pid=pid, ev=ev)
-                            if active:
-                                 for e in evs:
-                                     await active.remove_channel(e["camera_uuid"])
+                    if et_norm == "create_channel" or isinstance(ev, ChannelCreateEvent):
+                        cams, evs = await self._add_channel(
+                            db, pid=pid, ev=ev, user_id=uid, camera_code_prefix=camera_code_prefix, active=active
+                        )
+                    elif et_norm == "edit_channel" or isinstance(ev, ChannelEditEvent):
+                        cams, evs = await self._edit_channel(db, pid=pid, ev=ev, active=active)
+                    elif et_norm == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
+                        cams, evs = await self._remove_channel(db, pid=pid, ev=ev, active=active)
+                    else:
+                        logger.warning("Event type not matched: %s", et)
+                        continue
 
-                        else:
-                            logger.warning(f"Event type not matched: et={et}, ev={ev}")
-                            continue
-
-                        cameras_out.extend(cams)
-                        events_out.extend(evs)
-                        logger.info(f"Added {len(cams)} cameras to output, total now: {len(cameras_out)}")
-                    except Exception as e:
-                        logger.exception(f"Error processing individual event {ev}: {e}")
-                        # Depending on policy, we might want to continue or raise.
-                        # For creation, failing the whole batch is safer.
-                        raise
+                    cameras_out.extend(cams)
+                    events_out.extend(evs)
 
                 await db.commit()
-                logger.info(f"DB committed. Returning {len(cameras_out)} cameras.")
-                
+
             return PipelineUpdateResult(
                 pipeline_id=pid,
                 active_in_memory=False,
@@ -618,53 +614,21 @@ class Manager:
                 events=events_out,
             )
 
-
-    async def _pick_site_device_uuid(self, db: AsyncSession, site_uuid: uuid.UUID) -> Optional[uuid.UUID]:
-        """
-        Pick one device linked to the site (first match).
-        You can refine ordering/policy later (prefer enabled, lowest load, etc.).
-        """
-        q = select(SiteDevice.device_uuid).where(SiteDevice.site_uuid == site_uuid)
-        return (await db.execute(q)).scalars().first()
-
-    async def _get_device(self, db: AsyncSession, device_uuid: uuid.UUID) -> Device:
-        dev = (await db.execute(select(Device).where(Device.device_uuid == device_uuid))).scalar_one_or_none()
-        if dev is None:
-            raise ValueError(f"Device not found: {device_uuid}")
-        if not getattr(dev, "device_url", None):
-            raise ValueError(f"Device missing device_url: {device_uuid}")
-        return dev
-
-    def _edge_payload_from_config(self, *, camera_uuid: str, rtsp_url: str, config: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Build the payload you send to Jetson.
-
-        Keep it generous; Jetson can ignore unknown fields.
-        """
-        payload = dict(config)
-        payload.update(
-            {
-                "camera_uuid": camera_uuid,
-                "rtsp_url": rtsp_url,
-            }
-        )
-        return payload
-
+    # -------------------------
+    # Event handlers (UPDATED)
+    # -------------------------
     async def _add_channel(
         self,
         db: AsyncSession,
         *,
         pid: uuid.UUID,
         ev: VideoChannelEvent,
-        user_id: Optional[int],
+        user_id: int,
         camera_code_prefix: str,
+        active: Optional[ModelPipeline],
     ) -> Tuple[List[CameraOut], List[Dict[str, Any]]]:
-        logger.info(f"_add_channel called with pid={pid}, user_id={user_id}")
-        patch = self._patch_to_dict(getattr(ev, "configs", None))
-        logger.info(f"Extracted patch: {patch}")
 
-        if user_id is None:
-            raise ValueError("user_id is required when creating a new camera.")
+        patch = self._patch_to_dict(getattr(ev, "configs", None))
 
         rtsp_url = patch.get("rtsp_url")
         if not rtsp_url:
@@ -675,25 +639,19 @@ class Manager:
             raise ValueError("Create_Channel requires site_uuid")
         site_uuid = self._as_uuid(site_uuid, "site_uuid")
 
-        # choose / validate device assignment
-        primary_device_uuid = patch.get("primary_device_uuid") or patch.get("device_uuid")
-        if primary_device_uuid:
-            primary_device_uuid = self._as_uuid(primary_device_uuid, "primary_device_uuid")
-        else:
-            primary_device_uuid = await self._pick_site_device_uuid(db, site_uuid)
-            if primary_device_uuid is None:
-                raise ValueError("No device linked to this site. Link a Device to the Site first.")
+        device_uuid = patch.get("device_uuid")
+        if not device_uuid:
+            raise ValueError("Create_Channel requires device_uuid (each camera must have exactly 1 device).")
+        device_uuid = self._as_uuid(device_uuid, "device_uuid")
+        dev = await self._get_device(db, device_uuid)
 
-        # pick camera_uuid deterministically (so we can provision WebRTC with the same key)
         cam_uuid = patch.get("camera_uuid") or uuid.uuid4()
         cam_uuid = self._as_uuid(cam_uuid, "camera_uuid")
         patch["camera_uuid"] = cam_uuid
-        patch["channel_id"]=cam_uuid
+        patch["channel_id"] = cam_uuid  # keep compatibility
+
         camera_code = f"{camera_code_prefix}-{uuid.uuid4().hex[:8]}"
-
         webrtc_url = await self._webrtc.ensure_stream(stream_key=str(camera_code), rtsp_url=str(rtsp_url))
-
-        # 2) persist DB (webrtc_url stored once; immutable on edit)
         cam, cfg_json, tz = await self.channel_repo.upsert_camera_from_channel_config(
             db,
             pipeline_id=pid,
@@ -703,12 +661,10 @@ class Manager:
             camera_code=camera_code,
             site_uuid=site_uuid,
             webrtc_url=webrtc_url,
-            device_uuids=[primary_device_uuid],
-            primary_device_uuid=primary_device_uuid,
+            device_uuid=device_uuid,  
         )
 
-        # 3) provision Jetson edge inference
-        dev = await self._get_device(db, primary_device_uuid)
+        await self._set_single_camera_device(db, cam.camera_uuid, device_uuid)
 
         enabled = bool(getattr(cam, "is_enabled", True))
         det_enabled = bool(getattr(cam, "is_detection_enabled", True))
@@ -718,20 +674,38 @@ class Manager:
             rtsp_url=cam.rtsp_url,
             config={
                 **_only_jetson_config(patch),
-                
                 "enabled": enabled,
                 "detection_enabled": det_enabled,
                 "notification_enabled": bool(getattr(cam, "is_notification_enabled", True)),
             },
         )
-        logger.info("######################### Edge Payload ################################")
-        logger.info(edge_payload)
-        logger.info("#########################################################")
+
         if enabled and det_enabled:
-            # Fail early with a clear edge startup error, if exposed by edge health.
             await self._edge.upsert_camera(device_url=dev.device_url, payload=edge_payload)
         else:
             await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam.camera_uuid))
+
+        if active:
+            runtime_overrides = _runtime_config_overrides(
+                cfg_json or {},
+                extra_forbidden={"sample_fps", "decode_backend", "request_timeout_s"},
+            )
+            vcc = VideoChannelConfig(
+                camera_uuid=cam.camera_uuid,
+                rtsp_url=cam.rtsp_url,
+                webrtc_url=cam.webrtc_url or "",
+                site_uuid=cam.site_uuid,
+                device_uuid=device_uuid,
+                device_url=dev.device_url,
+                enabled=enabled,
+                detection_enabled=det_enabled,
+                notification_enabled=bool(getattr(cam, "is_notification_enabled", True)),
+                sample_fps=float((cfg_json or {}).get("sample_fps", patch.get("sample_fps", 5.0))),
+                decode_backend=str((cfg_json or {}).get("decode_backend", patch.get("decode_backend", "gstreamer"))),
+                request_timeout_s=float((cfg_json or {}).get("request_timeout_s", patch.get("request_timeout_s", 2.0))),
+                **runtime_overrides,
+            )
+            await active.add_channel(VideoChannel(config=vcc))
 
         cameras_out = [
             CameraOut(
@@ -743,59 +717,25 @@ class Manager:
                 enabled=bool(cam.is_enabled),
                 detection_enabled=bool(cam.is_detection_enabled),
                 notification_enabled=bool(cam.is_notification_enabled),
-                primary_device_uuid=primary_device_uuid,
-                primary_device_url=dev.device_url,
+                device_uuid=device_uuid,
+                device_url=dev.device_url,
                 sample_fps=float(patch.get("sample_fps", 5.0)),
                 decode_backend=str(patch.get("decode_backend", "gstreamer")),
                 resize=patch.get("resize"),
                 emit_format=str(patch.get("emit_format", "raw")),
                 jpeg_quality=int(patch.get("jpeg_quality", 80)),
                 roi=cam.roi,
-                configuration=cfg_json,
+                configuration=cfg_json or {},
                 timezone=tz,
             )
         ]
-
-        # Sync to in-memory active pipeline
-        active = self._active_pipeline
-        if active:
-            try:
-                # VideoChannelConfig has 'enabled', 'detection_enabled', etc.
-                # but 'patch' might have 'is_enabled', etc. from the client schema.
-                vcc_data = {
-                    "camera_uuid": cam.camera_uuid,
-                    "rtsp_url": cam.rtsp_url,
-                    "webrtc_url": cam.webrtc_url or "",
-                    "site_uuid": cam.site_uuid,
-                    "device_uuid": primary_device_uuid,
-                    "device_url": dev.device_url,
-                    "enabled": enabled,
-                    "detection_enabled": det_enabled,
-                    "notification_enabled": bool(getattr(cam, "is_notification_enabled", True)),
-                }
-                
-                # Add other fields from patch, making sure we don't duplicate or use wrong names
-                for k, v in patch.items():
-                    # Map is_enabled -> enabled etc if they are in the patch
-                    if k == "is_enabled" and "enabled" not in vcc_data: vcc_data["enabled"] = v
-                    elif k == "is_detection_enabled" and "detection_enabled" not in vcc_data: vcc_data["detection_enabled"] = v
-                    elif k == "is_notification_enabled" and "notification_enabled" not in vcc_data: vcc_data["notification_enabled"] = v
-
-                
-                vcc = VideoChannelConfig(**vcc_data)
-                await active.add_channel(VideoChannel(config=vcc))
-                logger.info(f"Added camera {cam.camera_uuid} to in-memory pipeline")
-            except Exception as e:
-                logger.exception(f"Failed to add camera to in-memory pipeline: {e}")
-                # We don't want to fail the whole API call if just the in-memory update fails
-                # since it's already in the DB.
 
         events_out = [
             {
                 "event_type": "Create_Channel",
                 "camera_uuid": str(cam.camera_uuid),
                 "site_uuid": str(cam.site_uuid),
-                "primary_device_uuid": str(primary_device_uuid),
+                "device_uuid": str(device_uuid),
                 "rtsp_url": cam.rtsp_url,
                 "webrtc_url": cam.webrtc_url,
             }
@@ -808,9 +748,10 @@ class Manager:
         *,
         pid: uuid.UUID,
         ev: VideoChannelEvent,
+        active: Optional[ModelPipeline],
     ) -> Tuple[List[CameraOut], List[Dict[str, Any]]]:
 
-        cam_uuid = getattr(ev, "channel_id", None)
+        cam_uuid = getattr(ev, "channel_id", None) or getattr(ev, "camera_uuid", None)
         if cam_uuid is None:
             raise ValueError("Edit_Channel missing channel_id (camera_uuid).")
         cam_uuid = self._as_uuid(cam_uuid, "camera_uuid")
@@ -822,28 +763,38 @@ class Manager:
         cam_db, chan_cfg_db, existing_pid = full
         if existing_pid is not None and existing_pid != pid:
             raise ValueError("Camera does not belong to provided pipeline_id")
+
         old_rtsp = cam_db.rtsp_url
         old_webrtc = cam_db.webrtc_url
-        old_primary_dev = await self.channel_repo.get_primary_device(db, camera_uuid=cam_uuid)
+
+        # ✅ must have exactly one device already
+        old_dev = await self._get_single_camera_device(db, cam_uuid, required=True)
+
         patch = self._patch_to_dict(getattr(ev, "configs", None))
-        patch.pop("webrtc_url", None)
-        new_primary_device_uuid = patch.get("primary_device_uuid") or patch.get("device_uuid")
-        if new_primary_device_uuid:
-            new_primary_device_uuid = self._as_uuid(new_primary_device_uuid, "primary_device_uuid")
-        else:
-            new_primary_device_uuid = old_primary_dev.device_uuid if old_primary_dev else None
+        patch.pop("webrtc_url", None)  # we keep existing / stable mapping
+
+        # device_uuid is optional on edit; if omitted, keep existing
+        new_device_uuid = patch.get("device_uuid")
+        if new_device_uuid is None:
+            new_device_uuid = old_dev.device_uuid
+        new_device_uuid = self._as_uuid(new_device_uuid, "device_uuid")
+
+        new_dev = await self._get_device(db, new_device_uuid)
+
+        # merge config json
         merged_cfg: Dict[str, Any] = {}
         if chan_cfg_db and getattr(chan_cfg_db, "configuration", None):
-            merged_cfg.update(chan_cfg_db.configuration)
+            merged_cfg.update(chan_cfg_db.configuration or {})
         merged_cfg.update(patch)
 
+        # write camera + channel_config
         cam2, cfg_json, tz = await self.channel_repo.upsert_camera_from_channel_config(
             db,
             pipeline_id=pid,
             channel_config={
                 **merged_cfg,
                 "camera_uuid": cam_uuid,
-                "webrtc_url":old_webrtc,
+                "webrtc_url": old_webrtc,
                 "rtsp_url": merged_cfg.get("rtsp_url", old_rtsp),
                 "enabled": merged_cfg.get("enabled", cam_db.is_enabled),
                 "detection_enabled": merged_cfg.get("detection_enabled", cam_db.is_detection_enabled),
@@ -851,87 +802,66 @@ class Manager:
             },
             site_uuid=cam_db.site_uuid,
             webrtc_url=old_webrtc,
-            device_uuids=[d for d in ([new_primary_device_uuid] if new_primary_device_uuid else [])] or None,
-            primary_device_uuid=new_primary_device_uuid,
+            device_uuid=new_device_uuid,  # ok if repo uses it
         )
 
-        # WebRTC gateway: update mapping if rtsp_url changed, but keep the same webrtc_url
-        if cam2.rtsp_url != old_rtsp:
+        if old_dev.device_uuid != new_device_uuid:
+            # remove from old device first (best-effort)
+            try:
+                await self._edge.delete_camera(device_url=old_dev.device_url, camera_uuid=str(cam_uuid))
+            except Exception:
+                logger.warning("Failed removing camera from old device during reassignment", exc_info=True)
+
+            await self._set_single_camera_device(db, cam_uuid, new_device_uuid)
+
+        # update WebRTC source if rtsp changed
+        if cam2.rtsp_url != old_rtsp and cam2.camera_code:
             await self._webrtc.update_stream(stream_key=str(cam2.camera_code), rtsp_url=cam2.rtsp_url)
 
         enabled = bool(cam2.is_enabled)
         det_enabled = bool(cam2.is_detection_enabled)
-        
-        dev = None
-        if old_primary_dev and new_primary_device_uuid and old_primary_dev.device_uuid != new_primary_device_uuid:
-            try:
-                await self._edge.delete_camera(device_url=old_primary_dev.device_url, camera_uuid=str(cam_uuid))
-            except Exception:
-                logger.exception("Failed removing camera from old device during reassignment")
 
-            new_dev = await self._get_device(db, new_primary_device_uuid)
-            edge_payload = self._edge_payload_from_config(
-                camera_uuid=str(cam_uuid),
-                rtsp_url=cam2.rtsp_url,
-                config={
-                    **merged_cfg,
-                    "enabled": enabled,
-                    "detection_enabled": det_enabled,
-                    "notification_enabled": bool(cam2.is_notification_enabled),
-                },
-            )
-            if enabled and det_enabled:
+        # send to edge
+        if enabled and det_enabled:
+            if old_dev.device_uuid != new_device_uuid:
+                edge_payload = self._edge_payload_from_config(
+                    camera_uuid=str(cam_uuid),
+                    rtsp_url=cam2.rtsp_url,
+                    config={
+                        **_only_jetson_config(merged_cfg),
+                        "enabled": enabled,
+                        "detection_enabled": det_enabled,
+                        "notification_enabled": bool(cam2.is_notification_enabled),
+                    },
+                )
                 await self._edge.upsert_camera(device_url=new_dev.device_url, payload=edge_payload)
             else:
-                await self._edge.delete_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid))
-            primary_device_url = new_dev.device_url
-            dev = new_dev
+                edge_patch = _only_jetson_config(patch)
+                edge_patch.setdefault("rtsp_url", cam2.rtsp_url)
+                edge_patch["enabled"] = enabled
+                edge_patch["detection_enabled"] = det_enabled
+                edge_patch["notification_enabled"] = bool(cam2.is_notification_enabled)
+                await self._edge.patch_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid), patch=edge_patch)
         else:
-            # same device
-            dev = old_primary_dev
-            if dev is None and new_primary_device_uuid is not None:
-                dev = await self._get_device(db, new_primary_device_uuid)
+            await self._edge.delete_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid))
 
-            if dev is None:
-                raise ValueError("Camera has no assigned device. Assign a Device to this camera.")
-
-            edge_patch = _only_jetson_config(patch)
-            if "rtsp_url" not in edge_patch:
-                edge_patch["rtsp_url"] = cam2.rtsp_url
-            edge_patch["enabled"] = enabled
-            edge_patch["detection_enabled"] = det_enabled
-            edge_patch["notification_enabled"] = bool(cam2.is_notification_enabled)
-
-            if enabled and det_enabled:
-                await self._edge.patch_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid), patch=edge_patch)
-            else:
-                await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid))
-
-            primary_device_url = dev.device_url
-            new_primary_device_uuid = dev.device_uuid
-
-        # Sync in-memory
-        active = self._active_pipeline
-        ch_in_mem = await active.get_channel_config(cam_uuid) if active else None
-
+        # update cached model pipeline
         if active:
-             # Just replace it
             runtime_overrides = _runtime_config_overrides(merged_cfg)
             vcc = VideoChannelConfig(
                 camera_uuid=cam2.camera_uuid,
                 rtsp_url=cam2.rtsp_url,
                 webrtc_url=cam2.webrtc_url or "",
                 site_uuid=cam2.site_uuid,
-                device_uuid=new_primary_device_uuid,
-                device_url=dev.device_url,
+                device_uuid=new_device_uuid,
+                device_url=new_dev.device_url,
                 enabled=enabled,
                 detection_enabled=det_enabled,
                 notification_enabled=bool(cam2.is_notification_enabled),
-                **runtime_overrides
+                **runtime_overrides,
             )
-            # edit_channel in ModelPipeline replaces it
             await active.edit_channel(VideoChannel(config=vcc))
-            
+
         cameras_out = [
             CameraOut(
                 camera_uuid=cam2.camera_uuid,
@@ -942,15 +872,15 @@ class Manager:
                 enabled=bool(cam2.is_enabled),
                 detection_enabled=bool(cam2.is_detection_enabled),
                 notification_enabled=bool(cam2.is_notification_enabled),
-                primary_device_uuid=new_primary_device_uuid,
-                primary_device_url=primary_device_url,
+                device_uuid=new_device_uuid,
+                device_url=new_dev.device_url,
                 sample_fps=float(merged_cfg.get("sample_fps", 5.0)),
                 decode_backend=str(merged_cfg.get("decode_backend", "gstreamer")),
                 resize=merged_cfg.get("resize"),
                 emit_format=str(merged_cfg.get("emit_format", "raw")),
                 jpeg_quality=int(merged_cfg.get("jpeg_quality", 80)),
                 roi=cam2.roi,
-                configuration=cfg_json,
+                configuration=cfg_json or {},
                 timezone=tz,
             )
         ]
@@ -960,45 +890,11 @@ class Manager:
             "camera_uuid": str(cam2.camera_uuid),
             "rtsp_url": cam2.rtsp_url,
             "webrtc_url": cam2.webrtc_url,
-            "primary_device_uuid": str(new_primary_device_uuid) if new_primary_device_uuid else None,
+            "device_uuid": str(new_device_uuid),
             "patch": patch,
         }]
 
         return cameras_out, events_out
-
-    async def cleanup_device_resources(self, db: AsyncSession, *, device_uuid: uuid.UUID) -> None:
-        """
-        Called when a Device is about to be deleted.
-        Finds all cameras on this device and sends DELETE to the edge service.
-        """
-        try:
-            # We need the device itself to get the URL
-            dev = await self._get_device(db, device_uuid)
-            if not dev.device_url:
-                return
-
-            # Find all cameras linked to this device
-            q = (
-                select(Camera)
-                .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
-                .where(CameraDevice.device_uuid == device_uuid)
-            )
-            cameras_on_device = (await db.execute(q)).scalars().all()
-
-            for cam in cameras_on_device:
-                try:
-                    logger.info(f"Cleaning up camera {cam.camera_uuid} from device {device_uuid} before deletion")
-                    await self._edge.delete_camera(
-                        device_url=dev.device_url,
-                        camera_uuid=str(cam.camera_uuid),
-                    )
-                except Exception:
-                    logger.warning(
-                        f"Failed to cleanup camera {cam.camera_uuid} on device {dev.device_uuid}",
-                        exc_info=True,
-                    )
-        except Exception:
-            logger.exception(f"Error during device cleanup for {device_uuid}")
 
     async def _remove_channel(
         self,
@@ -1006,9 +902,10 @@ class Manager:
         *,
         pid: uuid.UUID,
         ev: VideoChannelEvent,
+        active: Optional[ModelPipeline],
     ) -> Tuple[List[CameraOut], List[Dict[str, Any]]]:
 
-        cam_uuid = getattr(ev, "channel_id", None)
+        cam_uuid = getattr(ev, "channel_id", None) or getattr(ev, "camera_uuid", None)
         if cam_uuid is None:
             raise ValueError("Remove_Channel missing channel_id (camera_uuid).")
         cam_uuid = self._as_uuid(cam_uuid, "camera_uuid")
@@ -1019,28 +916,54 @@ class Manager:
             if existing_pid is not None and existing_pid != pid:
                 raise ValueError("Camera does not belong to provided pipeline_id")
 
-            # attempt external cleanup (best-effort)
+            # delete from edge (best-effort)
             try:
-                # NEW: iterate all associated devices, not just primary
-                devices = await self.channel_repo.get_associated_devices(db, camera_uuid=cam_uuid)
-                for dev in devices:
-                    if dev.device_url:
-                        try:
-                            # We don't want one failure to stop others
-                            await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid))
-                        except Exception:
-                            logger.warning(f"Failed removing camera {cam_uuid} from device {dev.device_url}", exc_info=True)
+                dev = await self._get_single_camera_device(db, cam_uuid, required=False)
+                if dev and dev.device_url:
+                    await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid))
             except Exception:
-                logger.exception("Edge delete failed during camera removal")
+                logger.warning("Edge delete failed during camera removal", exc_info=True)
 
+            # delete WebRTC stream mapping
             try:
-                # Use camera_code as stream key for WebRTC cleanup
                 if cam_db.camera_code:
                     await self._webrtc.delete_stream(stream_key=str(cam_db.camera_code))
             except Exception:
-                logger.exception("WebRTC delete failed during camera removal")
+                logger.warning("WebRTC delete failed during camera removal", exc_info=True)
 
             await self.channel_repo.delete_camera(db, camera_uuid=cam_db.camera_uuid)
 
+        # update cached model pipeline
+        if active:
+            try:
+                await active.remove_channel(cam_uuid)
+            except Exception:
+                logger.warning("Failed removing channel from cached ModelPipeline", exc_info=True)
+
         events_out = [{"event_type": "Remove_Channel", "camera_uuid": str(cam_uuid)}]
         return [], events_out
+
+    async def cleanup_device_resources(self, db: AsyncSession, *, device_uuid: uuid.UUID) -> None:
+        """
+        Called when a Device is about to be deleted.
+        Finds all cameras on this device and sends DELETE to the edge service.
+        """
+        try:
+            dev = await self._get_device(db, device_uuid)
+            if not dev.device_url:
+                return
+
+            q = (
+                select(Camera)
+                .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
+                .where(CameraDevice.device_uuid == device_uuid)
+            )
+            cameras_on_device = (await db.execute(q)).scalars().all()
+
+            for cam in cameras_on_device:
+                try:
+                    await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam.camera_uuid))
+                except Exception:
+                    logger.warning("Failed cleanup camera %s on device %s", cam.camera_uuid, dev.device_uuid, exc_info=True)
+        except Exception:
+            logger.exception("Error during device cleanup for %s", device_uuid)
