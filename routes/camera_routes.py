@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dependencies import get_async_db, get_manager
 from application.repositories.channel_repository import ChannelRepository
+from application.repositories.site_repository import SiteRepository
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent
 from core.schemas import (
     CameraSchema,
@@ -128,7 +129,8 @@ async def list_cameras(
         raise HTTPException(status_code=422, detail="site_uuid query param is required")
 
     repo = ChannelRepository()
-    cams = await repo.list_cameras(db, site_uuid)
+    site_repo=SiteRepository()
+    cams = await site_repo.list_cameras_by_site(db, site_uuid)
 
     out: List[CameraSchema] = []
     for cam in cams:
@@ -320,7 +322,9 @@ async def latest_detections_for_site(
     manager: Manager = Depends(get_manager),
 ):
     repo = ChannelRepository()
-    cams = await repo.list_cameras(db, site_uuid)
+    site_repo=SiteRepository()
+    cams = await site_repo.list_cameras_by_site(db, site_uuid)
+
     pipeline = await manager.get_activepipeline()
 
     out: Dict[str, Optional[Dict[str, Any]]] = {}
