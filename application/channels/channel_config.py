@@ -62,10 +62,10 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
     resize: Optional[Tuple[int, int]] = Field(default=None, description="(width, height)")
     reconnect_base_ms: Optional[int] = Field(default=1000, ge=100)
     reconnect_max_ms: Optional[int] = Field(default=8000, ge=1000)
-    poll_interval_ms: Optional[int] = Field(default=50, ge=10)
+    poll_interval_ms: Optional[int] = Field(default=250, ge=10)
     request_timeout_s: Optional[float] = Field(default=5.0, ge=0.1)
     detection_path_template: Optional[str] = Field(
-        default="/detections/{camera_uuid}",
+        default="/detection/{camera_uuid}",
         description="Jetson detection endpoint template.",
     )
     emit_format: Optional[Literal["raw", "jpeg"]] = Field(

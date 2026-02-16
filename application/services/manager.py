@@ -163,6 +163,7 @@ class Manager:
         self._pipeline_id_by_user: Dict[int, uuid.UUID] = {}
 
         self._default_user_id = int(os.getenv("DEFAULT_USER_ID", "1"))
+        self._default_request_timeout_s = 5.0
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -309,7 +310,9 @@ class Manager:
                             notification_enabled=bool(getattr(cam, "is_notification_enabled", True)),
                             sample_fps=float(cfg_json.get("sample_fps", 5.0)),
                             decode_backend=str(cfg_json.get("decode_backend", "gstreamer")),
-                            request_timeout_s=float(cfg_json.get("request_timeout_s", 2.0)),
+                            request_timeout_s=float(
+                                cfg_json.get("request_timeout_s", self._default_request_timeout_s)
+                            ),
                             **runtime_overrides,
                         )
                         await mp.add_channel(VideoChannel(config=vcc))
@@ -561,7 +564,12 @@ class Manager:
                 notification_enabled=bool(getattr(cam, "is_notification_enabled", True)),
                 sample_fps=float((cfg_json or {}).get("sample_fps", patch.get("sample_fps", 5.0))),
                 decode_backend=str((cfg_json or {}).get("decode_backend", patch.get("decode_backend", "gstreamer"))),
-                request_timeout_s=float((cfg_json or {}).get("request_timeout_s", patch.get("request_timeout_s", 2.0))),
+                request_timeout_s=float(
+                    (cfg_json or {}).get(
+                        "request_timeout_s",
+                        patch.get("request_timeout_s", self._default_request_timeout_s),
+                    )
+                ),
                 **runtime_overrides,
             )
             await active.add_channel(VideoChannel(config=vcc))

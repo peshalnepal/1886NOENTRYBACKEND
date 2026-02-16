@@ -477,6 +477,7 @@ class ModelPipeline:
     async def _poll_loop(self, key: str, ch: VideoChannel) -> None:
         backoff_ms = 250
         max_backoff_ms = 8000
+        empty_miss_count = 0
 
         while True:
             async with self._lock:
@@ -500,10 +501,13 @@ class ModelPipeline:
                 payload = await ch.stream()
                 resp = self._payload_to_resp(payload, ch)
                 if resp is None:
-                    backoff_ms = 250
-                    await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
+                    empty_miss_count = min(empty_miss_count + 1, 6)
+                    base_sleep_s = max(0.25, float(cfg.poll_interval_ms) / 1000.0)
+                    miss_sleep_s = min(5.0, base_sleep_s * (2 ** (empty_miss_count - 1)))
+                    await asyncio.sleep(miss_sleep_s)
                     continue
 
+                empty_miss_count = 0
                 prev = int(self._last_seq.get(key, 0))
                 if int(resp.frame_seq) <= prev:
                     await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
