@@ -25,8 +25,8 @@ class PipelineRepository:
     """
 
     async def pipeline_exists(self, db: AsyncSession, pipeline_id: uuid.UUID) -> bool:
-        stmt = select(Pipeline.id).where(Pipeline.id == pipeline_id)
-        row = (await db.execute(stmt)).scalar_one_or_none()
+        stmt = select(Pipeline).where(Pipeline.id == pipeline_id)
+        row = (await db.execute(stmt)).scalars().first()
         return row is not None
     
 

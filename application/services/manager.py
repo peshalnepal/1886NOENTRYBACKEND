@@ -574,45 +574,56 @@ class Manager:
         # do not call create_pipeline while holding lock
         active = await self.get_activepipeline(uid)
 
-        async with self._lock:
-            async with self._session_factory() as db:
-                exists = await self._repo.pipeline_exists(db, pid)
-                if not exists:
-                    logger.warning("Pipeline %s does not exist in DB.", pid)
-                    return None
+        for attempt in [1, 2]:
+            async with self._lock:
+                async with self._session_factory() as db:
+                    exists = await self._repo.pipeline_exists(db, pid)
+                    if not exists:
+                        logger.warning("Pipeline %s does not exist in DB for user %s. Invalidating cache (attempt %s).", pid, uid, attempt)
+                        self._pipelines_by_user.pop(uid, None)
+                        self._pipeline_id_by_user.pop(uid, None)
+                        if attempt == 1:
+                             # refresh 'active' and 'pid' for retry
+                             active = await self.get_activepipeline(uid)
+                             pid = self._pipeline_id_by_user.get(uid)
+                             if not pid:
+                                 return None
+                             continue
+                        return None
 
-                cameras_out: List[CameraOut] = []
-                events_out: List[Dict[str, Any]] = []
+                    cameras_out: List[CameraOut] = []
+                    events_out: List[Dict[str, Any]] = []
 
-                for ev in (channel_events or []):
-                    et = getattr(ev, "event_type", None)
-                    if et is None and isinstance(ev, dict):
-                        et = ev.get("event_type")
-                    et_norm = str(et or "").lower()
+                    for ev in (channel_events or []):
+                        et = getattr(ev, "event_type", None)
+                        if et is None and isinstance(ev, dict):
+                            et = ev.get("event_type")
+                        et_norm = str(et or "").lower()
 
-                    if et_norm == "create_channel" or isinstance(ev, ChannelCreateEvent):
-                        cams, evs = await self._add_channel(
-                            db, pid=pid, ev=ev, user_id=uid, camera_code_prefix=camera_code_prefix, active=active
-                        )
-                    elif et_norm == "edit_channel" or isinstance(ev, ChannelEditEvent):
-                        cams, evs = await self._edit_channel(db, pid=pid, ev=ev, active=active)
-                    elif et_norm == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
-                        cams, evs = await self._remove_channel(db, pid=pid, ev=ev, active=active)
-                    else:
-                        logger.warning("Event type not matched: %s", et)
-                        continue
+                        if et_norm == "create_channel" or isinstance(ev, ChannelCreateEvent):
+                            cams, evs = await self._add_channel(
+                                db, pid=pid, ev=ev, user_id=uid, camera_code_prefix=camera_code_prefix, active=active
+                            )
+                        elif et_norm == "edit_channel" or isinstance(ev, ChannelEditEvent):
+                            cams, evs = await self._edit_channel(db, pid=pid, ev=ev, active=active)
+                        elif et_norm == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
+                            cams, evs = await self._remove_channel(db, pid=pid, ev=ev, active=active)
+                        else:
+                            logger.warning("Event type not matched: %s", et)
+                            continue
 
-                    cameras_out.extend(cams)
-                    events_out.extend(evs)
+                        cameras_out.extend(cams)
+                        events_out.extend(evs)
 
-                await db.commit()
+                    await db.commit()
 
-            return PipelineUpdateResult(
-                pipeline_id=pid,
-                active_in_memory=False,
-                cameras=cameras_out,
-                events=events_out,
-            )
+                return PipelineUpdateResult(
+                    pipeline_id=pid,
+                    active_in_memory=False,
+                    cameras=cameras_out,
+                    events=events_out,
+                )
+        return None
 
     # -------------------------
     # Event handlers (UPDATED)
@@ -680,10 +691,13 @@ class Manager:
             },
         )
 
-        if enabled and det_enabled:
-            await self._edge.upsert_camera(device_url=dev.device_url, payload=edge_payload)
-        else:
-            await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam.camera_uuid))
+        try:
+            if enabled and det_enabled:
+                await self._edge.upsert_camera(device_url=dev.device_url, payload=edge_payload)
+            else:
+                await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam.camera_uuid))
+        except Exception:
+            logger.warning("Edge sync failed during camera creation", exc_info=True)
 
         if active:
             runtime_overrides = _runtime_config_overrides(
@@ -822,28 +836,31 @@ class Manager:
         det_enabled = bool(cam2.is_detection_enabled)
 
         # send to edge
-        if enabled and det_enabled:
-            if old_dev.device_uuid != new_device_uuid:
-                edge_payload = self._edge_payload_from_config(
-                    camera_uuid=str(cam_uuid),
-                    rtsp_url=cam2.rtsp_url,
-                    config={
-                        **_only_jetson_config(merged_cfg),
-                        "enabled": enabled,
-                        "detection_enabled": det_enabled,
-                        "notification_enabled": bool(cam2.is_notification_enabled),
-                    },
-                )
-                await self._edge.upsert_camera(device_url=new_dev.device_url, payload=edge_payload)
+        try:
+            if enabled and det_enabled:
+                if old_dev.device_uuid != new_device_uuid:
+                    edge_payload = self._edge_payload_from_config(
+                        camera_uuid=str(cam_uuid),
+                        rtsp_url=cam2.rtsp_url,
+                        config={
+                            **_only_jetson_config(merged_cfg),
+                            "enabled": enabled,
+                            "detection_enabled": det_enabled,
+                            "notification_enabled": bool(cam2.is_notification_enabled),
+                        },
+                    )
+                    await self._edge.upsert_camera(device_url=new_dev.device_url, payload=edge_payload)
+                else:
+                    edge_patch = _only_jetson_config(patch)
+                    edge_patch.setdefault("rtsp_url", cam2.rtsp_url)
+                    edge_patch["enabled"] = enabled
+                    edge_patch["detection_enabled"] = det_enabled
+                    edge_patch["notification_enabled"] = bool(cam2.is_notification_enabled)
+                    await self._edge.patch_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid), patch=edge_patch)
             else:
-                edge_patch = _only_jetson_config(patch)
-                edge_patch.setdefault("rtsp_url", cam2.rtsp_url)
-                edge_patch["enabled"] = enabled
-                edge_patch["detection_enabled"] = det_enabled
-                edge_patch["notification_enabled"] = bool(cam2.is_notification_enabled)
-                await self._edge.patch_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid), patch=edge_patch)
-        else:
-            await self._edge.delete_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid))
+                await self._edge.delete_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid))
+        except Exception:
+            logger.warning("Edge sync failed during camera edit", exc_info=True)
 
         # update cached model pipeline
         if active:

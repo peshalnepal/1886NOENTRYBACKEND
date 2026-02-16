@@ -359,7 +359,8 @@ async def create_camera(
         if not data.get("device_uuid"):
             raise HTTPException(status_code=422, detail="device_uuid is required (each camera must have a device).")
 
-        pipeline = await manager.get_activepipeline()
+        user_id = data.get("user_id")
+        pipeline = await manager.get_activepipeline(user_id=user_id)
 
         ev = ChannelCreateEvent(
             channel_id=None,
