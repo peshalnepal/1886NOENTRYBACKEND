@@ -221,6 +221,16 @@ class ChannelRepository:
 
         raise ValueError(f"Camera {camera_uuid} must have exactly 1 device, found {len(devices)}")
 
+    async def delete_camera(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> None:
+        """
+        Deletes a camera and its associated configurations.
+        """
+        await db.execute(delete(PipelineCamera).where(PipelineCamera.camera_uuid == camera_uuid))
+        await db.execute(delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
+        await db.execute(delete(CameraDevice).where(CameraDevice.camera_uuid == camera_uuid))
+        await db.execute(delete(Camera).where(Camera.camera_uuid == camera_uuid))
+        await db.flush()
+
     # -------------------------
     # Internal helpers (NEW/FIXED)
     # -------------------------
