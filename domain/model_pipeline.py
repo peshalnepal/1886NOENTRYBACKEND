@@ -226,16 +226,6 @@ class ModelPipeline:
     def set_session_factory(self, session_factory: SessionFactory) -> None:
         self._session_factory = session_factory
 
-    # ----- fake ROI for now
-    async def _fake_rois(self, camera_uuid: str) -> List[ROI]:
-        # normalized rectangle in the middle (20% margins)
-        return [
-            ROI(
-                roi_id="fake-default",
-                points=[(0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)],
-                normalized=True,
-            )
-        ]
 
     async def _get_site_name(self, site_uuid: Optional[str]) -> str:
         if not site_uuid:

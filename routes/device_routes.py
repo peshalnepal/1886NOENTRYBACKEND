@@ -30,7 +30,24 @@ async def _get_device_or_404(db: AsyncSession, user_id: int, device_uuid: uuid.U
         raise HTTPException(status_code=404, detail="Device not found")
     return device
 
+class EdgeCameraListOut(BaseModel):
+    device_uuid: uuid.UUID
+    device_url: str
+    camera_uuids: List[str] = Field(default_factory=list)
 
+
+class EdgeReconcileOut(BaseModel):
+    device_uuid: uuid.UUID
+    device_url: str
+
+    to_add: List[str] = Field(default_factory=list)
+    to_remove: List[str] = Field(default_factory=list)
+
+    added: List[str] = Field(default_factory=list)
+    removed: List[str] = Field(default_factory=list)
+
+    errors: List[str] = Field(default_factory=list)
+    
 # -----------------------
 # Schemas
 # -----------------------
@@ -144,3 +161,28 @@ async def delete_device(
     await db.delete(device)
     await db.commit()
     return None
+
+@router.post("/{device_uuid}/edge/reconcile", response_model=EdgeReconcileOut)
+async def reconcile_edge_cameras(
+    device_uuid: uuid.UUID,
+    dry_run: bool = False,
+    delete_unknown: bool = True,
+    db: AsyncSession = Depends(get_async_db),
+    user=Depends(get_current_user),
+    manager: Manager = Depends(get_manager),
+):
+    device = await _get_device_or_404(db, user.id, device_uuid)
+
+    # You need this Manager method (short version) — see next section
+    result = await manager.reconcile_device_edge_simple(
+        device_uuid=device_uuid,
+        user_id=user.id,
+        dry_run=dry_run,
+        delete_unknown=delete_unknown,
+    )
+
+    return EdgeReconcileOut(
+        device_uuid=device.device_uuid,
+        device_url=device.device_url,
+        **result,
+    )

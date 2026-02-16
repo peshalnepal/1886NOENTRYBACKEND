@@ -5,42 +5,29 @@ import logging
 import os
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from urllib.parse import quote
-from datetime import datetime, date
-import httpx
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
 
 from application.repositories.pipeline_repository import PipelineRepository
 from application.repositories.channel_repository import ChannelRepository
-from core.database_orm import Device, Camera, CameraDevice  # ✅ removed SiteDevice
+from core.database_orm import Device, Camera, CameraDevice
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent, VideoChannelEvent
 from domain.model_pipeline import ModelPipeline
 from application.channels.channel_config import VideoChannelConfig
 from application.channels.channel import VideoChannel
+from application.services.edgeinference import EdgeInferenceClient
+from application.services.webrtcgateway import WebRTCGatewayClient
+
 logger = logging.getLogger(__name__)
 
 # -------------------------
 # API DTOs
 # -------------------------
-def to_jsonable(obj):
-    if isinstance(obj, uuid.UUID):
-        return str(obj)
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-    if isinstance(obj, BaseModel):
-        return obj.model_dump(exclude_none=True)
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            if v is None:
-                continue
-            out[str(k)] = to_jsonable(v)
-        return out
-    if isinstance(obj, (list, tuple, set)):
-        return [to_jsonable(v) for v in obj]
-    return obj
+
     
 class CameraOut(BaseModel):
     camera_uuid: uuid.UUID
@@ -77,223 +64,6 @@ class PipelineUpdateResult(BaseModel):
 # -------------------------
 # External clients
 # -------------------------
-
-class WebRTCGatewayClient:
-    """
-    Provisions (or updates) RTSP->WebRTC streams on an Azure-hosted gateway (MediaMTX/go2rtc/etc).
-
-    We support two modes:
-      1) Admin API available -> call it to upsert streams.
-      2) No admin API -> derive a stable public webrtc_url from WEBRTC_PUBLIC_BASE_URL + stream_key.
-
-    Environment:
-      - WEBRTC_ADMIN_API_URL (optional)
-      - WEBRTC_ADMIN_UPSERT_PATH (default: /streams)
-      - WEBRTC_ADMIN_UPDATE_PATH (default: /streams/{stream_key})
-      - WEBRTC_ADMIN_DELETE_PATH (default: /streams/{stream_key})
-      - WEBRTC_PUBLIC_BASE_URL (required for derivation if admin doesn't return a url)
-      - WEBRTC_ADMIN_API_KEY (optional header: x-api-key)
-    """
-
-    def __init__(self):
-        # Default to MediaMTX API localhost if not set
-        self.admin_api_url = (os.getenv("WEBRTC_ADMIN_API_URL") or "https://noentrymtxfdxidm.centralus.azurecontainer.io:9997").rstrip("/")
-        
-        # Public URL for the frontend to consume (e.g. port 8889 for WebRTC)
-        pub_host = os.getenv("PUBLIC_HOST", "localhost")
-        pub_scheme = os.getenv("PUBLIC_SCHEME", "http")
-        pub_port = os.getenv("WEBRTC_HTTP_PORT", "8889")
-        self.public_base = (os.getenv("WEBRTC_PUBLIC_BASE_URL") or f"{pub_scheme}://{pub_host}:{pub_port}").rstrip("/")
-
-        self.api_user = os.getenv("MTX_API_USER", "api")
-        self.api_pass = os.getenv("MTX_API_PASS", "api_pass_123")
-
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
-
-    async def close(self) -> None:
-        await self._client.aclose()
-    
-    def _auth(self) -> Tuple[str, str]:
-        return (self.api_user, self.api_pass)
-
-    def _derive_public_webrtc_url(self, stream_key: str) -> str:
-        # This opens MediaMTX’s built-in WebRTC player page
-        return f"{self.public_base}/{stream_key}"
-
-
-    async def ensure_stream(self, *, stream_key: str, rtsp_url: str) -> Optional[str]:
-        """
-        Ensure stream exists in MediaMTX. Returns webrtc_url (stable).
-        """
-        if not self.admin_api_url:
-            return self._derive_public_webrtc_url(stream_key)
-
-        # MediaMTX v3: /v3/config/paths/add/{name}
-        safe_name = quote(stream_key, safe="")
-        add_url = f"{self.admin_api_url}/v3/config/paths/add/{safe_name}"
-        payload = {"source": rtsp_url, "rtspTransport": "tcp"}
-
-        # 1. Try Add
-        try:
-            r = await self._client.post(add_url, json=payload, auth=self._auth())
-            if r.status_code == 200:
-                return self._derive_public_webrtc_url(stream_key)
-        except Exception:
-            logger.warning("MediaMTX add request failed, trying patch or ignoring", exc_info=True)
-
-        # 2. If add failed (likely 400 exists), try Patch
-        patch_url = f"{self.admin_api_url}/v3/config/paths/patch/{safe_name}"
-        try:
-            r = await self._client.patch(patch_url, json=payload, auth=self._auth())
-            if r.status_code == 200:
-                return self._derive_public_webrtc_url(stream_key)
-        except Exception:
-            logger.error("MediaMTX patch request failed", exc_info=True)
-            
-        # Fallback: return derived URL anyway, optimization
-        return self._derive_public_webrtc_url(stream_key)
-
-    async def update_stream(self, *, stream_key: str, rtsp_url: str) -> None:
-        if not self.admin_api_url:
-            return
-            
-        safe_name = quote(stream_key, safe="")
-        url = f"{self.admin_api_url}/v3/config/paths/patch/{safe_name}"
-        payload = {"source": rtsp_url}
-        
-        try:
-            await self._client.patch(url, json=payload, auth=self._auth())
-        except Exception:
-             logger.error(f"MediaMTX update failed for {stream_key}", exc_info=True)
-
-    async def delete_stream(self, *, stream_key: str) -> None:
-        if not self.admin_api_url:
-            return
-            
-        safe_name = quote(stream_key, safe="")
-        url = f"{self.admin_api_url}/v3/config/paths/delete/{safe_name}"
-        
-        try:
-            await self._client.delete(url, auth=self._auth())
-        except Exception:
-             logger.warning(f"MediaMTX delete failed for {stream_key}", exc_info=True)
-
-
-class EdgeInferenceClient:
-    """
-    Talks to the Jetson TensorRT (inference) service.
-
-    Environment (defaults are guesses; set them to match your Jetson routes):
-      - EDGE_ADD_PATH (default: /api/cameras)
-      - EDGE_PATCH_PATH (default: /api/cameras/{camera_uuid})
-      - EDGE_DELETE_PATH (default: /api/cameras/{camera_uuid})
-      - EDGE_API_KEY (optional header: x-api-key)
-
-    Expected semantics on Jetson:
-      - POST   add/upsert a camera by camera_uuid
-      - PATCH  update config for camera_uuid
-      - DELETE remove camera_uuid
-    """
-
-    def __init__(self):
-        self.add_path = os.getenv("EDGE_ADD_PATH", "/cameras")
-        self.patch_path = os.getenv("EDGE_PATCH_PATH", "/cameras/{camera_uuid}")
-        self.delete_path = os.getenv("EDGE_DELETE_PATH", "/cameras/{camera_uuid}")
-        self.api_key = os.getenv("EDGE_API_KEY")
-
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
-
-    async def close(self) -> None:
-        await self._client.aclose()
-
-
-
-    def _headers(self) -> Dict[str, str]:
-        h: Dict[str, str] = {}
-        if self.api_key:
-            h["x-api-key"] = self.api_key
-        return h
-
-    async def get_health(self, *, device_url: str) -> Optional[Dict[str, Any]]:
-        """
-        Best-effort health probe.
-        Tries /health then /api/health and returns parsed JSON payload.
-        Accepts 503 responses too if they include structured readiness details.
-        """
-        base = device_url.rstrip("/")
-        urls = [
-            "{}/health".format(base),
-            "{}/api/health".format(base),
-        ]
-        for url in urls:
-            try:
-                r = await self._client.get(url, headers=self._headers())
-                data = r.json()
-                if isinstance(data, dict):
-                    if any(k in data for k in ("ok", "pipeline_ready", "startup_error")):
-                        return data
-                    if r.status_code < 400:
-                        return data
-            except Exception:
-                continue
-        return None
-
-    async def ensure_pipeline_ready(self, *, device_url: str) -> None:
-        """
-        Raise a clear error if edge reports startup failure / not-ready state.
-        If health endpoint is unavailable, this is a no-op (backward compatible).
-        """
-        h = await self.get_health(device_url=device_url)
-        if not isinstance(h, dict):
-            return
-
-        # Support both older {"ok": true} and richer payloads.
-        pipeline_ready = h.get("pipeline_ready")
-        ok = h.get("ok")
-        if pipeline_ready is False or ok is False:
-            startup_error = h.get("startup_error")
-            if startup_error:
-                raise RuntimeError(
-                    "Edge pipeline not ready at {} (startup_error: {})".format(device_url, startup_error)
-                )
-            raise RuntimeError("Edge pipeline not ready at {}".format(device_url))
-
-    async def upsert_camera(self, *, device_url: str, payload: dict) -> None:
-        url = f"{device_url.rstrip('/')}{self.add_path}"
-        await self._request("POST", url, json=payload)
-
-    async def patch_camera(self, *, device_url: str, camera_uuid: str, patch: dict) -> None:
-        """
-        Best-effort patch. If PATCH is not supported by the Jetson service, fallback to POST upsert.
-        """
-        url = f"{device_url.rstrip('/')}{self.patch_path.format(camera_uuid=camera_uuid)}"
-        try:
-            await self._request("PATCH", url, json=patch)
-        except Exception:
-            # fallback to upsert
-            upsert_url = f"{device_url.rstrip('/')}{self.add_path}"
-            await self._request("POST", upsert_url, json=patch)
-
-    async def delete_camera(self, *, device_url: str, camera_uuid: str) -> None:
-        url = f"{device_url.rstrip('/')}{self.delete_path.format(camera_uuid=camera_uuid)}"
-        await self._request("DELETE", url)
-
-    async def _request(self, method: str, url: str, *, json: Optional[dict] = None) -> None:
-        last_exc: Optional[Exception] = None
-        json_payload = to_jsonable(json) if json is not None else None
-        for attempt in range(3):
-            try:
-                r = await self._client.request(method, url, headers=self._headers(), json=json_payload)
-                # treat 404 delete as ok (idempotent)
-                if method == "DELETE" and r.status_code == 404:
-                    return
-                if r.status_code >= 400:
-                    raise RuntimeError(f"Edge service error {r.status_code}: {r.text[:300]}")
-                return
-            except Exception as e:
-                last_exc = e
-                await asyncio.sleep(0.2 * (2 ** attempt))
-        raise last_exc or RuntimeError("Edge service request failed")
 
 
 # -------------------------
@@ -626,9 +396,51 @@ class Manager:
                 )
         return None
 
-    # -------------------------
-    # Event handlers (UPDATED)
-    # -------------------------
+    async def reconcile_device_edge_simple(self, *, device_uuid: uuid.UUID, user_id: Optional[int] = None):
+        uid = int(user_id or self._default_user_id)
+
+        async with self._lock:
+            async with self._session_factory() as db:
+                dev = await self._get_device(db, device_uuid)
+
+                edge_set = await self._edge.list_cameras(device_url=dev.device_url)
+
+                q = (
+                    select(Camera)
+                    .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
+                    .where(CameraDevice.device_uuid == device_uuid)
+                    .where(Camera.user_id == uid)
+                    .options(selectinload(Camera.channel_configuration))
+                )
+                cams = (await db.execute(q)).scalars().all()
+
+                desired_set = {str(c.camera_uuid) for c in cams if c.is_enabled and c.is_detection_enabled}
+
+                to_add = desired_set - edge_set
+                to_remove = edge_set - desired_set
+
+                for c in cams:
+                    cu = str(c.camera_uuid)
+                    if cu not in to_add:
+                        continue
+
+                    cfg = (c.channel_configuration.configuration or {}) if c.channel_configuration else {}
+                    payload = {
+                        "camera_uuid": cu,
+                        "rtsp_url": c.rtsp_url,
+                        "enabled": True,
+                        "detection_enabled": True,
+                        "notification_enabled": bool(c.is_notification_enabled),
+                        **_only_jetson_config(cfg),
+                    }
+                    await self._edge.upsert_camera(device_url=dev.device_url, payload=payload)
+
+                for cu in to_remove:
+                    await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=cu)
+
+                return {"to_add": sorted(to_add), "to_remove": sorted(to_remove)}
+
+
     async def _add_channel(
         self,
         db: AsyncSession,
