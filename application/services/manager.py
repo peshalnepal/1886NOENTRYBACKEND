@@ -329,6 +329,7 @@ JETSON_PATCH_KEYS = {
     "jpeg_quality",
     "reconnect_base_ms",
     "reconnect_max_ms",
+    "camera_uuid",
     "channel_id",
 }
 def _only_jetson_config(patch: Dict[str, Any]) -> Dict[str, Any]:
