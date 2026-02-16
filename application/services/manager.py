@@ -163,7 +163,7 @@ class Manager:
         self._pipeline_id_by_user: Dict[int, uuid.UUID] = {}
 
         self._default_user_id = int(os.getenv("DEFAULT_USER_ID", "1"))
-        self._default_request_timeout_s = 5.0
+        self._default_request_timeout_s = 3.0
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -474,6 +474,49 @@ class Manager:
                             out["errors"].append(f"Failed to remove {cu}: {e}")
 
                 return out
+
+    async def reconcile_all_devices_edge(
+        self,
+        *,
+        user_id: Optional[int] = None,
+        dry_run: bool = False,
+        delete_unknown: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Reconcile every device for the user.
+        Useful at startup/after edge reboot so Jetson gets re-hydrated from DB state.
+        """
+        uid = int(user_id or self._default_user_id)
+        async with self._session_factory() as db:
+            rows = await db.execute(
+                select(Device.device_uuid)
+                .where(Device.user_id == uid)
+                .where(Device.is_enabled.is_(True))
+            )
+            device_uuids = [r[0] for r in rows.all()]
+
+        summary: Dict[str, Any] = {
+            "user_id": uid,
+            "device_count": len(device_uuids),
+            "devices": {},
+            "errors": [],
+        }
+
+        for du in device_uuids:
+            key = str(du)
+            try:
+                result = await self.reconcile_device_edge_simple(
+                    device_uuid=du,
+                    user_id=uid,
+                    dry_run=dry_run,
+                    delete_unknown=delete_unknown,
+                )
+                summary["devices"][key] = result
+            except Exception as e:
+                logger.warning("Startup reconcile failed for device=%s", key, exc_info=True)
+                summary["errors"].append("{}: {}".format(key, e))
+
+        return summary
 
 
     async def _add_channel(

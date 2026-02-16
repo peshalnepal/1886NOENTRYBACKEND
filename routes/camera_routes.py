@@ -240,11 +240,11 @@ async def get_latest_detection(
 
     return _resp_to_detection_out(resp, normalize=normalize)
 
-
 @router.get("/{camera_uuid}/detections/stream")
 async def stream_detections_sse(
     request: Request,
     camera_uuid: uuid.UUID,
+    after_ts_ms: int = 0,
     after_seq: int = 0,
     timeout_ms: int = 30000,
     normalize: bool = False,
@@ -260,13 +260,18 @@ async def stream_detections_sse(
     cam_key = str(camera_uuid)
 
     async def gen():
-        last = int(after_seq)
+        last_ts = int(after_ts_ms)
+        last_seq = int(after_seq)
 
         initial = await pipeline.get_latest_detection(cam_key)
-        if initial is not None and int(initial.frame_seq) > last:
-            last = int(initial.frame_seq)
-            payload = _resp_to_detection_out(initial, normalize=normalize).model_dump()
-            yield f"event: detection\ndata: {json.dumps(payload)}\n\n"
+        if initial is not None and last_ts == 0 and last_seq > 0:
+            last_ts = int(initial.frame_ts_ms)
+        if initial is not None:
+            its, isq = int(initial.frame_ts_ms), int(initial.frame_seq)
+            if its > last_ts or (its == last_ts and isq > last_seq):
+                last_ts, last_seq = its, isq
+                payload = _resp_to_detection_out(initial, normalize=normalize).model_dump()
+                yield f"event: detection\ndata: {json.dumps(payload)}\n\n"
 
         while True:
             if await request.is_disconnected():
@@ -274,7 +279,8 @@ async def stream_detections_sse(
 
             resp = await pipeline.detect_store.wait_new(
                 cam_key,
-                after_seq=last,
+                after_ts_ms=last_ts,
+                after_seq=last_seq,
                 timeout_ms=int(timeout_ms),
             )
 
@@ -282,7 +288,8 @@ async def stream_detections_sse(
                 yield "event: heartbeat\ndata: {}\n\n"
                 continue
 
-            last = int(resp.frame_seq)
+            last_ts = int(resp.frame_ts_ms)
+            last_seq = int(resp.frame_seq)
             payload = _resp_to_detection_out(resp, normalize=normalize).model_dump()
             yield f"event: detection\ndata: {json.dumps(payload)}\n\n"
 

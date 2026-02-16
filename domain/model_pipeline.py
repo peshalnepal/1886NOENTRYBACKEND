@@ -11,6 +11,8 @@ cache per camera by polling Jetson: /detection/{camera_uuid}
 
 import asyncio
 import logging
+import os
+import random
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Set, Tuple
@@ -55,7 +57,14 @@ class ObjDetectResponse:
 class ObjDetectStorePort(Protocol):
     async def put(self, resp: ObjDetectResponse) -> None: ...
     async def get_latest(self, camera_uuid: str) -> Optional[ObjDetectResponse]: ...
-    async def wait_new(self, camera_uuid: str, *, after_seq: int, timeout_ms: int) -> Optional[ObjDetectResponse]: ...
+    async def wait_new(
+        self,
+        camera_uuid: str,
+        *,
+        after_ts_ms: int,
+        after_seq: int,
+        timeout_ms: int
+    ) -> Optional[ObjDetectResponse]: ...
 
 
 class InMemoryObjDetectStore:
@@ -84,7 +93,14 @@ class InMemoryObjDetectStore:
         async with self._lock:
             return self._latest.get(str(camera_uuid))
 
-    async def wait_new(self, camera_uuid: str, *, after_seq: int, timeout_ms: int) -> Optional[ObjDetectResponse]:
+    async def wait_new(
+        self,
+        camera_uuid: str,
+        *,
+        after_ts_ms: int,
+        after_seq: int,
+        timeout_ms: int
+    ) -> Optional[ObjDetectResponse]:
         key = str(camera_uuid)
         evt = await self._evt(key)
         timeout_s = max(0.0, timeout_ms / 1000.0)
@@ -98,9 +114,11 @@ class InMemoryObjDetectStore:
             async with self._lock:
                 resp = self._latest.get(key)
                 evt.clear()
-
-            if resp is not None and int(resp.frame_seq) > int(after_seq):
-                return resp
+            if resp is not None:
+                if resp.frame_ts_ms > after_ts_ms:
+                    return resp
+                if resp.frame_ts_ms == after_ts_ms and resp.frame_seq > after_seq:
+                    return resp
 
 
 class DetectionHub:
@@ -163,6 +181,8 @@ class ModelPipeline:
         self.pipeline_id = pipeline_id
         self.detect_store = detect_store or InMemoryObjDetectStore()
         self.detection_hub = DetectionHub()
+        self._last_seen: Dict[str, Tuple[int, int]] = {}     
+        self._last_ok_s: Dict[str, float] = {}
 
         self._channels: Dict[str, VideoChannel] = {}
         self._poll_tasks: Dict[str, asyncio.Task] = {}
@@ -174,6 +194,15 @@ class ModelPipeline:
         self._session_factory: Optional[SessionFactory] = None
         self._site_cache: Dict[str, Tuple[str, float]] = {}
         self._site_cache_lock = asyncio.Lock()
+        self._device_fetch_limits: Dict[str, asyncio.Semaphore] = {}
+        self._max_concurrent_fetch_per_device = max(
+            1,
+            int(os.getenv("DETECTION_MAX_CONCURRENT_FETCH_PER_DEVICE", "2")),
+        )
+        self._startup_jitter_ms = max(
+            0,
+            int(os.getenv("DETECTION_STARTUP_JITTER_MS", "500")),
+        )
         self._lock = asyncio.Lock()
         self._started = False
         self._closing = False
@@ -199,9 +228,12 @@ class ModelPipeline:
             self._closing = True
             tasks = list(self._poll_tasks.values())
             self._poll_tasks.clear()
+            self._device_fetch_limits.clear()
             self._channels.clear()
             self._started = False
-
+            self._last_seen.clear()
+            self._last_ok_s.clear()
+            self._last_seq.clear()
         for t in tasks:
             if t and not t.done():
                 t.cancel()
@@ -213,6 +245,26 @@ class ModelPipeline:
             except Exception:
                 logger.exception("Poller task failed during shutdown")
 
+    def _is_new_detection(self, key: str, resp: ObjDetectResponse) -> bool:
+        prev_ts, prev_seq = self._last_seen.get(key, (0, -1))
+        cur_ts, cur_seq = int(resp.frame_ts_ms), int(resp.frame_seq)
+
+        # normal monotonic case
+        if cur_ts > prev_ts:
+            return True
+        if cur_ts == prev_ts and cur_seq > prev_seq:
+            return True
+
+        # regression case: if we had a gap (disconnect), assume Jetson restarted -> accept & reset
+        last_ok = self._last_ok_s.get(key, 0.0)
+        if (time.monotonic() - last_ok) > 5.0:
+            logger.warning(
+                "Detected possible Jetson restart (ts/seq regressed). Resetting last_seen. camera=%s prev=(%s,%s) cur=(%s,%s)",
+                key, prev_ts, prev_seq, cur_ts, cur_seq
+            )
+            return True
+
+        return False
 
     async def _no_rois(self, camera_uuid: str) -> List[ROI]:
         return []
@@ -309,7 +361,8 @@ class ModelPipeline:
             self._channels.pop(key, None)
             t = self._poll_tasks.pop(key, None)
             self._last_seq.pop(key, None)
-            
+            self._last_seen.pop(key, None)
+            self._last_ok_s.pop(key, None)
         self._tracker.remove_camera(key)
         self._roi_engine.reset_camera(key)
 
@@ -420,14 +473,18 @@ class ModelPipeline:
         if resp is None:
             return None
 
-        last = self._last_seq.get(key, 0)
-        if int(resp.frame_seq) <= int(last):
+        if not self._is_new_detection(key, resp):
             return await self.detect_store.get_latest(key)
 
-        self._last_seq[key] = int(resp.frame_seq)
+        now = time.monotonic()
+        self._last_seen[key] = (int(resp.frame_ts_ms), int(resp.frame_seq))
+        self._last_ok_s[key] = now
+        self._last_seq[key] = int(resp.frame_seq)  # optional compat
+
         await self.detect_store.put(resp)
         return resp
 
+ 
     def _ensure_poller(self, key: str, ch: VideoChannel) -> None:
         t = self._poll_tasks.get(key)
         if t is None or t.done():
@@ -435,7 +492,15 @@ class ModelPipeline:
                 self._poll_loop(key, ch),
                 name="poll_jetson_detection:%s" % key,
             )
-            
+
+    def _device_fetch_semaphore(self, device_url: Optional[str]) -> asyncio.Semaphore:
+        key = str(device_url or "").strip().lower()
+        sem = self._device_fetch_limits.get(key)
+        if sem is None:
+            sem = asyncio.Semaphore(self._max_concurrent_fetch_per_device)
+            self._device_fetch_limits[key] = sem
+        return sem
+
     async def _emit_roi_alert_notifications(self, resp: ObjDetectResponse, alerts: List[Dict[str, Any]]) -> None:
         svc = self._notification_service
         if svc is None:
@@ -478,6 +543,8 @@ class ModelPipeline:
         backoff_ms = 250
         max_backoff_ms = 8000
         empty_miss_count = 0
+        if self._startup_jitter_ms > 0:
+            await asyncio.sleep(random.uniform(0.0, self._startup_jitter_ms / 1000.0))
 
         while True:
             async with self._lock:
@@ -498,7 +565,9 @@ class ModelPipeline:
                 continue
 
             try:
-                payload = await ch.stream()
+                sem = self._device_fetch_semaphore(getattr(cfg, "device_url", None))
+                async with sem:
+                    payload = await ch.stream()
                 resp = self._payload_to_resp(payload, ch)
                 if resp is None:
                     empty_miss_count = min(empty_miss_count + 1, 6)
@@ -508,8 +577,7 @@ class ModelPipeline:
                     continue
 
                 empty_miss_count = 0
-                prev = int(self._last_seq.get(key, 0))
-                if int(resp.frame_seq) <= prev:
+                if not self._is_new_detection(key, resp):
                     await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
                     continue
 
@@ -535,14 +603,14 @@ class ModelPipeline:
                     track_events=track_events,
                     alerts=tuple(alerts),
                 )
-
+                now = time.monotonic()
+                self._last_seen[key] = (int(resp2.frame_ts_ms), int(resp2.frame_seq))
+                self._last_ok_s[key] = now
                 self._last_seq[key] = int(resp2.frame_seq)
                 await self.detect_store.put(resp2)
                 await self.detection_hub.publish(resp2)
-
                 if alerts and getattr(cfg, "notification_enabled", True) and self._notification_service:
-                    await self._emit_roi_alert_notifications(resp2, alerts)
-
+                    asyncio.create_task(self._emit_roi_alert_notifications(resp2, alerts))
                 backoff_ms = 250
                 await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
 

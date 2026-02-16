@@ -17,6 +17,7 @@ This file intentionally contains NO OpenCV/GStreamer code.
 
 import asyncio
 import json
+import httpx
 import logging
 import urllib.request
 import urllib.error
@@ -26,7 +27,10 @@ from urllib.parse import urljoin
 from application.channels.channel_config import VideoChannelConfig
 logger = logging.getLogger(__name__)
 
-
+_http = httpx.AsyncClient(
+    timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=2.0),
+    limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+)
 async def _run_blocking(fn, *args, **kwargs):
     """Python 3.7+ friendly replacement for asyncio.to_thread()."""
     loop = asyncio.get_running_loop()
@@ -79,49 +83,44 @@ class VideoChannel:
         
     async def fetch_detection_json(self) -> Optional[Dict[str, Any]]:
         return await self.stream()
-
+    
     async def stream(self) -> Optional[Dict[str, Any]]:
-        """
-        Returns parsed JSON (dict) or None on network/parse errors.
-        """
         if not self.config.enabled:
             return None
         if not self.config.device_url:
             logger.warning("Jetson device_url not configured for camera=%s", self.key())
             return None
 
-        def _http_get_json(url: str):
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=float(self.config.request_timeout_s)) as resp:
-                raw = resp.read()
-            return json.loads(raw.decode("utf-8", errors="replace"))
-
         urls = self.detection_urls()
         last_err_sig: Optional[str] = None
 
         for url in urls:
             try:
-                data = await _run_blocking(_http_get_json, url)
+                # per-camera timeout (override if you want)
+                timeout_s = float(self.config.request_timeout_s)
+                r = await _http.get(url, timeout=httpx.Timeout(timeout_s, connect=min(2.0, timeout_s)))
+                if r.status_code in (404, 405):
+                    last_err_sig = f"http:{r.status_code}:{url}"
+                    continue
+                r.raise_for_status()
+                data = r.json()
+
                 self._last_good_detection_url = url
                 self._last_error_sig = None
                 return data
-            except urllib.error.HTTPError as e:
-                # 404/405 usually mean "wrong endpoint path"; try next candidate.
-                last_err_sig = "http:{}:{}".format(getattr(e, "code", "unknown"), url)
-                continue
-            except urllib.error.URLError as e:
-                last_err_sig = "url:{}:{}".format(str(e), url)
+
+            except (httpx.ConnectTimeout, httpx.ConnectError):
+                last_err_sig = f"connect_error:{url}"
+                break  # device likely down; don't try other paths
+            except httpx.ReadTimeout:
+                last_err_sig = f"read_timeout:{url}"
+                # I'd continue here (server slow on that path; other path might work)
                 continue
             except Exception as e:
-                last_err_sig = "exc:{}:{}".format(type(e).__name__, url)
+                last_err_sig = f"exc:{type(e).__name__}:{url}"
                 continue
 
         if last_err_sig and last_err_sig != self._last_error_sig:
-            logger.warning(
-                "Jetson detection fetch failed camera=%s tried=%d last=%s",
-                self.key(),
-                len(urls),
-                last_err_sig,
-            )
+            logger.warning("Jetson detection fetch failed camera=%s tried=%d last=%s", self.key(), len(urls), last_err_sig)
             self._last_error_sig = last_err_sig
         return None

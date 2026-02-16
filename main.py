@@ -1,5 +1,7 @@
 import logging
+import asyncio
 from contextlib import asynccontextmanager
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,21 +15,58 @@ from routes.notification_email_routes import router as notification_emails_route
 from core.config import DEBUG
 from core.database import db_manager, async_engine
 from application.services.manager import Manager  # adjust if your path is different
-import logging
 from application.models.yolo_config import YoloModelConfig
 from application.services.notification import WebNotificationHub, NotificationService, EmailNotifier, EmailConfig
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 SessionLocal = async_sessionmaker(async_engine, expire_on_commit=False)
 
 # Load SMTP configuration from environment
-import os
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL") or os.environ.get("SMTP_FROM", "noreply@1886noentry.com")
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "")
+RECONCILE_INTERVAL_S = max(0, int(os.environ.get("EDGE_RECONCILE_INTERVAL_S", "90")))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _edge_reconcile_loop(app: FastAPI) -> None:
+    manager = app.state.manager
+    delete_unknown = _env_bool("EDGE_RECONCILE_DELETE_UNKNOWN", False)
+    while True:
+        try:
+            summary = await manager.reconcile_all_devices_edge(
+                dry_run=False,
+                delete_unknown=delete_unknown,
+            )
+            if summary.get("errors"):
+                logger.warning(
+                    "Edge reconcile completed with errors device_count=%s errors=%s",
+                    summary.get("device_count"),
+                    len(summary.get("errors") or []),
+                )
+            else:
+                logger.info(
+                    "Edge reconcile completed device_count=%s",
+                    summary.get("device_count"),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Edge reconcile loop failed")
+
+        if RECONCILE_INTERVAL_S <= 0:
+            return
+        await asyncio.sleep(float(RECONCILE_INTERVAL_S))
 
 
 @asynccontextmanager
@@ -73,17 +112,32 @@ async def lifespan(app: FastAPI):
     pipeline.set_roi_provider(svc._get_rois)
     await pipeline.start()
     app.state.pipeline = pipeline
-
-
+    app.state.edge_reconcile_task = asyncio.create_task(_edge_reconcile_loop(app), name="edge_reconcile_loop")
 
     yield
     # Shutdown
     try:
+        task = getattr(app.state, "edge_reconcile_task", None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Edge reconcile task shutdown failed")
+
         if hasattr(app.state, "pipeline") and app.state.pipeline:
-            if hasattr(app.state.pipeline, "stop"):
+            if hasattr(app.state.pipeline, "shutdown"):
+                await app.state.pipeline.shutdown()
+            elif hasattr(app.state.pipeline, "stop"):
                 await app.state.pipeline.stop()
-    except Exception:
-        pass
+    finally:
+        try:
+            if hasattr(app.state, "manager") and app.state.manager:
+                await app.state.manager.shutdown()
+        except Exception:
+            logger.exception("Manager shutdown failed")
 
 app = FastAPI(debug=DEBUG, lifespan=lifespan)
 
@@ -118,4 +172,3 @@ app.include_router(notification_emails_router, prefix="/api")
 @app.get("/")
 async def root():
     return {"status": "healthy", "message": "API is running"}
-
