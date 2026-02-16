@@ -39,6 +39,7 @@ class NotificationMessage(BaseModel):
     id: str
     ts_ms: int
     camera_uuid: str
+    site_uuid: str
     site_name: str
 
     title: str
@@ -331,7 +332,7 @@ class NotificationService:
         *,
         hub: WebNotificationHub,
         email: Optional[EmailNotifier] = None,
-        interesting_classes: Iterable[str] = ("person", "car"),
+        interesting_classes: Iterable[str] = ("person", "car","motorcycle","truck"),
         cooldown_s: float = 10.0,
         enable_tracking: bool = True,
         tracker_cfg: Optional[dict] = None,
@@ -428,10 +429,10 @@ class NotificationService:
             logging.getLogger(__name__).warning(f"Failed to fetch notification emails for {camera_uuid}: {e}")
             return []
 
-    async def _get_site_name(self, camera_uuid: str) -> str:
-        """Fetch site name from database for a camera."""
+    async def _get_site_name_and_uuid(self, camera_uuid: str) -> Tuple[str, str]:
+        """Fetch site name and uuid from database for a camera."""
         if not self._session_factory:
-            return "Unknown Site"
+            return "Unknown Site", ""
         
         try:
             from core.database_orm import Camera, Site
@@ -439,13 +440,16 @@ class NotificationService:
             
             async with self._session_factory() as session:
                 result = await session.execute(
-                    select(Site.name).join(Camera, Camera.site_uuid == Site.site_uuid)
+                    select(Site.name, Site.site_uuid).join(Camera, Camera.site_uuid == Site.site_uuid)
                     .where(Camera.camera_uuid == camera_uuid)
                 )
-                name = result.scalar_one_or_none()
-                return name or "Unknown Site"
+                row = result.first()
+                if row:
+                    name, suid = row
+                    return name, str(suid)
+                return "Unknown Site", ""
         except Exception:
-            return "Unknown Site"
+            return "Unknown Site", ""
 
 
     async def handle_detection_event(
@@ -500,13 +504,14 @@ class NotificationService:
                     if not tr:
                         continue
 
-                    # Fetch site name for notification
-                    site_name = await self._get_site_name(cam)
+                    # Fetch site name and uuid for notification
+                    site_name, site_uuid = await self._get_site_name_and_uuid(cam)
                     
                     msg = NotificationMessage(
                         id=f"{cam}-trk{track_id}-confirm-{ts_ms}",
                         ts_ms=ts_ms,
                         camera_uuid=cam,
+                        site_uuid=site_uuid,
                         site_name=site_name,
                         title=f"Confirmed: {tr['cls_name']}",
                         body=f"{tr['cls_name']} confirmed (track_id={track_id}, conf={float(tr['conf']):.2f})",
@@ -540,13 +545,14 @@ class NotificationService:
                         ts_ms=ts_ms,
                     )
                     for a in alerts:
-                        # Fetch site name for notification
-                        site_name = await self._get_site_name(cam)
+                        # Fetch site name and uuid for notification
+                        site_name, site_uuid = await self._get_site_name_and_uuid(cam)
                         
                         msg = NotificationMessage(
                             id=f"{cam}-trk{a['track_id']}-roi{a['roi_id']}-{ts_ms}",
                             ts_ms=ts_ms,
                             camera_uuid=cam,
+                            site_uuid=site_uuid,
                             site_name=site_name,
                             title=f"ROI Enter: {a['cls_name']}",
                             body=f"{a['cls_name']} entered ROI={a['roi_id']} (track_id={a['track_id']})",
@@ -594,14 +600,15 @@ class NotificationService:
 
         max_conf = max([c for (_n, c) in matches] or [0.0])
 
-        # Fetch site name for notification
+        # Fetch site name and uuid for notification
         cam = str(det_ev.camera_uuid)
-        site_name = await self._get_site_name(cam)
-
+        site_name, site_uuid = await self._get_site_name_and_uuid(cam)
+ 
         msg = NotificationMessage(
             id=f"{det_ev.camera_uuid}-{det_ev.frame_ts_ms}-{det_ev.frame_seq}",
             ts_ms=int(det_ev.frame_ts_ms),
             camera_uuid=cam,
+            site_uuid=site_uuid,
             site_name=site_name,
             title=f"Detection: {', '.join(sorted(set(send_classes)))}",
             body=f"Detected {', '.join(sorted(set(send_classes)))} (max_conf={max_conf:.2f})",

@@ -3,10 +3,10 @@ from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Request, HTTPException, status
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
+from core.database_orm import Camera
+from sqlalchemy import select
 
-from application.services.notification import WebNotificationHub
-from domain.events import DetectionsProducedEvent, DetectionItem, DetectionBox
-from application.services.notification import  CameraMode
+from application.services.notification import WebNotificationHub, CameraMode
 
 router = APIRouter(prefix="/notifications")
 
@@ -72,9 +72,22 @@ async def receive_alert(payload: AlertRequest, request: Request):
         detections=det_items
     )
 
-    # For now, assume notifications are enabled for all incoming alerts
-    # In a real app, you might fetch camera config from DB to check `notification_enabled`
+    # Fetch camera mode from DB to check detection/notification status
     mode = CameraMode(detection_enabled=True, notification_enabled=True)
+    if hasattr(request.app.state, "manager"):
+        async with request.app.state.manager.session_factory() as session:
+            res = await session.execute(
+                select(Camera.is_enabled, Camera.is_detection_enabled, Camera.is_notification_enabled)
+                .where(Camera.camera_uuid == payload.camera_uuid)
+            )
+            row = res.first()
+            if row:
+                enabled, det_enabled, notif_enabled = row
+                # If camera itself is disabled, treat detection/notification as disabled
+                mode = CameraMode(
+                    detection_enabled=bool(enabled and det_enabled),
+                    notification_enabled=bool(enabled and notif_enabled)
+                )
 
     await svc.handle_detection_event(
         ev,
