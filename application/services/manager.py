@@ -396,7 +396,14 @@ class Manager:
                 )
         return None
 
-    async def reconcile_device_edge_simple(self, *, device_uuid: uuid.UUID, user_id: Optional[int] = None):
+    async def reconcile_device_edge_simple(
+        self,
+        *,
+        device_uuid: uuid.UUID,
+        user_id: Optional[int] = None,
+        dry_run: bool = False,
+        delete_unknown: bool = True,
+    ) -> Dict[str, List[str]]:
         uid = int(user_id or self._default_user_id)
 
         async with self._lock:
@@ -416,29 +423,54 @@ class Manager:
 
                 desired_set = {str(c.camera_uuid) for c in cams if c.is_enabled and c.is_detection_enabled}
 
-                to_add = desired_set - edge_set
-                to_remove = edge_set - desired_set
+                to_add = sorted(desired_set - edge_set)
+                to_remove = sorted(edge_set - desired_set)
 
-                for c in cams:
-                    cu = str(c.camera_uuid)
-                    if cu not in to_add:
+                out: Dict[str, List[str]] = {
+                    "to_add": to_add,
+                    "to_remove": to_remove,
+                    "added": [],
+                    "removed": [],
+                    "errors": [],
+                }
+
+                if dry_run:
+                    return out
+
+                cams_by_uuid = {str(c.camera_uuid): c for c in cams}
+
+                for cu in to_add:
+                    cam = cams_by_uuid.get(cu)
+                    if cam is None:
+                        out["errors"].append(f"Camera not found in DB during reconcile: {cu}")
                         continue
 
-                    cfg = (c.channel_configuration.configuration or {}) if c.channel_configuration else {}
+                    cfg = (cam.channel_configuration.configuration or {}) if cam.channel_configuration else {}
                     payload = {
                         "camera_uuid": cu,
-                        "rtsp_url": c.rtsp_url,
+                        "rtsp_url": cam.rtsp_url,
                         "enabled": True,
                         "detection_enabled": True,
-                        "notification_enabled": bool(c.is_notification_enabled),
+                        "notification_enabled": bool(cam.is_notification_enabled),
                         **_only_jetson_config(cfg),
                     }
-                    await self._edge.upsert_camera(device_url=dev.device_url, payload=payload)
+                    try:
+                        await self._edge.upsert_camera(device_url=dev.device_url, payload=payload)
+                        out["added"].append(cu)
+                    except Exception as e:
+                        logger.warning("Edge upsert failed during reconcile for camera %s", cu, exc_info=True)
+                        out["errors"].append(f"Failed to add {cu}: {e}")
 
-                for cu in to_remove:
-                    await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=cu)
+                if delete_unknown:
+                    for cu in to_remove:
+                        try:
+                            await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=cu)
+                            out["removed"].append(cu)
+                        except Exception as e:
+                            logger.warning("Edge delete failed during reconcile for camera %s", cu, exc_info=True)
+                            out["errors"].append(f"Failed to remove {cu}: {e}")
 
-                return {"to_add": sorted(to_add), "to_remove": sorted(to_remove)}
+                return out
 
 
     async def _add_channel(
