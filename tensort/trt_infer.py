@@ -13,6 +13,7 @@
 import os
 import time
 import threading
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -20,6 +21,8 @@ import cv2
 
 import tensorrt as trt
 import pycuda.driver as cuda
+
+logger = logging.getLogger(__name__)
 
 # -----------------------------
 # Explicit CUDA init + per-thread context
@@ -96,37 +99,40 @@ def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) 
 
 
 def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk: int = 300) -> List[int]:
-    if len(boxes) == 0:
+    if boxes is None or len(boxes) == 0:
         return []
 
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
-    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    boxes = boxes.astype(np.float32, copy=False)
+    scores = scores.astype(np.float32, copy=False)
+
+    x1 = boxes[:, 0]; y1 = boxes[:, 1]
+    x2 = boxes[:, 2]; y2 = boxes[:, 3]
+    areas = (x2 - x1 + 1.0) * (y2 - y1 + 1.0)
 
     order = scores.argsort()[::-1]
     keep = []
 
+    eps = 1e-9
     while order.size > 0 and len(keep) < topk:
         i = int(order[0])
         keep.append(i)
-
         if order.size == 1:
             break
 
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
+        rest = order[1:]
 
-        w = np.maximum(0.0, xx2 - xx1 + 1)
-        h = np.maximum(0.0, yy2 - yy1 + 1)
+        xx1 = np.maximum(x1[i], x1[rest])
+        yy1 = np.maximum(y1[i], y1[rest])
+        xx2 = np.minimum(x2[i], x2[rest])
+        yy2 = np.minimum(y2[i], y2[rest])
+
+        w = np.maximum(0.0, xx2 - xx1 + 1.0)
+        h = np.maximum(0.0, yy2 - yy1 + 1.0)
         inter = w * h
 
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
-        inds = np.where(iou <= iou_thr)[0]
-        order = order[inds + 1]
+        iou = inter / (areas[i] + areas[rest] - inter + eps)
+
+        order = rest[iou <= iou_thr]
 
     return keep
 
@@ -236,11 +242,14 @@ class TRTEngine(object):
 COCO_NAMES = {
     0: "person",
     2: "car",
+    3: "motorcycle",
+    7: "truck",
 }
 
 
+
 class YoloV8DetTRT(object):
-    def __init__(self, engine_path: str, imgsz: int = 640, conf: float = 0.25, iou: float = 0.45, allowed=("person", "car"), device_id: int = 0):
+    def __init__(self, engine_path: str, imgsz: int = 640, conf: float = 0.25, iou: float = 0.45, allowed=("person", "car","motorcycle","truck"), device_id: int = 0):
         self.trt = TRTEngine(engine_path, device_id=device_id)
         self.imgsz = int(imgsz)
         self.conf = float(conf)
@@ -414,17 +423,19 @@ class TRTInfer(object):
     def __init__(
         self,
         det_engine_path: str,
-        pose_engine_path: str,
+        pose_engine_path: Optional[str] = None,
         imgsz: int = 640,
         conf: float = 0.25,
         iou: float = 0.45,
-        allowed=("person", "car"),
+        allowed=("person", "car","motorcycle","truck"),
         kpts: int = 17,
         model_id: str = "yolo-trt",
         device_id: int = 0,
+        enable_pose: bool = False,
     ):
         self.model_id = model_id
         self.device_id = int(device_id)
+        self.enable_pose = bool(enable_pose)
 
         # Ensure context exists for this thread before building engines
         ensure_cuda_context(self.device_id)
@@ -432,9 +443,11 @@ class TRTInfer(object):
         self.det_runner = YoloV8DetTRT(
             det_engine_path, imgsz=imgsz, conf=conf, iou=iou, allowed=allowed, device_id=self.device_id
         )
-        self.pose_runner = YoloV8PoseTRT(
-            pose_engine_path, imgsz=imgsz, conf=conf, iou=iou, kpts=kpts, device_id=self.device_id
-        )
+        self.pose_runner = None
+        if self.enable_pose and pose_engine_path:
+            self.pose_runner = YoloV8PoseTRT(
+                pose_engine_path, imgsz=imgsz, conf=conf, iou=iou, kpts=kpts, device_id=self.device_id
+            )
 
     def infer_multitask(self, bgr: np.ndarray, meta: Dict) -> Dict:
         t0 = time.perf_counter()
@@ -444,25 +457,10 @@ class TRTInfer(object):
         frame_ts_ms = int(meta.get("frame_ts_ms", int(time.time() * 1000)))
         frame_seq = int(meta.get("frame_seq", 0))
 
-        print(f"[TRT] Starting inference for {camera_uuid} (seq={frame_seq})")
+        logger.debug("[TRT] Starting inference for %s (seq=%s)", camera_uuid, frame_seq)
 
         try:
             dets = self.det_runner.run(bgr)
-
-            has_person = False
-            for d in dets:
-                if d.get("cls_name") == "person":
-                    has_person = True
-                    break
-            
-            print(f"[TRT] Det runner found {len(dets)} objects for {camera_uuid}")
-
-
-            pose_dets = []
-            pose_obj = None
-            if has_person:
-                pose_dets, pose_obj = self.pose_runner.run(bgr)
-
             ms = int((time.perf_counter() - t0) * 1000)
             H, W = bgr.shape[:2]
             return {
@@ -474,8 +472,8 @@ class TRTInfer(object):
                 "frame_seq": frame_seq,
                 "frame_w": W,
                 "frame_h": H,
-                "detections": dets + pose_dets,
-                "pose": pose_obj,
+                "detections": dets,
+                "pose": None,
                 "inference_ms": ms,
             }
 
@@ -493,8 +491,15 @@ class TRTInfer(object):
 
 
 def build_default() -> TRTInfer:
-    det_engine = os.getenv("DET_ENGINE", "./models/yolov8n.engine")
-    pose_engine = os.getenv("POSE_ENGINE", "./models/yolov8n-pose.engine")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    det_engine = os.getenv("DET_ENGINE")
+    if not det_engine:
+        det_engine = os.path.join(base_dir, "models", "yolov8n.engine")
+    elif not os.path.isabs(det_engine) and not os.path.exists(det_engine):
+        candidate = os.path.join(base_dir, det_engine)
+        if os.path.exists(candidate):
+            det_engine = candidate
+
     imgsz = int(os.getenv("IMG_SZ", "640"))
     conf = float(os.getenv("CONF", "0.25"))
     iou = float(os.getenv("IOU", "0.45"))
@@ -502,9 +507,10 @@ def build_default() -> TRTInfer:
 
     return TRTInfer(
         det_engine_path=det_engine,
-        pose_engine_path=pose_engine,
+        pose_engine_path=None,
         imgsz=imgsz,
         conf=conf,
         iou=iou,
         device_id=device_id,
+        enable_pose=False,
     )

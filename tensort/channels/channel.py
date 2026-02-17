@@ -117,7 +117,11 @@ class VideoChannel():
         self._loop = None
         self._thread = None
         self._stop_thread_evt = threading.Event()
-        self._out_q = asyncio.Queue(maxsize=2)
+        try:
+            out_q_max = max(1, int(os.getenv("CHANNEL_OUT_Q_MAX", "4")))
+        except Exception:
+            out_q_max = 4
+        self._out_q = asyncio.Queue(maxsize=out_q_max)
         self._event_queue = None
         self._cap = None
         self._stopping = False
@@ -364,7 +368,8 @@ class VideoChannel():
             return
         self._stopping = True
 
-        logger.info(f"[{self.camera_uuid}] Stopping channel thread...")
+        cam = getattr(self.config, "camera_uuid", None) or getattr(self.config, "channel_id", "unknown")
+        logger.info(f"[{cam}] Stopping channel thread...")
         self._stop_thread_evt.set()
 
         # Signal stream() to end cleanly (unblocks async consumers)

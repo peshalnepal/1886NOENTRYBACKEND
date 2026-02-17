@@ -3,6 +3,7 @@ import asyncio
 import logging
 import threading
 import uuid
+import os
 from typing import Any, Dict
 
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -21,6 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jetson-app")
 
 app = Flask(__name__)
+DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "3.0"))
 
 
 # -----------------------------
@@ -207,7 +209,7 @@ class PipelineRuntime(object):
             "enabled": True,
             "detection_enabled": True,
             "notification_enabled": True,
-            "sample_fps": 5.0,
+            "sample_fps": DEFAULT_SAMPLE_FPS,
             "decode_backend": "gstreamer",   # best on Jetson if OpenCV built with GStreamer
             "resize": None,                 # e.g. (640, 360)
             "reconnect_base_ms": 1000,
@@ -302,6 +304,15 @@ class PipelineRuntime(object):
         result = self._call(self.pipeline.get_latest(camera_uuid), timeout_s=5.0)
         return result
 
+    def get_stats(self) -> Dict[str, Any]:
+        if self.loop is None or self.pipeline is None:
+            return {}
+        try:
+            return self._call(self.pipeline.get_stats(), timeout_s=2.0)
+        except Exception:
+            logger.exception("Failed to fetch pipeline stats")
+            return {}
+
 
 runtime = PipelineRuntime()
 
@@ -326,7 +337,11 @@ def _require_rtsp(url: str):
 # -----------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "pipeline_ready": bool(runtime.pipeline is not None and runtime.loop is not None),
+        "stats": runtime.get_stats(),
+    })
 
 
 @app.route("/cameras", methods=["GET"])
@@ -336,8 +351,6 @@ def list_cameras():
 @app.route("/cameras", methods=["POST"])
 def add_camera():
     body = _json()
-
-    # Accept rtsp_url from either top-level or config
     rtsp_url = body.get("rtsp_url")
     cfg = body.get("config")
     if not isinstance(cfg, dict):
@@ -349,15 +362,12 @@ def add_camera():
     if not _require_rtsp(rtsp_url):
         return jsonify({"error": "rtsp_url is required and must start with rtsp://"}), 400
 
-    # Backward/forward compatibility:
-    # If backend sends camera_uuid at top-level (Azure Manager does), copy it into cfg
     if "camera_uuid" not in cfg and body.get("camera_uuid"):
         cfg["camera_uuid"] = body.get("camera_uuid")
 
     if "channel_id" not in cfg and body.get("channel_id"):
         cfg["channel_id"] = body.get("channel_id")
 
-    # emit_format default
     if cfg.get("emit_format") not in ("jpeg", "raw"):
         cfg["emit_format"] = "raw"
 

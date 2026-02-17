@@ -4,7 +4,7 @@ import logging
 import threading
 import queue
 import os
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 
 try:
     # Script mode (python main.py from Backend/tensort)
@@ -17,6 +17,14 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 _DONE = object()
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        v = int(os.getenv(name, str(default)))
+    except Exception:
+        v = int(default)
+    return max(minimum, v)
 
 
 class Broadcaster:
@@ -99,6 +107,7 @@ class InferenceWorker(object):
         """
         try:
             self._q.put_nowait((bgr, meta, fut))
+            return True
         except queue.Full:
             # drop if overloaded: set a failure result (non-blocking)
             def _set():
@@ -111,6 +120,7 @@ class InferenceWorker(object):
                         "reason": "Inference queue full (dropped)",
                     })
             self._loop.call_soon_threadsafe(_set)
+            return False
 
     def stop(self):
         self._stop.set()
@@ -182,13 +192,18 @@ class InferenceWorker(object):
 
 
 class SimpleInferencePipeline(object):
-    def __init__(self, out_queue_max=500):
+    def __init__(self, out_queue_max=None, infer_q_max=None):
+        if out_queue_max is None:
+            out_queue_max = _env_int("PIPELINE_OUT_QUEUE_MAX", 500, minimum=10)
+        if infer_q_max is None:
+            infer_q_max = _env_int("INFER_QUEUE_MAX", 8, minimum=1)
+
         self._channels = {}
         self._channel_tasks = {}
         self._closing = False
         self._started = False
 
-        self._buffer = CoalescingBuffer()
+        self._buffer = CoalescingBuffer(max_pending_keys=_env_int("PENDING_KEY_MAX", 1000, minimum=100))
         self._out_q = asyncio.Queue(maxsize=out_queue_max)
 
         self._latest = {}
@@ -197,6 +212,16 @@ class SimpleInferencePipeline(object):
         self._lock = asyncio.Lock()
         self._inference_task = None
         self._infer_worker = None  # created on start()
+        self._infer_q_max = int(infer_q_max)
+        self._log_every_n = _env_int("PIPELINE_LOG_EVERY_N_FRAMES", 0, minimum=0)
+        self._stats = {
+            "frames_in": 0,
+            "infer_ok": 0,
+            "infer_fail": 0,
+            "infer_dropped": 0,
+            "detections_total": 0,
+            "alerts_attempted": 0,
+        }
 
         self.broadcaster = Broadcaster()
 
@@ -261,7 +286,7 @@ class SimpleInferencePipeline(object):
             self._closing = False
 
             loop = asyncio.get_event_loop()
-            self._infer_worker = InferenceWorker(loop=loop, max_q=2)
+            self._infer_worker = InferenceWorker(loop=loop, max_q=self._infer_q_max)
 
             self._inference_task = asyncio.ensure_future(self._pump_inference())
 
@@ -333,7 +358,7 @@ class SimpleInferencePipeline(object):
 
     async def _pump_channel(self, camera_key, ch):
         try:
-            print(f"[Jetson] Starting pump for camera {camera_key}")
+            logger.info("[Jetson] Starting pump for camera %s", camera_key)
             async for ev in ch.stream(event_queue=None):
                 if self._closing:
                     break
@@ -341,8 +366,6 @@ class SimpleInferencePipeline(object):
                 if isinstance(ev, RTSPEvent):
                     if getattr(ev, "detection_enabled", True):
                         await self._buffer.put(ev)
-                    else:
-                        print(f"[Jetson] Detection disabled for camera {camera_key}")
                 else:
                     await self._put_out(ev)
 
@@ -375,7 +398,13 @@ class SimpleInferencePipeline(object):
         try:
             while not self._closing:
                 rtsp_ev = await self._buffer.get()
-                print(f"[Jetson] Received frame for {rtsp_ev.camera_uuid} (seq={rtsp_ev.seq})")
+                self._stats["frames_in"] += 1
+                if self._log_every_n and (int(getattr(rtsp_ev, "seq", 0)) % self._log_every_n == 0):
+                    logger.debug(
+                        "[Jetson] Received frame camera=%s seq=%s",
+                        rtsp_ev.camera_uuid,
+                        rtsp_ev.seq,
+                    )
 
                 bgr = getattr(rtsp_ev, "frame", None)
                 if bgr is None:
@@ -387,6 +416,7 @@ class SimpleInferencePipeline(object):
                         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
                 if bgr is None:
+                    self._stats["infer_fail"] += 1
                     await self._put_out({
                         "type": "InferenceFailedEvent",
                         "camera_uuid": str(rtsp_ev.camera_uuid),
@@ -421,7 +451,21 @@ class SimpleInferencePipeline(object):
 
                 # await result (non-blocking for loop)
                 result = await fut
-                print(f"[Jetson] Inference done for {rtsp_ev.camera_uuid}, found {len(result.get('detections', []))} objects")
+                if isinstance(result, dict) and result.get("type") == "InferenceFailedEvent":
+                    self._stats["infer_fail"] += 1
+                    reason = str(result.get("reason", "") or "")
+                    if "queue full" in reason.lower():
+                        self._stats["infer_dropped"] += 1
+                    logger.warning(
+                        "[Jetson] Inference failed camera=%s seq=%s reason=%s",
+                        rtsp_ev.camera_uuid,
+                        rtsp_ev.seq,
+                        reason or "unknown error",
+                    )
+                else:
+                    self._stats["infer_ok"] += 1
+                    if isinstance(result, dict):
+                        self._stats["detections_total"] += len(result.get("detections", []) or [])
 
                 if notify_url and result.get("detections"):
                     dets = []
@@ -438,12 +482,21 @@ class SimpleInferencePipeline(object):
                              })
                     
                     if dets:
+                        self._stats["alerts_attempted"] += 1
+                        frame_h = result.get("frame_h")
+                        frame_w = result.get("frame_w")
+                        if (frame_w is None or frame_h is None) and bgr is not None:
+                            frame_h, frame_w = bgr.shape[:2]
                         alert_payload = {
                             "camera_uuid": str(meta["camera_uuid"]),
                             "frame_ts_ms": int(meta["frame_ts_ms"]),
                             "frame_seq": int(meta["frame_seq"]),
                             "detections": dets
                         }
+                        if frame_w is not None:
+                            alert_payload["frame_w"] = int(frame_w)
+                        if frame_h is not None:
+                            alert_payload["frame_h"] = int(frame_h)
                         loop.run_in_executor(None, _send_alert, notify_url, alert_payload)
 
                 async with self._latest_lock:
@@ -470,3 +523,17 @@ class SimpleInferencePipeline(object):
     async def get_latest(self, camera_uuid):
         async with self._latest_lock:
             return self._latest.get(str(camera_uuid))
+
+    async def get_stats(self) -> Dict[str, Any]:
+        async with self._lock:
+            channel_count = len(self._channels)
+        async with self._latest_lock:
+            latest_count = len(self._latest)
+        stats = dict(self._stats)
+        stats.update({
+            "channel_count": int(channel_count),
+            "latest_cache_size": int(latest_count),
+            "infer_queue_max": int(self._infer_q_max),
+            "out_queue_max": int(self._out_q.maxsize),
+        })
+        return stats
