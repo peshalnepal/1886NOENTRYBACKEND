@@ -3,10 +3,11 @@
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from email.mime.text import MIMEText
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import html
 import smtplib
 from datetime import datetime, timezone
@@ -369,6 +370,46 @@ class NotificationService:
         """Set the session factory for database lookups."""
         self._session_factory = session_factory
 
+    def _parse_roi_points(self, raw_points: Any) -> List[Tuple[float, float]]:
+        if not isinstance(raw_points, (list, tuple)):
+            return []
+
+        points: List[Tuple[float, float]] = []
+        for p in raw_points:
+            if not isinstance(p, (list, tuple)) or len(p) < 2:
+                continue
+            try:
+                x = float(p[0])
+                y = float(p[1])
+            except Exception:
+                continue
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            points.append((x, y))
+        return points
+
+    def _coerce_roi_normalized(self, raw_normalized: Any, points: List[Tuple[float, float]]) -> bool:
+        if isinstance(raw_normalized, bool):
+            return raw_normalized
+        if isinstance(raw_normalized, (int, float)):
+            return bool(raw_normalized)
+        if isinstance(raw_normalized, str):
+            s = raw_normalized.strip().lower()
+            if s in {"true", "1", "yes", "on"}:
+                return True
+            if s in {"false", "0", "no", "off"}:
+                return False
+
+        if not points:
+            return True
+        return all(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for (x, y) in points)
+
+    def _clamp_unit_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        return [
+            (max(0.0, min(1.0, x)), max(0.0, min(1.0, y)))
+            for (x, y) in points
+        ]
+
     async def _get_rois(self, camera_uuid: str) -> List[ROI]:
         """Fetch ROI from database for a camera."""
         if not self._session_factory:
@@ -387,18 +428,16 @@ class NotificationService:
                 if not row or not isinstance(row, dict):
                     return []
                 
-                points = row.get("points", [])
-                normalized = row.get("normalized", True)
+                points = self._parse_roi_points(row.get("points", []))
+                normalized = self._coerce_roi_normalized(row.get("normalized"), points)
                 
                 if not points or len(points) < 3:
                     return []
-                
-                # Convert to tuple format expected by ROI
-                roi_points = [(float(p[0]), float(p[1])) for p in points]
+
+                roi_points = self._clamp_unit_points(points) if normalized else points
                 return [ROI(roi_id=f"{camera_uuid}-roi", points=roi_points, normalized=normalized)]
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(f"Failed to fetch ROI for {camera_uuid}: {e}")
+            logger.warning("Failed to fetch ROI for %s: %s", camera_uuid, e)
             return []
 
     async def _get_notification_emails(self, camera_uuid: str) -> List[str]:
