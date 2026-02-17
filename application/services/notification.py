@@ -44,6 +44,7 @@ class NotificationMessage(BaseModel):
 
     title: str
     body: str
+    alert_type: str = "item_detected"  # item_detected | roi_enter | detection_summary
 
     cls_names: List[str] = Field(default_factory=list)
     max_conf: Optional[float] = None
@@ -51,6 +52,8 @@ class NotificationMessage(BaseModel):
     # Optional: handy for email templates / UI later
     device_name: Optional[str] = None
     camera_name: Optional[str] = None
+    roi_id: Optional[str] = None
+    track_id: Optional[int] = None
 
 
 class WebNotificationHub:
@@ -513,10 +516,12 @@ class NotificationService:
                         camera_uuid=cam,
                         site_uuid=site_uuid,
                         site_name=site_name,
-                        title=f"Confirmed: {tr['cls_name']}",
+                        title=f"Item Detected: {tr['cls_name']}",
                         body=f"{tr['cls_name']} confirmed (track_id={track_id}, conf={float(tr['conf']):.2f})",
+                        alert_type="item_detected",
                         cls_names=[tr["cls_name"]],
                         max_conf=float(tr["conf"]),
+                        track_id=int(track_id),
                     )
                     await self.hub.publish(msg)
                     if self.email:
@@ -556,8 +561,11 @@ class NotificationService:
                             site_name=site_name,
                             title=f"ROI Enter: {a['cls_name']}",
                             body=f"{a['cls_name']} entered ROI={a['roi_id']} (track_id={a['track_id']})",
+                            alert_type="roi_enter",
                             cls_names=[a["cls_name"]],
                             max_conf=float(a["conf"]),
+                            roi_id=str(a["roi_id"]),
+                            track_id=int(a["track_id"]),
                         )
                         await self.hub.publish(msg)
                         if self.email:
@@ -612,6 +620,7 @@ class NotificationService:
             site_name=site_name,
             title=f"Detection: {', '.join(sorted(set(send_classes)))}",
             body=f"Detected {', '.join(sorted(set(send_classes)))} (max_conf={max_conf:.2f})",
+            alert_type="item_detected",
             cls_names=sorted(set(send_classes)),
             max_conf=float(max_conf),
         )

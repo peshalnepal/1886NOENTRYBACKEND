@@ -1,12 +1,13 @@
-import asyncio
+import uuid
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Request, HTTPException, status
+from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 from core.database_orm import Camera
 from sqlalchemy import select
 
 from application.services.notification import WebNotificationHub, CameraMode
+from domain.events import DetectionBox, DetectionItem, DetectionsProducedEvent
 
 router = APIRouter(prefix="/notifications")
 
@@ -48,6 +49,10 @@ async def receive_alert(payload: AlertRequest, request: Request):
         raise HTTPException(status_code=503, detail="Notification service not available")
     
     svc = request.app.state.notification_service
+    try:
+        camera_uuid = str(uuid.UUID(str(payload.camera_uuid)))
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid camera_uuid")
 
     # Convert payload -> DetectionsProducedEvent
     det_items = []
@@ -65,7 +70,7 @@ async def receive_alert(payload: AlertRequest, request: Request):
         ))
 
     ev = DetectionsProducedEvent(
-        camera_uuid=payload.camera_uuid,
+        camera_uuid=camera_uuid,
         model_id="remote-jetson",
         frame_ts_ms=payload.frame_ts_ms,
         frame_seq=payload.frame_seq,
@@ -74,11 +79,12 @@ async def receive_alert(payload: AlertRequest, request: Request):
 
     # Fetch camera mode from DB to check detection/notification status
     mode = CameraMode(detection_enabled=True, notification_enabled=True)
-    if hasattr(request.app.state, "manager"):
-        async with request.app.state.manager.session_factory() as session:
+    session_factory = getattr(svc, "_session_factory", None)
+    if session_factory is not None:
+        async with session_factory() as session:
             res = await session.execute(
                 select(Camera.is_enabled, Camera.is_detection_enabled, Camera.is_notification_enabled)
-                .where(Camera.camera_uuid == payload.camera_uuid)
+                .where(Camera.camera_uuid == camera_uuid)
             )
             row = res.first()
             if row:

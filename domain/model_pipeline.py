@@ -507,6 +507,7 @@ class ModelPipeline:
             return
 
         site_name = await self._get_site_name(resp.site_uuid)
+        site_uuid = str(resp.site_uuid) if resp.site_uuid else ""
         cam_uuid = str(resp.camera_uuid)
         to_emails: List[str] = []
         if svc.email:
@@ -518,16 +519,25 @@ class ModelPipeline:
         for a in alerts:
             title = f"ROI Alert ({a.get('type','roi')})"
             body = f"{a.get('cls_name','object')} entered ROI {a.get('roi_id')} (track {a.get('track_id')})"
+            raw_track_id = a.get("track_id")
+            try:
+                track_id = int(raw_track_id) if raw_track_id is not None else None
+            except Exception:
+                track_id = None
 
             msg = NotificationMessage(
                 id=f"{resp.camera_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-{a.get('roi_id')}-{a.get('track_id')}",
                 ts_ms=int(resp.frame_ts_ms),
                 camera_uuid=cam_uuid,
+                site_uuid=site_uuid,
                 site_name=site_name,
                 title=title,
                 body=body,
+                alert_type="roi_enter",
                 cls_names=[str(a.get("cls_name", "object"))],
                 max_conf=float(a.get("conf", 0.0) or 0.0),
+                roi_id=str(a.get("roi_id", "")),
+                track_id=track_id,
             )
 
             # web notification
@@ -538,6 +548,65 @@ class ModelPipeline:
                     await svc.email.send(msg, to_emails=to_emails if to_emails else None)
                 except Exception:
                     logger.exception("Failed sending ROI email camera=%s alert=%s", cam_uuid, a)
+
+    async def _emit_item_detected_notifications(
+        self,
+        resp: ObjDetectResponse,
+        tracks: Tuple[Dict[str, Any], ...],
+        track_events: Tuple[Tuple[str, int], ...],
+    ) -> None:
+        svc = self._notification_service
+        if svc is None:
+            return
+
+        confirmed_track_ids = [int(track_id) for (ev_type, track_id) in track_events if ev_type == "track_confirmed"]
+        if not confirmed_track_ids:
+            return
+
+        tracks_by_id: Dict[int, Dict[str, Any]] = {}
+        for tr in tracks:
+            try:
+                tracks_by_id[int(tr.get("track_id"))] = tr
+            except Exception:
+                continue
+
+        site_name = await self._get_site_name(resp.site_uuid)
+        site_uuid = str(resp.site_uuid) if resp.site_uuid else ""
+        cam_uuid = str(resp.camera_uuid)
+        to_emails: List[str] = []
+        if svc.email:
+            try:
+                to_emails = await svc._get_notification_emails(cam_uuid)
+            except Exception:
+                logger.exception("Failed loading notification recipients for camera=%s", cam_uuid)
+
+        for track_id in confirmed_track_ids:
+            tr = tracks_by_id.get(track_id)
+            if tr is None:
+                continue
+            cls_name = str(tr.get("cls_name") or "object")
+            conf = float(tr.get("conf", 0.0) or 0.0)
+
+            msg = NotificationMessage(
+                id=f"{resp.camera_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-track-{track_id}",
+                ts_ms=int(resp.frame_ts_ms),
+                camera_uuid=cam_uuid,
+                site_uuid=site_uuid,
+                site_name=site_name,
+                title=f"Item Detected: {cls_name}",
+                body=f"{cls_name} confirmed (track_id={track_id}, conf={conf:.2f})",
+                alert_type="item_detected",
+                cls_names=[cls_name],
+                max_conf=conf,
+                track_id=track_id,
+            )
+
+            await svc.hub.publish(msg)
+            if svc.email:
+                try:
+                    await svc.email.send(msg, to_emails=to_emails if to_emails else None)
+                except Exception:
+                    logger.exception("Failed sending item detection email camera=%s track=%s", cam_uuid, track_id)
                 
     async def _poll_loop(self, key: str, ch: VideoChannel) -> None:
         backoff_ms = 250
@@ -609,8 +678,11 @@ class ModelPipeline:
                 self._last_seq[key] = int(resp2.frame_seq)
                 await self.detect_store.put(resp2)
                 await self.detection_hub.publish(resp2)
-                if alerts and getattr(cfg, "notification_enabled", True) and self._notification_service:
-                    asyncio.create_task(self._emit_roi_alert_notifications(resp2, alerts))
+                if getattr(cfg, "notification_enabled", True) and self._notification_service:
+                    if track_events:
+                        asyncio.create_task(self._emit_item_detected_notifications(resp2, tracks, track_events))
+                    if alerts:
+                        asyncio.create_task(self._emit_roi_alert_notifications(resp2, alerts))
                 backoff_ms = 250
                 await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
 
