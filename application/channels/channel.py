@@ -28,9 +28,14 @@ from application.channels.channel_config import VideoChannelConfig
 logger = logging.getLogger(__name__)
 
 _http = httpx.AsyncClient(
-    timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=2.0),
-    limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+    timeout=httpx.Timeout(connect=8.0, read=8.0, write=5.0, pool=8.0),
+    limits=httpx.Limits(
+        max_connections=50,
+        max_keepalive_connections=20,
+        keepalive_expiry=30.0,
+    ),
 )
+
 async def _run_blocking(fn, *args, **kwargs):
     """Python 3.7+ friendly replacement for asyncio.to_thread()."""
     loop = asyncio.get_running_loop()
@@ -96,9 +101,9 @@ class VideoChannel:
 
         for url in urls:
             try:
-                # per-camera timeout (override if you want)
-                timeout_s = float(self.config.request_timeout_s)
-                r = await _http.get(url, timeout=httpx.Timeout(timeout_s, connect=min(2.0, timeout_s)))
+                timeout_s = float(self.config.request_timeout_s or 6.0)
+                t = httpx.Timeout(timeout_s, connect=min(8.0, timeout_s), read=timeout_s, write=timeout_s, pool=timeout_s)
+                r = await _http.get(url, timeout=t)
                 if r.status_code in (404, 405):
                     last_err_sig = f"http:{r.status_code}:{url}"
                     continue
