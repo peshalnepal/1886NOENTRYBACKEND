@@ -40,6 +40,36 @@ class AlertRequest(BaseModel):
     frame_h: Optional[int] = None
     detections: List[Dict[str, Any]]
 
+
+def _parse_box(raw_box: Any) -> Optional[DetectionBox]:
+    # Accept both {"x1":..,"y1":..,"x2":..,"y2":..} and [x1,y1,x2,y2]
+    if isinstance(raw_box, dict):
+        keys = ("x1", "y1", "x2", "y2")
+        if not all(k in raw_box for k in keys):
+            return None
+        try:
+            return DetectionBox(
+                x1=int(raw_box["x1"]),
+                y1=int(raw_box["y1"]),
+                x2=int(raw_box["x2"]),
+                y2=int(raw_box["y2"]),
+            )
+        except Exception:
+            return None
+
+    if isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
+        try:
+            return DetectionBox(
+                x1=int(raw_box[0]),
+                y1=int(raw_box[1]),
+                x2=int(raw_box[2]),
+                y2=int(raw_box[3]),
+            )
+        except Exception:
+            return None
+
+    return None
+
 @router.post("/alert")
 async def receive_alert(payload: AlertRequest, request: Request):
     """
@@ -57,12 +87,10 @@ async def receive_alert(payload: AlertRequest, request: Request):
     # Convert payload -> DetectionsProducedEvent
     det_items = []
     for d in payload.detections:
-        box_arr = d.get("box")
-        if not box_arr or len(box_arr) < 4:
+        box = _parse_box(d.get("box"))
+        if box is None:
             continue
-        
-        # safely parse box
-        box = DetectionBox(x1=int(box_arr[0]), y1=int(box_arr[1]), x2=int(box_arr[2]), y2=int(box_arr[3]))
+
         det_items.append(DetectionItem(
             cls_name=str(d.get("cls_name", "unknown")),
             conf=float(d.get("conf", 0.0)),

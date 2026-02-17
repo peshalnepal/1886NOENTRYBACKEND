@@ -249,7 +249,12 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'SMTP_USERNAME', value: smtpUsername }
             { name: 'SMTP_PASSWORD', value: smtpPassword }
             { name: 'SMTP_FROM', value: smtpFrom }
-
+            { name: 'DEFAULT_SAMPLE_FPS', value: '3.0' }
+            { name: 'INFER_QUEUE_MAX', value: '8' }
+            { name: 'CHANNEL_OUT_Q_MAX', value: '4' }
+            { name: 'PIPELINE_OUT_QUEUE_MAX', value: '500' }
+            { name: 'PENDING_KEY_MAX', value: '1000' }
+            { name: 'PIPELINE_LOG_EVERY_N_FRAMES', value: '0' }
             { name: 'WEBRTC_ADMIN_API_URL', value: webrtcAdminApiUrl }
             { name: 'WEBRTC_PUBLIC_BASE_URL', value: webrtcPublicBaseUrl }
             { name: 'WEBRTC_ADMIN_API_KEY', value: webrtcAdminApiKey }
