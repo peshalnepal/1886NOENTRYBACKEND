@@ -298,8 +298,14 @@ var mediamtxPublicHost = '${mediamtxDns}.${regionForHost}.azurecontainer.io'
 var proxyHost = (mediamtxHostOverride != '') ? mediamtxHostOverride : mediamtxPublicHost
 
 var mediamtxYaml = $'''
-logLevel: info
+logLevel: warn
 logDestinations: [stdout]
+
+# helps with throughput when many streams are active (uses a bit more RAM)
+writeQueueSize: 2048
+
+# reduce UDP packet loss when networks are busy (0=OS default)
+udpReadBufferSize: 1048576
 
 authMethod: internal
 authInternalUsers:
@@ -325,17 +331,44 @@ apiAllowOrigins: ['*']
 
 webrtc: yes
 webrtcAddress: :8889
-
-webrtcLocalUDPAddress: :8189
-webrtcLocalTCPAddress: ''
 webrtcAllowOrigins: ['*']
+
+webrtcTrustedProxies: ['127.0.0.1', '::1']
+
+webrtcLocalTCPAddress: :8189
 
 webrtcIPsFromInterfaces: no
 webrtcAdditionalHosts: ['${proxyHost}']
 
-webrtcICEServers2:
-  - url: stun:stun.l.google.com:19302
+# Optional: try WITHOUT STUN first (often faster and simpler when server has a public IP+port)
+# If some clients fail to connect, re-enable STUN.
+webrtcICEServers2: []
+# webrtcICEServers2:
+#   - url: stun:stun.l.google.com:19302
+
+# Tighten these only if you want failures to happen quicker; defaults are fine
+# webrtcHandshakeTimeout: 10s
+# webrtcTrackGatherTimeout: 2s
+# webrtcSTUNGatherTimeout: 5s
+
+# If you don't use these, turn them off to save resources
+hls: no
+rtmp: no
+srt: no
+
+# Default path behavior: good for 50 cams
+pathDefaults:
+  # If your "RTSP -> HTTPS view" means MediaMTX PULLS RTSP sources,
+  # forcing TCP avoids UDP/NAT retries and usually reduces startup delay.
+  rtspTransport: tcp
+
+  # Scale-friendly: don't pull all 50 cameras 24/7 unless needed.
+  # First viewer may still wait for the next keyframe, but this avoids constant bandwidth.
+  sourceOnDemand: true
+  sourceOnDemandStartTimeout: 10s
+  sourceOnDemandCloseAfter: 60s
 '''
+
 var caddyfile = $'''
 {
   email ${caddyEmail}
@@ -372,7 +405,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       ports: [
         { port: 80,  protocol: 'TCP' }
         { port: 443, protocol: 'TCP' }
-        { port: 8189, protocol: 'UDP' }
+        { port: 8189, protocol: 'TCP' }
       ]
     }
 
@@ -399,12 +432,12 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
           ports: [
             { port: 8889, protocol: 'TCP' }
             { port: 9997, protocol: 'TCP' }
-            { port: 8189, protocol: 'UDP' }
+            { port: 8189, protocol: 'TCP' }
           ]
           resources: {
             requests: {
-              cpu: 1
-              memoryInGB: json('1.5')
+              cpu: 2
+              memoryInGB: json('4')
             }
           }
           volumeMounts: [
@@ -427,8 +460,8 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
           ]
           resources: {
             requests: {
-              cpu: json('0.25')
-              memoryInGB: json('0.5')
+              cpu: json('0.5')
+              memoryInGB: json('1')
             }
           }
           volumeMounts: [
