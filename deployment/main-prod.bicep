@@ -337,9 +337,11 @@ webrtcAdditionalHosts: ['${proxyHost}']
 
 webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
-hls: no
-rtmp: no
-srt: no
+hls: false
+rtmp: false
+srt: false
+'''
+
 var caddyfile = $'''
 {
   email ${caddyEmail}
