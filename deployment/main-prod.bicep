@@ -300,12 +300,8 @@ var proxyHost = (mediamtxHostOverride != '') ? mediamtxHostOverride : mediamtxPu
 var mediamtxYaml = $'''
 logLevel: info
 logDestinations: [stdout]
-
-# helps with throughput when many streams are active (uses a bit more RAM)
-writeQueueSize: 2048
-
-# reduce UDP packet loss when networks are busy (0=OS default)
-udpReadBufferSize: 1048576
+writeQueueSize: 1024
+udpReadBufferSize: 0
 
 authMethod: internal
 authInternalUsers:
@@ -341,23 +337,9 @@ webrtcAdditionalHosts: ['${proxyHost}']
 
 webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
-
 hls: no
 rtmp: no
 srt: no
-
-# Default path behavior: good for 50 cams
-pathDefaults:
-  # If your "RTSP -> HTTPS view" means MediaMTX PULLS RTSP sources,
-  # forcing TCP avoids UDP/NAT retries and usually reduces startup delay.
-  rtspTransport: tcp
-
-  # Scale-friendly: don't pull all 50 cameras 24/7 unless needed.
-  # First viewer may still wait for the next keyframe, but this avoids constant bandwidth.
-  sourceOnDemand: true
-  sourceOnDemandStartTimeout: 10s
-  sourceOnDemandCloseAfter: 60s
-'''
 var caddyfile = $'''
 {
   email ${caddyEmail}
