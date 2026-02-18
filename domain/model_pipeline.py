@@ -25,6 +25,11 @@ from application.channels.channel import VideoChannel, VideoChannelConfig
 from application.services.tracker import MultiCameraByteTrack, ROI, ROIAlertEngine
 from application.services.notification import NotificationMessage, NotificationService
 from core.database_orm import Site
+from application.repositories.notification_repository import (
+    NotificationRepository,
+    CameraContext,
+    dt_from_ts_ms,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -191,6 +196,10 @@ class ModelPipeline:
         self._roi_engine = ROIAlertEngine()                 
         self._roi_provider: ROIProvider = roi_provider or self._no_rois 
         self._notification_service = notification_service    
+        self._notif_repo = NotificationRepository()
+        self._cam_ctx_cache: Dict[str, Tuple[CameraContext, float]] = {}
+        self._cam_ctx_cache_lock = asyncio.Lock()
+        self._cam_ctx_ttl_s = 60.0 
         self._session_factory: Optional[SessionFactory] = None
         self._site_cache: Dict[str, Tuple[str, float]] = {}
         self._site_cache_lock = asyncio.Lock()
@@ -277,6 +286,11 @@ class ModelPipeline:
 
     def set_session_factory(self, session_factory: SessionFactory) -> None:
         self._session_factory = session_factory
+        if self._notification_service is not None:
+            try:
+                self._notification_service.set_session_factory(session_factory)
+            except Exception:
+                logger.exception("Failed to set session factory on NotificationService")
 
 
     async def _get_site_name(self, site_uuid: Optional[str]) -> str:
@@ -451,7 +465,6 @@ class ModelPipeline:
 
         return True
 
-    # ---------- detections ----------
     async def put_detection(self, resp: ObjDetectResponse) -> None:
         await self.detect_store.put(resp)
 
@@ -484,7 +497,117 @@ class ModelPipeline:
         await self.detect_store.put(resp)
         return resp
 
- 
+    async def _get_camera_ctx(self, camera_uuid: str) -> Optional[CameraContext]:
+        """
+        Resolve user/site/device/camera names via NotificationRepository with TTL cache.
+        """
+        sf = self._session_factory
+        if sf is None:
+            return None
+
+        key = str(camera_uuid)
+        now = time.monotonic()
+
+        async with self._cam_ctx_cache_lock:
+            cached = self._cam_ctx_cache.get(key)
+            if cached and cached[1] > now:
+                return cached[0]
+
+        try:
+            cam_uuid = UUID(key)
+        except Exception:
+            return None
+
+        try:
+            async with sf() as db:
+                ctx = await self._notif_repo.get_camera_context(db, camera_uuid=cam_uuid)
+        except Exception:
+            logger.exception("Failed to load CameraContext for camera=%s", key)
+            ctx = None
+
+        if ctx:
+            async with self._cam_ctx_cache_lock:
+                self._cam_ctx_cache[key] = (ctx, now + self._cam_ctx_ttl_s)
+
+        return ctx
+
+    async def _persist_and_maybe_email(
+        self,
+        *,
+        ctx: CameraContext,
+        msg: NotificationMessage,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Create Notification row (status=created), email if enabled, then mark sent/failed.
+        Runs inside a task (non-blocking to poll loop).
+        """
+        sf = self._session_factory
+        svc = self._notification_service
+        if sf is None or svc is None:
+            return
+
+        notif_id: Optional[int] = None
+        recipients: List[str] = []
+
+        try:
+            async with sf() as db:
+                notif = await self._notif_repo.create_notification(
+                    db,
+                    user_id=ctx.user_id,
+                    site_uuid=ctx.site_uuid,
+                    camera_uuid=UUID(msg.camera_uuid),
+                    device_uuid=ctx.device_uuid,
+                    event_type=msg.alert_type,
+                    title=msg.title,
+                    message=msg.body,
+                    payload={
+                        "msg": msg.model_dump(),
+                        "extra": extra_payload or {},
+                    },
+                    detected_at=dt_from_ts_ms(msg.ts_ms),
+                    status="created",
+                    sent_at=None,
+                )
+                notif_id = int(notif.id)
+
+                recipients = await self._notif_repo.list_notification_emails_for_site(
+                    db,
+                    user_id=ctx.user_id,
+                    site_uuid=ctx.site_uuid,
+                    only_enabled=True,
+                )
+
+                await db.commit()
+            sent_ok = False
+            if svc.email:
+                try:
+                    await svc.email.send(msg, to_emails=recipients if recipients else None)
+                    sent_ok = True
+                except Exception:
+                    logger.exception("Email send failed camera=%s", msg.camera_uuid)
+                    sent_ok = False
+
+            if notif_id is not None:
+                async with sf() as db2:
+                    if sent_ok:
+                        await self._notif_repo.mark_notification_sent(db2, notification_id=notif_id)
+                    else:
+                        # Only mark failed if we actually attempted (email enabled + recipients present)
+                        if svc.email and recipients:
+                            await self._notif_repo.mark_notification_failed(db2, notification_id=notif_id)
+                    await db2.commit()
+
+        except Exception:
+            logger.exception("Persist/email workflow failed for camera=%s", msg.camera_uuid)
+            if notif_id is not None:
+                try:
+                    async with sf() as db3:
+                        await self._notif_repo.mark_notification_failed(db3, notification_id=notif_id)
+                        await db3.commit()
+                except Exception:
+                    logger.exception("Failed to mark notification failed id=%s", notif_id)
+
     def _ensure_poller(self, key: str, ch: VideoChannel) -> None:
         t = self._poll_tasks.get(key)
         if t is None or t.done():
@@ -506,19 +629,17 @@ class ModelPipeline:
         if svc is None:
             return
 
-        site_name = await self._get_site_name(resp.site_uuid)
-        site_uuid = str(resp.site_uuid) if resp.site_uuid else ""
         cam_uuid = str(resp.camera_uuid)
-        to_emails: List[str] = []
-        if svc.email:
-            try:
-                to_emails = await svc._get_notification_emails(cam_uuid)
-            except Exception:
-                logger.exception("Failed loading notification recipients for camera=%s", cam_uuid)
+
+        ctx = await self._get_camera_ctx(cam_uuid)
+
+        site_name = ctx.site_name if ctx else await self._get_site_name(resp.site_uuid)
+        site_uuid_str = str(ctx.site_uuid) if ctx else (str(resp.site_uuid) if resp.site_uuid else "")
 
         for a in alerts:
             title = f"ROI Alert ({a.get('type','roi')})"
             body = f"{a.get('cls_name','object')} entered ROI {a.get('roi_id')} (track {a.get('track_id')})"
+
             raw_track_id = a.get("track_id")
             try:
                 track_id = int(raw_track_id) if raw_track_id is not None else None
@@ -526,10 +647,10 @@ class ModelPipeline:
                 track_id = None
 
             msg = NotificationMessage(
-                id=f"{resp.camera_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-{a.get('roi_id')}-{a.get('track_id')}",
+                id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-{a.get('roi_id')}-{a.get('track_id')}",
                 ts_ms=int(resp.frame_ts_ms),
                 camera_uuid=cam_uuid,
-                site_uuid=site_uuid,
+                site_uuid=site_uuid_str,
                 site_name=site_name,
                 title=title,
                 body=body,
@@ -538,17 +659,19 @@ class ModelPipeline:
                 max_conf=float(a.get("conf", 0.0) or 0.0),
                 roi_id=str(a.get("roi_id", "")),
                 track_id=track_id,
+                device_name=ctx.device_name if ctx else None,
+                camera_name=ctx.camera_name if ctx else None,
             )
 
-            # web notification
             await svc.hub.publish(msg)
-            # email if configured
-            if svc.email:
-                try:
-                    await svc.email.send(msg, to_emails=to_emails if to_emails else None)
-                except Exception:
-                    logger.exception("Failed sending ROI email camera=%s alert=%s", cam_uuid, a)
 
+            # Persist + email in background only if ctx exists (camera may be deleted)
+            if ctx:
+                asyncio.create_task(
+                    self._persist_and_maybe_email(ctx=ctx, msg=msg, extra_payload={"alert": a}),
+                    name=f"persist_roi_alert:{cam_uuid}",
+                )
+                
     async def _emit_item_detected_notifications(
         self,
         resp: ObjDetectResponse,
@@ -570,28 +693,25 @@ class ModelPipeline:
             except Exception:
                 continue
 
-        site_name = await self._get_site_name(resp.site_uuid)
-        site_uuid = str(resp.site_uuid) if resp.site_uuid else ""
         cam_uuid = str(resp.camera_uuid)
-        to_emails: List[str] = []
-        if svc.email:
-            try:
-                to_emails = await svc._get_notification_emails(cam_uuid)
-            except Exception:
-                logger.exception("Failed loading notification recipients for camera=%s", cam_uuid)
+        ctx = await self._get_camera_ctx(cam_uuid)
+
+        site_name = ctx.site_name if ctx else await self._get_site_name(resp.site_uuid)
+        site_uuid_str = str(ctx.site_uuid) if ctx else (str(resp.site_uuid) if resp.site_uuid else "")
 
         for track_id in confirmed_track_ids:
             tr = tracks_by_id.get(track_id)
             if tr is None:
                 continue
+
             cls_name = str(tr.get("cls_name") or "object")
             conf = float(tr.get("conf", 0.0) or 0.0)
 
             msg = NotificationMessage(
-                id=f"{resp.camera_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-track-{track_id}",
+                id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-track-{track_id}",
                 ts_ms=int(resp.frame_ts_ms),
                 camera_uuid=cam_uuid,
-                site_uuid=site_uuid,
+                site_uuid=site_uuid_str,
                 site_name=site_name,
                 title=f"Item Detected: {cls_name}",
                 body=f"{cls_name} confirmed (track_id={track_id}, conf={conf:.2f})",
@@ -599,15 +719,22 @@ class ModelPipeline:
                 cls_names=[cls_name],
                 max_conf=conf,
                 track_id=track_id,
+                device_name=ctx.device_name if ctx else None,
+                camera_name=ctx.camera_name if ctx else None,
             )
 
             await svc.hub.publish(msg)
-            if svc.email:
-                try:
-                    await svc.email.send(msg, to_emails=to_emails if to_emails else None)
-                except Exception:
-                    logger.exception("Failed sending item detection email camera=%s track=%s", cam_uuid, track_id)
-                
+
+            if ctx:
+                asyncio.create_task(
+                    self._persist_and_maybe_email(
+                        ctx=ctx,
+                        msg=msg,
+                        extra_payload={"track": tr, "event": "track_confirmed"},
+                    ),
+                    name=f"persist_track_confirmed:{cam_uuid}:{track_id}",
+                )
+
     async def _poll_loop(self, key: str, ch: VideoChannel) -> None:
         backoff_ms = 250
         max_backoff_ms = 8000

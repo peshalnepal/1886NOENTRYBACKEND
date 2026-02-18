@@ -6,34 +6,38 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from email.mime.text import MIMEText
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import html
 import smtplib
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
-import smtplib
-from pydantic import BaseModel, Field
-
-from domain.events import DetectionsProducedEvent, DetectionItem  # your existing events
-import numpy as np
-from application.services.tracker import (
-    MultiCameraByteTrack,
-    ROIAlertEngine,
-    ROI,
-)
 import os
+import uuid
 
-SMTP_USERNAME=os.environ.get("SMTP_USERNAME")
-SMTP_PASSWORD=os.environ.get("SMTP_PASSWORD")
+from pydantic import BaseModel, Field
+import numpy as np
+
+from domain.events import DetectionsProducedEvent, DetectionItem
+from application.services.tracker import MultiCameraByteTrack, ROIAlertEngine, ROI
+
+# NEW: repository
+from application.repositories.notification_repository import (
+    NotificationRepository,
+    CameraContext,
+    dt_from_ts_ms,
+)
+
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+
 logger = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
 class CameraMode:
     detection_enabled: bool = True
     notification_enabled: bool = True
-
 
 
 class NotificationMessage(BaseModel):
@@ -50,7 +54,6 @@ class NotificationMessage(BaseModel):
     cls_names: List[str] = Field(default_factory=list)
     max_conf: Optional[float] = None
 
-    # Optional: handy for email templates / UI later
     device_name: Optional[str] = None
     camera_name: Optional[str] = None
     roi_id: Optional[str] = None
@@ -58,10 +61,6 @@ class NotificationMessage(BaseModel):
 
 
 class WebNotificationHub:
-    """
-    Simple in-memory pubsub for browser notifications.
-    Each connected client gets its own asyncio.Queue.
-    """
     def __init__(self, max_q: int = 200):
         self._subs: Set[asyncio.Queue[NotificationMessage]] = set()
         self._lock = asyncio.Lock()
@@ -81,12 +80,10 @@ class WebNotificationHub:
         async with self._lock:
             subs = list(self._subs)
 
-        # best-effort: never block pipeline
         for q in subs:
             try:
                 q.put_nowait(msg)
             except asyncio.QueueFull:
-                # drop oldest then try once
                 try:
                     _ = q.get_nowait()
                 except Exception:
@@ -97,9 +94,6 @@ class WebNotificationHub:
                     pass
 
 
-# -----------------------------
-# Email notifier (SMTP)
-# -----------------------------
 class EmailConfig(BaseModel):
     enabled: bool = True
 
@@ -110,15 +104,11 @@ class EmailConfig(BaseModel):
     use_tls: bool = True
 
     from_email: str
-
-    # FIX: recipients should live here OR be provided at send-time (we do both)
     to_emails: List[str] = Field(default_factory=list)
 
     subject_prefix: str = "[1886NOENTRY Alert]"
-
-    # Optional: link users back to your frontend (button in email)
-    dashboard_base_url: Optional[str] = None  # e.g. "https://your-frontend.com"
-    camera_path_template: str = "/app?camera={camera_uuid}"  # customize for your UI
+    dashboard_base_url: Optional[str] = None
+    camera_path_template: str = "/app?camera={camera_uuid}"
 
 
 class EmailNotifier:
@@ -131,7 +121,6 @@ class EmailNotifier:
 
         recipients = (to_emails or []) or self.cfg.to_emails
         if not recipients:
-            # No recipients configured; quietly skip (or log if you prefer)
             return
 
         await asyncio.to_thread(self._send_sync, msg, recipients)
@@ -147,7 +136,6 @@ class EmailNotifier:
         m["From"] = self.cfg.from_email
         m["To"] = ", ".join(to_emails)
 
-        # Plain text first, HTML second
         m.attach(MIMEText(text_body, "plain", "utf-8"))
         m.attach(MIMEText(html_body, "html", "utf-8"))
 
@@ -156,8 +144,6 @@ class EmailNotifier:
                 server.starttls()
             if self.cfg.smtp_user and self.cfg.smtp_pass:
                 server.login(self.cfg.smtp_user, self.cfg.smtp_pass)
-
-            # FIX: sendmail needs recipients list
             server.sendmail(self.cfg.from_email, to_emails, m.as_string())
 
     def _render_text(self, msg: NotificationMessage) -> str:
@@ -197,7 +183,6 @@ class EmailNotifier:
         classes = ", ".join(html.escape(c) for c in (msg.cls_names or ["unknown"]))
         conf = f"{msg.max_conf:.2f}" if msg.max_conf is not None else "n/a"
 
-        # optional button
         button_html = ""
         if self.cfg.dashboard_base_url:
             url = html.escape(self._camera_url(msg.camera_uuid))
@@ -222,7 +207,6 @@ class EmailNotifier:
         <td align="center">
           <table role="presentation" width="640" cellspacing="0" cellpadding="0"
                  style="background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #e6e8ef;">
-            <!-- Header -->
             <tr>
               <td style="padding:18px 24px;background:#0b1220;color:#ffffff;font-family:Arial,sans-serif;">
                 <div style="font-size:14px;opacity:0.85;font-weight:700;letter-spacing:0.3px;">1886NOENTRY</div>
@@ -230,7 +214,6 @@ class EmailNotifier:
               </td>
             </tr>
 
-            <!-- Summary card -->
             <tr>
               <td style="padding:18px 24px;font-family:Arial,sans-serif;">
                 <div style="display:inline-block;background:#fee2e2;color:#991b1b;padding:6px 10px;border-radius:999px;
@@ -285,7 +268,6 @@ class EmailNotifier:
 
             {button_html}
 
-            <!-- Footer -->
             <tr>
               <td style="padding:14px 24px 18px 24px;background:#f8fafc;border-top:1px solid #e2e8f0;
                          font-family:Arial,sans-serif;color:#64748b;font-size:12px;line-height:1.5;">
@@ -316,41 +298,25 @@ class EmailNotifier:
         return f"{base}{path}"
 
 
-# -----------------------------
-# Main service (filters + cooldown + fan-out)
-# -----------------------------
-
 class NotificationService:
-    """
-    Consumes DetectionsProducedEvent and sends:
-      - Email notification
-      - Web notification (top bar via SSE)
-
-    Includes:
-      - per-camera mode checks (detection_enabled/notification_enabled)
-      - cooldown to prevent spam
-      - class filter (person/car)
-    """
     def __init__(
         self,
         *,
         hub: WebNotificationHub,
         email: Optional[EmailNotifier] = None,
-        interesting_classes: Iterable[str] = ("person", "car","motorcycle","truck"),
+        interesting_classes: Iterable[str] = ("person", "car", "motorcycle", "truck"),
         cooldown_s: float = 10.0,
         enable_tracking: bool = True,
         tracker_cfg: Optional[dict] = None,
         roi_provider=None,
         notify_on_confirmed: bool = True,
         notify_on_roi_enter: bool = True,
-
     ):
         self.hub = hub
         self.email = email
         self.interesting = set(interesting_classes)
         self.cooldown_s = float(cooldown_s)
 
-        # (camera_uuid, cls) -> last_sent_monotonic
         self._last_sent: Dict[Tuple[str, str], float] = {}
         self._lock = asyncio.Lock()
 
@@ -362,18 +328,119 @@ class NotificationService:
         cfg = tracker_cfg or {}
         self._tracker = MultiCameraByteTrack(**cfg)
         self._roi_engine = ROIAlertEngine()
-        
-        # Session factory for database lookups (ROI, notification emails)
         self._session_factory = None
+        self._repo = NotificationRepository()
+        self._ctx_cache: Dict[str, Tuple[float, CameraContext]] = {}
+        self._ctx_ttl_s = 60.0  # reduce DB hits on frequent detections
 
     def set_session_factory(self, session_factory):
-        """Set the session factory for database lookups."""
         self._session_factory = session_factory
+
+    def _fire_and_forget(self, coro):
+        async def _runner():
+            try:
+                await coro
+            except Exception:
+                logger.exception("Notification background task failed")
+        asyncio.create_task(_runner())
+
+    async def _get_camera_ctx_cached(self, camera_uuid_str: str) -> Optional[CameraContext]:
+        if not self._session_factory:
+            return None
+
+        now = time.monotonic()
+        hit = self._ctx_cache.get(camera_uuid_str)
+        if hit and hit[0] > now:
+            return hit[1]
+
+        try:
+            cam_uuid = uuid.UUID(str(camera_uuid_str))
+        except Exception:
+            return None
+
+        async with self._session_factory() as db:
+            ctx = await self._repo.get_camera_context(db, camera_uuid=cam_uuid)
+
+        if ctx:
+            self._ctx_cache[camera_uuid_str] = (now + self._ctx_ttl_s, ctx)
+
+        return ctx
+
+    async def _persist_and_send(self, msg: NotificationMessage, ctx: CameraContext) -> None:
+        """
+        Store notification row in DB (site/camera/user scoped),
+        then send email (site-scoped recipients),
+        then mark sent/failed.
+        """
+        if not self._session_factory:
+            return
+
+        notification_id: Optional[int] = None
+        recipients: List[str] = []
+
+        try:
+            # 1) insert row (status=created) + load recipients
+            async with self._session_factory() as db:
+                notif = await self._repo.create_notification(
+                    db,
+                    user_id=ctx.user_id,
+                    site_uuid=ctx.site_uuid,
+                    camera_uuid=uuid.UUID(msg.camera_uuid),
+                    device_uuid=ctx.device_uuid,
+                    event_type=msg.alert_type,
+                    title=msg.title,
+                    message=msg.body,
+                    payload={"msg": msg.model_dump()},
+                    detected_at=dt_from_ts_ms(msg.ts_ms),
+                    status="created",
+                    sent_at=None,
+                )
+                notification_id = int(notif.id)
+
+                recipients = await self._repo.list_notification_emails_for_site(
+                    db,
+                    user_id=ctx.user_id,
+                    site_uuid=ctx.site_uuid,
+                    only_enabled=True,
+                )
+
+                await db.commit()
+
+            # 2) email send (optional)
+            sent_ok = False
+            if self.email:
+                try:
+                    await self.email.send(msg, to_emails=recipients if recipients else None)
+                    sent_ok = True
+                except Exception:
+                    logger.exception("Email send failed camera=%s", msg.camera_uuid)
+                    sent_ok = False
+
+            # 3) mark sent/failed
+            if notification_id is not None:
+                async with self._session_factory() as db2:
+                    if sent_ok:
+                        await self._repo.mark_notification_sent(db2, notification_id=notification_id)
+                    else:
+                        # If email is disabled/no recipients, you can keep status=created,
+                        # but if you want a failure marker when email attempted and failed:
+                        if self.email and recipients:
+                            await self._repo.mark_notification_failed(db2, notification_id=notification_id)
+                    await db2.commit()
+
+        except Exception:
+            logger.exception("Persist+send failed camera=%s", msg.camera_uuid)
+            if notification_id is not None and self._session_factory:
+                try:
+                    async with self._session_factory() as db3:
+                        await self._repo.mark_notification_failed(db3, notification_id=notification_id)
+                        await db3.commit()
+                except Exception:
+                    logger.exception("Failed to mark notification failed id=%s", notification_id)
 
     def _parse_roi_points(self, raw_points: Any) -> List[Tuple[float, float]]:
         if not isinstance(raw_points, (list, tuple)):
             return []
-
         points: List[Tuple[float, float]] = []
         for p in raw_points:
             if not isinstance(p, (list, tuple)) or len(p) < 2:
@@ -399,100 +466,44 @@ class NotificationService:
                 return True
             if s in {"false", "0", "no", "off"}:
                 return False
-
         if not points:
             return True
         return all(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for (x, y) in points)
 
     def _clamp_unit_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        return [
-            (max(0.0, min(1.0, x)), max(0.0, min(1.0, y)))
-            for (x, y) in points
-        ]
+        return [(max(0.0, min(1.0, x)), max(0.0, min(1.0, y))) for (x, y) in points]
 
     async def _get_rois(self, camera_uuid: str) -> List[ROI]:
-        """Fetch ROI from database for a camera."""
         if not self._session_factory:
             return []
-        
+
         try:
             from core.database_orm import Camera
             from sqlalchemy import select
-            
+
+            cam_uuid = uuid.UUID(str(camera_uuid))  # FIX: compare UUID to UUID
+
             async with self._session_factory() as session:
                 result = await session.execute(
-                    select(Camera.roi).where(Camera.camera_uuid == camera_uuid)
+                    select(Camera.roi).where(Camera.camera_uuid == cam_uuid)
                 )
                 row = result.scalar_one_or_none()
-                
-                if not row or not isinstance(row, dict):
-                    return []
-                
-                points = self._parse_roi_points(row.get("points", []))
-                normalized = self._coerce_roi_normalized(row.get("normalized"), points)
-                
-                if not points or len(points) < 3:
-                    return []
 
-                roi_points = self._clamp_unit_points(points) if normalized else points
-                return [ROI(roi_id=f"{camera_uuid}-roi", points=roi_points, normalized=normalized)]
+            if not row or not isinstance(row, dict):
+                return []
+
+            points = self._parse_roi_points(row.get("points", []))
+            normalized = self._coerce_roi_normalized(row.get("normalized"), points)
+
+            if not points or len(points) < 3:
+                return []
+
+            roi_points = self._clamp_unit_points(points) if normalized else points
+            return [ROI(roi_id=f"{camera_uuid}-roi", points=roi_points, normalized=normalized)]
+
         except Exception as e:
             logger.warning("Failed to fetch ROI for %s: %s", camera_uuid, e)
             return []
-
-    async def _get_notification_emails(self, camera_uuid: str) -> List[str]:
-        """Fetch notification emails from database for the camera's user."""
-        if not self._session_factory:
-            return []
-        
-        try:
-            from core.database_orm import Camera, NotificationEmail
-            from sqlalchemy import select
-            from sqlalchemy.orm import selectinload
-            
-            async with self._session_factory() as session:
-                # Get user_id from camera
-                result = await session.execute(
-                    select(Camera.user_id).where(Camera.camera_uuid == camera_uuid)
-                )
-                user_id = result.scalar_one_or_none()
-                
-                if not user_id:
-                    return []
-                
-                # Get notification emails for user
-                result = await session.execute(
-                    select(NotificationEmail.email).where(NotificationEmail.user_id == user_id)
-                )
-                emails = [row[0] for row in result.fetchall()]
-                return emails
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(f"Failed to fetch notification emails for {camera_uuid}: {e}")
-            return []
-
-    async def _get_site_name_and_uuid(self, camera_uuid: str) -> Tuple[str, str]:
-        """Fetch site name and uuid from database for a camera."""
-        if not self._session_factory:
-            return "Unknown Site", ""
-        
-        try:
-            from core.database_orm import Camera, Site
-            from sqlalchemy import select
-            
-            async with self._session_factory() as session:
-                result = await session.execute(
-                    select(Site.name, Site.site_uuid).join(Camera, Camera.site_uuid == Site.site_uuid)
-                    .where(Camera.camera_uuid == camera_uuid)
-                )
-                row = result.first()
-                if row:
-                    name, suid = row
-                    return name, str(suid)
-                return "Unknown Site", ""
-        except Exception:
-            return "Unknown Site", ""
-
 
     async def handle_detection_event(
         self,
@@ -509,11 +520,19 @@ class NotificationService:
         if not matches:
             return
 
-        if self.enable_tracking:
-            cam = str(det_ev.camera_uuid)
-            ts_ms = int(det_ev.frame_ts_ms)
+        cam = str(det_ev.camera_uuid)
+        ts_ms = int(det_ev.frame_ts_ms)
 
-            # Convert to tracker detection format
+        ctx = await self._get_camera_ctx_cached(cam)
+        site_name = ctx.site_name if ctx else "Unknown Site"
+        site_uuid_str = str(ctx.site_uuid) if ctx else ""
+        device_name = ctx.device_name if ctx else None
+        camera_name = ctx.camera_name if ctx else None
+
+        # -------------------------
+        # Tracking path
+        # -------------------------
+        if self.enable_tracking:
             dets = []
             for d in det_ev.detections or []:
                 cls_name = getattr(d, "cls_name", None)
@@ -536,24 +555,20 @@ class NotificationService:
             tracks = res["tracks"]
             events = res["events"]
 
-            # A) notify-on-confirmed (fires once per track when it becomes confirmed)
+            # A) notify-on-confirmed-track
             if self.notify_on_confirmed:
                 for ev_type, track_id in events:
                     if ev_type != "track_confirmed":
                         continue
-                    # find that track
                     tr = next((t for t in tracks if int(t["track_id"]) == int(track_id)), None)
                     if not tr:
                         continue
 
-                    # Fetch site name and uuid for notification
-                    site_name, site_uuid = await self._get_site_name_and_uuid(cam)
-                    
                     msg = NotificationMessage(
                         id=f"{cam}-trk{track_id}-confirm-{ts_ms}",
                         ts_ms=ts_ms,
                         camera_uuid=cam,
-                        site_uuid=site_uuid,
+                        site_uuid=site_uuid_str,
                         site_name=site_name,
                         title=f"Item Detected: {tr['cls_name']}",
                         body=f"{tr['cls_name']} confirmed (track_id={track_id}, conf={float(tr['conf']):.2f})",
@@ -561,21 +576,19 @@ class NotificationService:
                         cls_names=[tr["cls_name"]],
                         max_conf=float(tr["conf"]),
                         track_id=int(track_id),
+                        device_name=device_name,
+                        camera_name=camera_name,
                     )
-                    await self.hub.publish(msg)
-                    if self.email:
-                        try:
-                            # Fetch notification emails from database
-                            to_emails = await self._get_notification_emails(cam)
-                            await self.email.send(msg, to_emails=to_emails if to_emails else None)
-                        except Exception:
-                            logger.exception("Email send failed for confirmed track camera=%s track_id=%s", cam, track_id)
 
-            # B) notify-on-ROI-enter (fires once per ROI enter per track)
+                    await self.hub.publish(msg)
+
+                    # DB + email in background (only if ctx exists)
+                    if ctx:
+                        self._fire_and_forget(self._persist_and_send(msg, ctx))
+
+            # B) notify-on-ROI-enter
             if self.notify_on_roi_enter:
                 if frame_w is None or frame_h is None:
-                    # ROI normalized needs dimensions; if your ROIs are pixel-based you can pass any.
-                    # Best is to include frame_w/h in payload (shown below).
                     return
 
                 rois = await self._get_rois(cam)
@@ -589,14 +602,11 @@ class NotificationService:
                         ts_ms=ts_ms,
                     )
                     for a in alerts:
-                        # Fetch site name and uuid for notification
-                        site_name, site_uuid = await self._get_site_name_and_uuid(cam)
-                        
                         msg = NotificationMessage(
                             id=f"{cam}-trk{a['track_id']}-roi{a['roi_id']}-{ts_ms}",
                             ts_ms=ts_ms,
                             camera_uuid=cam,
-                            site_uuid=site_uuid,
+                            site_uuid=site_uuid_str,
                             site_name=site_name,
                             title=f"ROI Enter: {a['cls_name']}",
                             body=f"{a['cls_name']} entered ROI={a['roi_id']} (track_id={a['track_id']})",
@@ -605,38 +615,22 @@ class NotificationService:
                             max_conf=float(a["conf"]),
                             roi_id=str(a["roi_id"]),
                             track_id=int(a["track_id"]),
+                            device_name=device_name,
+                            camera_name=camera_name,
                         )
+
                         await self.hub.publish(msg)
-                        if self.email:
-                            try:
-                                # Fetch notification emails from database
-                                to_emails = await self._get_notification_emails(cam)
-                                await self.email.send(msg, to_emails=to_emails if to_emails else None)
-                            except Exception:
-                                logger.exception(
-                                    "Email send failed for ROI enter camera=%s track_id=%s roi_id=%s",
-                                    cam,
-                                    a.get("track_id"),
-                                    a.get("roi_id"),
-                                )
 
-            return
+                        if ctx:
+                            self._fire_and_forget(self._persist_and_send(msg, ctx))
 
-
-        if not camera_mode.notification_enabled:
-            return
-        if not camera_mode.detection_enabled:
-            return
-
-        matches = self._extract_interesting(det_ev.detections)
-        if not matches:
             return
 
         now = time.monotonic()
         async with self._lock:
             send_classes: List[str] = []
             for cls_name, _conf in matches:
-                key = (str(det_ev.camera_uuid), cls_name)
+                key = (cam, cls_name)
                 last = self._last_sent.get(key, 0.0)
                 if (now - last) >= self.cooldown_s:
                     self._last_sent[key] = now
@@ -647,31 +641,25 @@ class NotificationService:
 
         max_conf = max([c for (_n, c) in matches] or [0.0])
 
-        # Fetch site name and uuid for notification
-        cam = str(det_ev.camera_uuid)
-        site_name, site_uuid = await self._get_site_name_and_uuid(cam)
- 
         msg = NotificationMessage(
             id=f"{det_ev.camera_uuid}-{det_ev.frame_ts_ms}-{det_ev.frame_seq}",
-            ts_ms=int(det_ev.frame_ts_ms),
+            ts_ms=ts_ms,
             camera_uuid=cam,
-            site_uuid=site_uuid,
+            site_uuid=site_uuid_str,
             site_name=site_name,
             title=f"Detection: {', '.join(sorted(set(send_classes)))}",
             body=f"Detected {', '.join(sorted(set(send_classes)))} (max_conf={max_conf:.2f})",
-            alert_type="item_detected",
+            alert_type="detection_summary",
             cls_names=sorted(set(send_classes)),
             max_conf=float(max_conf),
+            device_name=device_name,
+            camera_name=camera_name,
         )
 
         await self.hub.publish(msg)
-        if self.email:
-            try:
-                # Fetch notification emails from database
-                to_emails = await self._get_notification_emails(cam)
-                await self.email.send(msg, to_emails=to_emails if to_emails else None)
-            except Exception:
-                logger.exception("Email send failed for detection summary camera=%s", cam)
+
+        if ctx:
+            self._fire_and_forget(self._persist_and_send(msg, ctx))
 
     def _extract_interesting(self, detections: List[DetectionItem]) -> List[Tuple[str, float]]:
         out: List[Tuple[str, float]] = []

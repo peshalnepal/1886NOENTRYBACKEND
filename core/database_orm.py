@@ -146,6 +146,9 @@ def sanitize_to_snake_case(name: str) -> str:
 # =========================
 # USER
 # =========================
+# =========================
+# USER
+# =========================
 class User(Base):
     __tablename__ = "users"
 
@@ -165,11 +168,19 @@ class User(Base):
     # Relationships
     sites = relationship("Site", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
     devices = relationship("Device", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
-
     cameras = relationship("Camera", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
 
+    # site-scoped email recipients
     notification_emails = relationship(
         "NotificationEmail",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    # stored notification events
+    notifications = relationship(
+        "Notification",
         back_populates="user",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -180,15 +191,6 @@ class User(Base):
 # SITE
 # =========================
 class Site(Base):
-    """
-    One user -> many sites
-    One site -> many cameras
-    One site <-> many devices (M:N via SiteDevice)
-
-    IMPORTANT:
-      - deleting a Site deletes Cameras (and their children)
-      - deleting a Site DOES NOT delete Devices (only the site-device link rows)
-    """
     __tablename__ = "sites"
 
     site_uuid = Column(GUID, primary_key=True, default=uuid.uuid4, unique=True, nullable=False, index=True)
@@ -204,7 +206,6 @@ class Site(Base):
 
     user = relationship("User", back_populates="sites")
 
-    # Site -> Cameras (delete site => delete cameras)
     cameras = relationship(
         "Camera",
         back_populates="site",
@@ -212,17 +213,31 @@ class Site(Base):
         passive_deletes=True,
     )
 
-    # Site <-> Devices (M:N)
     devices = relationship(
         "Device",
         secondary="site_devices",
         back_populates="sites",
     )
 
+    # site-scoped email recipients
+    notification_emails = relationship(
+        "NotificationEmail",
+        back_populates="site",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    # stored notification events
+    notifications = relationship(
+        "Notification",
+        back_populates="site",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
     __table_args__ = (
         UniqueConstraint("user_id", "site_code", name="uq_site_user_site_code"),
     )
-
 
 # =========================
 # DEVICE
@@ -491,20 +506,65 @@ class VideoRecord(Base):
     camera = relationship("Camera", back_populates="video_records")
 
 
+class Notification(Base):
+    """
+    Stores notification events received for a user's specific site
+    (optionally linked to camera/device).
+    """
+    __tablename__ = "notification"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    site_uuid = Column(GUID, ForeignKey("sites.site_uuid", ondelete="CASCADE"), nullable=False, index=True)
+
+    # optional links (helpful for UI filters)
+    camera_uuid = Column(GUID, ForeignKey("camera.camera_uuid", ondelete="SET NULL"), nullable=True, index=True)
+    device_uuid = Column(GUID, ForeignKey("devices.device_uuid", ondelete="SET NULL"), nullable=True, index=True)
+
+    event_type = Column(String(64), nullable=False, default="detection")  # e.g. detection, offline, roi_alert
+    title = Column(String(255), nullable=True)
+    message = Column(Text, nullable=True)
+
+    payload = Column(JSONDict, nullable=True)  # store raw detection/alert JSON
+    detected_at = Column(DateTime(timezone=True), default=utc_now, index=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+
+    read_at = Column(DateTime(timezone=True), nullable=True)  # for dashboard "read/unread"
+    sent_at = Column(DateTime(timezone=True), nullable=True)  # when email send happened (if applicable)
+    status = Column(String(32), nullable=False, default="created")  # created/sent/failed
+
+    user = relationship("User", back_populates="notifications")
+    site = relationship("Site", back_populates="notifications")
+    camera = relationship("Camera")
+    device = relationship("Device")
+    
 # =========================
 # NOTIFICATION EMAILS
 # =========================
 class NotificationEmail(Base):
+    """
+    Emails that should receive notifications for a specific site.
+    """
     __tablename__ = "notification_emails"
 
     id = Column(Integer, primary_key=True, index=True)
+
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    site_uuid = Column(GUID, ForeignKey("sites.site_uuid", ondelete="CASCADE"), nullable=False, index=True)
 
     email = Column(String(255), nullable=False)
+    is_enabled = Column(Boolean, default=True)
+
     created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     user = relationship("User", back_populates="notification_emails")
+    site = relationship("Site", back_populates="notification_emails")
 
+    __table_args__ = (
+        UniqueConstraint("user_id", "site_uuid", "email", name="uq_notif_email_user_site_email"),
+    )
 
 # =========================
 # EMAIL VERIFICATION
