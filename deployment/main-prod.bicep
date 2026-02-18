@@ -298,7 +298,7 @@ var mediamtxPublicHost = '${mediamtxDns}.${regionForHost}.azurecontainer.io'
 var proxyHost = (mediamtxHostOverride != '') ? mediamtxHostOverride : mediamtxPublicHost
 
 var mediamtxYaml = $'''
-logLevel: warn
+logLevel: info
 logDestinations: [stdout]
 
 # helps with throughput when many streams are active (uses a bit more RAM)
