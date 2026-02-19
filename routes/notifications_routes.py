@@ -2,10 +2,11 @@
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -386,12 +387,127 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+_OBJECT_CLASS_ALIASES: Dict[str, str] = {
+    "person": "person",
+    "people": "person",
+    "persons": "person",
+    "car": "car",
+    "cars": "car",
+    "truck": "truck",
+    "trucks": "truck",
+    "motorcycle": "motorcycle",
+    "motorcycles": "motorcycle",
+    "motor cycle": "motorcycle",
+    "motor bike": "motorcycle",
+    "motorbike": "motorcycle",
+    "motor-bike": "motorcycle",
+}
+
+
+def _canonical_object_class(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+
+    key = str(raw).strip().lower()
+    if not key or key == "all":
+        return None
+
+    key = key.replace("_", " ").replace("-", " ")
+    key = " ".join(key.split())
+
+    normalized = _OBJECT_CLASS_ALIASES.get(key)
+    if normalized:
+        return normalized
+
+    if key.endswith("s"):
+        normalized = _OBJECT_CLASS_ALIASES.get(key[:-1])
+        if normalized:
+            return normalized
+
+    return None
+
+
+def _normalize_object_class(raw: Optional[str]) -> Optional[str]:
+    normalized = _canonical_object_class(raw)
+    if normalized:
+        return normalized
+    if raw is None or str(raw).strip().lower() in {"", "all"}:
+        return None
+
+    raise HTTPException(
+        status_code=422,
+        detail="Invalid object_class. Use one of: person, car, truck, motorcycle",
+    )
+
+
+def _payload_msg(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    msg = payload.get("msg")
+    if isinstance(msg, dict):
+        return msg
+    return payload
+
+
+def _extract_object_classes(event_type: Any, title: Any, message: Any, payload: Any) -> Set[str]:
+    msg = _payload_msg(payload)
+    classes: Set[str] = set()
+
+    for source in (msg.get("cls_names"), payload.get("cls_names") if isinstance(payload, dict) else None):
+        if isinstance(source, (list, tuple)):
+            for item in source:
+                normalized = _canonical_object_class(item)
+                if normalized:
+                    classes.add(normalized)
+
+    for source in (msg.get("cls_name"), payload.get("cls_name") if isinstance(payload, dict) else None):
+        normalized = _canonical_object_class(source)
+        if normalized:
+            classes.add(normalized)
+
+    hint = " ".join(
+        [
+            str(event_type or ""),
+            str(title or ""),
+            str(message or ""),
+        ]
+    ).lower()
+
+    if re.search(r"\bperson\b|\bpeople\b", hint):
+        classes.add("person")
+    if re.search(r"\bcar\b|\bcars\b", hint):
+        classes.add("car")
+    if re.search(r"\btruck\b|\btrucks\b", hint):
+        classes.add("truck")
+    if re.search(r"\bmotor[\s-]?cycle\b|\bmotor bike\b|\bmotorbike\b", hint):
+        classes.add("motorcycle")
+
+    return classes
+
+
+def _is_roi_notification(event_type: Any, title: Any, message: Any, payload: Any) -> bool:
+    hint = " ".join([str(event_type or ""), str(title or ""), str(message or "")]).lower()
+    if "roi" in hint:
+        return True
+
+    msg = _payload_msg(payload)
+    if msg.get("roi_id") not in (None, "", 0):
+        return True
+
+    if isinstance(payload, dict) and payload.get("roi_id") not in (None, "", 0):
+        return True
+
+    return False
+
+
 @router.get("/detections-over-time")
 async def detections_over_time(
     request: Request,
     user_id: int,
     site_uuid: Optional[str] = None,
     hours: int = 24,
+    object_class: Optional[str] = None,
+    roi_only: bool = False,
 ):
     """
     Returns simple time buckets for dashboard charts.
@@ -405,6 +521,8 @@ async def detections_over_time(
         su = uuid.UUID(site_uuid) if site_uuid else None
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid site_uuid")
+
+    class_filter = _normalize_object_class(object_class)
 
     hours_i = max(1, min(int(hours), 24 * 90))
     # Keep output compact and readable:
@@ -420,17 +538,31 @@ async def detections_over_time(
     now_ms = int(now.timestamp() * 1000)
 
     async with sf() as db:
-        stmt = select(Notification.detected_at).where(
+        stmt = select(
+            Notification.detected_at,
+            Notification.event_type,
+            Notification.title,
+            Notification.message,
+            Notification.payload,
+        ).where(
             Notification.user_id == int(user_id),
             Notification.detected_at >= start,
         )
         if su:
             stmt = stmt.where(Notification.site_uuid == su)
 
-        rows = (await db.execute(stmt)).scalars().all()
+        rows = (await db.execute(stmt)).all()
 
     counts: Dict[int, int] = {}
-    for raw_dt in rows:
+    for raw_dt, event_type, title, message, payload in rows:
+        if roi_only and not _is_roi_notification(event_type, title, message, payload):
+            continue
+
+        if class_filter:
+            classes = _extract_object_classes(event_type, title, message, payload)
+            if class_filter not in classes:
+                continue
+
         dt = _as_utc(raw_dt)
         ts_ms = int(dt.timestamp() * 1000)
         bucket = ts_ms - (ts_ms % bucket_ms)
@@ -452,6 +584,8 @@ async def detections_over_time(
         "user_id": int(user_id),
         "site_uuid": str(su) if su else None,
         "hours": hours_i,
+        "object_class": class_filter,
+        "roi_only": bool(roi_only),
         "bucket_minutes": bucket_minutes,
         "from": datetime.fromtimestamp(aligned_start_ms / 1000.0, tz=timezone.utc),
         "to": now,
