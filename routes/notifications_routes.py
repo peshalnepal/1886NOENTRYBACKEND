@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -330,6 +330,7 @@ class DeleteNotificationsRequest(BaseModel):
     user_id: int
     site_uuid: Optional[str] = None
     camera_uuid: Optional[str] = None
+    notification_ids: Optional[List[int]] = None
 
 
 @router.delete("")
@@ -358,12 +359,105 @@ async def delete_notifications(payload: DeleteNotificationsRequest, request: Req
             conds.append(Notification.site_uuid == su)
         if cu:
             conds.append(Notification.camera_uuid == cu)
+        if payload.notification_ids:
+            ids: List[int] = []
+            for raw_id in payload.notification_ids:
+                try:
+                    parsed = int(raw_id)
+                except Exception:
+                    continue
+                if parsed > 0:
+                    ids.append(parsed)
+            ids = sorted(set(ids))
+            if not ids:
+                return {"ok": True, "deleted": 0}
+            conds.append(Notification.id.in_(ids))
 
         stmt = delete(Notification).where(and_(*conds))
         res = await db.execute(stmt)
         await db.commit()
 
     return {"ok": True, "deleted": int(getattr(res, "rowcount", 0) or 0)}
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+@router.get("/detections-over-time")
+async def detections_over_time(
+    request: Request,
+    user_id: int,
+    site_uuid: Optional[str] = None,
+    hours: int = 24,
+):
+    """
+    Returns simple time buckets for dashboard charts.
+    """
+    sf = _session_factory_from_app(request)
+    if sf is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    su = None
+    try:
+        su = uuid.UUID(site_uuid) if site_uuid else None
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid site_uuid")
+
+    hours_i = max(1, min(int(hours), 24 * 90))
+    # Keep output compact and readable:
+    # - 1 day or less => hourly buckets
+    # - over 1 day     => daily buckets
+    bucket_minutes = 60 if hours_i <= 24 else 24 * 60
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours_i)
+    bucket_ms = bucket_minutes * 60 * 1000
+    start_ms = int(start.timestamp() * 1000)
+    aligned_start_ms = start_ms - (start_ms % bucket_ms)
+    now_ms = int(now.timestamp() * 1000)
+
+    async with sf() as db:
+        stmt = select(Notification.detected_at).where(
+            Notification.user_id == int(user_id),
+            Notification.detected_at >= start,
+        )
+        if su:
+            stmt = stmt.where(Notification.site_uuid == su)
+
+        rows = (await db.execute(stmt)).scalars().all()
+
+    counts: Dict[int, int] = {}
+    for raw_dt in rows:
+        dt = _as_utc(raw_dt)
+        ts_ms = int(dt.timestamp() * 1000)
+        bucket = ts_ms - (ts_ms % bucket_ms)
+        counts[bucket] = counts.get(bucket, 0) + 1
+
+    points = []
+    cursor = aligned_start_ms
+    while cursor <= now_ms:
+        points.append(
+            {
+                "bucket_start": datetime.fromtimestamp(cursor / 1000.0, tz=timezone.utc),
+                "count": int(counts.get(cursor, 0)),
+            }
+        )
+        cursor += bucket_ms
+
+    total = sum(p["count"] for p in points)
+    return {
+        "user_id": int(user_id),
+        "site_uuid": str(su) if su else None,
+        "hours": hours_i,
+        "bucket_minutes": bucket_minutes,
+        "from": datetime.fromtimestamp(aligned_start_ms / 1000.0, tz=timezone.utc),
+        "to": now,
+        "total": int(total),
+        "points": points,
+    }
 
 
 @router.get("/unread-count")
