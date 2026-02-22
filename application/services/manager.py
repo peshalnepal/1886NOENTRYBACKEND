@@ -406,13 +406,13 @@ class Manager:
         user_id: Optional[int] = None,
         dry_run: bool = False,
         delete_unknown: bool = True,
+        camera_code_prefix: str = "cam",
     ) -> Dict[str, List[str]]:
         uid = int(user_id or self._default_user_id)
 
         async with self._lock:
             async with self._session_factory() as db:
                 dev = await self._get_device(db, device_uuid)
-
                 edge_set = await self._edge.list_cameras(device_url=dev.device_url)
 
                 q = (
@@ -459,6 +459,8 @@ class Manager:
                     }
                     try:
                         await self._edge.upsert_camera(device_url=dev.device_url, payload=payload)
+                        camera_code = f"{camera_code_prefix}-{cu.hex[:8]}"
+                        await self._webrtc.ensure_stream(stream_key=str(camera_code), rtsp_url=str(cam.rtsp_url))
                         out["added"].append(cu)
                     except Exception as e:
                         logger.warning("Edge upsert failed during reconcile for camera %s", cu, exc_info=True)
