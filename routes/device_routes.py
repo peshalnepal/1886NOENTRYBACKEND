@@ -14,9 +14,7 @@ from application.services.manager import Manager
 router = APIRouter(prefix="/devices", tags=["devices"])
 
 
-# -----------------------
-# Helpers
-# -----------------------
+
 def _is_blank(s: Optional[str]) -> bool:
     return s is None or (isinstance(s, str) and s.strip() == "")
 
@@ -173,7 +171,6 @@ async def reconcile_edge_cameras(
 ):
     device = await _get_device_or_404(db, user.id, device_uuid)
 
-    # You need this Manager method (short version) — see next section
     result = await manager.reconcile_device_edge_simple(
         device_uuid=device_uuid,
         user_id=user.id,

@@ -350,9 +350,6 @@ async def latest_detections_for_site(
     return {"site_uuid": str(site_uuid), "latest": out}
 
 
-# -------------------------
-# Create / Edit / Delete
-# -------------------------
 @router.post("", response_model=CameraWithConfigSchema)
 async def create_camera(
     payload: CameraCreateSchema,
@@ -464,10 +461,6 @@ async def delete_camera(
     await manager.update_pipeline(pipeline.pipeline_id, [ev])
     return {"ok": True}
 
-
-# --------------------------------------------------------------------
-# Legacy endpoints (MJPEG/snapshot) intentionally disabled
-# --------------------------------------------------------------------
 @router.get("/{camera_uuid}/snapshot.jpg")
 async def snapshot_jpg(camera_uuid: uuid.UUID):
     raise HTTPException(

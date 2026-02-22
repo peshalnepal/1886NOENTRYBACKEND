@@ -97,3 +97,102 @@ class WebRTCGatewayClient:
             await self._client.delete(url, auth=self._auth())
         except Exception:
              logger.warning(f"MediaMTX delete failed for {stream_key}", exc_info=True)
+
+
+    async def list_configured_paths(self) -> List[Dict[str, Any]]:
+        """
+        List configured paths in MediaMTX (i.e., what you've added via /v3/config/paths/add).
+        Returns the raw 'items' array (filtered for non-null).
+        """
+        if not self.admin_api_url:
+            return []
+
+        url = f"{self.admin_api_url}/v3/config/paths/list"
+        try:
+            r = await self._client.get(url, auth=self._auth())
+            r.raise_for_status()
+            data = r.json() or {}
+            items = data.get("items") or []
+            # Some versions may include nulls in items; filter them out
+            return [it for it in items if isinstance(it, dict)]
+        except Exception:
+            logger.exception("MediaMTX list_configured_paths failed")
+            return []
+
+    async def list_active_paths(self) -> List[Dict[str, Any]]:
+        """
+        List active paths (runtime) including 'readers' (viewers) and other stats.
+        """
+        if not self.admin_api_url:
+            return []
+
+        url = f"{self.admin_api_url}/v3/paths/list"
+        try:
+            r = await self._client.get(url, auth=self._auth())
+            r.raise_for_status()
+            data = r.json() or {}
+            items = data.get("items") or []
+            return [it for it in items if isinstance(it, dict)]
+        except Exception:
+            logger.exception("MediaMTX list_active_paths failed")
+            return []
+
+    @staticmethod
+    def _count_reader_types(readers: Any) -> Dict[str, int]:
+        """
+        MediaMTX 'readers' is a list of objects like:
+          { "type": "webRTCSession" | "rtspSession" | "hlsMuxer" | ..., "id": "..." }
+        """
+        out: Dict[str, int] = {}
+        if not isinstance(readers, list):
+            return out
+        for r in readers:
+            if not isinstance(r, dict):
+                continue
+            t = str(r.get("type") or "unknown")
+            out[t] = out.get(t, 0) + 1
+        return out
+
+    async def list_webrtc_cameras(self, *, include_active: bool = True) -> List[Dict[str, Any]]:
+        """
+        Your "camera list" for the MediaMTX server:
+        - Uses config list as the source of truth (configured paths)
+        - Optionally merges in runtime stats (active readers/viewers)
+        """
+        cfg_paths = await self.list_configured_paths()
+
+        active_by_name: Dict[str, Dict[str, Any]] = {}
+        if include_active:
+            for p in await self.list_active_paths():
+                name = p.get("name")
+                if isinstance(name, str) and name:
+                    active_by_name[name] = p
+
+        out: List[Dict[str, Any]] = []
+        for c in cfg_paths:
+            name = c.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+
+            active = active_by_name.get(name) or {}
+            readers = active.get("readers") or []
+            counts = self._count_reader_types(readers)
+
+            out.append(
+                {
+                    "stream_key": name,
+                    "rtsp_url": c.get("source"),                 # what you set in ensure_stream()
+                    "webrtc_url": self._derive_public_webrtc_url(name),
+                    "max_readers": c.get("maxReaders"),
+                    "source_on_demand": c.get("sourceOnDemand"),
+                    # runtime (optional)
+                    "ready": active.get("ready"),
+                    "bytes_received": active.get("bytesReceived"),
+                    "bytes_sent": active.get("bytesSent"),
+                    "readers": sum(counts.values()),
+                    "reader_types": counts,
+                    "webrtc_readers": counts.get("webRTCSession", 0),
+                }
+            )
+
+        return out
