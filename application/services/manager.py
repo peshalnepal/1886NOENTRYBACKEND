@@ -425,7 +425,7 @@ class Manager:
                 cams = (await db.execute(q)).scalars().all()
 
                 desired_set = {str(c.camera_uuid) for c in cams if c.is_enabled and c.is_detection_enabled}
-                active_streams={str(cam.camera_code) for c in cams if c.is_enabled}
+                active_streams={str(c.camera_code) for c in cams if c.is_enabled}
                 to_add = sorted(desired_set - edge_set)
                 to_remove = sorted(edge_set - desired_set)
                 to_add_stream= sorted(active_streams - webrtc_set)
@@ -434,8 +434,8 @@ class Manager:
                 out: Dict[str, List[str]] = {
                     "to_add": to_add,
                     "to_remove": to_remove,
-                    "to_add_stream": to_add,
-                    "to_remove_stream": to_remove,
+                    "to_add_stream": to_add_stream,
+                    "to_remove_stream": to_remove_stream,
                     "added": [],
                     "removed": [],
                     "errors": [],
@@ -483,7 +483,7 @@ class Manager:
                         out["errors"].append(f"Camera not found in DB during reconcile: {cu}")
                         continue
                     try:
-                        await self._webrtc.update_stream(stream_key=cu,rtsp_url=cam.rtsp_url)
+                        await self._webrtc.ensure_stream(stream_key=cu,rtsp_url=cam.rtsp_url)
                         if cam.camera_uuid not in out["added"]:
                             out["added"].append(cam.camera_uuid)
                     except Exception as e:

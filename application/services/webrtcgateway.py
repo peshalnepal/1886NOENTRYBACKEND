@@ -32,7 +32,7 @@ class WebRTCGatewayClient:
         self.api_user = os.getenv("MTX_API_USER", "api")
         self.api_pass = os.getenv("MTX_API_PASS", "api_pass_123")
 
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=10.0))
 
     async def close(self) -> None:
         await self._client.aclose()

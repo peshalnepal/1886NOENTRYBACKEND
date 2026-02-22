@@ -49,7 +49,7 @@ class EdgeInferenceClient:
         self.api_key = os.getenv("EDGE_API_KEY")
         self.list_path = os.getenv("EDGE_LIST_PATH", self.add_path)
 
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=10.0))
 
     async def close(self) -> None:
         await self._client.aclose()

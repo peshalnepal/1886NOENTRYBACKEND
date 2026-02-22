@@ -16,9 +16,12 @@ pythonenv*/
 # Python cache / compiled
 # -------------------------
 __pycache__/
+**/__pycache__/
 tensort/__pycache__/
+routes/__pycache__
 *.py[cod]
 *$py.class
 *.pyo
 *.pyd
 .env
+*.log
