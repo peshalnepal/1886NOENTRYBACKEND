@@ -406,7 +406,6 @@ class Manager:
         user_id: Optional[int] = None,
         dry_run: bool = False,
         delete_unknown: bool = True,
-        camera_code_prefix: str = "cam",
     ) -> Dict[str, List[str]]:
         uid = int(user_id or self._default_user_id)
 
@@ -459,7 +458,7 @@ class Manager:
                     }
                     try:
                         await self._edge.upsert_camera(device_url=dev.device_url, payload=payload)
-                        camera_code = f"{camera_code_prefix}-{cu.hex[:8]}"
+                        camera_code = cam.camera_code
                         await self._webrtc.ensure_stream(stream_key=str(camera_code), rtsp_url=str(cam.rtsp_url))
                         out["added"].append(cu)
                     except Exception as e:
@@ -470,6 +469,8 @@ class Manager:
                     for cu in to_remove:
                         try:
                             await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=cu)
+                            camera_code = cam.camera_code
+                            await self._webrtc.delete_stream(stream_key=str(camera_code))
                             out["removed"].append(cu)
                         except Exception as e:
                             logger.warning("Edge delete failed during reconcile for camera %s", cu, exc_info=True)
@@ -554,7 +555,7 @@ class Manager:
         patch["camera_uuid"] = cam_uuid
         patch["channel_id"] = cam_uuid  # keep compatibility
 
-        camera_code = f"{camera_code_prefix}-{uuid.uuid4().hex[:8]}"
+        camera_code = f"{camera_code_prefix}-{cam_uuid.hex[:8]}"
         webrtc_url = await self._webrtc.ensure_stream(stream_key=str(camera_code), rtsp_url=str(rtsp_url))
         cam, cfg_json, tz = await self.channel_repo.upsert_camera_from_channel_config(
             db,
@@ -679,13 +680,10 @@ class Manager:
         old_rtsp = cam_db.rtsp_url
         old_webrtc = cam_db.webrtc_url
 
-        # ✅ must have exactly one device already
         old_dev = await self._get_single_camera_device(db, cam_uuid, required=True)
 
         patch = self._patch_to_dict(getattr(ev, "configs", None))
-        patch.pop("webrtc_url", None)  # we keep existing / stable mapping
-
-        # device_uuid is optional on edit; if omitted, keep existing
+        patch.pop("webrtc_url", None)
         new_device_uuid = patch.get("device_uuid")
         if new_device_uuid is None:
             new_device_uuid = old_dev.device_uuid
@@ -699,7 +697,6 @@ class Manager:
             merged_cfg.update(chan_cfg_db.configuration or {})
         merged_cfg.update(patch)
 
-        # write camera + channel_config
         cam2, cfg_json, tz = await self.channel_repo.upsert_camera_from_channel_config(
             db,
             pipeline_id=pid,
@@ -718,7 +715,6 @@ class Manager:
         )
 
         if old_dev.device_uuid != new_device_uuid:
-            # remove from old device first (best-effort)
             try:
                 await self._edge.delete_camera(device_url=old_dev.device_url, camera_uuid=str(cam_uuid))
             except Exception:
@@ -831,15 +827,12 @@ class Manager:
             if existing_pid is not None and existing_pid != pid:
                 raise ValueError("Camera does not belong to provided pipeline_id")
 
-            # delete from edge (best-effort)
             try:
                 dev = await self._get_single_camera_device(db, cam_uuid, required=False)
                 if dev and dev.device_url:
                     await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid))
             except Exception:
                 logger.warning("Edge delete failed during camera removal", exc_info=True)
-
-            # delete WebRTC stream mapping
             try:
                 if cam_db.camera_code:
                     await self._webrtc.delete_stream(stream_key=str(cam_db.camera_code))
@@ -848,7 +841,6 @@ class Manager:
 
             await self.channel_repo.delete_camera(db, camera_uuid=cam_db.camera_uuid)
 
-        # update cached model pipeline
         if active:
             try:
                 await active.remove_channel(cam_uuid)
@@ -878,6 +870,7 @@ class Manager:
             for cam in cameras_on_device:
                 try:
                     await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam.camera_uuid))
+                    await self._webrtc.delete_stream(stream_key=str(cam.camera_code))
                 except Exception:
                     logger.warning("Failed cleanup camera %s on device %s", cam.camera_uuid, dev.device_uuid, exc_info=True)
         except Exception:
