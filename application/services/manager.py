@@ -331,9 +331,6 @@ class Manager:
             return mp
         return await self.create_pipeline(uid)
 
-    # -------------------------
-    # Update pipeline from events
-    # -------------------------
     async def update_pipeline(
         self,
         pipeline_id: Union[str, uuid.UUID],

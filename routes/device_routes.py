@@ -152,9 +152,8 @@ async def delete_device(
     manager: Manager = Depends(get_manager),  # NEW dependency
 ):
     device = await _get_device_or_404(db, user.id, device_uuid)
-    
-    # NEW: cleanup edge resources
-    await manager.cleanup_device_resources(db, device_uuid=device_uuid)
+    active_pipeline=await manager.get_activepipeline(user_id=user.id)
+    await manager.cleanup_device_resources(db, device_uuid=device_uuid,active=active_pipeline)
     
     await db.delete(device)
     await db.commit()

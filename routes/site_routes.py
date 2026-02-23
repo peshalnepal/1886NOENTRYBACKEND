@@ -203,7 +203,9 @@ async def unlink_device_from_site(
 
 ):
     site = await _get_site_or_404(db, user.id, site_uuid)
-    await manager.cleanup_site_resources(user_id=user.id,site_uuid=site_uuid)
+    active_pipeline=manager.get_activepipeline(user_id=user.id)
+    await manager.cleanup_site_resources(user_id=user.id,site_uuid=site_uuid,active=active_pipeline)
+
     stmt = delete(SiteDevice).where(
         SiteDevice.site_uuid == site.site_uuid,
         SiteDevice.device_uuid == device_uuid,
