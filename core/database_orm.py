@@ -530,18 +530,16 @@ class Notification(Base):
     detected_at = Column(DateTime(timezone=True), default=utc_now, index=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
-    read_at = Column(DateTime(timezone=True), nullable=True)  # for dashboard "read/unread"
-    sent_at = Column(DateTime(timezone=True), nullable=True)  # when email send happened (if applicable)
-    status = Column(String(32), nullable=False, default="created")  # created/sent/failed
+    read_at = Column(DateTime(timezone=True), nullable=True) 
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(String(32), nullable=False, default="created")
+    visible=Column(Boolean,default=True)
 
     user = relationship("User", back_populates="notifications")
     site = relationship("Site", back_populates="notifications")
     camera = relationship("Camera")
     device = relationship("Device")
     
-# =========================
-# NOTIFICATION EMAILS
-# =========================
 class NotificationEmail(Base):
     """
     Emails that should receive notifications for a specific site.

@@ -48,8 +48,6 @@ async def notifications_stream(request: Request):
             while True:
                 if await request.is_disconnected():
                     break
-
-                # Keepalive ping every 20s so proxies don’t kill the connection
                 now = time.monotonic()
                 if (now - last_ping) > 20.0:
                     last_ping = now
@@ -86,7 +84,6 @@ class AlertRequest(BaseModel):
 
 
 def _parse_box(raw_box: Any) -> Optional[DetectionBox]:
-    # Accept dict {"x1":..,"y1":..,"x2":..,"y2":..} or list [x1,y1,x2,y2]
     if isinstance(raw_box, dict):
         keys = ("x1", "y1", "x2", "y2")
         if not all(k in raw_box for k in keys):
@@ -165,7 +162,6 @@ async def receive_alert(payload: AlertRequest, request: Request):
         detections=det_items,
     )
 
-    # Fetch camera mode from DB (correct UUID compare)
     mode = CameraMode(detection_enabled=True, notification_enabled=True)
     sf = _session_factory_from_app(request)
     if sf is not None:
@@ -200,9 +196,6 @@ async def receive_alert(payload: AlertRequest, request: Request):
     return {"ok": True}
 
 
-# ---------------------------
-# DB-backed notifications (list / clear / delete)
-# ---------------------------
 class NotificationOut(BaseModel):
     id: int
     user_id: int
@@ -252,7 +245,6 @@ async def list_notifications(
     if sf is None:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    # parse filters
     su = None
     cu = None
     try:
@@ -266,7 +258,8 @@ async def list_notifications(
         raise HTTPException(status_code=422, detail="Invalid camera_uuid")
 
     async with sf() as db:
-        stmt = select(Notification).where(Notification.user_id == int(user_id))
+        stmt = select(Notification).where(Notification.user_id == int(user_id),
+                                          Notification.visible==True)
         if su:
             stmt = stmt.where(Notification.site_uuid == su)
         if cu:
@@ -374,8 +367,12 @@ async def delete_notifications(payload: DeleteNotificationsRequest, request: Req
                 return {"ok": True, "deleted": 0}
             conds.append(Notification.id.in_(ids))
 
-        stmt = delete(Notification).where(and_(*conds))
-        res = await db.execute(stmt)
+        stmt = (
+            update(Notification)
+            .where(and_(*conds))
+            .values(visible=False)
+        )
+        res = await db.execute(stmt)        
         await db.commit()
 
     return {"ok": True, "deleted": int(getattr(res, "rowcount", 0) or 0)}
@@ -614,6 +611,7 @@ async def unread_count(
         stmt = select(func.count(Notification.id)).where(
             Notification.user_id == int(user_id),
             Notification.read_at.is_(None),
+            Notification.visible==True
         )
         if su:
             stmt = stmt.where(Notification.site_uuid == su)
