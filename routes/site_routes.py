@@ -8,8 +8,9 @@ from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import Site, Device, SiteDevice  # adjust import path
-from dependencies import get_db, get_async_db, get_current_user      # adjust import path
+from dependencies import get_db, get_async_db, get_current_user, get_manager
 from routes.device_routes import DeviceOut
+from application.services.manager import Manager
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -198,9 +199,11 @@ async def unlink_device_from_site(
     device_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
+    manager: Manager = Depends(get_manager),  # NEW dependency
+
 ):
     site = await _get_site_or_404(db, user.id, site_uuid)
-
+    await manager.cleanup_site_resources(user_id=user.id,site_uuid=site_uuid)
     stmt = delete(SiteDevice).where(
         SiteDevice.site_uuid == site.site_uuid,
         SiteDevice.device_uuid == device_uuid,

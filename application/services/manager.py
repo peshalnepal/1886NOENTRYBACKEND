@@ -11,10 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from fastapi import HTTPException
 
 from application.repositories.pipeline_repository import PipelineRepository
 from application.repositories.channel_repository import ChannelRepository
-from core.database_orm import Device, Camera, CameraDevice
+from core.database_orm import Site,Device, Camera, CameraDevice
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent, VideoChannelEvent
 from domain.model_pipeline import ModelPipeline
 from application.channels.channel_config import VideoChannelConfig
@@ -779,7 +780,6 @@ class Manager:
         except Exception:
             logger.warning("Edge sync failed during camera edit", exc_info=True)
 
-        # update cached model pipeline
         if active:
             runtime_overrides = _runtime_config_overrides(merged_cfg)
             vcc = VideoChannelConfig(
@@ -873,7 +873,7 @@ class Manager:
         events_out = [{"event_type": "Remove_Channel", "camera_uuid": str(cam_uuid)}]
         return [], events_out
 
-    async def cleanup_device_resources(self, db: AsyncSession, *, device_uuid: uuid.UUID) -> None:
+    async def cleanup_device_resources(self, db: AsyncSession, *, device_uuid: uuid.UUID,active: Optional[ModelPipeline]) -> None:
         """
         Called when a Device is about to be deleted.
         Finds all cameras on this device and sends DELETE to the edge service.
@@ -889,12 +889,57 @@ class Manager:
                 .where(CameraDevice.device_uuid == device_uuid)
             )
             cameras_on_device = (await db.execute(q)).scalars().all()
-
+            
             for cam in cameras_on_device:
                 try:
                     await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam.camera_uuid))
-                    await self._webrtc.delete_stream(stream_key=str(cam.camera_code))
+                    if cam.camera_code:
+                        await self._webrtc.delete_stream(stream_key=str(cam.camera_code))
+                    await self.channel_repo.delete_camera(db, camera_uuid=cam.camera_uuid)
+                    if active:
+                        try:
+                            await active.remove_channel(cam.camera_uuid)
+                        except Exception:
+                            logger.warning("Failed removing channel from cached ModelPipeline", exc_info=True)
+
                 except Exception:
                     logger.warning("Failed cleanup camera %s on device %s", cam.camera_uuid, dev.device_uuid, exc_info=True)
         except Exception:
             logger.exception("Error during device cleanup for %s", device_uuid)
+            
+    async def _get_site(db: AsyncSession, user_id: int, site_uuid: uuid.UUID) -> Site:
+        q = select(Site).where(Site.site_uuid == site_uuid, Site.user_id == user_id)
+        site = (await db.execute(q)).scalar_one_or_none()
+        if not site:
+            raise HTTPException(status_code=404, detail="Site not found")
+        return site
+
+
+    async def cleanup_site_resources(self, db: AsyncSession, *,user_id: int, site_uuid: uuid.UUID,active: Optional[ModelPipeline]) -> None:
+        """
+        Called when a Site is about to be deleted.
+        Finds all cameras on this site and sends DELETE to the edge service.
+        """
+        try:
+            site = await self._get_site(db,user_id=user_id, site_uuid=site_uuid)
+            if not site.site_uuid:
+                return
+            q = (
+                select(Camera)
+                .where(Camera.site_uuid == site_uuid)
+                .options(selectinload(Camera.devices))
+            )
+            cameras_on_site = (await db.execute(q)).scalars().all()
+
+            for cam in cameras_on_site:
+
+                if cam.devices and cam.devices[0].device_url:
+                    await self._edge.delete_camera(device_url=cam.devices[0].device_url, camera_uuid=str(cam.camera_uuid))                    await self.channel_repo.delete_camera(db, camera_uuid=cam.camera_uuid)
+                if active:
+                    try:
+                        await active.remove_channel(cam.camera_uuid)
+                    except Exception:
+                        logger.warning("Failed removing channel from cached ModelPipeline", exc_info=True)
+
+        except Exception:
+            logger.exception("Error during device cleanup for %s", site_uuid)
