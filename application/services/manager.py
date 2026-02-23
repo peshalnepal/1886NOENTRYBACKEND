@@ -743,14 +743,12 @@ class Manager:
 
             await self._set_single_camera_device(db, cam_uuid, new_device_uuid)
 
-        # update WebRTC source if rtsp changed
         if cam2.rtsp_url != old_rtsp and cam2.camera_code:
             await self._webrtc.update_stream(stream_key=str(cam2.camera_code), rtsp_url=cam2.rtsp_url)
 
         enabled = bool(cam2.is_enabled)
         det_enabled = bool(cam2.is_detection_enabled)
 
-        # send to edge
         try:
             if enabled and det_enabled:
                 if old_dev.device_uuid != new_device_uuid:
@@ -931,7 +929,10 @@ class Manager:
             for cam in cameras_on_site:
 
                 if cam.devices and cam.devices[0].device_url:
-                    await self._edge.delete_camera(device_url=cam.devices[0].device_url, camera_uuid=str(cam.camera_uuid))                    await self.channel_repo.delete_camera(db, camera_uuid=cam.camera_uuid)
+                    await self._edge.delete_camera(device_url=cam.devices[0].device_url, camera_uuid=str(cam.camera_uuid))    
+                if cam.camera_code:
+                    await self._webrtc.delete_stream(stream_key=str(cam.camera_code))
+                await self.channel_repo.delete_camera(db, camera_uuid=cam.camera_uuid)
                 if active:
                     try:
                         await active.remove_channel(cam.camera_uuid)
