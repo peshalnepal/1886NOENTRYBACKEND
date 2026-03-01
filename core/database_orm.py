@@ -146,14 +146,6 @@ def sanitize_to_snake_case(name: str) -> str:
 # =========================
 # USER
 # =========================
-# =========================
-# USER
-# =========================
-from sqlalchemy import DateTime, Boolean, String, Column
-from datetime import datetime, timezone
-
-def utc_now():
-    return datetime.now(timezone.utc)
 
 class User(Base):
     __tablename__ = "users"
@@ -570,9 +562,6 @@ class NotificationEmail(Base):
 # =========================
 # EMAIL VERIFICATION
 # =========================
-
-def utc_now():
-    return datetime.now(timezone.utc)
 
 class EmailVerification(Base):
     __tablename__ = "email_verifications"

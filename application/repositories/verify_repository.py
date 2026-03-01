@@ -1,10 +1,24 @@
+import os
 from datetime import timedelta
+
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from core.database_orm import EmailVerification,utc_now
-import os
-OTP_TTL_SECONDS = 10 * 60
-OTP_MAX_ATTEMPTS = os.getenv("OTP_MAX_ATTEMPTS",5)
+
+from core.database_orm import EmailVerification, utc_now
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+OTP_TTL_SECONDS = max(60, _env_int("OTP_TTL_SECONDS", 600))
+
 
 class EmailVerificationRepository:
     def __init__(self, db: AsyncSession):
@@ -15,6 +29,7 @@ class EmailVerificationRepository:
             update(EmailVerification)
             .where(EmailVerification.email == email, EmailVerification.used == False)  # noqa: E712
             .values(used=True, consumed_at=utc_now())
+            .execution_options(synchronize_session=False)
         )
         await self.db.execute(stmt)
 
@@ -37,7 +52,7 @@ class EmailVerificationRepository:
             user_agent=user_agent,
         )
         self.db.add(v)
-        await self.db.flush()  
+        await self.db.flush()
         return v
 
     async def get_latest_active(self, email: str) -> EmailVerification | None:
@@ -60,6 +75,7 @@ class EmailVerificationRepository:
             update(EmailVerification)
             .where(EmailVerification.id == verification_id)
             .values(attempts=EmailVerification.attempts + 1)
+            .execution_options(synchronize_session=False)
         )
         await self.db.execute(stmt)
 
@@ -68,5 +84,6 @@ class EmailVerificationRepository:
             update(EmailVerification)
             .where(EmailVerification.id == verification_id)
             .values(used=True, consumed_at=utc_now())
+            .execution_options(synchronize_session=False)
         )
         await self.db.execute(stmt)
