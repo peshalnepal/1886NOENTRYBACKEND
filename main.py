@@ -11,7 +11,7 @@ from routes.site_routes import router as sites_router
 from routes.device_routes import router as devices_router
 from routes.notifications_routes import router as notifications_router
 from routes.notification_email_routes import router as notification_emails_router
-from routes.auth.signup import router as auth_router
+from routes.auth import router as auth_router
 
 from core.config import DEBUG
 from core.database import db_manager, async_engine

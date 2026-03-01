@@ -264,6 +264,15 @@ class ModelPipeline:
         if cur_ts == prev_ts and cur_seq > prev_seq:
             return True
 
+        # exact duplicate frame (same ts and seq): not new, and not a restart.
+        if cur_ts == prev_ts and cur_seq == prev_seq:
+            return False
+
+        # stale/backward frame but no actual regression (older seq with newer ts is handled above)
+        regressed = (cur_ts < prev_ts) or (cur_ts == prev_ts and cur_seq < prev_seq)
+        if not regressed:
+            return False
+
         # regression case: if we had a gap (disconnect), assume Jetson restarted -> accept & reset
         last_ok = self._last_ok_s.get(key, 0.0)
         if (time.monotonic() - last_ok) > 5.0:
