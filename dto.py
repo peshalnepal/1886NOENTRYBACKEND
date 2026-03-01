@@ -71,8 +71,8 @@ class SignupRequestCode(BaseModel):
 
     @field_validator("user_email")
     @classmethod
-    def normalize_email(cls, v: EmailStr) -> EmailStr:
-        return EmailStr(str(v).lower())
+    def normalize_email(cls, v: EmailStr) -> str:
+        return str(v).lower().strip()
 
 
 class SignupConfirm(BaseModel):
@@ -85,8 +85,8 @@ class SignupConfirm(BaseModel):
 
     @field_validator("user_email")
     @classmethod
-    def normalize_email(cls, v: EmailStr) -> EmailStr:
-        return EmailStr(str(v).lower())
+    def normalize_email(cls, v: EmailStr) -> str:
+        return str(v).lower().strip()
 
     @field_validator("password")
     @classmethod
@@ -111,5 +111,5 @@ class LoginRequest(BaseModel):
 
     @field_validator("user_email")
     @classmethod
-    def normalize_email(cls, v: EmailStr) -> EmailStr:
-        return EmailStr(str(v).lower())
+    def normalize_email(cls, v: EmailStr) -> str:
+        return str(v).lower().strip()
