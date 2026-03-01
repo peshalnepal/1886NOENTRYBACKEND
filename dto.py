@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, Protocol, Tuple, runtime_checkable,Literal
+from typing import Optional, Tuple,Literal
 import uuid
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator,SecretStr
+from datetime import datetime, timezone
+from pydantic import BaseModel, EmailStr, Field, SecretStr, ConfigDict, field_validator, model_validator
+import re
 
 from abc import ABC
 
@@ -49,3 +52,64 @@ class ChannelConfig(ABC):
     reconnect_max_ms: int
     emit_format: Literal["raw", "jpeg"]
     jpeg_quality: int
+
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+PASSWORD_MIN_LEN = 8
+
+class SignupRequestCode(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    user_name: str = Field(..., min_length=1, max_length=100)
+    user_email: EmailStr
+
+    @field_validator("user_email")
+    @classmethod
+    def normalize_email(cls, v: EmailStr) -> EmailStr:
+        return EmailStr(str(v).lower())
+
+
+class SignupConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    user_name: str = Field(..., min_length=1, max_length=100)
+    user_email: EmailStr
+    code: str = Field(..., min_length=6, max_length=10)  # e.g., "123456"
+    password: SecretStr = Field(..., min_length=PASSWORD_MIN_LEN)
+
+    @field_validator("user_email")
+    @classmethod
+    def normalize_email(cls, v: EmailStr) -> EmailStr:
+        return EmailStr(str(v).lower())
+
+    @field_validator("password")
+    @classmethod
+    def password_complexity(cls, v: SecretStr) -> SecretStr:
+        pw = v.get_secret_value()
+        if len(pw) < PASSWORD_MIN_LEN:
+            raise ValueError("Password must be at least 8 characters")
+        if not re.search(r"[A-Z]", pw):
+            raise ValueError("Password must contain at least 1 uppercase letter")
+        if not re.search(r"\d", pw):
+            raise ValueError("Password must contain at least 1 digit")
+        return v
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    user_email: EmailStr
+    password: SecretStr
+    # If you want the request time too (optional):
+    login_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("user_email")
+    @classmethod
+    def normalize_email(cls, v: EmailStr) -> EmailStr:
+        return EmailStr(str(v).lower())

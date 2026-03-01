@@ -66,7 +66,7 @@ class CameraCreateSchema(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
 
-    user_id: int = Field(..., ge=1, description="Current user id (single-tenant now, multi-tenant later).")
+    user_id: Optional[int] = Field(default=None, ge=1, description="Optional. Server resolves user from JWT.")
 
     site_uuid: uuid.UUID
     device_uuid: uuid.UUID

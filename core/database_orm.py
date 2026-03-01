@@ -149,22 +149,25 @@ def sanitize_to_snake_case(name: str) -> str:
 # =========================
 # USER
 # =========================
+from sqlalchemy import DateTime, Boolean, String, Column
+from datetime import datetime, timezone
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
 class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
     user_name = Column(String(255), nullable=False)
-    email = Column(String(255), unique=True, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
-
-    business_url = Column(String(255), nullable=False)
-    contact_name = Column(String(255), nullable=True)
     contact_phone = Column(String(20), nullable=True)
-    business_address = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 
-    created_at = Column(DateTime(timezone=True), default=utc_now)
-    email_verified = Column(Boolean, default=False)
-
+    email_verified = Column(Boolean, default=False, nullable=False)
+    verified_at = Column(DateTime(timezone=True), nullable=True)
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
     # Relationships
     sites = relationship("Site", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
     devices = relationship("Device", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
@@ -567,18 +570,34 @@ class NotificationEmail(Base):
 # =========================
 # EMAIL VERIFICATION
 # =========================
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
 class EmailVerification(Base):
     __tablename__ = "email_verifications"
 
     id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), index=True)
-    code = Column(String(6), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=utc_now)
+
+    email = Column(String(255), index=True, nullable=False)
+
+    # store hashed OTP (e.g., sha256 hex -> 64 chars)
+    code_hash = Column(String(128), nullable=False)
+
+    sent_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
-    used = Column(Boolean, default=False)
+
+    attempts = Column(Integer, default=0, nullable=False)
+    used = Column(Boolean, default=False, nullable=False)
+
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+
+    # optional: for debugging/auditing/rate-limits
+    ip = Column(String(64), nullable=True)
+    user_agent = Column(String(512), nullable=True)
+
+    # optional extra payload (json string or JSONDict)
     additional_data = Column(String(2048), nullable=True)
-
-
 # =========================
 # SYSTEM SETTINGS
 # =========================

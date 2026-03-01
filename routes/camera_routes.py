@@ -12,10 +12,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dependencies import get_async_db, get_manager
+from dependencies import get_async_db, get_current_user, get_manager
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent
+from core.database_orm import User
 from core.schemas import (
     CameraSchema,
     CameraCreateSchema,
@@ -26,6 +27,11 @@ from application.services.manager import Manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/cameras", tags=["cameras"])
+
+
+def _ensure_user_owns_camera(cam: Any, user_id: int) -> None:
+    if int(getattr(cam, "user_id", -1)) != int(user_id):
+        raise HTTPException(status_code=404, detail="Camera not found")
 
 
 # -------------------------
@@ -119,6 +125,7 @@ def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
 @router.get("", response_model=List[CameraSchema])
 async def list_cameras(
     db: AsyncSession = Depends(get_async_db),
+    user: User = Depends(get_current_user),
     site_uuid: uuid.UUID = None,  # keep query param; if None -> 422 below
 ):
     """
@@ -134,6 +141,7 @@ async def list_cameras(
         raise HTTPException(status_code=400, detail="site_uuid is required")
 
     cams = await site_repo.list_cameras_by_site(db, site_uuid=site_uuid)
+    cams = [cam for cam in cams if int(getattr(cam, "user_id", -1)) == int(user.id)]
 
     out: List[CameraSchema] = []
     for cam in cams:
@@ -163,6 +171,7 @@ async def list_cameras(
 async def get_camera(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
+    user: User = Depends(get_current_user),
 ):
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
@@ -170,6 +179,7 @@ async def get_camera(
         raise HTTPException(status_code=404, detail="Camera not found")
 
     cam, cfg, _pid = full
+    _ensure_user_owns_camera(cam, user.id)
 
     # New rule: must have exactly 1 device
     try:
@@ -199,6 +209,7 @@ async def get_camera(
 async def get_camera_playback(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
+    user: User = Depends(get_current_user),
 ):
     """Returns the WebRTC playback URL for this camera."""
     repo = ChannelRepository()
@@ -207,6 +218,7 @@ async def get_camera_playback(
         raise HTTPException(status_code=404, detail="Camera not found")
 
     cam, _cfg, _pid = full
+    _ensure_user_owns_camera(cam, user.id)
     if not getattr(cam, "webrtc_url", None):
         raise HTTPException(status_code=409, detail="WebRTC URL not provisioned yet")
 
@@ -223,13 +235,17 @@ async def get_latest_detection(
     normalize: bool = False,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
+    user: User = Depends(get_current_user),
 ):
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
         raise HTTPException(status_code=404, detail="Camera not found")
 
-    pipeline = await manager.get_activepipeline()
+    cam, _cfg, _pid = full
+    _ensure_user_owns_camera(cam, user.id)
+
+    pipeline = await manager.get_activepipeline(user_id=user.id)
 
     resp = await pipeline.get_latest_detection(str(camera_uuid))
     if resp is None and refresh:
@@ -250,13 +266,17 @@ async def stream_detections_sse(
     normalize: bool = False,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
+    user: User = Depends(get_current_user),
 ):
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
         raise HTTPException(status_code=404, detail="Camera not found")
 
-    pipeline = await manager.get_activepipeline()
+    cam, _cfg, _pid = full
+    _ensure_user_owns_camera(cam, user.id)
+
+    pipeline = await manager.get_activepipeline(user_id=user.id)
     cam_key = str(camera_uuid)
 
     async def gen():
@@ -302,8 +322,9 @@ async def stream_all_detections_sse(
     timeout_ms: int = 30000,
     normalize: bool = False,
     manager: Manager = Depends(get_manager),
+    user: User = Depends(get_current_user),
 ):
-    pipeline = await manager.get_activepipeline()
+    pipeline = await manager.get_activepipeline(user_id=user.id)
     hub = pipeline.detection_hub
 
     async def gen():
@@ -330,6 +351,7 @@ async def latest_detections_for_site(
     site_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
+    user: User = Depends(get_current_user),
 ):
     repo = ChannelRepository()
     site_repo=SiteRepository()
@@ -337,9 +359,9 @@ async def latest_detections_for_site(
         raise HTTPException(status_code=400, detail="site_uuid is required")
 
     cams = await site_repo.list_cameras_by_site(db, site_uuid=site_uuid)
+    cams = [cam for cam in cams if int(getattr(cam, "user_id", -1)) == int(user.id)]
 
-
-    pipeline = await manager.get_activepipeline()
+    pipeline = await manager.get_activepipeline(user_id=user.id)
 
     out: Dict[str, Optional[Dict[str, Any]]] = {}
     for cam in cams:
@@ -355,6 +377,7 @@ async def create_camera(
     payload: CameraCreateSchema,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
+    user: User = Depends(get_current_user),
 ):
     try:
         data = payload.model_dump(exclude_none=True)
@@ -363,8 +386,9 @@ async def create_camera(
         if not data.get("device_uuid"):
             raise HTTPException(status_code=422, detail="device_uuid is required (each camera must have a device).")
 
-        user_id = data.get("user_id")
-        pipeline = await manager.get_activepipeline(user_id=user_id)
+        # Trust JWT context, not client-provided user_id.
+        data["user_id"] = int(user.id)
+        pipeline = await manager.get_activepipeline(user_id=user.id)
 
         ev = ChannelCreateEvent(
             channel_id=None,
@@ -375,7 +399,7 @@ async def create_camera(
         result = await manager.update_pipeline(
             pipeline.pipeline_id,
             [ev],
-            user_id=data.get("user_id"),
+            user_id=user.id,
             camera_code_prefix="cam",
         )
 
@@ -412,16 +436,26 @@ async def edit_camera(
     payload: CameraEditSchema,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
+    user: User = Depends(get_current_user),
 ):
-    pipeline = await manager.get_activepipeline()
+    repo = ChannelRepository()
+    full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
+    if not full:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    cam, _cfg, _pid = full
+    _ensure_user_owns_camera(cam, user.id)
+
+    pipeline = await manager.get_activepipeline(user_id=user.id)
+    patch_payload = payload.model_dump(exclude_none=True)
+    patch_payload.pop("user_id", None)
 
     ev = ChannelEditEvent(
         channel_id=camera_uuid,
-        configs=payload.model_dump(exclude_none=True),
+        configs=patch_payload,
         created_at=datetime.now(timezone.utc),
     )
 
-    result = await manager.update_pipeline(pipeline.pipeline_id, [ev])
+    result = await manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=user.id)
     if not result or not result.cameras:
         raise HTTPException(status_code=500, detail="Failed to edit camera")
 
@@ -449,8 +483,16 @@ async def delete_camera(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
+    user: User = Depends(get_current_user),
 ):
-    pipeline = await manager.get_activepipeline()
+    repo = ChannelRepository()
+    full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
+    if not full:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    cam, _cfg, _pid = full
+    _ensure_user_owns_camera(cam, user.id)
+
+    pipeline = await manager.get_activepipeline(user_id=user.id)
 
     ev = ChannelRemoveEvent(
         channel_id=camera_uuid,
@@ -458,7 +500,7 @@ async def delete_camera(
         created_at=datetime.now(timezone.utc),
     )
 
-    await manager.update_pipeline(pipeline.pipeline_id, [ev])
+    await manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=user.id)
     return {"ok": True}
 
 @router.get("/{camera_uuid}/snapshot.jpg")

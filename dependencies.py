@@ -1,26 +1,21 @@
 import logging
-import os
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from passlib.context import CryptContext
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
 
-# --- MODIFIED: Import the global factory function ---
 from core.database_orm import User
 from core.database import db_manager
 from core.security.tokens import decode_access_token
 from application.services.manager import Manager
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
+
 def get_db():
-    """Provides a sync database session from the manager."""
     if not db_manager.SessionLocal:
         raise Exception("Sync database has not been initialized.")
     db = db_manager.SessionLocal()
@@ -31,33 +26,57 @@ def get_db():
 
 
 async def get_async_db() -> AsyncSession:
-    """Provides an async database session from the manager."""
     if not db_manager.AsyncSessionLocal:
         raise Exception("Async database has not been initialized.")
     async with db_manager.AsyncSessionLocal() as session:
         yield session
 
 
-# # --- MODIFIED: Use the global instance factory ---
 def get_manager(request: Request) -> Manager:
     return request.app.state.manager
 
 
+def _auth_error(detail: str = "Could not validate credentials") -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
 
 async def get_current_user(
-    db: Session = Depends(get_db),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_async_db),
 ) -> User:
+    if credentials is None or not credentials.credentials:
+        raise _auth_error("Missing bearer token")
 
     try:
-        user = db.query(User).filter(User.id == 1).first()
+        payload = decode_access_token(credentials.credentials)
+    except ValueError as exc:
+        raise _auth_error(str(exc)) from exc
+
+    raw_user_id = payload.get("user_id") or payload.get("sub")
+    try:
+        user_id = int(raw_user_id)
+    except (TypeError, ValueError):
+        raise _auth_error("Invalid token payload")
+
+    try:
+        user = (
+            await db.execute(select(User).where(User.id == user_id).limit(1))
+        ).scalar_one_or_none()
         if user is None:
-            raise HTTPException(status_code=401, detail="User not found")
-
+            raise _auth_error("User not found")
         return user
-    except ValueError as e:
-        # Catch errors from decode_access_token
-        raise HTTPException(status_code=401, detail=str(e))
-    except Exception as e:
-        logger.error(f"Auth error: {str(e)}")
-        raise HTTPException(status_code=401, detail="Could not validate credentials")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Auth dependency failed: %s", exc)
+        raise _auth_error()
 
+
+async def get_current_user_id(
+    current_user: User = Depends(get_current_user),
+) -> int:
+    return int(current_user.id)

@@ -1,8 +1,9 @@
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple
 import httpx
 import os 
 from urllib.parse import quote
 import logging
+import time
 logger = logging.getLogger(__name__)
 
 class WebRTCGatewayClient:
@@ -23,16 +24,43 @@ class WebRTCGatewayClient:
     """
 
     def __init__(self):
-        self.admin_api_url = (os.getenv("WEBRTC_ADMIN_API_URL") or "https://noentrymtxfdxidm.centralus.azurecontainer.io:9997").rstrip("/")
+        enabled_raw = str(os.getenv("WEBRTC_ADMIN_API_ENABLED", "true")).strip().lower()
+        self.admin_api_enabled = enabled_raw in {"1", "true", "yes", "on"}
+
+        self.admin_api_url = (
+            os.getenv("WEBRTC_ADMIN_API_URL")
+            or "https://noentrymtxfdxidm.centralus.azurecontainer.io:9997"
+        ).rstrip("/")
+        if not self.admin_api_enabled:
+            self.admin_api_url = ""
+
         pub_host = os.getenv("PUBLIC_HOST", "localhost")
         pub_scheme = os.getenv("PUBLIC_SCHEME", "http")
         pub_port = os.getenv("WEBRTC_HTTP_PORT", "8889")
         self.public_base = (os.getenv("WEBRTC_PUBLIC_BASE_URL") or f"{pub_scheme}://{pub_host}:{pub_port}").rstrip("/")
 
-        self.api_user = os.getenv("MTX_API_USER", "api")
-        self.api_pass = os.getenv("MTX_API_PASS", "api_pass_123")
+        self.api_user = os.getenv("MTX_API_USER") or os.getenv("MEDIAMTX_API_USER", "api")
+        self.api_pass = os.getenv("MTX_API_PASS") or os.getenv("MEDIAMTX_API_PASS", "api_pass_123")
 
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=10.0))
+        request_timeout_s = float(os.getenv("WEBRTC_ADMIN_TIMEOUT_S", "15"))
+        connect_timeout_s = float(os.getenv("WEBRTC_ADMIN_CONNECT_TIMEOUT_S", "5"))
+        self._warn_interval_s = float(os.getenv("WEBRTC_WARN_INTERVAL_S", "60"))
+        self._last_warn: Dict[str, float] = {}
+
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(request_timeout_s, connect=connect_timeout_s)
+        )
+
+    def _warn_throttled(self, key: str, message: str, *args: object) -> None:
+        now = time.time()
+        last = self._last_warn.get(key, 0.0)
+        if (now - last) < self._warn_interval_s:
+            return
+        self._last_warn[key] = now
+        logger.warning(message, *args)
+
+    def _is_timeout_or_network_error(self, exc: Exception) -> bool:
+        return isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError))
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -60,16 +88,32 @@ class WebRTCGatewayClient:
             r = await self._client.post(add_url, json=payload, auth=self._auth())
             if r.status_code == 200:
                 return self._derive_public_webrtc_url(stream_key)
-        except Exception:
-            logger.warning("MediaMTX add request failed, trying patch or ignoring", exc_info=True)
+        except Exception as exc:
+            if self._is_timeout_or_network_error(exc):
+                self._warn_throttled(
+                    "ensure_stream_add_timeout",
+                    "MediaMTX add timed out/unreachable. stream_key=%s admin_api=%s",
+                    stream_key,
+                    self.admin_api_url,
+                )
+            else:
+                logger.warning("MediaMTX add request failed, trying patch. stream_key=%s", stream_key, exc_info=True)
 
         patch_url = f"{self.admin_api_url}/v3/config/paths/patch/{safe_name}"
         try:
             r = await self._client.patch(patch_url, json=payload, auth=self._auth())
             if r.status_code == 200:
                 return self._derive_public_webrtc_url(stream_key)
-        except Exception:
-            logger.error("MediaMTX patch request failed", exc_info=True)
+        except Exception as exc:
+            if self._is_timeout_or_network_error(exc):
+                self._warn_throttled(
+                    "ensure_stream_patch_timeout",
+                    "MediaMTX patch timed out/unreachable. stream_key=%s admin_api=%s",
+                    stream_key,
+                    self.admin_api_url,
+                )
+            else:
+                logger.error("MediaMTX patch request failed. stream_key=%s", stream_key, exc_info=True)
             
         return self._derive_public_webrtc_url(stream_key)
 
@@ -83,8 +127,16 @@ class WebRTCGatewayClient:
         
         try:
             await self._client.patch(url, json=payload, auth=self._auth())
-        except Exception:
-             logger.error(f"MediaMTX update failed for {stream_key}", exc_info=True)
+        except Exception as exc:
+            if self._is_timeout_or_network_error(exc):
+                self._warn_throttled(
+                    "update_stream_timeout",
+                    "MediaMTX update timed out/unreachable. stream_key=%s admin_api=%s",
+                    stream_key,
+                    self.admin_api_url,
+                )
+            else:
+                logger.error("MediaMTX update failed for %s", stream_key, exc_info=True)
 
     async def delete_stream(self, *, stream_key: str) -> None:
         if not self.admin_api_url:
@@ -95,8 +147,16 @@ class WebRTCGatewayClient:
         
         try:
             await self._client.delete(url, auth=self._auth())
-        except Exception:
-             logger.warning(f"MediaMTX delete failed for {stream_key}", exc_info=True)
+        except Exception as exc:
+            if self._is_timeout_or_network_error(exc):
+                self._warn_throttled(
+                    "delete_stream_timeout",
+                    "MediaMTX delete timed out/unreachable. stream_key=%s admin_api=%s",
+                    stream_key,
+                    self.admin_api_url,
+                )
+            else:
+                logger.warning("MediaMTX delete failed for %s", stream_key, exc_info=True)
 
 
     async def list_configured_paths(self) -> List[Dict[str, Any]]:
@@ -115,8 +175,22 @@ class WebRTCGatewayClient:
             items = data.get("items") or []
             # Some versions may include nulls in items; filter them out
             return [it for it in items if isinstance(it, dict)]
-        except Exception:
-            logger.exception("MediaMTX list_configured_paths failed")
+        except Exception as exc:
+            if self._is_timeout_or_network_error(exc):
+                self._warn_throttled(
+                    "list_configured_paths_timeout",
+                    "MediaMTX list_configured_paths timeout/unreachable. admin_api=%s",
+                    self.admin_api_url,
+                )
+            elif isinstance(exc, httpx.HTTPStatusError):
+                self._warn_throttled(
+                    "list_configured_paths_status",
+                    "MediaMTX list_configured_paths HTTP error. status=%s admin_api=%s",
+                    exc.response.status_code,
+                    self.admin_api_url,
+                )
+            else:
+                logger.exception("MediaMTX list_configured_paths failed")
             return []
 
     async def list_active_paths(self) -> List[Dict[str, Any]]:
@@ -133,8 +207,22 @@ class WebRTCGatewayClient:
             data = r.json() or {}
             items = data.get("items") or []
             return [it for it in items if isinstance(it, dict)]
-        except Exception:
-            logger.exception("MediaMTX list_active_paths failed")
+        except Exception as exc:
+            if self._is_timeout_or_network_error(exc):
+                self._warn_throttled(
+                    "list_active_paths_timeout",
+                    "MediaMTX list_active_paths timeout/unreachable. admin_api=%s",
+                    self.admin_api_url,
+                )
+            elif isinstance(exc, httpx.HTTPStatusError):
+                self._warn_throttled(
+                    "list_active_paths_status",
+                    "MediaMTX list_active_paths HTTP error. status=%s admin_api=%s",
+                    exc.response.status_code,
+                    self.admin_api_url,
+                )
+            else:
+                logger.exception("MediaMTX list_active_paths failed")
             return []
 
     @staticmethod

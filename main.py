@@ -11,6 +11,7 @@ from routes.site_routes import router as sites_router
 from routes.device_routes import router as devices_router
 from routes.notifications_routes import router as notifications_router
 from routes.notification_email_routes import router as notification_emails_router
+from routes.auth.signup import router as auth_router
 
 from core.config import DEBUG
 from core.database import db_manager, async_engine
@@ -167,6 +168,7 @@ app.include_router(sites_router,prefix="/api")
 app.include_router(devices_router,prefix="/api")
 app.include_router(notifications_router, prefix="/api")
 app.include_router(notification_emails_router, prefix="/api")
+app.include_router(auth_router, prefix="/api")
 
 # Health
 @app.get("/")

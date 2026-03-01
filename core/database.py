@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from core.database_orm import Base
 from sqlalchemy import select
 from core.database_orm import User
+from core.security.hashing import get_password_hash
 
 logger = logging.getLogger(__name__)
 logging.getLogger("sqlalchemy.engine").setLevel(logging.ERROR)
@@ -134,7 +135,7 @@ class DatabaseManager:
         async with self.async_engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        # Seed a dev user so user_id=1 exists (for your current API dependency)
+        # Seed a dev user if DB is empty.
         async with self.AsyncSessionLocal() as db:
             existing = (await db.execute(select(User.id).limit(1))).scalar_one_or_none()
             if existing is None:
@@ -142,8 +143,8 @@ class DatabaseManager:
                     User(
                         user_name="dev",
                         email="dev@example.com",
-                        hashed_password="dev",          # placeholder
-                        business_url="http://localhost" # required by your ORM
+                        hashed_password=get_password_hash("DevPass123!"),
+                        email_verified=True,
                     )
                 )
                 await db.commit()
