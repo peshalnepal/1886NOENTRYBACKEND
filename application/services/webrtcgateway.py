@@ -1,6 +1,8 @@
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import httpx
 import os 
+from typing import Optional, Tuple,Literal
+
 from urllib.parse import quote
 import logging
 import time
@@ -273,7 +275,6 @@ class WebRTCGatewayClient:
                     "webrtc_url": self._derive_public_webrtc_url(name),
                     "max_readers": c.get("maxReaders"),
                     "source_on_demand": c.get("sourceOnDemand"),
-                    # runtime (optional)
                     "ready": active.get("ready"),
                     "bytes_received": active.get("bytesReceived"),
                     "bytes_sent": active.get("bytesSent"),

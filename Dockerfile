@@ -29,10 +29,6 @@ COPY requirements.txt .
 
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt \
-    # ----
-    # Ensure we only have headless OpenCV at runtime.
-    # Some deps (e.g., ultralytics) may pull opencv-python; remove it.
-    # ----
     && pip uninstall -y opencv-python || true \
     && pip install --no-cache-dir --force-reinstall opencv-python-headless==4.10.0.84
 
