@@ -3,7 +3,7 @@ import logging
 import traceback
 import urllib.parse
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -134,6 +134,25 @@ class DatabaseManager:
         ...
         async with self.async_engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+            # Migrate: old schema had a NOT NULL `code` column in email_verifications
+            # that stored the plaintext OTP. New schema uses `code_hash` instead.
+            # create_all never alters existing tables, so we fix the column here.
+            res = await conn.execute(text("""
+                SELECT COLUMN_TYPE
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME   = 'email_verifications'
+                  AND COLUMN_NAME  = 'code'
+                  AND IS_NULLABLE  = 'NO'
+            """))
+            row = res.fetchone()
+            if row:
+                col_type = row[0]
+                await conn.execute(
+                    text(f"ALTER TABLE email_verifications MODIFY COLUMN `code` {col_type} NULL DEFAULT NULL")
+                )
+                logger.info("Migrated email_verifications.code to nullable.")
 
         # Seed a dev user if DB is empty.
         async with self.AsyncSessionLocal() as db:

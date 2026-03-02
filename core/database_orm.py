@@ -160,7 +160,6 @@ class User(Base):
     email_verified = Column(Boolean, default=False, nullable=False)
     verified_at = Column(DateTime(timezone=True), nullable=True)
     last_login_at = Column(DateTime(timezone=True), nullable=True)
-    # Relationships
     sites = relationship("Site", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
     devices = relationship("Device", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
     cameras = relationship("Camera", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
@@ -513,15 +512,14 @@ class Notification(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     site_uuid = Column(GUID, ForeignKey("sites.site_uuid", ondelete="CASCADE"), nullable=False, index=True)
 
-    # optional links (helpful for UI filters)
     camera_uuid = Column(GUID, ForeignKey("camera.camera_uuid", ondelete="SET NULL"), nullable=True, index=True)
     device_uuid = Column(GUID, ForeignKey("devices.device_uuid", ondelete="SET NULL"), nullable=True, index=True)
 
-    event_type = Column(String(64), nullable=False, default="detection")  # e.g. detection, offline, roi_alert
+    event_type = Column(String(64), nullable=False, default="detection")
     title = Column(String(255), nullable=True)
     message = Column(Text, nullable=True)
 
-    payload = Column(JSONDict, nullable=True)  # store raw detection/alert JSON
+    payload = Column(JSONDict, nullable=True)
     detected_at = Column(DateTime(timezone=True), default=utc_now, index=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
@@ -570,7 +568,6 @@ class EmailVerification(Base):
 
     email = Column(String(255), index=True, nullable=False)
 
-    # store hashed OTP (e.g., sha256 hex -> 64 chars)
     code_hash = Column(String(128), nullable=False)
 
     sent_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
@@ -580,13 +577,10 @@ class EmailVerification(Base):
     used = Column(Boolean, default=False, nullable=False)
 
     consumed_at = Column(DateTime(timezone=True), nullable=True)
-
-    # optional: for debugging/auditing/rate-limits
     ip = Column(String(64), nullable=True)
     user_agent = Column(String(512), nullable=True)
-
-    # optional extra payload (json string or JSONDict)
     additional_data = Column(String(2048), nullable=True)
+    
 # =========================
 # SYSTEM SETTINGS
 # =========================
@@ -609,7 +603,7 @@ class SignupTempData(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     token = Column(String(255), unique=True, nullable=False, index=True)
-    data = Column(JSON, nullable=False)
+    data = Column(JSONDict, nullable=False)
     created_at = Column(DateTime(timezone=True), default=utc_now)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used = Column(Boolean, default=False)

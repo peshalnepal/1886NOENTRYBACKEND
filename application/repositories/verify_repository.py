@@ -27,9 +27,8 @@ class EmailVerificationRepository:
     async def invalidate_active(self, email: str) -> None:
         stmt = (
             update(EmailVerification)
-            .where(EmailVerification.email == email, EmailVerification.used == False)  # noqa: E712
+            .where(EmailVerification.email == email, EmailVerification.used == False)
             .values(used=True, consumed_at=utc_now())
-            .execution_options(synchronize_session=False)
         )
         await self.db.execute(stmt)
 
@@ -61,10 +60,10 @@ class EmailVerificationRepository:
             select(EmailVerification)
             .where(
                 EmailVerification.email == email,
-                EmailVerification.used == False,          # noqa: E712
+                EmailVerification.used == False,
                 EmailVerification.expires_at > now,
             )
-            .order_by(EmailVerification.sent_at.desc())
+            .order_by(EmailVerification.id.desc())
             .limit(1)
         )
         res = await self.db.execute(stmt)
@@ -75,7 +74,6 @@ class EmailVerificationRepository:
             update(EmailVerification)
             .where(EmailVerification.id == verification_id)
             .values(attempts=EmailVerification.attempts + 1)
-            .execution_options(synchronize_session=False)
         )
         await self.db.execute(stmt)
 
@@ -84,6 +82,5 @@ class EmailVerificationRepository:
             update(EmailVerification)
             .where(EmailVerification.id == verification_id)
             .values(used=True, consumed_at=utc_now())
-            .execution_options(synchronize_session=False)
         )
         await self.db.execute(stmt)

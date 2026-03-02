@@ -10,12 +10,12 @@ from email.mime.text import MIMEText
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, field_validator
-from sqlalchemy import select, text
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.verify_repository import EmailVerificationRepository
-from core.database_orm import SignupTempData, User, utc_now
+from core.database_orm import SignupTempData, User,EmailVerification, utc_now
 from core.security.hashing import get_password_hash, verify_password
 from core.security.tokens import create_access_token
 from dependencies import get_async_db, get_current_user
@@ -158,85 +158,6 @@ def _build_access_token(user: User) -> str:
         }
     )
 
-
-async def _get_users_table_columns(db: AsyncSession) -> set[str]:
-    res = await db.execute(
-        text(
-            """
-            SELECT COLUMN_NAME
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = 'users'
-            """
-        )
-    )
-    return {str(row[0]) for row in res.fetchall()}
-
-
-async def _insert_user_compat(
-    db: AsyncSession,
-    *,
-    user_name: str,
-    email: str,
-    password_hash: str,
-    email_verified: bool,
-    verified_at: datetime | None,
-    commit: bool = True,
-) -> User:
-    cols = await _get_users_table_columns(db)
-    now = utc_now()
-
-    values: dict[str, object] = {}
-    if "user_name" in cols:
-        values["user_name"] = user_name
-    if "email" in cols:
-        values["email"] = email
-    if "hashed_password" in cols:
-        values["hashed_password"] = password_hash
-    if "contact_phone" in cols:
-        values["contact_phone"] = None
-    if "created_at" in cols:
-        values["created_at"] = now
-    if "email_verified" in cols:
-        values["email_verified"] = 1 if email_verified else 0
-    if "verified_at" in cols:
-        values["verified_at"] = verified_at
-    if "last_login_at" in cols:
-        values["last_login_at"] = None
-
-    # Legacy columns present in some deployed databases.
-    if "user_email" in cols:
-        values["user_email"] = email
-    if "password_hash" in cols:
-        values["password_hash"] = password_hash
-    if "is_verified" in cols:
-        values["is_verified"] = 1 if email_verified else 0
-    if "business_url" in cols:
-        values["business_url"] = os.getenv("DEFAULT_BUSINESS_URL", "https://1886noentry.com")
-    if "contact_name" in cols:
-        values["contact_name"] = user_name
-    if "business_address" in cols:
-        values["business_address"] = os.getenv("DEFAULT_BUSINESS_ADDRESS", "")
-
-    if "email" not in values and "user_email" not in values:
-        raise HTTPException(status_code=500, detail="Users table is missing email columns")
-    if "hashed_password" not in values and "password_hash" not in values:
-        raise HTTPException(status_code=500, detail="Users table is missing password columns")
-
-    columns_sql = ", ".join(f"`{k}`" for k in values.keys())
-    values_sql = ", ".join(f":{k}" for k in values.keys())
-    await db.execute(text(f"INSERT INTO users ({columns_sql}) VALUES ({values_sql})"), values)
-    if commit:
-        await db.commit()
-
-    user = (
-        await db.execute(select(User).where(User.email == email).limit(1))
-    ).scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=500, detail="Failed to create user")
-    return user
-
-
 def _build_signup_email_body(user_name: str, code: str) -> str:
     return (
         f"Hello {user_name},\n\n"
@@ -317,19 +238,16 @@ async def signup_request_code(
             user_agent=request.headers.get("user-agent"),
         )
 
-        # Mark older signup tokens for this email as used.
-        await db.execute(
-            text(
-                """
-                UPDATE signup_temp_data
-                SET used = 1
-                WHERE used = 0
-                  AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.user_email')) = :email
-                """
-            ),
-            {"email": email},
+        stmt = (
+            update(SignupTempData)
+            .where(
+                SignupTempData.used.is_(False),
+                SignupTempData.data["user_email"].as_string() == email, 
+            )
+            .values(used=True)
         )
 
+        await db.execute(stmt)
         db.add(
             SignupTempData(
                 token=signup_token,
@@ -382,7 +300,7 @@ async def signup_verify(
         await db.execute(
             select(SignupTempData).where(
                 SignupTempData.token == payload.signup_token,
-                SignupTempData.used == False,  # noqa: E712
+                SignupTempData.used.is_(False),
                 SignupTempData.expires_at > utc_now(),
             ).limit(1)
         )
@@ -398,6 +316,7 @@ async def signup_verify(
     if not user_name or not email or not password_hash:
         temp.used = True
         await db.commit()
+        
         raise HTTPException(status_code=400, detail="Signup token payload is invalid. Request a new code.")
 
     existing = (
@@ -438,24 +357,25 @@ async def signup_verify(
     await verify_repo.consume(int(verification.id))
 
     try:
-        user = await _insert_user_compat(
-            db,
+        user = User(
             user_name=user_name,
             email=email,
-            password_hash=password_hash,
+            hashed_password=password_hash,
             email_verified=True,
             verified_at=utc_now(),
-            commit=False,
+            created_at=utc_now(),
         )
+        db.add(user)
         user.last_login_at = utc_now()
         await db.commit()
+        await db.refresh(user) 
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Account already exists")
     except Exception:
         await db.rollback()
         raise
-
+    await db.refresh(user)
     token = _build_access_token(user)
     return AuthTokenOut(access_token=token, user=_to_user_out(user))
 
