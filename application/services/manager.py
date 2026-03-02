@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -201,13 +201,35 @@ class Manager:
         except Exception as e:
             raise ValueError(f"Invalid {name}: {v}") from e
 
-    async def _get_device(self, db: AsyncSession, device_uuid: uuid.UUID) -> Device:
-        dev = (await db.execute(select(Device).where(Device.device_uuid == device_uuid))).scalar_one_or_none()
+    async def _get_device(
+        self,
+        db: AsyncSession,
+        device_uuid: uuid.UUID,
+        *,
+        user_id: Optional[int] = None,
+    ) -> Device:
+        q = select(Device).where(Device.device_uuid == device_uuid)
+        if user_id is not None:
+            q = q.where(Device.user_id == int(user_id))
+
+        dev = (await db.execute(q)).scalar_one_or_none()
         if dev is None:
             raise ValueError(f"Device not found: {device_uuid}")
         if not getattr(dev, "device_url", None):
             raise ValueError(f"Device missing device_url: {device_uuid}")
         return dev
+
+    async def _ensure_site_owned_by_user(self, db: AsyncSession, *, site_uuid: uuid.UUID, user_id: int) -> None:
+        site = (
+            await db.execute(
+                select(Site.site_uuid).where(
+                    Site.site_uuid == site_uuid,
+                    Site.user_id == int(user_id),
+                )
+            )
+        ).scalar_one_or_none()
+        if site is None:
+            raise ValueError(f"Site not found for user: {site_uuid}")
 
     async def _get_single_camera_device(self, db: AsyncSession, camera_uuid: uuid.UUID, *, required: bool = True) -> Optional[Device]:
         """
@@ -377,9 +399,9 @@ class Manager:
                                 db, pid=pid, ev=ev, user_id=uid, camera_code_prefix=camera_code_prefix, active=active
                             )
                         elif et_norm == "edit_channel" or isinstance(ev, ChannelEditEvent):
-                            cams, evs = await self._edit_channel(db, pid=pid, ev=ev, active=active)
+                            cams, evs = await self._edit_channel(db, pid=pid, ev=ev, user_id=uid, active=active)
                         elif et_norm == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
-                            cams, evs = await self._remove_channel(db, pid=pid, ev=ev, active=active)
+                            cams, evs = await self._remove_channel(db, pid=pid, ev=ev, user_id=uid, active=active)
                         else:
                             logger.warning("Event type not matched: %s", et)
                             continue
@@ -564,12 +586,13 @@ class Manager:
         if not site_uuid:
             raise ValueError("Create_Channel requires site_uuid")
         site_uuid = self._as_uuid(site_uuid, "site_uuid")
+        await self._ensure_site_owned_by_user(db, site_uuid=site_uuid, user_id=user_id)
 
         device_uuid = patch.get("device_uuid")
         if not device_uuid:
             raise ValueError("Create_Channel requires device_uuid (each camera must have exactly 1 device).")
         device_uuid = self._as_uuid(device_uuid, "device_uuid")
-        dev = await self._get_device(db, device_uuid)
+        dev = await self._get_device(db, device_uuid, user_id=user_id)
 
         cam_uuid = patch.get("camera_uuid") or uuid.uuid4()
         cam_uuid = self._as_uuid(cam_uuid, "camera_uuid")
@@ -682,6 +705,7 @@ class Manager:
         *,
         pid: uuid.UUID,
         ev: VideoChannelEvent,
+        user_id: int,
         active: Optional[ModelPipeline],
     ) -> Tuple[List[CameraOut], List[Dict[str, Any]]]:
 
@@ -695,6 +719,8 @@ class Manager:
             raise ValueError(f"Camera not found: {cam_uuid}")
 
         cam_db, chan_cfg_db, existing_pid = full
+        if int(getattr(cam_db, "user_id", -1)) != int(user_id):
+            raise ValueError(f"Camera does not belong to user: {cam_uuid}")
         if existing_pid is not None and existing_pid != pid:
             raise ValueError("Camera does not belong to provided pipeline_id")
 
@@ -710,7 +736,7 @@ class Manager:
             new_device_uuid = old_dev.device_uuid
         new_device_uuid = self._as_uuid(new_device_uuid, "device_uuid")
 
-        new_dev = await self._get_device(db, new_device_uuid)
+        new_dev = await self._get_device(db, new_device_uuid, user_id=user_id)
 
         # merge config json
         merged_cfg: Dict[str, Any] = {}
@@ -831,6 +857,7 @@ class Manager:
         *,
         pid: uuid.UUID,
         ev: VideoChannelEvent,
+        user_id: int,
         active: Optional[ModelPipeline],
     ) -> Tuple[List[CameraOut], List[Dict[str, Any]]]:
 
@@ -842,6 +869,8 @@ class Manager:
         full = await self.channel_repo.get_camera_full(db, camera_uuid=cam_uuid)
         if full:
             cam_db, _cfg, existing_pid = full
+            if int(getattr(cam_db, "user_id", -1)) != int(user_id):
+                raise ValueError(f"Camera does not belong to user: {cam_uuid}")
             if existing_pid is not None and existing_pid != pid:
                 raise ValueError("Camera does not belong to provided pipeline_id")
 
@@ -867,6 +896,85 @@ class Manager:
 
         events_out = [{"event_type": "Remove_Channel", "camera_uuid": str(cam_uuid)}]
         return [], events_out
+
+    async def cleanup_user_resources(self, db: AsyncSession, *, user_id: int) -> Dict[str, Any]:
+        """
+        Clean up external/runtime resources for a user before deleting the DB user row.
+        This does not delete DB rows directly; caller should delete the User after this succeeds.
+        """
+        uid = int(user_id)
+        errors: List[str] = []
+        edge_deleted: List[str] = []
+        streams_deleted: List[str] = []
+
+        q = (
+            select(Camera)
+            .where(Camera.user_id == uid)
+            .options(selectinload(Camera.devices))
+        )
+        user_cameras = (await db.execute(q)).scalars().all()
+
+        edge_seen: Set[Tuple[str, str]] = set()
+        stream_seen: Set[str] = set()
+
+        # Best-effort external cleanup while camera/device metadata still exists.
+        for cam in user_cameras:
+            cam_uuid_str = str(cam.camera_uuid)
+            for dev in list(getattr(cam, "devices", None) or []):
+                dev_url = str(getattr(dev, "device_url", "") or "").strip()
+                if not dev_url:
+                    continue
+                key = (dev_url, cam_uuid_str)
+                if key in edge_seen:
+                    continue
+                edge_seen.add(key)
+                try:
+                    await self._edge.delete_camera(device_url=dev_url, camera_uuid=cam_uuid_str)
+                    edge_deleted.append(cam_uuid_str)
+                except Exception as e:
+                    logger.warning(
+                        "Failed deleting edge camera during user cleanup user=%s camera=%s device=%s",
+                        uid,
+                        cam_uuid_str,
+                        getattr(dev, "device_uuid", None),
+                        exc_info=True,
+                    )
+                    errors.append(f"edge:{cam_uuid_str}:{e}")
+
+            stream_key = str(getattr(cam, "camera_code", "") or "").strip()
+            if stream_key and stream_key not in stream_seen:
+                stream_seen.add(stream_key)
+                try:
+                    await self._webrtc.delete_stream(stream_key=stream_key)
+                    streams_deleted.append(stream_key)
+                except Exception as e:
+                    logger.warning(
+                        "Failed deleting WebRTC stream during user cleanup user=%s stream=%s",
+                        uid,
+                        stream_key,
+                        exc_info=True,
+                    )
+                    errors.append(f"webrtc:{stream_key}:{e}")
+
+        pipeline_to_shutdown: Optional[ModelPipeline] = None
+        async with self._lock:
+            pipeline_to_shutdown = self._pipelines_by_user.pop(uid, None)
+            self._pipeline_id_by_user.pop(uid, None)
+
+        if pipeline_to_shutdown is not None:
+            try:
+                await pipeline_to_shutdown.shutdown()
+            except Exception as e:
+                logger.warning("Failed shutting down in-memory pipeline for deleted user=%s", uid, exc_info=True)
+                errors.append(f"pipeline_shutdown:{e}")
+
+        return {
+            "user_id": uid,
+            "camera_count": len(user_cameras),
+            "edge_deleted_count": len(edge_deleted),
+            "stream_deleted_count": len(streams_deleted),
+            "errors": errors,
+        }
 
     async def cleanup_device_resources(self, db: AsyncSession, *, device_uuid: uuid.UUID,active: Optional[ModelPipeline]) -> None:
         """
@@ -902,7 +1010,7 @@ class Manager:
         except Exception:
             logger.exception("Error during device cleanup for %s", device_uuid)
             
-    async def _get_site(db: AsyncSession, user_id: int, site_uuid: uuid.UUID) -> Site:
+    async def _get_site(self, db: AsyncSession, user_id: int, site_uuid: uuid.UUID) -> Site:
         q = select(Site).where(Site.site_uuid == site_uuid, Site.user_id == user_id)
         site = (await db.execute(q)).scalar_one_or_none()
         if not site:

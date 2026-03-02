@@ -16,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import User
 from core.security.hashing import get_password_hash, verify_password
-from dependencies import get_async_db, get_current_user
+from dependencies import get_async_db, get_current_user, get_manager
+from application.services.manager import Manager
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -163,13 +164,27 @@ async def delete_my_account(
     payload: DeleteAccountRequest,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
+    manager: Manager = Depends(get_manager),
 ):
     if not verify_password(payload.password.get_secret_value(), current_user.hashed_password):
         raise HTTPException(status_code=400, detail="Password is incorrect")
 
     try:
+        cleanup = await manager.cleanup_user_resources(db, user_id=int(current_user.id))
+        if cleanup.get("errors"):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Failed to fully clean external camera/MediaMTX resources. User was not deleted.",
+                    "errors": cleanup["errors"],
+                },
+            )
+
         await db.delete(current_user)
         await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
     except Exception:
         await db.rollback()
         raise
