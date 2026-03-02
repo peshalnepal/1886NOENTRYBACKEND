@@ -106,12 +106,9 @@ async def lifespan(app: FastAPI):
 
     app.state.notification_hub = hub
     app.state.notification_service = svc
+    app.state.manager.set_notification_service(svc)
     
     pipeline = await app.state.manager.create_pipeline()
-    pipeline.set_session_factory(SessionLocal)          # <-- IMPORTANT (site_name lookup)
-    pipeline.set_notification_service(app.state.notification_service)
-    # Use DB-backed ROI definitions for alert checks.
-    pipeline.set_roi_provider(svc._get_rois)
     await pipeline.start()
     app.state.pipeline = pipeline
     app.state.edge_reconcile_task = asyncio.create_task(_edge_reconcile_loop(app), name="edge_reconcile_loop")

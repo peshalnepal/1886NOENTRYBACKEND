@@ -162,9 +162,24 @@ class Manager:
 
         self._pipelines_by_user: Dict[int, ModelPipeline] = {}
         self._pipeline_id_by_user: Dict[int, uuid.UUID] = {}
+        self._notification_service: Optional[Any] = None
 
         self._default_user_id = int(os.getenv("DEFAULT_USER_ID", "1"))
         self._default_request_timeout_s = 3.0
+
+    def _wire_pipeline(self, mp: ModelPipeline) -> None:
+        mp.set_session_factory(self._session_factory)
+        if self._notification_service is None:
+            return
+        mp.set_notification_service(self._notification_service)
+        roi_provider = getattr(self._notification_service, "_get_rois", None)
+        if callable(roi_provider):
+            mp.set_roi_provider(roi_provider)
+
+    def set_notification_service(self, notification_service: Optional[Any]) -> None:
+        self._notification_service = notification_service
+        for mp in list(self._pipelines_by_user.values()):
+            self._wire_pipeline(mp)
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -288,6 +303,7 @@ class Manager:
                 full_pl = await self._repo.get_full_pipeline(db, pid)
 
                 mp = ModelPipeline(pipeline_id=pid)
+                self._wire_pipeline(mp)
 
                 if full_pl and getattr(full_pl, "cameras", None):
                     for cam in full_pl.cameras:
