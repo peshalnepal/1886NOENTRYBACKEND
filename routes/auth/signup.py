@@ -56,7 +56,7 @@ SIGNUP_TEMP_TTL_SECONDS = max(
     OTP_TTL_SECONDS,
     _env_int("SIGNUP_TEMP_TTL_SECONDS", OTP_TTL_SECONDS),
 )
-OTP_SECRET_PEPPER = os.getenv("OTP_SECRET_PEPPER") or os.getenv("SECRET_KEY", "your_secret_key")
+OTP_SECRET_PEPPER = os.getenv("SECRET_KEY", "")
 AUTH_DEBUG_RETURN_OTP = _env_bool("AUTH_DEBUG_RETURN_OTP", False)
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")

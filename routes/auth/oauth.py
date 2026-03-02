@@ -7,7 +7,6 @@ OTP_TTL_SECONDS = os.getenv("OTP_TTL_SECONDS",600)
 OTP_MAX_ATTEMPTS = os.getenv("OTP_MAX_ATTEMPTS",5)
 
 def generate_otp(length: int = 6) -> str:
-    # numeric OTP
     return "".join(str(secrets.randbelow(10)) for _ in range(length))
 
 def hash_otp(email: str, otp: str, secret_pepper: str) -> str:
