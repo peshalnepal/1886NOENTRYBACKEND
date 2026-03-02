@@ -427,29 +427,33 @@ class Manager:
         dry_run: bool = False,
         delete_unknown: bool = True,
     ) -> Dict[str, List[str]]:
-        uid = int(user_id or self._default_user_id)
+        uid = int(user_id) if user_id is not None else None
 
         async with self._lock:
             async with self._session_factory() as db:
-                dev = await self._get_device(db, device_uuid)
+                dev = await self._get_device(db, device_uuid, user_id=uid)
                 edge_set = await self._edge.list_cameras(device_url=dev.device_url)
-                webrtc_list=await self._webrtc.list_webrtc_cameras()
-                webrtc_set={str(c["stream_key"]) for c in webrtc_list}
+                webrtc_list = await self._webrtc.list_webrtc_cameras()
+                webrtc_set = {
+                    str(c.get("stream_key"))
+                    for c in webrtc_list
+                    if isinstance(c, dict) and c.get("stream_key")
+                }
                 q = (
                     select(Camera)
                     .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
                     .where(CameraDevice.device_uuid == device_uuid)
-                    .where(Camera.user_id == uid)
                     .options(selectinload(Camera.channel_configuration))
                 )
                 cams = (await db.execute(q)).scalars().all()
 
                 desired_set = {str(c.camera_uuid) for c in cams if c.is_enabled and c.is_detection_enabled}
-                active_streams={str(c.camera_code) for c in cams if c.is_enabled}
+                known_streams = {str(c.camera_code) for c in cams if c.camera_code}
+                active_streams = {str(c.camera_code) for c in cams if c.is_enabled and c.camera_code}
                 to_add = sorted(desired_set - edge_set)
                 to_remove = sorted(edge_set - desired_set)
-                to_add_stream= sorted(active_streams - webrtc_set)
-                to_remove_stream= sorted(webrtc_set - active_streams)
+                to_add_stream = sorted(active_streams - webrtc_set)
+                to_remove_stream = sorted((webrtc_set & known_streams) - active_streams)
 
                 out: Dict[str, List[str]] = {
                     "to_add": to_add,
@@ -495,7 +499,7 @@ class Manager:
                         except Exception as e:
                             logger.warning("Edge delete failed during reconcile for camera %s", cu, exc_info=True)
                             out["errors"].append(f"Failed to remove {cu}: {e}")
-                cams_by_code = {str(c.camera_code): c for c in cams}   
+                cams_by_code = {str(c.camera_code): c for c in cams if c.camera_code}
                     
                 for cu in to_add_stream:
                     cam = cams_by_code.get(cu)
@@ -503,9 +507,10 @@ class Manager:
                         out["errors"].append(f"Camera not found in DB during reconcile: {cu}")
                         continue
                     try:
-                        await self._webrtc.ensure_stream(stream_key=cu,rtsp_url=cam.rtsp_url)
-                        if cam.camera_uuid not in out["added"]:
-                            out["added"].append(cam.camera_uuid)
+                        await self._webrtc.ensure_stream(stream_key=cu, rtsp_url=cam.rtsp_url)
+                        cam_uuid = str(cam.camera_uuid)
+                        if cam_uuid not in out["added"]:
+                            out["added"].append(cam_uuid)
                     except Exception as e:
                         logger.warning("Edge upsert failed during reconcile for camera %s", cu, exc_info=True)
                         out["errors"].append(f"Failed to add {cu}: {e}")
@@ -532,13 +537,12 @@ class Manager:
         Reconcile every device for the user.
         Useful at startup/after edge reboot so Jetson gets re-hydrated from DB state.
         """
-        uid = int(user_id or self._default_user_id)
+        uid = int(user_id) if user_id is not None else None
         async with self._session_factory() as db:
-            rows = await db.execute(
-                select(Device.device_uuid)
-                .where(Device.user_id == uid)
-                .where(Device.is_enabled.is_(True))
-            )
+            stmt = select(Device.device_uuid).where(Device.is_enabled.is_(True))
+            if uid is not None:
+                stmt = stmt.where(Device.user_id == uid)
+            rows = await db.execute(stmt)
             device_uuids = [r[0] for r in rows.all()]
 
         summary: Dict[str, Any] = {

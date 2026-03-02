@@ -355,6 +355,14 @@ def add_camera():
     cfg = body.get("config")
     if not isinstance(cfg, dict):
         cfg = {}
+    else:
+        cfg = dict(cfg)
+
+    for k, v in body.items():
+        if k in {"config", "rtsp_url"}:
+            continue
+        if k not in cfg and v is not None:
+            cfg[k] = v
 
     if not rtsp_url:
         rtsp_url = cfg.get("rtsp_url")
