@@ -196,6 +196,11 @@ class ModelPipeline:
         self._roi_engine = ROIAlertEngine()                 
         self._roi_provider: ROIProvider = roi_provider or self._no_rois 
         self._notification_service = notification_service    
+        self._last_detection_summary_s: Dict[str, float] = {}
+        self._detection_summary_cooldown_s = max(
+            0.0,
+            float(os.getenv("DETECTION_ALERT_COOLDOWN_S", "8.0")),
+        )
         self._notif_repo = NotificationRepository()
         self._cam_ctx_cache: Dict[str, Tuple[CameraContext, float]] = {}
         self._cam_ctx_cache_lock = asyncio.Lock()
@@ -243,6 +248,7 @@ class ModelPipeline:
             self._last_seen.clear()
             self._last_ok_s.clear()
             self._last_seq.clear()
+            self._last_detection_summary_s.clear()
         for t in tasks:
             if t and not t.done():
                 t.cancel()
@@ -386,6 +392,7 @@ class ModelPipeline:
             self._last_seq.pop(key, None)
             self._last_seen.pop(key, None)
             self._last_ok_s.pop(key, None)
+            self._last_detection_summary_s.pop(key, None)
         self._tracker.remove_camera(key)
         self._roi_engine.reset_camera(key)
 
@@ -633,6 +640,16 @@ class ModelPipeline:
             self._device_fetch_limits[key] = sem
         return sem
 
+    def _reserve_detection_summary_alert(self, camera_uuid: str) -> bool:
+        cam = str(camera_uuid)
+        cooldown_s = float(self._detection_summary_cooldown_s or 0.0)
+        now = time.monotonic()
+        last = self._last_detection_summary_s.get(cam, 0.0)
+        if cooldown_s > 0.0 and (now - last) < cooldown_s:
+            return False
+        self._last_detection_summary_s[cam] = now
+        return True
+
     async def _emit_roi_alert_notifications(self, resp: ObjDetectResponse, alerts: List[Dict[str, Any]]) -> None:
         svc = self._notification_service
         if svc is None:
@@ -749,6 +766,70 @@ class ModelPipeline:
                 name=f"persist_track_confirmed:{cam_uuid}:{track_id}",
             )
 
+    async def _emit_detection_summary_notification(self, resp: ObjDetectResponse) -> None:
+        svc = self._notification_service
+        if svc is None:
+            return
+
+        cam_uuid = str(resp.camera_uuid)
+        raw_detections = list(resp.detections or [])
+        if not raw_detections:
+            return
+
+        interesting = getattr(svc, "interesting", None)
+        filtered: List[Dict[str, Any]] = []
+        classes: List[str] = []
+        max_conf = 0.0
+        for d in raw_detections:
+            if not isinstance(d, dict):
+                continue
+            cls_name = str(d.get("cls_name") or "").strip()
+            if not cls_name:
+                continue
+            if interesting and cls_name not in interesting:
+                continue
+            conf = float(d.get("conf", 0.0) or 0.0)
+            max_conf = max(max_conf, conf)
+            classes.append(cls_name)
+            filtered.append(d)
+
+        if not filtered:
+            return
+
+        ctx = await self._get_camera_ctx(cam_uuid)
+        if ctx is None:
+            logger.warning("Skipping detection-summary alert because camera context was not found camera=%s", cam_uuid)
+            return
+
+        uniq_classes = sorted(set(classes))
+        classes_text = ", ".join(uniq_classes)
+        msg = NotificationMessage(
+            user_id=int(ctx.user_id),
+            id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-summary",
+            ts_ms=int(resp.frame_ts_ms),
+            camera_uuid=cam_uuid,
+            site_uuid=str(ctx.site_uuid),
+            site_name=ctx.site_name,
+            title=f"Detection: {classes_text}",
+            body=f"Detected {classes_text} (max_conf={max_conf:.2f})",
+            alert_type="detection_summary",
+            cls_names=uniq_classes,
+            max_conf=float(max_conf),
+            device_name=ctx.device_name,
+            camera_name=ctx.camera_name,
+        )
+
+        await svc.hub.publish(msg)
+
+        asyncio.create_task(
+            self._persist_and_maybe_email(
+                ctx=ctx,
+                msg=msg,
+                extra_payload={"detections": filtered[:20], "event": "detection_summary"},
+            ),
+            name=f"persist_detection_summary:{cam_uuid}",
+        )
+
     async def _poll_loop(self, key: str, ch: VideoChannel) -> None:
         backoff_ms = 250
         max_backoff_ms = 8000
@@ -824,6 +905,10 @@ class ModelPipeline:
                         asyncio.create_task(self._emit_item_detected_notifications(resp2, tracks, track_events))
                     if alerts:
                         asyncio.create_task(self._emit_roi_alert_notifications(resp2, alerts))
+                    if (not track_events) and (not alerts) and resp2.detections:
+                        cam_uuid = str(resp2.camera_uuid)
+                        if self._reserve_detection_summary_alert(cam_uuid):
+                            asyncio.create_task(self._emit_detection_summary_notification(resp2))
                 backoff_ms = 250
                 await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
 
