@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dependencies import get_async_db, get_current_user, get_manager
@@ -17,6 +18,7 @@ from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent
 from core.database_orm import User
+from core.security.tokens import decode_access_token
 from core.schemas import (
     CameraSchema,
     CameraCreateSchema,
@@ -32,6 +34,38 @@ router = APIRouter(prefix="/cameras", tags=["cameras"])
 def _ensure_user_owns_camera(cam: Any, user_id: int) -> None:
     if int(getattr(cam, "user_id", -1)) != int(user_id):
         raise HTTPException(status_code=404, detail="Camera not found")
+
+
+async def _resolve_stream_user(
+    *,
+    request: Request,
+    db: AsyncSession,
+    access_token: Optional[str],
+) -> User:
+    auth_header = request.headers.get("authorization", "")
+    token = ""
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        token = str(access_token or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    try:
+        payload = decode_access_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+
+    raw_user_id = payload.get("user_id") or payload.get("sub")
+    try:
+        user_id = int(raw_user_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    user = (await db.execute(select(User).where(User.id == user_id).limit(1))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
 
 
 # -------------------------
@@ -264,10 +298,11 @@ async def stream_detections_sse(
     after_seq: int = 0,
     timeout_ms: int = 30000,
     normalize: bool = False,
+    access_token: Optional[str] = None,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
-    user: User = Depends(get_current_user),
 ):
+    user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
@@ -321,9 +356,11 @@ async def stream_all_detections_sse(
     request: Request,
     timeout_ms: int = 30000,
     normalize: bool = False,
+    access_token: Optional[str] = None,
+    db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
-    user: User = Depends(get_current_user),
 ):
+    user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
     pipeline = await manager.get_activepipeline(user_id=user.id)
     hub = pipeline.detection_hub
 
