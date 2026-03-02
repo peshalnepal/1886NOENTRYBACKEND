@@ -336,6 +336,7 @@ def _require_rtsp(url: str):
 # Routes
 # -----------------------------
 @app.route("/health", methods=["GET"])
+@app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({
         "ok": True,
@@ -345,10 +346,12 @@ def health():
 
 
 @app.route("/cameras", methods=["GET"])
+@app.route("/api/cameras", methods=["GET"])
 def list_cameras():
     return jsonify({"cameras": runtime.list_cameras()})
 
 @app.route("/cameras", methods=["POST"])
+@app.route("/api/cameras", methods=["POST"])
 def add_camera():
     body = _json()
     rtsp_url = body.get("rtsp_url")
@@ -388,6 +391,7 @@ def add_camera():
 
 
 @app.route("/cameras/<camera_uuid>", methods=["DELETE"])
+@app.route("/api/cameras/<camera_uuid>", methods=["DELETE"])
 def delete_camera(camera_uuid):
     try:
         existed = runtime.remove_camera(camera_uuid)
@@ -398,6 +402,7 @@ def delete_camera(camera_uuid):
 
 
 @app.route("/cameras/<camera_uuid>", methods=["PATCH"])
+@app.route("/api/cameras/<camera_uuid>", methods=["PATCH"])
 def patch_camera(camera_uuid):
     body = _json()
     patch = body.get("config") or body  # allow either {"config": {...}} or direct patch
@@ -415,6 +420,7 @@ def patch_camera(camera_uuid):
 
 
 @app.route("/cameras/<camera_uuid>/latest", methods=["GET"])
+@app.route("/api/cameras/<camera_uuid>/latest", methods=["GET"])
 def latest(camera_uuid):
     try:
         result = runtime.get_latest(camera_uuid)
@@ -427,6 +433,9 @@ def latest(camera_uuid):
 
 
 @app.route("/detection/<camera_uuid>", methods=["GET"])
+@app.route("/detections/<camera_uuid>", methods=["GET"])
+@app.route("/api/detection/<camera_uuid>", methods=["GET"])
+@app.route("/api/detections/<camera_uuid>", methods=["GET"])
 def detection(camera_uuid):
     """
     Alternative endpoint for Azure backend compatibility.
@@ -440,10 +449,10 @@ def detection(camera_uuid):
     except Exception as e:
         logger.exception("detection failed: %s", e)
         return jsonify({"error": str(e)}), 500
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/cameras/detections/stream", methods=["GET"])
+@app.route("/api/cameras/detections/stream", methods=["GET"])
 def stream_all_detections():
     """
     SSE endpoint for all detections.
@@ -452,6 +461,7 @@ def stream_all_detections():
 
 
 @app.route("/cameras/<camera_uuid>/detections/stream", methods=["GET"])
+@app.route("/api/cameras/<camera_uuid>/detections/stream", methods=["GET"])
 def stream_camera_detections(camera_uuid):
     """
     SSE endpoint for specific camera detections.

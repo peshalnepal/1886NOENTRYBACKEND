@@ -349,9 +349,10 @@ class Manager:
     async def get_activepipeline(self, user_id: int | None = None) -> ModelPipeline:
         uid = int(user_id or self._default_user_id)
         mp = self._pipelines_by_user.get(uid)
-        if mp is not None:
-            return mp
-        return await self.create_pipeline(uid)
+        if mp is None:
+            mp = await self.create_pipeline(uid)
+        await mp.start()
+        return mp
 
     async def update_pipeline(
         self,

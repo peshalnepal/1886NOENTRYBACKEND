@@ -31,9 +31,9 @@ class EdgeInferenceClient:
     Talks to the Jetson TensorRT (inference) service.
 
     Environment (defaults are guesses; set them to match your Jetson routes):
-      - EDGE_ADD_PATH (default: /api/cameras)
-      - EDGE_PATCH_PATH (default: /api/cameras/{camera_uuid})
-      - EDGE_DELETE_PATH (default: /api/cameras/{camera_uuid})
+      - EDGE_ADD_PATH (default: /cameras)
+      - EDGE_PATCH_PATH (default: /cameras/{camera_uuid})
+      - EDGE_DELETE_PATH (default: /cameras/{camera_uuid})
       - EDGE_API_KEY (optional header: x-api-key)
 
     Expected semantics on Jetson:
@@ -152,8 +152,10 @@ class EdgeInferenceClient:
         try:
             await self._request("PATCH", url, json=patch)
         except Exception:
+            upsert_payload = dict(patch or {})
+            upsert_payload.setdefault("camera_uuid", str(camera_uuid))
             upsert_url = f"{device_url.rstrip('/')}{self.add_path}"
-            await self._request("POST", upsert_url, json=patch)
+            await self._request("POST", upsert_url, json=upsert_payload)
 
     async def delete_camera(self, *, device_url: str, camera_uuid: str) -> None:
         url = f"{device_url.rstrip('/')}{self.delete_path.format(camera_uuid=camera_uuid)}"
@@ -174,4 +176,3 @@ class EdgeInferenceClient:
                 last_exc = e
                 await asyncio.sleep(0.2 * (2 ** attempt))
         raise last_exc or RuntimeError("Edge service request failed")
-
