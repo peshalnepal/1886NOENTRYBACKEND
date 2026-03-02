@@ -41,6 +41,7 @@ class CameraMode:
 
 
 class NotificationMessage(BaseModel):
+    user_id: int
     id: str
     ts_ms: int
     camera_uuid: str
@@ -62,23 +63,35 @@ class NotificationMessage(BaseModel):
 
 class WebNotificationHub:
     def __init__(self, max_q: int = 200):
-        self._subs: Set[asyncio.Queue[NotificationMessage]] = set()
+        self._subs_by_user: Dict[int, Set[asyncio.Queue[NotificationMessage]]] = {}
         self._lock = asyncio.Lock()
         self._max_q = max_q
 
-    async def subscribe(self) -> asyncio.Queue[NotificationMessage]:
+    async def subscribe(self, *, user_id: int) -> asyncio.Queue[NotificationMessage]:
         q: asyncio.Queue[NotificationMessage] = asyncio.Queue(maxsize=self._max_q)
         async with self._lock:
-            self._subs.add(q)
+            uid = int(user_id)
+            bucket = self._subs_by_user.get(uid)
+            if bucket is None:
+                bucket = set()
+                self._subs_by_user[uid] = bucket
+            bucket.add(q)
         return q
 
-    async def unsubscribe(self, q: asyncio.Queue[NotificationMessage]) -> None:
+    async def unsubscribe(self, *, user_id: int, q: asyncio.Queue[NotificationMessage]) -> None:
         async with self._lock:
-            self._subs.discard(q)
+            uid = int(user_id)
+            bucket = self._subs_by_user.get(uid)
+            if not bucket:
+                return
+            bucket.discard(q)
+            if not bucket:
+                self._subs_by_user.pop(uid, None)
 
     async def publish(self, msg: NotificationMessage) -> None:
+        uid = int(msg.user_id)
         async with self._lock:
-            subs = list(self._subs)
+            subs = list(self._subs_by_user.get(uid, set()))
 
         for q in subs:
             try:
@@ -524,10 +537,14 @@ class NotificationService:
         ts_ms = int(det_ev.frame_ts_ms)
 
         ctx = await self._get_camera_ctx_cached(cam)
-        site_name = ctx.site_name if ctx else "Unknown Site"
-        site_uuid_str = str(ctx.site_uuid) if ctx else ""
-        device_name = ctx.device_name if ctx else None
-        camera_name = ctx.camera_name if ctx else None
+        if ctx is None:
+            logger.warning("Skipping alert publish because camera context was not found camera=%s", cam)
+            return
+
+        site_name = ctx.site_name
+        site_uuid_str = str(ctx.site_uuid)
+        device_name = ctx.device_name
+        camera_name = ctx.camera_name
 
         # -------------------------
         # Tracking path
@@ -565,6 +582,7 @@ class NotificationService:
                         continue
 
                     msg = NotificationMessage(
+                        user_id=int(ctx.user_id),
                         id=f"{cam}-trk{track_id}-confirm-{ts_ms}",
                         ts_ms=ts_ms,
                         camera_uuid=cam,
@@ -582,9 +600,7 @@ class NotificationService:
 
                     await self.hub.publish(msg)
 
-                    # DB + email in background (only if ctx exists)
-                    if ctx:
-                        self._fire_and_forget(self._persist_and_send(msg, ctx))
+                    self._fire_and_forget(self._persist_and_send(msg, ctx))
 
             # B) notify-on-ROI-enter
             if self.notify_on_roi_enter:
@@ -603,6 +619,7 @@ class NotificationService:
                     )
                     for a in alerts:
                         msg = NotificationMessage(
+                            user_id=int(ctx.user_id),
                             id=f"{cam}-trk{a['track_id']}-roi{a['roi_id']}-{ts_ms}",
                             ts_ms=ts_ms,
                             camera_uuid=cam,
@@ -621,8 +638,7 @@ class NotificationService:
 
                         await self.hub.publish(msg)
 
-                        if ctx:
-                            self._fire_and_forget(self._persist_and_send(msg, ctx))
+                        self._fire_and_forget(self._persist_and_send(msg, ctx))
 
             return
 
@@ -642,6 +658,7 @@ class NotificationService:
         max_conf = max([c for (_n, c) in matches] or [0.0])
 
         msg = NotificationMessage(
+            user_id=int(ctx.user_id),
             id=f"{det_ev.camera_uuid}-{det_ev.frame_ts_ms}-{det_ev.frame_seq}",
             ts_ms=ts_ms,
             camera_uuid=cam,
@@ -658,8 +675,7 @@ class NotificationService:
 
         await self.hub.publish(msg)
 
-        if ctx:
-            self._fire_and_forget(self._persist_and_send(msg, ctx))
+        self._fire_and_forget(self._persist_and_send(msg, ctx))
 
     def _extract_interesting(self, detections: List[DetectionItem]) -> List[Tuple[str, float]]:
         out: List[Tuple[str, float]] = []

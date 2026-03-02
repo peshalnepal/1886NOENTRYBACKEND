@@ -10,8 +10,8 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dependencies import get_async_db
-from core.database_orm import NotificationEmail, Site
+from dependencies import get_async_db, get_current_user
+from core.database_orm import NotificationEmail, Site, User
 
 router = APIRouter(prefix="/notification-emails", tags=["notification-emails"])
 
@@ -20,7 +20,6 @@ router = APIRouter(prefix="/notification-emails", tags=["notification-emails"])
 # Schemas
 # -------------------------
 class NotificationEmailCreate(BaseModel):
-    user_id: int
     email: EmailStr
     # If omitted, email is applied to all sites owned by the user.
     site_uuid: Optional[uuid.UUID] = None
@@ -46,15 +45,15 @@ class NotificationEmailCreateResult(BaseModel):
 # -------------------------
 @router.get("", response_model=List[NotificationEmailOut])
 async def list_notification_emails(
-    user_id: int,
     site_uuid: Optional[uuid.UUID] = None,
     db: AsyncSession = Depends(get_async_db),
+    user: User = Depends(get_current_user),
 ):
     """
     List notification emails for a user.
     Optional site_uuid filter narrows results to one site.
     """
-    stmt = select(NotificationEmail).where(NotificationEmail.user_id == user_id)
+    stmt = select(NotificationEmail).where(NotificationEmail.user_id == int(user.id))
     if site_uuid is not None:
         stmt = stmt.where(NotificationEmail.site_uuid == site_uuid)
     stmt = stmt.order_by(NotificationEmail.email.asc(), NotificationEmail.site_uuid.asc())
@@ -77,6 +76,7 @@ async def list_notification_emails(
 async def add_notification_email(
     payload: NotificationEmailCreate,
     db: AsyncSession = Depends(get_async_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Add a notification email.
@@ -84,7 +84,7 @@ async def add_notification_email(
     """
     normalized_email = payload.email.lower().strip()
 
-    site_stmt = select(Site.site_uuid).where(Site.user_id == payload.user_id)
+    site_stmt = select(Site.site_uuid).where(Site.user_id == int(user.id))
     if payload.site_uuid is not None:
         site_stmt = site_stmt.where(Site.site_uuid == payload.site_uuid)
 
@@ -103,7 +103,7 @@ async def add_notification_email(
         )
 
     existing_stmt = select(NotificationEmail.site_uuid).where(
-        NotificationEmail.user_id == payload.user_id,
+        NotificationEmail.user_id == int(user.id),
         NotificationEmail.email == normalized_email,
         NotificationEmail.site_uuid.in_(target_site_uuids),
     )
@@ -116,7 +116,7 @@ async def add_notification_email(
             continue
 
         row = NotificationEmail(
-            user_id=payload.user_id,
+            user_id=int(user.id),
             site_uuid=target_site_uuid,
             email=normalized_email,
             is_enabled=True,
@@ -156,13 +156,17 @@ async def delete_notification_email(
     email_id: int,
     all_sites: bool = False,
     db: AsyncSession = Depends(get_async_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Delete one notification email entry by ID.
     If all_sites=true, remove the same user/email pair from all sites.
     """
     result = await db.execute(
-        select(NotificationEmail).where(NotificationEmail.id == email_id)
+        select(NotificationEmail).where(
+            NotificationEmail.id == email_id,
+            NotificationEmail.user_id == int(user.id),
+        )
     )
     email = result.scalar_one_or_none()
     if not email:

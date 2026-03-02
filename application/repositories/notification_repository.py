@@ -62,6 +62,7 @@ class NotificationRepository:
                 Camera.site_uuid,
                 Site.name,
                 Camera.name,
+                Camera.camera_code,
                 Device.device_uuid,
                 Device.name,
             )
@@ -76,13 +77,14 @@ class NotificationRepository:
         if not row:
             return None
 
-        user_id, site_uuid, site_name, camera_name, device_uuid, device_name = row
+        user_id, site_uuid, site_name, camera_name, camera_code, device_uuid, device_name = row
+        display_camera_name = camera_name or camera_code
 
         return CameraContext(
             user_id=int(user_id),
             site_uuid=site_uuid,
             site_name=site_name or "Unknown Site",
-            camera_name=camera_name,
+            camera_name=display_camera_name,
             device_uuid=device_uuid,
             device_name=device_name,
         )

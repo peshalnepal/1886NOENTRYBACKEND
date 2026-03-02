@@ -641,9 +641,12 @@ class ModelPipeline:
         cam_uuid = str(resp.camera_uuid)
 
         ctx = await self._get_camera_ctx(cam_uuid)
+        if ctx is None:
+            logger.warning("Skipping ROI alert publish because camera context was not found camera=%s", cam_uuid)
+            return
 
-        site_name = ctx.site_name if ctx else await self._get_site_name(resp.site_uuid)
-        site_uuid_str = str(ctx.site_uuid) if ctx else (str(resp.site_uuid) if resp.site_uuid else "")
+        site_name = ctx.site_name
+        site_uuid_str = str(ctx.site_uuid)
 
         for a in alerts:
             title = f"ROI Alert ({a.get('type','roi')})"
@@ -656,6 +659,7 @@ class ModelPipeline:
                 track_id = None
 
             msg = NotificationMessage(
+                user_id=int(ctx.user_id),
                 id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-{a.get('roi_id')}-{a.get('track_id')}",
                 ts_ms=int(resp.frame_ts_ms),
                 camera_uuid=cam_uuid,
@@ -674,12 +678,10 @@ class ModelPipeline:
 
             await svc.hub.publish(msg)
 
-            # Persist + email in background only if ctx exists (camera may be deleted)
-            if ctx:
-                asyncio.create_task(
-                    self._persist_and_maybe_email(ctx=ctx, msg=msg, extra_payload={"alert": a}),
-                    name=f"persist_roi_alert:{cam_uuid}",
-                )
+            asyncio.create_task(
+                self._persist_and_maybe_email(ctx=ctx, msg=msg, extra_payload={"alert": a}),
+                name=f"persist_roi_alert:{cam_uuid}",
+            )
                 
     async def _emit_item_detected_notifications(
         self,
@@ -704,9 +706,12 @@ class ModelPipeline:
 
         cam_uuid = str(resp.camera_uuid)
         ctx = await self._get_camera_ctx(cam_uuid)
+        if ctx is None:
+            logger.warning("Skipping item-detected alert publish because camera context was not found camera=%s", cam_uuid)
+            return
 
-        site_name = ctx.site_name if ctx else await self._get_site_name(resp.site_uuid)
-        site_uuid_str = str(ctx.site_uuid) if ctx else (str(resp.site_uuid) if resp.site_uuid else "")
+        site_name = ctx.site_name
+        site_uuid_str = str(ctx.site_uuid)
 
         for track_id in confirmed_track_ids:
             tr = tracks_by_id.get(track_id)
@@ -717,6 +722,7 @@ class ModelPipeline:
             conf = float(tr.get("conf", 0.0) or 0.0)
 
             msg = NotificationMessage(
+                user_id=int(ctx.user_id),
                 id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-track-{track_id}",
                 ts_ms=int(resp.frame_ts_ms),
                 camera_uuid=cam_uuid,
@@ -734,15 +740,14 @@ class ModelPipeline:
 
             await svc.hub.publish(msg)
 
-            if ctx:
-                asyncio.create_task(
-                    self._persist_and_maybe_email(
-                        ctx=ctx,
-                        msg=msg,
-                        extra_payload={"track": tr, "event": "track_confirmed"},
-                    ),
-                    name=f"persist_track_confirmed:{cam_uuid}:{track_id}",
-                )
+            asyncio.create_task(
+                self._persist_and_maybe_email(
+                    ctx=ctx,
+                    msg=msg,
+                    extra_payload={"track": tr, "event": "track_confirmed"},
+                ),
+                name=f"persist_track_confirmed:{cam_uuid}:{track_id}",
+            )
 
     async def _poll_loop(self, key: str, ch: VideoChannel) -> None:
         backoff_ms = 250

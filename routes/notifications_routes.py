@@ -8,13 +8,16 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, desc, func, select, update, delete
+from sqlalchemy import and_, desc, func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
-from core.database_orm import Camera, Notification
-from application.services.notification import WebNotificationHub, CameraMode
+from application.services.notification import CameraMode, WebNotificationHub
+from core.database_orm import Camera, Notification, User
+from core.security.tokens import decode_access_token
+from dependencies import get_async_db, get_current_user
 from domain.events import DetectionBox, DetectionItem, DetectionsProducedEvent
 
 router = APIRouter(prefix="/notifications")
@@ -30,17 +33,55 @@ def _sse(data: str, event: Optional[str] = None) -> str:
     return f"data: {data}\n\n"
 
 
+async def _resolve_stream_user(
+    *,
+    request: Request,
+    db: AsyncSession,
+    access_token: Optional[str],
+) -> User:
+    auth_header = request.headers.get("authorization", "")
+    token = ""
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        token = str(access_token or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    try:
+        payload = decode_access_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+
+    raw_user_id = payload.get("user_id") or payload.get("sub")
+    try:
+        user_id = int(raw_user_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    user = (await db.execute(select(User).where(User.id == user_id).limit(1))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
 @router.get("/stream")
-async def notifications_stream(request: Request):
+async def notifications_stream(
+    request: Request,
+    access_token: Optional[str] = None,
+    db: AsyncSession = Depends(get_async_db),
+):
     """
-    Global notifications SSE stream.
-    Reads from in-memory hub (WebNotificationHub).
+    User-scoped notifications SSE stream.
+    Authentication can be provided via Authorization header or access_token query param.
     """
     hub: WebNotificationHub = getattr(request.app.state, "notification_hub", None)
     if hub is None:
         raise HTTPException(status_code=503, detail="Notification hub not available")
 
-    q = await hub.subscribe()
+    user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+    user_id = int(user.id)
+    q = await hub.subscribe(user_id=user_id)
 
     async def gen():
         last_ping = time.monotonic()
@@ -60,7 +101,7 @@ async def notifications_stream(request: Request):
 
                 yield _sse(msg.model_dump_json(), event="notification")
         finally:
-            await hub.unsubscribe(q)
+            await hub.unsubscribe(user_id=user_id, q=q)
 
     headers = {
         "Cache-Control": "no-cache",
@@ -201,6 +242,8 @@ class NotificationOut(BaseModel):
     user_id: int
     site_uuid: str
     camera_uuid: Optional[str] = None
+    site_name: Optional[str] = None
+    camera_name: Optional[str] = None
     device_uuid: Optional[str] = None
     event_type: str
     title: Optional[str] = None
@@ -214,11 +257,14 @@ class NotificationOut(BaseModel):
 
 
 def _to_out(n: Notification) -> NotificationOut:
+    msg = _payload_msg(n.payload)
     return NotificationOut(
         id=int(n.id),
         user_id=int(n.user_id),
         site_uuid=str(n.site_uuid),
         camera_uuid=str(n.camera_uuid) if n.camera_uuid else None,
+        site_name=str(msg.get("site_name") or "") or None,
+        camera_name=str(msg.get("camera_name") or "") or None,
         device_uuid=str(n.device_uuid) if n.device_uuid else None,
         event_type=str(n.event_type),
         title=n.title,
@@ -235,11 +281,11 @@ def _to_out(n: Notification) -> NotificationOut:
 @router.get("", response_model=List[NotificationOut])
 async def list_notifications(
     request: Request,
-    user_id: int,
     site_uuid: Optional[str] = None,
     camera_uuid: Optional[str] = None,
     unread_only: bool = False,
     limit: int = 100,
+    user: User = Depends(get_current_user),
 ):
     sf = _session_factory_from_app(request)
     if sf is None:
@@ -258,8 +304,10 @@ async def list_notifications(
         raise HTTPException(status_code=422, detail="Invalid camera_uuid")
 
     async with sf() as db:
-        stmt = select(Notification).where(Notification.user_id == int(user_id),
-                                          Notification.visible==True)
+        stmt = select(Notification).where(
+            Notification.user_id == int(user.id),
+            Notification.visible.is_(True),
+        )
         if su:
             stmt = stmt.where(Notification.site_uuid == su)
         if cu:
@@ -274,13 +322,16 @@ async def list_notifications(
 
 
 class ClearNotificationsRequest(BaseModel):
-    user_id: int
     site_uuid: Optional[str] = None
     camera_uuid: Optional[str] = None
 
 
 @router.post("/clear")
-async def clear_notifications(payload: ClearNotificationsRequest, request: Request):
+async def clear_notifications(
+    payload: ClearNotificationsRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+):
     """
     Recommended behavior: do NOT delete history.
     Mark as read (read_at + status='read').
@@ -303,7 +354,7 @@ async def clear_notifications(payload: ClearNotificationsRequest, request: Reque
     now = datetime.now(timezone.utc)
 
     async with sf() as db:
-        conds = [Notification.user_id == int(payload.user_id)]
+        conds = [Notification.user_id == int(user.id)]
         if su:
             conds.append(Notification.site_uuid == su)
         if cu:
@@ -321,14 +372,17 @@ async def clear_notifications(payload: ClearNotificationsRequest, request: Reque
 
 
 class DeleteNotificationsRequest(BaseModel):
-    user_id: int
     site_uuid: Optional[str] = None
     camera_uuid: Optional[str] = None
     notification_ids: Optional[List[int]] = None
 
 
 @router.delete("")
-async def delete_notifications(payload: DeleteNotificationsRequest, request: Request):
+async def delete_notifications(
+    payload: DeleteNotificationsRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+):
     """
     Hard delete (use sparingly).
     """
@@ -348,7 +402,7 @@ async def delete_notifications(payload: DeleteNotificationsRequest, request: Req
         raise HTTPException(status_code=422, detail="Invalid camera_uuid")
 
     async with sf() as db:
-        conds = [Notification.user_id == int(payload.user_id)]
+        conds = [Notification.user_id == int(user.id)]
         if su:
             conds.append(Notification.site_uuid == su)
         if cu:
@@ -500,11 +554,11 @@ def _is_roi_notification(event_type: Any, title: Any, message: Any, payload: Any
 @router.get("/detections-over-time")
 async def detections_over_time(
     request: Request,
-    user_id: int,
     site_uuid: Optional[str] = None,
     hours: int = 24,
     object_class: Optional[str] = None,
     roi_only: bool = False,
+    user: User = Depends(get_current_user),
 ):
     """
     Returns simple time buckets for dashboard charts.
@@ -542,7 +596,7 @@ async def detections_over_time(
             Notification.message,
             Notification.payload,
         ).where(
-            Notification.user_id == int(user_id),
+            Notification.user_id == int(user.id),
             Notification.detected_at >= start,
         )
         if su:
@@ -578,7 +632,7 @@ async def detections_over_time(
 
     total = sum(p["count"] for p in points)
     return {
-        "user_id": int(user_id),
+        "user_id": int(user.id),
         "site_uuid": str(su) if su else None,
         "hours": hours_i,
         "object_class": class_filter,
@@ -594,8 +648,8 @@ async def detections_over_time(
 @router.get("/unread-count")
 async def unread_count(
     request: Request,
-    user_id: int,
     site_uuid: Optional[str] = None,
+    user: User = Depends(get_current_user),
 ):
     sf = _session_factory_from_app(request)
     if sf is None:
@@ -609,13 +663,13 @@ async def unread_count(
 
     async with sf() as db:
         stmt = select(func.count(Notification.id)).where(
-            Notification.user_id == int(user_id),
+            Notification.user_id == int(user.id),
             Notification.read_at.is_(None),
-            Notification.visible==True
+            Notification.visible.is_(True),
         )
         if su:
             stmt = stmt.where(Notification.site_uuid == su)
 
         n = (await db.execute(stmt)).scalar_one()
 
-    return {"user_id": int(user_id), "site_uuid": str(su) if su else None, "unread": int(n)}
+    return {"user_id": int(user.id), "site_uuid": str(su) if su else None, "unread": int(n)}
