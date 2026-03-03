@@ -17,7 +17,7 @@ from starlette.responses import StreamingResponse
 from application.services.notification import CameraMode, WebNotificationHub
 from core.database_orm import Camera, Notification, User
 from core.security.tokens import decode_access_token
-from dependencies import get_async_db, get_current_user
+from dependencies import get_current_user
 from domain.events import DetectionBox, DetectionItem, DetectionsProducedEvent
 
 router = APIRouter(prefix="/notifications")
@@ -69,7 +69,6 @@ async def _resolve_stream_user(
 async def notifications_stream(
     request: Request,
     access_token: Optional[str] = None,
-    db: AsyncSession = Depends(get_async_db),
 ):
     """
     User-scoped notifications SSE stream.
@@ -79,7 +78,12 @@ async def notifications_stream(
     if hub is None:
         raise HTTPException(status_code=503, detail="Notification hub not available")
 
-    user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+    sf = _session_factory_from_app(request)
+    if sf is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with sf() as db:
+        user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
     user_id = int(user.id)
     q = await hub.subscribe(user_id=user_id)
 

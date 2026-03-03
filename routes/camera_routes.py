@@ -18,6 +18,7 @@ from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent
 from core.database_orm import User
+from core.database import db_manager
 from core.security.tokens import decode_access_token
 from core.schemas import (
     CameraSchema,
@@ -66,6 +67,13 @@ async def _resolve_stream_user(
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
     return user
+
+
+def _session_factory_from_app(request: Request):
+    sf = getattr(request.app.state, "session_factory", None)
+    if sf is not None:
+        return sf
+    return getattr(db_manager, "AsyncSessionLocal", None)
 
 
 # -------------------------
@@ -299,17 +307,20 @@ async def stream_detections_sse(
     timeout_ms: int = 30000,
     normalize: bool = False,
     access_token: Optional[str] = None,
-    db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
 ):
-    user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
-    repo = ChannelRepository()
-    full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
-    if not full:
-        raise HTTPException(status_code=404, detail="Camera not found")
+    sf = _session_factory_from_app(request)
+    if sf is None:
+        raise HTTPException(status_code=503, detail="Database not available")
 
-    cam, _cfg, _pid = full
-    _ensure_user_owns_camera(cam, user.id)
+    async with sf() as db:
+        user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+        repo = ChannelRepository()
+        full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
+        if not full:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        cam, _cfg, _pid = full
+        _ensure_user_owns_camera(cam, user.id)
 
     pipeline = await manager.get_activepipeline(user_id=user.id)
     cam_key = str(camera_uuid)
@@ -357,10 +368,15 @@ async def stream_all_detections_sse(
     timeout_ms: int = 30000,
     normalize: bool = False,
     access_token: Optional[str] = None,
-    db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
 ):
-    user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+    sf = _session_factory_from_app(request)
+    if sf is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with sf() as db:
+        user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+
     pipeline = await manager.get_activepipeline(user_id=user.id)
     hub = pipeline.detection_hub
 

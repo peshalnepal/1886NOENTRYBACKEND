@@ -86,6 +86,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("FATAL: Could not initialize database tables and defaults.")
 
     app.state.manager = Manager(session_factory=SessionLocal)
+    app.state.session_factory = SessionLocal
     hub = WebNotificationHub()
     
     # Configure email notifier with proper SMTP settings

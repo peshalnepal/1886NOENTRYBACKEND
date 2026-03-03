@@ -345,6 +345,8 @@ class NotificationService:
         self._repo = NotificationRepository()
         self._ctx_cache: Dict[str, Tuple[float, CameraContext]] = {}
         self._ctx_ttl_s = 60.0  # reduce DB hits on frequent detections
+        self._roi_cache: Dict[str, Tuple[float, List[ROI]]] = {}
+        self._roi_ttl_s = 15.0
 
     def set_session_factory(self, session_factory):
         self._session_factory = session_factory
@@ -490,6 +492,11 @@ class NotificationService:
         if not self._session_factory:
             return []
 
+        now = time.monotonic()
+        hit = self._roi_cache.get(camera_uuid)
+        if hit and hit[0] > now:
+            return hit[1]
+
         try:
             from core.database_orm import Camera
             from sqlalchemy import select
@@ -503,18 +510,27 @@ class NotificationService:
                 row = result.scalar_one_or_none()
 
             if not row or not isinstance(row, dict):
-                return []
+                rois: List[ROI] = []
+                self._roi_cache[camera_uuid] = (now + self._roi_ttl_s, rois)
+                return rois
 
             points = self._parse_roi_points(row.get("points", []))
             normalized = self._coerce_roi_normalized(row.get("normalized"), points)
 
             if not points or len(points) < 3:
-                return []
+                rois = []
+                self._roi_cache[camera_uuid] = (now + self._roi_ttl_s, rois)
+                return rois
 
             roi_points = self._clamp_unit_points(points) if normalized else points
-            return [ROI(roi_id=f"{camera_uuid}-roi", points=roi_points, normalized=normalized)]
+            rois = [ROI(roi_id=f"{camera_uuid}-roi", points=roi_points, normalized=normalized)]
+            self._roi_cache[camera_uuid] = (now + self._roi_ttl_s, rois)
+            return rois
 
         except Exception as e:
+            stale = self._roi_cache.get(camera_uuid)
+            if stale:
+                return stale[1]
             logger.warning("Failed to fetch ROI for %s: %s", camera_uuid, e)
             return []
 
