@@ -182,8 +182,7 @@ async def list_cameras(
     if site_uuid is None:
         raise HTTPException(status_code=400, detail="site_uuid is required")
 
-    cams = await site_repo.list_cameras_by_site(db, site_uuid=site_uuid)
-    cams = [cam for cam in cams if int(getattr(cam, "user_id", -1)) == int(user.id)]
+    cams = await site_repo.list_cameras_by_site(db, site_uuid=site_uuid,user_id=int(user.id))
 
     out: List[CameraSchema] = []
     for cam in cams:
@@ -411,8 +410,7 @@ async def latest_detections_for_site(
     if site_uuid is None:
         raise HTTPException(status_code=400, detail="site_uuid is required")
 
-    cams = await site_repo.list_cameras_by_site(db, site_uuid=site_uuid)
-    cams = [cam for cam in cams if int(getattr(cam, "user_id", -1)) == int(user.id)]
+    cams = await site_repo.list_cameras_by_site(db, site_uuid=site_uuid,user_id=int(user.id))
 
     pipeline = await manager.get_activepipeline(user_id=user.id)
 

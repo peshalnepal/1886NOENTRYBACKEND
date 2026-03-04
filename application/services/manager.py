@@ -369,73 +369,99 @@ class Manager:
             mp = await self.create_pipeline(uid)
         await mp.start()
         return mp
-
+    
     async def update_pipeline(
         self,
-        pipeline_id: Union[str, uuid.UUID],
+        pipeline_id: Union[str, uuid.UUID, None],
         channel_events: List[VideoChannelEvent],
         *,
         user_id: Optional[int] = None,
         camera_code_prefix: str = "cam",
     ) -> Optional[PipelineUpdateResult]:
 
-        pid = self._as_uuid(pipeline_id, "pipeline_id")
         uid = int(user_id or self._default_user_id)
 
-        # do not call create_pipeline while holding lock
+        # get active pipeline OUTSIDE any Manager lock
         active = await self.get_activepipeline(uid)
 
-        for attempt in [1, 2]:
+        active_pid = getattr(active, "pipeline_id", None) or self._pipeline_id_by_user.get(uid)
+        if not active_pid:
             async with self._lock:
-                async with self._session_factory() as db:
-                    exists = await self._repo.pipeline_exists(db, pid)
-                    if not exists:
-                        logger.warning("Pipeline %s does not exist in DB for user %s. Invalidating cache (attempt %s).", pid, uid, attempt)
+                self._pipelines_by_user.pop(uid, None)
+                self._pipeline_id_by_user.pop(uid, None)
+            active = await self.get_activepipeline(uid)
+            active_pid = getattr(active, "pipeline_id", None)
+
+        pid = self._as_uuid(active_pid, "pipeline_id")
+
+        if pipeline_id is not None:
+            try:
+                supplied_pid = self._as_uuid(pipeline_id, "pipeline_id")
+                if supplied_pid != pid:
+                    logger.warning(
+                        "update_pipeline called with pipeline_id=%s but active pipeline_id=%s user=%s; using active",
+                        supplied_pid, pid, uid
+                    )
+            except Exception:
+                logger.warning("update_pipeline got non-uuid pipeline_id=%s; using active", pipeline_id)
+
+        for attempt in (1, 2):
+            async with self._session_factory() as db:
+                exists = await self._repo.pipeline_exists(db, pid)
+                if not exists:
+                    logger.warning(
+                        "Active pipeline %s missing in DB for user %s (attempt %s).",
+                        pid, uid, attempt
+                    )
+                    async with self._lock:
                         self._pipelines_by_user.pop(uid, None)
                         self._pipeline_id_by_user.pop(uid, None)
-                        if attempt == 1:
-                             # refresh 'active' and 'pid' for retry
-                             active = await self.get_activepipeline(uid)
-                             pid = self._pipeline_id_by_user.get(uid)
-                             if not pid:
-                                 return None
-                             continue
-                        return None
 
-                    cameras_out: List[CameraOut] = []
-                    events_out: List[Dict[str, Any]] = []
+                    if attempt == 1:
+                        active = await self.get_activepipeline(uid)
+                        active_pid = getattr(active, "pipeline_id", None) or self._pipeline_id_by_user.get(uid)
+                        if not active_pid:
+                            return None
+                        pid = self._as_uuid(active_pid, "pipeline_id")
+                        continue
+                    return None
 
-                    for ev in (channel_events or []):
-                        et = getattr(ev, "event_type", None)
-                        if et is None and isinstance(ev, dict):
-                            et = ev.get("event_type")
-                        et_norm = str(et or "").lower()
+                cameras_out: List[CameraOut] = []
+                events_out: List[Dict[str, Any]] = []
 
-                        if et_norm == "create_channel" or isinstance(ev, ChannelCreateEvent):
-                            cams, evs = await self._add_channel(
-                                db, pid=pid, ev=ev, user_id=uid, camera_code_prefix=camera_code_prefix, active=active
-                            )
-                        elif et_norm == "edit_channel" or isinstance(ev, ChannelEditEvent):
-                            cams, evs = await self._edit_channel(db, pid=pid, ev=ev, user_id=uid, active=active)
-                        elif et_norm == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
-                            cams, evs = await self._remove_channel(db, pid=pid, ev=ev, user_id=uid, active=active)
-                        else:
-                            logger.warning("Event type not matched: %s", et)
-                            continue
+                for ev in (channel_events or []):
+                    et = getattr(ev, "event_type", None)
+                    if et is None and isinstance(ev, dict):
+                        et = ev.get("event_type")
+                    et_norm = str(et or "").lower()
 
-                        cameras_out.extend(cams)
-                        events_out.extend(evs)
+                    if et_norm == "create_channel" or isinstance(ev, ChannelCreateEvent):
+                        cams, evs = await self._add_channel(
+                            db, pid=pid, ev=ev, user_id=uid,
+                            camera_code_prefix=camera_code_prefix, active=active
+                        )
+                    elif et_norm == "edit_channel" or isinstance(ev, ChannelEditEvent):
+                        cams, evs = await self._edit_channel(db, pid=pid, ev=ev, user_id=uid, active=active)
+                    elif et_norm == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
+                        cams, evs = await self._remove_channel(db, pid=pid, ev=ev, user_id=uid, active=active)
+                    else:
+                        logger.warning("Event type not matched: %s", et)
+                        continue
 
-                    await db.commit()
+                    cameras_out.extend(cams)
+                    events_out.extend(evs)
+
+                await db.commit()
 
                 return PipelineUpdateResult(
                     pipeline_id=pid,
-                    active_in_memory=False,
+                    active_in_memory=True,
                     cameras=cameras_out,
                     events=events_out,
                 )
-        return None
 
+        return None
+    
     async def reconcile_device_edge_simple(
         self,
         *,

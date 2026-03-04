@@ -25,9 +25,12 @@ class SiteRepository:
         db: AsyncSession,
         *,
         site_uuid: uuid.UUID,
+        user_id:int,
         include_config: bool = True,
         include_device: bool = True,
+
         only_enabled: Optional[bool] = None,
+
     ) -> List[Camera]:
         """
         Returns all cameras linked to a site_uuid.
@@ -48,7 +51,7 @@ class SiteRepository:
             # loads Camera.devices (Device objects) using the secondary table camera_devices
             opts.append(selectinload(Camera.devices))
 
-        stmt = select(Camera).where(Camera.site_uuid == site_uuid)
+        stmt = select(Camera).where(Camera.site_uuid == site_uuid,Camera.user_id==user_id)
 
         if only_enabled is True:
             stmt = stmt.where(Camera.is_enabled.is_(True))
