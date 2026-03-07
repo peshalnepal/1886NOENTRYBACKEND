@@ -199,7 +199,7 @@ async def unlink_device_from_site(
     device_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    manager: Manager = Depends(get_manager),  # NEW dependency
+    manager: Manager = Depends(get_manager),
 
 ):
     site = await _get_site_or_404(db, user.id, site_uuid)

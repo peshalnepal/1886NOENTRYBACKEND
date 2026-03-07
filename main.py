@@ -108,10 +108,21 @@ async def lifespan(app: FastAPI):
     app.state.notification_hub = hub
     app.state.notification_service = svc
     app.state.manager.set_notification_service(svc)
-    
-    pipeline = await app.state.manager.create_pipeline()
-    await pipeline.start()
-    app.state.pipeline = pipeline
+
+    pipeline_startup = await app.state.manager.start_background_pipelines()
+    app.state.pipeline_startup = pipeline_startup
+    if pipeline_startup["error_count"]:
+        logger.warning(
+            "Background pipeline startup completed with errors started=%s errors=%s",
+            pipeline_startup["started_count"],
+            pipeline_startup["error_count"],
+        )
+    else:
+        logger.info(
+            "Background pipeline startup completed started=%s",
+            pipeline_startup["started_count"],
+        )
+
     app.state.edge_reconcile_task = asyncio.create_task(_edge_reconcile_loop(app), name="edge_reconcile_loop")
 
     yield
@@ -126,12 +137,6 @@ async def lifespan(app: FastAPI):
                 pass
             except Exception:
                 logger.exception("Edge reconcile task shutdown failed")
-
-        if hasattr(app.state, "pipeline") and app.state.pipeline:
-            if hasattr(app.state.pipeline, "shutdown"):
-                await app.state.pipeline.shutdown()
-            elif hasattr(app.state.pipeline, "stop"):
-                await app.state.pipeline.stop()
     finally:
         try:
             if hasattr(app.state, "manager") and app.state.manager:

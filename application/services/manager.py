@@ -183,10 +183,74 @@ class Manager:
 
     async def shutdown(self) -> None:
         async with self._lock:
+            pipelines = list(self._pipelines_by_user.values())
             self._pipelines_by_user.clear()
             self._pipeline_id_by_user.clear()
+
+        for mp in pipelines:
+            if mp is None:
+                continue
+            try:
+                await mp.shutdown()
+            except Exception:
+                logger.exception(
+                    "Pipeline shutdown failed pipeline_id=%s",
+                    getattr(mp, "pipeline_id", None),
+                )
         await self._webrtc.close()
         await self._edge.close()
+
+    async def start_background_pipelines(self) -> Dict[str, Any]:
+        """
+        Start polling pipelines for every user that has at least one enabled
+        detection camera so notifications continue even when nobody is logged in.
+        """
+        async with self._session_factory() as db:
+            rows = await db.execute(
+                select(Camera.user_id)
+                .where(
+                    Camera.is_enabled.is_(True),
+                    Camera.is_detection_enabled.is_(True),
+                )
+                .distinct()
+                .order_by(Camera.user_id.asc())
+            )
+            user_ids = sorted(
+                {
+                    int(row[0])
+                    for row in rows.all()
+                    if row and row[0] is not None
+                }
+            )
+
+        summary: Dict[str, Any] = {
+            "user_ids": user_ids,
+            "started": [],
+            "errors": [],
+        }
+
+        for uid in user_ids:
+            try:
+                mp = await self.get_activepipeline(user_id=uid)
+                summary["started"].append(
+                    {
+                        "user_id": uid,
+                        "pipeline_id": str(getattr(mp, "pipeline_id", "")),
+                        "channel_count": len(mp.list_channel_ids()),
+                    }
+                )
+            except Exception as exc:
+                logger.exception("Failed to start background pipeline user=%s", uid)
+                summary["errors"].append(
+                    {
+                        "user_id": uid,
+                        "error": str(exc),
+                    }
+                )
+
+        summary["started_count"] = len(summary["started"])
+        summary["error_count"] = len(summary["errors"])
+        return summary
 
     def _patch_to_dict(self, obj: Any) -> Dict[str, Any]:
         if obj is None:

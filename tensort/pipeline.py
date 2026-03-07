@@ -436,7 +436,6 @@ class SimpleInferencePipeline(object):
                 # create an asyncio Future to receive result
                 fut = asyncio.Future()
 
-                # submit to TRT worker thread
                 if self._infer_worker is None:
                     await self._put_out({
                         "type": "InferenceFailedEvent",
@@ -447,10 +446,20 @@ class SimpleInferencePipeline(object):
                     })
                     continue
 
-                self._infer_worker.submit(bgr, meta, fut)
-
-                # await result (non-blocking for loop)
-                result = await fut
+                ok = self._infer_worker.submit(bgr, meta, fut)
+                if not ok:
+                    result = await fut
+                else:
+                    try:
+                        result = await asyncio.wait_for(fut, timeout=2.0)  # tune
+                    except asyncio.TimeoutError:
+                        result = {
+                            "type": "InferenceFailedEvent",
+                            "camera_uuid": meta["camera_uuid"],
+                            "frame_ts_ms": meta["frame_ts_ms"],
+                            "frame_seq": meta["frame_seq"],
+                            "reason": "Inference timed out",
+                        }
                 if isinstance(result, dict) and result.get("type") == "InferenceFailedEvent":
                     self._stats["infer_fail"] += 1
                     reason = str(result.get("reason", "") or "")
