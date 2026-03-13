@@ -397,6 +397,9 @@ pathDefaults:
 hls: false
 rtmp: false
 srt: false
+
+paths:
+  all_others: {}
 '''
 
 var caddyfile = $'''
