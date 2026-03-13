@@ -28,7 +28,6 @@ from core.database_orm import Site
 from application.repositories.notification_repository import (
     NotificationRepository,
     CameraContext,
-    dt_from_ts_ms,
 )
 
 
@@ -554,75 +553,10 @@ class ModelPipeline:
         msg: NotificationMessage,
         extra_payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Create Notification row (status=created), email if enabled, then mark sent/failed.
-        Runs inside a task (non-blocking to poll loop).
-        """
-        sf = self._session_factory
         svc = self._notification_service
-        if sf is None or svc is None:
+        if svc is None:
             return
-
-        notif_id: Optional[int] = None
-        recipients: List[str] = []
-
-        try:
-            async with sf() as db:
-                notif = await self._notif_repo.create_notification(
-                    db,
-                    user_id=ctx.user_id,
-                    site_uuid=ctx.site_uuid,
-                    camera_uuid=UUID(msg.camera_uuid),
-                    device_uuid=ctx.device_uuid,
-                    event_type=msg.alert_type,
-                    title=msg.title,
-                    message=msg.body,
-                    payload={
-                        "msg": msg.model_dump(),
-                        "extra": extra_payload or {},
-                    },
-                    detected_at=dt_from_ts_ms(msg.ts_ms),
-                    status="created",
-                    sent_at=None,
-                )
-                notif_id = int(notif.id)
-
-                recipients = await self._notif_repo.list_notification_emails_for_site(
-                    db,
-                    user_id=ctx.user_id,
-                    site_uuid=ctx.site_uuid,
-                    only_enabled=True,
-                )
-
-                await db.commit()
-            sent_ok = False
-            if svc.email:
-                try:
-                    await svc.email.send(msg, to_emails=recipients if recipients else None)
-                    sent_ok = True
-                except Exception:
-                    logger.exception("Email send failed camera=%s", msg.camera_uuid)
-                    sent_ok = False
-
-            if notif_id is not None:
-                async with sf() as db2:
-                    if sent_ok:
-                        await self._notif_repo.mark_notification_sent(db2, notification_id=notif_id)
-                    else:
-                        # Only mark failed if we actually attempted (email enabled + recipients present)
-                        if svc.email and recipients:
-                            await self._notif_repo.mark_notification_failed(db2, notification_id=notif_id)
-                    await db2.commit()
-
-        except Exception:
-            logger.exception("Persist/email workflow failed for camera=%s", msg.camera_uuid)
-            if notif_id is not None:
-                try:
-                    async with sf() as db3:
-                        await self._notif_repo.mark_notification_failed(db3, notification_id=notif_id)
-                        await db3.commit()
-                except Exception:
-                    logger.exception("Failed to mark notification failed id=%s", notif_id)
+        await svc.enqueue_notification(msg, ctx, extra_payload=extra_payload)
 
     def _ensure_poller(self, key: str, ch: VideoChannel) -> None:
         t = self._poll_tasks.get(key)

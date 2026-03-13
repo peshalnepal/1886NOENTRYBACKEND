@@ -143,6 +143,12 @@ async def lifespan(app: FastAPI):
                 await app.state.manager.shutdown()
         except Exception:
             logger.exception("Manager shutdown failed")
+        try:
+            svc = getattr(app.state, "notification_service", None)
+            if svc is not None and hasattr(svc, "shutdown"):
+                await svc.shutdown()
+        except Exception:
+            logger.exception("Notification service shutdown failed")
 
 app = FastAPI(debug=DEBUG, lifespan=lifespan)
 

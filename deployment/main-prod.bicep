@@ -23,6 +23,8 @@ param mysqlLocation string = location
 // Feature toggles
 param deployMediaMtx bool = true
 param createMysqlDatabase bool = false
+param videoClipStorageAccountName string = '1886noentry'
+param videoClipContainerName string = 'event-clips'
 
 param mediamtxImageRepo string = 'mediamtx'
 param mediamtxImageTag string = '1.16.1'
@@ -125,6 +127,9 @@ resource environment 'Microsoft.App/managedEnvironments@2023-05-01' = {
 var mysqlSuffix = toLower(substring(uniqueString(resourceGroup().id, namePrefix, environmentName, mysqlLocation), 0, 6))
 var mysqlServerName = toLower('${namePrefix}-mysql-${mysqlSuffix}')
 var mysqlFqdn = '${mysqlServerName}.mysql.database.azure.com'
+var clipStorageName = videoClipStorageAccountName != '' ? toLower(videoClipStorageAccountName) : toLower(substring(replace('${namePrefix}clips${suffix}', '-', ''), 0, 24))
+var clipStorageKey = listKeys(clipStorage.id, '2023-05-01').keys[0].value
+var clipStorageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${clipStorage.name};AccountKey=${clipStorageKey};EndpointSuffix=core.windows.net'
 
 // This is the exact format you are using in .env today
 var databaseUrl = 'Driver={MySQL ODBC 8.0 Unicode Driver};Server=${mysqlFqdn};Port=3306;Database=${mysqlDatabaseName};User=${appDbUser};Password=${appDbPassword};Option=3;'
@@ -181,6 +186,32 @@ resource mysqlDb 'Microsoft.DBforMySQL/flexibleServers/databases@2024-12-30' = i
     collation: 'utf8mb4_unicode_ci'
   }
 }
+
+resource clipStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: clipStorageName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    accessTier: 'Hot'
+    allowBlobPublicAccess: false
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+  }
+}
+
+resource clipStorageBlobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+  name: '${clipStorage.name}/default'
+}
+
+resource clipStorageContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  name: '${clipStorage.name}/default/${videoClipContainerName}'
+  properties: {
+    publicAccess: 'None'
+  }
+}
 // ----------------------------
 // Backend API (Container App)
 // ----------------------------
@@ -218,6 +249,10 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
         {
           name: 'acr-password'
           value: acrPassword
+        }
+        {
+          name: 'video-clip-blob-connection-string'
+          value: clipStorageConnectionString
         }
       ]
       registries: [
@@ -262,6 +297,13 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'WEBRTC_ADMIN_UPSERT_PATH', value: webrtcAdminUpsertPath }
             { name: 'WEBRTC_ADMIN_UPDATE_PATH', value: webrtcAdminUpdatePath }
             { name: 'WEBRTC_ADMIN_DELETE_PATH', value: webrtcAdminDeletePath }
+            { name: 'VIDEO_CLIP_CAPTURE_ENABLED', value: 'true' }
+            { name: 'VIDEO_CLIP_DURATION_S', value: '120' }
+            { name: 'VIDEO_CLIP_COOLDOWN_S', value: '120' }
+            { name: 'VIDEO_CLIP_SAS_TTL_HOURS', value: '168' }
+            { name: 'VIDEO_CLIP_BLOB_CONTAINER', value: videoClipContainerName }
+            { name: 'MEDIAMTX_PLAYBACK_BASE_URL', value: deployMediaMtx ? 'https://${proxyHost}/playback' : '' }
+            { name: 'VIDEO_CLIP_BLOB_CONNECTION_STRING', secretRef: 'video-clip-blob-connection-string' }
           ]
         }
       ]
@@ -274,11 +316,13 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
 
   dependsOn: createMysqlDatabase
     ? [
+        clipStorageContainer
         mysqlDb
         mysqlFwAzure
         mysqlRequireSecureTransport
       ]
     : [
+        clipStorageContainer
         mysqlFwAzure
         mysqlRequireSecureTransport
       ]
@@ -325,6 +369,10 @@ api: yes
 apiAddress: :9997
 apiAllowOrigins: ['*']
 
+playback: yes
+playbackAddress: :9996
+playbackAllowOrigins: ['*']
+
 webrtc: yes
 webrtcAddress: :8889
 
@@ -337,6 +385,15 @@ webrtcAdditionalHosts: ['${proxyHost}']
 
 webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
+
+pathDefaults:
+  record: yes
+  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 15s
+  recordDeleteAfter: 2m
+
 hls: false
 rtmp: false
 srt: false
@@ -349,6 +406,10 @@ var caddyfile = $'''
 
 ${proxyHost} {
   encode gzip
+
+  handle_path /playback/* {
+    reverse_proxy 127.0.0.1:9996
+  }
 
   @api path /v3/*
   reverse_proxy @api 127.0.0.1:9997
@@ -403,6 +464,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
         properties: {
           image: '${acr.properties.loginServer}/${mediamtxImageRepo}:${mediamtxImageTag}'
           ports: [
+            { port: 9996, protocol: 'TCP' }
             { port: 8889, protocol: 'TCP' }
             { port: 9997, protocol: 'TCP' }
             { port: 8189, protocol: 'UDP' }

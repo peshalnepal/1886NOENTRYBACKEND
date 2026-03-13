@@ -1,6 +1,7 @@
 # application/repositories/notification_repository.py
 
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -35,6 +36,7 @@ class CameraContext:
     user_id: int
     site_uuid: uuid.UUID
     site_name: str
+    camera_code: Optional[str]
     camera_name: Optional[str]
     device_uuid: Optional[uuid.UUID]
     device_name: Optional[str]
@@ -84,6 +86,7 @@ class NotificationRepository:
             user_id=int(user_id),
             site_uuid=site_uuid,
             site_name=site_name or "Unknown Site",
+            camera_code=str(camera_code) if camera_code else None,
             camera_name=display_camera_name,
             device_uuid=device_uuid,
             device_name=device_name,
@@ -106,6 +109,33 @@ class NotificationRepository:
 
         res = await db.execute(stmt)
         return [r[0] for r in res.all()]
+
+    async def list_notification_emails_for_sites(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        site_uuids: List[uuid.UUID],
+        only_enabled: bool = True,
+    ) -> Dict[uuid.UUID, List[str]]:
+        site_uuid_values = [_as_uuid(site_uuid) for site_uuid in (site_uuids or [])]
+        site_uuid_values = [site_uuid for site_uuid in site_uuid_values if site_uuid is not None]
+        if not site_uuid_values:
+            return {}
+
+        stmt = select(NotificationEmail.site_uuid, NotificationEmail.email).where(
+            NotificationEmail.user_id == int(user_id),
+            NotificationEmail.site_uuid.in_(site_uuid_values),
+        )
+        if only_enabled:
+            stmt = stmt.where(NotificationEmail.is_enabled.is_(True))
+
+        rows = (await db.execute(stmt)).all()
+        grouped: Dict[uuid.UUID, List[str]] = defaultdict(list)
+        for site_uuid, email in rows:
+            grouped[site_uuid].append(email)
+
+        return {site_uuid: emails for site_uuid, emails in grouped.items()}
 
     async def create_notification(
         self,
@@ -140,6 +170,35 @@ class NotificationRepository:
         await db.flush()  # makes row.id available
         return row
 
+    async def create_notifications(
+        self,
+        db: AsyncSession,
+        *,
+        rows: List[Dict[str, Any]],
+    ) -> List[Notification]:
+        notifications: List[Notification] = []
+        for item in rows or []:
+            row = Notification(
+                user_id=int(item["user_id"]),
+                site_uuid=_as_uuid(item["site_uuid"]),
+                camera_uuid=_as_uuid(item.get("camera_uuid")),
+                device_uuid=_as_uuid(item.get("device_uuid")),
+                event_type=item["event_type"],
+                title=item.get("title"),
+                message=item.get("message"),
+                payload=item.get("payload"),
+                detected_at=item["detected_at"],
+                status=item.get("status", "created"),
+                sent_at=item.get("sent_at"),
+            )
+            notifications.append(row)
+
+        if notifications:
+            db.add_all(notifications)
+            await db.flush()
+
+        return notifications
+
     async def mark_notification_sent(
         self,
         db: AsyncSession,
@@ -159,6 +218,29 @@ class NotificationRepository:
         await db.execute(stmt)
         await db.flush()
 
+    async def mark_notifications_sent(
+        self,
+        db: AsyncSession,
+        *,
+        notification_ids: List[int],
+        sent_at: Optional[datetime] = None,
+        status: str = "sent",
+    ) -> None:
+        ids = sorted({int(notification_id) for notification_id in (notification_ids or []) if int(notification_id) > 0})
+        if not ids:
+            return
+
+        stmt = (
+            update(Notification)
+            .where(Notification.id.in_(ids))
+            .values(
+                status=status,
+                sent_at=sent_at or datetime.now(timezone.utc),
+            )
+        )
+        await db.execute(stmt)
+        await db.flush()
+
     async def mark_notification_failed(
         self,
         db: AsyncSession,
@@ -169,6 +251,25 @@ class NotificationRepository:
         stmt = (
             update(Notification)
             .where(Notification.id == int(notification_id))
+            .values(status=status)
+        )
+        await db.execute(stmt)
+        await db.flush()
+
+    async def mark_notifications_failed(
+        self,
+        db: AsyncSession,
+        *,
+        notification_ids: List[int],
+        status: str = "failed",
+    ) -> None:
+        ids = sorted({int(notification_id) for notification_id in (notification_ids or []) if int(notification_id) > 0})
+        if not ids:
+            return
+
+        stmt = (
+            update(Notification)
+            .where(Notification.id.in_(ids))
             .values(status=status)
         )
         await db.execute(stmt)

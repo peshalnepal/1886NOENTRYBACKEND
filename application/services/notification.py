@@ -1,6 +1,7 @@
 # application/notifications/notification_service.py
 
 import asyncio
+from collections import defaultdict
 import json
 import logging
 import math
@@ -27,11 +28,48 @@ from application.repositories.notification_repository import (
     CameraContext,
     dt_from_ts_ms,
 )
+from application.services.clip_storage import EventClipService
 
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        value = float(default)
+    return max(minimum, value)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return _json_safe(value.model_dump())
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
 @dataclass(frozen=True)
@@ -59,6 +97,13 @@ class NotificationMessage(BaseModel):
     camera_name: Optional[str] = None
     roi_id: Optional[str] = None
     track_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class BufferedNotification:
+    msg: NotificationMessage
+    ctx: CameraContext
+    extra_payload: Optional[Dict[str, Any]] = None
 
 
 class WebNotificationHub:
@@ -138,11 +183,55 @@ class EmailNotifier:
 
         await asyncio.to_thread(self._send_sync, msg, recipients)
 
+    async def send_digest(
+        self,
+        messages: List[NotificationMessage],
+        to_emails: Optional[List[str]] = None,
+    ) -> None:
+        ordered = sorted(messages or [], key=lambda msg: int(msg.ts_ms), reverse=True)
+        if not ordered:
+            return
+        if len(ordered) == 1:
+            await self.send(ordered[0], to_emails=to_emails)
+            return
+
+        if not self.cfg.enabled:
+            return
+
+        recipients = (to_emails or []) or self.cfg.to_emails
+        if not recipients:
+            return
+
+        await asyncio.to_thread(self._send_digest_sync, ordered, recipients)
+
     def _send_sync(self, msg: NotificationMessage, to_emails: List[str]) -> None:
         subject = f"{self.cfg.subject_prefix} {msg.site_name} — {msg.title}"
 
         text_body = self._render_text(msg)
         html_body = self._render_html(msg)
+
+        m = MIMEMultipart("alternative")
+        m["Subject"] = subject
+        m["From"] = self.cfg.from_email
+        m["To"] = ", ".join(to_emails)
+
+        m.attach(MIMEText(text_body, "plain", "utf-8"))
+        m.attach(MIMEText(html_body, "html", "utf-8"))
+
+        with smtplib.SMTP(self.cfg.smtp_host, self.cfg.smtp_port, timeout=10) as server:
+            if self.cfg.use_tls:
+                server.starttls()
+            if self.cfg.smtp_user and self.cfg.smtp_pass:
+                server.login(self.cfg.smtp_user, self.cfg.smtp_pass)
+            server.sendmail(self.cfg.from_email, to_emails, m.as_string())
+
+    def _send_digest_sync(self, messages: List[NotificationMessage], to_emails: List[str]) -> None:
+        first = messages[0]
+        total = len(messages)
+        subject = f"{self.cfg.subject_prefix} {first.site_name} — {total} alerts"
+
+        text_body = self._render_digest_text(messages)
+        html_body = self._render_digest_html(messages)
 
         m = MIMEMultipart("alternative")
         m["Subject"] = subject
@@ -301,6 +390,104 @@ class EmailNotifier:
 </html>
 """
 
+    def _render_digest_text(self, messages: List[NotificationMessage]) -> str:
+        first = messages[0]
+        shown = messages[:20]
+        remaining = max(0, len(messages) - len(shown))
+
+        lines = [
+            "1886NOENTRY — Buffered Alert Digest",
+            "",
+            f"Site: {first.site_name}",
+            f"Alerts in batch: {len(messages)}",
+            "",
+        ]
+
+        for msg in shown:
+            lines.append(
+                f"- [{self._fmt_ts(msg.ts_ms)} UTC] {msg.title}: {msg.body}"
+            )
+
+        if remaining > 0:
+            lines += ["", f"... and {remaining} more alerts in this batch."]
+
+        if self.cfg.dashboard_base_url:
+            lines += ["", f"Open dashboard: {self._camera_url(first.camera_uuid)}"]
+
+        return "\n".join(lines)
+
+    def _render_digest_html(self, messages: List[NotificationMessage]) -> str:
+        first = messages[0]
+        shown = messages[:20]
+        remaining = max(0, len(messages) - len(shown))
+
+        rows = []
+        for msg in shown:
+            rows.append(
+                f"""
+                <tr>
+                  <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;color:#0f172a;font-size:13px;white-space:nowrap;">{html.escape(self._fmt_ts(msg.ts_ms))}</td>
+                  <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;color:#0f172a;font-size:13px;font-weight:700;">{html.escape(msg.title or "Alert")}</td>
+                  <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;color:#334155;font-size:13px;">{html.escape(msg.body or "")}</td>
+                </tr>
+                """
+            )
+
+        more_html = ""
+        if remaining > 0:
+            more_html = f"""
+              <div style="margin-top:12px;color:#64748b;font-size:13px;">
+                ... and {remaining} more alerts in this batch.
+              </div>
+            """
+
+        button_html = ""
+        if self.cfg.dashboard_base_url:
+            url = html.escape(self._camera_url(first.camera_uuid))
+            button_html = f"""
+              <div style="margin-top:16px;">
+                <a href="{url}"
+                   style="display:inline-block;text-decoration:none;background:#0ea5e9;color:#ffffff;
+                          padding:12px 16px;border-radius:10px;font-weight:700;font-family:Arial,sans-serif;">
+                  Open Dashboard
+                </a>
+              </div>
+            """
+
+        return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;padding:24px;background:#f4f6fb;font-family:Arial,sans-serif;">
+    <div style="max-width:760px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">
+      <div style="padding:18px 24px;background:#0b1220;color:#ffffff;">
+        <div style="font-size:14px;opacity:0.85;font-weight:700;">1886NOENTRY</div>
+        <div style="font-size:22px;font-weight:800;margin-top:6px;">Buffered Alert Digest</div>
+      </div>
+      <div style="padding:18px 24px;">
+        <div style="color:#0f172a;font-size:16px;font-weight:800;">{html.escape(first.site_name or "Unknown Site")}</div>
+        <div style="margin-top:6px;color:#475569;font-size:14px;">{len(messages)} alerts were buffered and delivered together.</div>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+               style="margin-top:16px;border-collapse:separate;border-spacing:0;background:#f8fafc;
+                      border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+          <thead>
+            <tr>
+              <th style="padding:10px 12px;border-bottom:1px solid #e2e8f0;text-align:left;color:#0f172a;font-size:12px;">Time (UTC)</th>
+              <th style="padding:10px 12px;border-bottom:1px solid #e2e8f0;text-align:left;color:#0f172a;font-size:12px;">Title</th>
+              <th style="padding:10px 12px;border-bottom:1px solid #e2e8f0;text-align:left;color:#0f172a;font-size:12px;">Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            {"".join(rows)}
+          </tbody>
+        </table>
+        {more_html}
+        {button_html}
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
     def _fmt_ts(self, ts_ms: int) -> str:
         dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -324,6 +511,7 @@ class NotificationService:
         roi_provider=None,
         notify_on_confirmed: bool = True,
         notify_on_roi_enter: bool = True,
+        clip_service: Optional[EventClipService] = None,
     ):
         self.hub = hub
         self.email = email
@@ -347,9 +535,43 @@ class NotificationService:
         self._ctx_ttl_s = 60.0  # reduce DB hits on frequent detections
         self._roi_cache: Dict[str, Tuple[float, List[ROI]]] = {}
         self._roi_ttl_s = 15.0
+        self._recipient_cache: Dict[Tuple[int, str], Tuple[float, List[str]]] = {}
+        self._recipient_ttl_s = _env_float("NOTIFICATION_RECIPIENT_CACHE_TTL_S", 60.0, minimum=1.0)
+
+        self._buffer_lock = asyncio.Lock()
+        self._flush_event = asyncio.Event()
+        self._pending_by_user: Dict[int, List[BufferedNotification]] = {}
+        self._pending_since: Dict[int, float] = {}
+        self._active_flush_users: Set[int] = set()
+        self._flush_task: Optional[asyncio.Task] = None
+        self._closing = False
+        self._buffer_max_items = _env_int("NOTIFICATION_BUFFER_MAX_ITEMS", 100, minimum=1)
+        self._buffer_max_age_s = _env_float("NOTIFICATION_BUFFER_MAX_AGE_S", 60.0, minimum=1.0)
+        self._buffer_poll_s = _env_float("NOTIFICATION_BUFFER_POLL_S", 1.0, minimum=0.2)
+        self._clip_service = clip_service or EventClipService()
 
     def set_session_factory(self, session_factory):
         self._session_factory = session_factory
+        if self._clip_service is not None:
+            try:
+                self._clip_service.set_session_factory(session_factory)
+            except Exception:
+                logger.exception("Failed to set session factory on EventClipService")
+
+    def invalidate_recipient_cache(
+        self,
+        *,
+        user_id: int,
+        site_uuid: Optional[uuid.UUID] = None,
+    ) -> None:
+        uid = int(user_id)
+        if site_uuid is not None:
+            self._recipient_cache.pop((uid, str(site_uuid)), None)
+            return
+
+        for key in list(self._recipient_cache.keys()):
+            if key[0] == uid:
+                self._recipient_cache.pop(key, None)
 
     def _fire_and_forget(self, coro):
         async def _runner():
@@ -358,6 +580,266 @@ class NotificationService:
             except Exception:
                 logger.exception("Notification background task failed")
         asyncio.create_task(_runner())
+
+    def _ensure_flush_task(self) -> None:
+        if self._closing:
+            return
+        task = self._flush_task
+        if task is None or task.done():
+            self._flush_task = asyncio.create_task(
+                self._flush_loop(),
+                name="notification_buffer_flush",
+            )
+
+    async def shutdown(self) -> None:
+        self._closing = True
+        self._flush_event.set()
+        task = self._flush_task
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Notification flush task shutdown failed")
+        self._flush_task = None
+        clip_service = self._clip_service
+        if clip_service is not None:
+            try:
+                await clip_service.close()
+            except Exception:
+                logger.exception("Event clip service shutdown failed")
+
+    async def _attach_clip_payload(
+        self,
+        *,
+        msg: NotificationMessage,
+        ctx: CameraContext,
+        extra_payload: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        clip_service = self._clip_service
+        if clip_service is None:
+            return extra_payload
+        if msg.alert_type not in {"item_detected", "roi_enter", "detection_summary"}:
+            return extra_payload
+
+        clip = await clip_service.capture_pre_event_clip(
+            camera_uuid=msg.camera_uuid,
+            ctx=ctx,
+            event_ts_ms=msg.ts_ms,
+            trigger=msg.alert_type,
+        )
+        if not clip:
+            return extra_payload
+
+        merged = dict(extra_payload or {})
+        merged["clip"] = clip
+        return merged
+
+    async def _flush_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(self._flush_event.wait(), timeout=self._buffer_poll_s)
+            except asyncio.TimeoutError:
+                pass
+            self._flush_event.clear()
+
+            force_all = bool(self._closing)
+            await self._flush_ready_users(force_all=force_all)
+            if force_all:
+                return
+
+    async def _flush_ready_users(self, *, force_all: bool = False) -> None:
+        now = time.monotonic()
+        ready: Dict[int, List[BufferedNotification]] = {}
+
+        async with self._buffer_lock:
+            for user_id, items in list(self._pending_by_user.items()):
+                if user_id in self._active_flush_users:
+                    continue
+
+                since = self._pending_since.get(user_id, now)
+                if force_all or len(items) >= self._buffer_max_items or (now - since) >= self._buffer_max_age_s:
+                    ready[user_id] = items
+                    self._pending_by_user.pop(user_id, None)
+                    self._pending_since.pop(user_id, None)
+                    self._active_flush_users.add(user_id)
+
+        if not ready:
+            return
+
+        results = await asyncio.gather(
+            *[
+                self._flush_user_batch(user_id, items)
+                for user_id, items in ready.items()
+            ],
+            return_exceptions=True,
+        )
+
+        for (user_id, items), result in zip(ready.items(), results):
+            requeue_items = False
+            if isinstance(result, Exception):
+                logger.error(
+                    "Notification batch flush failed user=%s",
+                    user_id,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+                requeue_items = not force_all
+            elif result is False:
+                requeue_items = not force_all
+
+            async with self._buffer_lock:
+                self._active_flush_users.discard(user_id)
+
+                if requeue_items:
+                    existing = self._pending_by_user.get(user_id)
+                    if existing:
+                        self._pending_by_user[user_id] = list(items) + existing
+                    else:
+                        self._pending_by_user[user_id] = list(items)
+                        self._pending_since[user_id] = time.monotonic() - self._buffer_max_age_s
+                    self._flush_event.set()
+
+                if user_id in self._pending_by_user and len(self._pending_by_user[user_id]) >= self._buffer_max_items:
+                    self._flush_event.set()
+
+    async def _get_recipients_for_sites_cached(
+        self,
+        *,
+        user_id: int,
+        site_uuids: List[uuid.UUID],
+    ) -> Dict[uuid.UUID, List[str]]:
+        now = time.monotonic()
+        out: Dict[uuid.UUID, List[str]] = {}
+        missing: List[uuid.UUID] = []
+
+        for site_uuid in site_uuids:
+            cache_key = (int(user_id), str(site_uuid))
+            hit = self._recipient_cache.get(cache_key)
+            if hit and hit[0] > now:
+                out[site_uuid] = list(hit[1])
+            else:
+                missing.append(site_uuid)
+
+        if missing and self._session_factory:
+            async with self._session_factory() as db:
+                loaded = await self._repo.list_notification_emails_for_sites(
+                    db,
+                    user_id=int(user_id),
+                    site_uuids=missing,
+                    only_enabled=True,
+                )
+
+            for site_uuid in missing:
+                emails = list(loaded.get(site_uuid, []))
+                self._recipient_cache[(int(user_id), str(site_uuid))] = (
+                    now + self._recipient_ttl_s,
+                    emails,
+                )
+                out[site_uuid] = list(emails)
+
+        return out
+
+    async def _flush_user_batch(self, user_id: int, items: List[BufferedNotification]) -> bool:
+        if not items:
+            return True
+        if not self._session_factory:
+            logger.warning("Skipping notification batch flush because session factory is missing user=%s", user_id)
+            return False
+
+        site_groups: Dict[uuid.UUID, List[int]] = defaultdict(list)
+        create_rows: List[Dict[str, Any]] = []
+        for idx, item in enumerate(items):
+            site_groups[item.ctx.site_uuid].append(idx)
+            create_rows.append(
+                {
+                    "user_id": int(item.ctx.user_id),
+                    "site_uuid": item.ctx.site_uuid,
+                    "camera_uuid": uuid.UUID(item.msg.camera_uuid),
+                    "device_uuid": item.ctx.device_uuid,
+                    "event_type": item.msg.alert_type,
+                    "title": item.msg.title,
+                    "message": item.msg.body,
+                    "payload": _json_safe(
+                        {
+                            "msg": item.msg.model_dump(),
+                            "extra": item.extra_payload or {},
+                        }
+                    ),
+                    "detected_at": dt_from_ts_ms(item.msg.ts_ms),
+                    "status": "created",
+                    "sent_at": None,
+                }
+            )
+
+        recipients_by_site = await self._get_recipients_for_sites_cached(
+            user_id=int(user_id),
+            site_uuids=list(site_groups.keys()),
+        )
+
+        notification_ids_by_site: Dict[uuid.UUID, List[int]] = {}
+        try:
+            async with self._session_factory() as db:
+                rows = await self._repo.create_notifications(db, rows=create_rows)
+                await db.commit()
+        except Exception:
+            logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
+            return False
+
+        for site_uuid, indices in site_groups.items():
+            notification_ids_by_site[site_uuid] = [
+                int(rows[idx].id)
+                for idx in indices
+                if idx < len(rows) and getattr(rows[idx], "id", None) is not None
+            ]
+
+        if not self.email:
+            return True
+
+        sent_ids: List[int] = []
+        failed_ids: List[int] = []
+        sent_at = datetime.now(timezone.utc)
+
+        for site_uuid, indices in site_groups.items():
+            recipients = recipients_by_site.get(site_uuid, [])
+            if not recipients:
+                continue
+
+            site_messages = [items[idx].msg for idx in indices]
+            try:
+                await self.email.send_digest(site_messages, to_emails=recipients)
+                sent_ids.extend(notification_ids_by_site.get(site_uuid, []))
+            except Exception:
+                logger.exception(
+                    "Buffered email digest send failed user=%s site=%s count=%s",
+                    user_id,
+                    site_uuid,
+                    len(site_messages),
+                )
+                failed_ids.extend(notification_ids_by_site.get(site_uuid, []))
+
+        if not sent_ids and not failed_ids:
+            return True
+
+        try:
+            async with self._session_factory() as db:
+                if sent_ids:
+                    await self._repo.mark_notifications_sent(
+                        db,
+                        notification_ids=sent_ids,
+                        sent_at=sent_at,
+                    )
+                if failed_ids:
+                    await self._repo.mark_notifications_failed(
+                        db,
+                        notification_ids=failed_ids,
+                    )
+                await db.commit()
+        except Exception:
+            logger.exception("Failed to update buffered notification statuses user=%s", user_id)
+            return True
+
+        return True
 
     async def _get_camera_ctx_cached(self, camera_uuid_str: str) -> Optional[CameraContext]:
         if not self._session_factory:
@@ -381,77 +863,43 @@ class NotificationService:
 
         return ctx
 
-    async def _persist_and_send(self, msg: NotificationMessage, ctx: CameraContext) -> None:
-        """
-        Store notification row in DB (site/camera/user scoped),
-        then send email (site-scoped recipients),
-        then mark sent/failed.
-        """
+    async def enqueue_notification(
+        self,
+        msg: NotificationMessage,
+        ctx: CameraContext,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not self._session_factory:
             return
 
-        notification_id: Optional[int] = None
-        recipients: List[str] = []
+        extra_payload = await self._attach_clip_payload(msg=msg, ctx=ctx, extra_payload=extra_payload)
+        self._ensure_flush_task()
+        user_id = int(ctx.user_id)
+        item = BufferedNotification(
+            msg=msg,
+            ctx=ctx,
+            extra_payload=extra_payload,
+        )
 
-        try:
-            # 1) insert row (status=created) + load recipients
-            async with self._session_factory() as db:
-                notif = await self._repo.create_notification(
-                    db,
-                    user_id=ctx.user_id,
-                    site_uuid=ctx.site_uuid,
-                    camera_uuid=uuid.UUID(msg.camera_uuid),
-                    device_uuid=ctx.device_uuid,
-                    event_type=msg.alert_type,
-                    title=msg.title,
-                    message=msg.body,
-                    payload={"msg": msg.model_dump()},
-                    detected_at=dt_from_ts_ms(msg.ts_ms),
-                    status="created",
-                    sent_at=None,
-                )
-                notification_id = int(notif.id)
+        async with self._buffer_lock:
+            bucket = self._pending_by_user.get(user_id)
+            if bucket is None:
+                bucket = []
+                self._pending_by_user[user_id] = bucket
+                self._pending_since[user_id] = time.monotonic()
+            bucket.append(item)
+            should_flush = len(bucket) >= self._buffer_max_items
 
-                recipients = await self._repo.list_notification_emails_for_site(
-                    db,
-                    user_id=ctx.user_id,
-                    site_uuid=ctx.site_uuid,
-                    only_enabled=True,
-                )
+        if should_flush:
+            self._flush_event.set()
 
-                await db.commit()
-
-            # 2) email send (optional)
-            sent_ok = False
-            if self.email:
-                try:
-                    await self.email.send(msg, to_emails=recipients if recipients else None)
-                    sent_ok = True
-                except Exception:
-                    logger.exception("Email send failed camera=%s", msg.camera_uuid)
-                    sent_ok = False
-
-            # 3) mark sent/failed
-            if notification_id is not None:
-                async with self._session_factory() as db2:
-                    if sent_ok:
-                        await self._repo.mark_notification_sent(db2, notification_id=notification_id)
-                    else:
-                        # If email is disabled/no recipients, you can keep status=created,
-                        # but if you want a failure marker when email attempted and failed:
-                        if self.email and recipients:
-                            await self._repo.mark_notification_failed(db2, notification_id=notification_id)
-                    await db2.commit()
-
-        except Exception:
-            logger.exception("Persist+send failed camera=%s", msg.camera_uuid)
-            if notification_id is not None and self._session_factory:
-                try:
-                    async with self._session_factory() as db3:
-                        await self._repo.mark_notification_failed(db3, notification_id=notification_id)
-                        await db3.commit()
-                except Exception:
-                    logger.exception("Failed to mark notification failed id=%s", notification_id)
+    async def _persist_and_send(
+        self,
+        msg: NotificationMessage,
+        ctx: CameraContext,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        await self.enqueue_notification(msg, ctx, extra_payload=extra_payload)
 
     def _parse_roi_points(self, raw_points: Any) -> List[Tuple[float, float]]:
         if not isinstance(raw_points, (list, tuple)):
@@ -616,7 +1064,13 @@ class NotificationService:
 
                     await self.hub.publish(msg)
 
-                    self._fire_and_forget(self._persist_and_send(msg, ctx))
+                    self._fire_and_forget(
+                        self._persist_and_send(
+                            msg,
+                            ctx,
+                            extra_payload={"track": _json_safe(tr), "event": "track_confirmed"},
+                        )
+                    )
 
             # B) notify-on-ROI-enter
             if self.notify_on_roi_enter:
@@ -654,7 +1108,13 @@ class NotificationService:
 
                         await self.hub.publish(msg)
 
-                        self._fire_and_forget(self._persist_and_send(msg, ctx))
+                        self._fire_and_forget(
+                            self._persist_and_send(
+                                msg,
+                                ctx,
+                                extra_payload={"alert": _json_safe(a), "event": "roi_enter"},
+                            )
+                        )
 
             return
 
@@ -691,7 +1151,24 @@ class NotificationService:
 
         await self.hub.publish(msg)
 
-        self._fire_and_forget(self._persist_and_send(msg, ctx))
+        self._fire_and_forget(
+            self._persist_and_send(
+                msg,
+                ctx,
+                extra_payload={
+                    "detections": _json_safe(
+                        [
+                            {
+                                "cls_name": cls_name,
+                                "conf": conf,
+                            }
+                            for cls_name, conf in matches
+                        ]
+                    ),
+                    "event": "detection_summary",
+                },
+            )
+        )
 
     def _extract_interesting(self, detections: List[DetectionItem]) -> List[Tuple[str, float]]:
         out: List[Tuple[str, float]] = []

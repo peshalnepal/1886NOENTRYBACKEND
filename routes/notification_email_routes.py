@@ -5,7 +5,7 @@ API routes for managing user notification emails.
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +14,13 @@ from dependencies import get_async_db, get_current_user
 from core.database_orm import NotificationEmail, Site, User
 
 router = APIRouter(prefix="/notification-emails", tags=["notification-emails"])
+
+
+def _invalidate_notification_email_cache(request: Request, *, user_id: int, site_uuid: Optional[uuid.UUID] = None) -> None:
+    svc = getattr(request.app.state, "notification_service", None)
+    if svc is None or not hasattr(svc, "invalidate_recipient_cache"):
+        return
+    svc.invalidate_recipient_cache(user_id=int(user_id), site_uuid=site_uuid)
 
 
 # -------------------------
@@ -75,6 +82,7 @@ async def list_notification_emails(
 @router.post("", response_model=NotificationEmailCreateResult, status_code=status.HTTP_201_CREATED)
 async def add_notification_email(
     payload: NotificationEmailCreate,
+    request: Request,
     db: AsyncSession = Depends(get_async_db),
     user: User = Depends(get_current_user),
 ):
@@ -132,6 +140,8 @@ async def add_notification_email(
 
     await db.commit()
     for row in created_rows:
+        _invalidate_notification_email_cache(request, user_id=row.user_id, site_uuid=row.site_uuid)
+    for row in created_rows:
         await db.refresh(row)
 
     return NotificationEmailCreateResult(
@@ -155,6 +165,7 @@ async def add_notification_email(
 async def delete_notification_email(
     email_id: int,
     all_sites: bool = False,
+    request: Request = None,
     db: AsyncSession = Depends(get_async_db),
     user: User = Depends(get_current_user),
 ):
@@ -186,4 +197,10 @@ async def delete_notification_email(
         await db.delete(email)
 
     await db.commit()
+    if request is not None:
+        _invalidate_notification_email_cache(
+            request,
+            user_id=email.user_id,
+            site_uuid=None if all_sites else email.site_uuid,
+        )
     return None
