@@ -303,10 +303,18 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'WEBRTC_ADMIN_UPSERT_PATH', value: webrtcAdminUpsertPath }
             { name: 'WEBRTC_ADMIN_UPDATE_PATH', value: webrtcAdminUpdatePath }
             { name: 'WEBRTC_ADMIN_DELETE_PATH', value: webrtcAdminDeletePath }
+
+            // MediaMTX admin API credentials (must match mediamtx.yml authInternalUsers)
+            { name: 'MTX_API_USER', value: mediamtxApiUser }
+            { name: 'MTX_API_PASS', value: mediamtxApiPass }
+
+            // Video clip capture (pre-record on detection)
             { name: 'VIDEO_CLIP_CAPTURE_ENABLED', value: 'true' }
             { name: 'VIDEO_CLIP_DURATION_S', value: '120' }
             { name: 'VIDEO_CLIP_COOLDOWN_S', value: '120' }
+            { name: 'VIDEO_CLIP_MIN_DURATION_S', value: '10' }
             { name: 'VIDEO_CLIP_SAS_TTL_HOURS', value: '168' }
+            { name: 'VIDEO_CLIP_HTTP_TIMEOUT_S', value: '180' }
             { name: 'VIDEO_CLIP_BLOB_CONTAINER', value: videoClipContainerName }
             { name: 'MEDIAMTX_PLAYBACK_BASE_URL', value: deployMediaMtx ? 'https://${proxyHost}/playback' : '' }
             { name: 'VIDEO_CLIP_BLOB_CONNECTION_STRING', secretRef: 'video-clip-blob-connection-string' }
@@ -547,3 +555,9 @@ output mysqlHost string = mysqlFqdn
 output mysqlDatabase string = mysqlDatabaseName
 output mediamtxFqdn string = deployMediaMtx ? proxyHost : ''
 output mediamtxHttpsBase string = deployMediaMtx ? 'https://${proxyHost}' : ''
+
+output mediamtxPlaybackUrl string = deployMediaMtx ? 'https://${proxyHost}/playback' : ''
+output mediamtxWebrtcBase string = deployMediaMtx ? 'https://${proxyHost}' : ''
+output mediamtxRecordingPath string = '/recordings/<stream_key>/<YYYY-MM-DD_HH-MM-SS>'
+output clipStorageAccount string = clipStorage.name
+output clipBlobContainer string = videoClipContainerName
