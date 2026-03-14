@@ -212,6 +212,12 @@ resource clipStorageContainer 'Microsoft.Storage/storageAccounts/blobServices/co
     publicAccess: 'None'
   }
 }
+resource caddyDataFileShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-05-01' = if (deployMediaMtx) {
+  name: '${clipStorage.name}/default/caddy-tls'
+  properties: {
+    shareQuota: 1
+  }
+}
 // ----------------------------
 // Backend API (Container App)
 // ----------------------------
@@ -392,7 +398,7 @@ pathDefaults:
   recordFormat: fmp4
   recordPartDuration: 1s
   recordSegmentDuration: 15s
-  recordDeleteAfter: 2m
+  recordDeleteAfter: 7m
 
 hls: false
 rtmp: false
@@ -459,6 +465,15 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
           'Caddyfile': base64(caddyfile)
         }
       }
+      {
+        name: 'caddy-data'
+        azureFile: {
+          shareName: 'caddy-tls'
+          storageAccountName: clipStorage.name
+          storageAccountKey: clipStorageKey
+          readOnly: false
+        }
+      }
     ]
 
     containers: [
@@ -504,6 +519,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
           }
           volumeMounts: [
             { name: 'caddy', mountPath: '/etc/caddy', readOnly: true }
+            { name: 'caddy-data', mountPath: '/data', readOnly: false }
           ]
           command: [
             'caddy'
@@ -517,6 +533,9 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       }
     ]
   }
+  dependsOn: [
+    caddyDataFileShare
+  ]
 }
 
 // ----------------------------
