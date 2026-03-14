@@ -128,7 +128,25 @@ function validate_prerequisites() {
 function ensure_subscription_context() {
   if [[ -n "${AZURE_SUBSCRIPTION}" ]]; then
     write_info "Setting subscription: ${AZURE_SUBSCRIPTION}"
-    az account set --subscription "${AZURE_SUBSCRIPTION}" >/dev/null 2>&1 || true
+    if ! az account set --subscription "${AZURE_SUBSCRIPTION}" >/dev/null 2>&1; then
+      write_error "Unable to select Azure subscription: ${AZURE_SUBSCRIPTION}"
+      exit 1
+    fi
+  fi
+}
+
+function ensure_subscription_is_writable() {
+  local account_name account_id account_state
+  account_name="$(az account show --query name -o tsv)"
+  account_id="$(az account show --query id -o tsv)"
+  account_state="$(az account show --query state -o tsv)"
+
+  write_info "Using Azure subscription: ${account_name} (${account_id}) [state=${account_state}]"
+
+  if [[ "${account_state,,}" != "enabled" ]]; then
+    write_error "Azure subscription '${account_name}' (${account_id}) is '${account_state}'. Azure treats that state as read-only and will reject deployment writes."
+    write_error "Re-enable the subscription in Azure Portal or resolve billing/reactivation before retrying this workflow."
+    exit 1
   fi
 }
 
@@ -184,42 +202,50 @@ function deploy_infrastructure() {
   write_info "Starting Bicep deployment for ${ENVIRONMENT_NAME} environment..."
 
   local app_fqdn
-  app_fqdn=$(az deployment group create \
-    --resource-group "${AZURE_RESOURCE_GROUP}" \
-    --template-file "${BICEP_FILE}" \
-    --parameters \
-      location="${AZURE_LOCATION}" \
-      environmentName="${AZURE_ENVIRONMENT_NAME}" \
-      keyVaultName="${AZURE_KEY_VAULT_NAME}" \
-      acrName="${AZURE_ACR_NAME}" \
-      appImageTag="${IMAGE_TAG}" \
-      revisionSuffix="${REV_SUFFIX}" \
-      acrUsername="${ACR_USER}" \
-      acrPassword="${ACR_PASS}" \
-      mysqlLocation="${MYSQL_LOCATION:-canadacentral}" \
-      revisionMode="${REVISION_MODE}" \
-      namePrefix="${NAME_PREFIX}" \
-      appName="${APP_NAME_MAIN}" \
-      mysqlAdminUser="${MYSQL_ADMIN_USER}" \
-      mysqlAdminPassword="${MYSQL_ADMIN_PASSWORD}" \
-      mysqlDatabaseName="${MYSQL_DB_NAME}" \
-      appDbUser="${APP_DB_USER}" \
-      appDbPassword="${APP_DB_PASSWORD}" \
-      enableSmtp="${ENABLE_SMTP}" \
-      smtpUsername="${SMTP_USERNAME}" \
-      smtpPassword="${SMTP_PASSWORD}" \
-      smtpFrom="${SMTP_FROM}" \
-      webrtcAdminApiUrl="${WEBRTC_ADMIN_API_URL}" \
-      webrtcPublicBaseUrl="${WEBRTC_PUBLIC_BASE_URL}" \
-      webrtcAdminApiKey="${WEBRTC_ADMIN_API_KEY}" \
-      webrtcAdminUpsertPath="${WEBRTC_ADMIN_UPSERT_PATH}" \
-      webrtcAdminUpdatePath="${WEBRTC_ADMIN_UPDATE_PATH}" \
-      webrtcAdminDeletePath="${WEBRTC_ADMIN_DELETE_PATH}" \
-      deployMediaMtx="${DEPLOY_MEDIA_MTX}" \
-      mediamtxApiUser="${MEDIAMTX_API_USER}" \
-      mediamtxApiPass="${MEDIAMTX_API_PASS}" \
-    --query "properties.outputs.appUrl.value" \
-    -o tsv)
+  if ! app_fqdn=$(az deployment group create \
+      --resource-group "${AZURE_RESOURCE_GROUP}" \
+      --template-file "${BICEP_FILE}" \
+      --parameters \
+        location="${AZURE_LOCATION}" \
+        environmentName="${AZURE_ENVIRONMENT_NAME}" \
+        keyVaultName="${AZURE_KEY_VAULT_NAME}" \
+        acrName="${AZURE_ACR_NAME}" \
+        appImageTag="${IMAGE_TAG}" \
+        revisionSuffix="${REV_SUFFIX}" \
+        acrUsername="${ACR_USER}" \
+        acrPassword="${ACR_PASS}" \
+        mysqlLocation="${MYSQL_LOCATION:-canadacentral}" \
+        revisionMode="${REVISION_MODE}" \
+        namePrefix="${NAME_PREFIX}" \
+        appName="${APP_NAME_MAIN}" \
+        mysqlAdminUser="${MYSQL_ADMIN_USER}" \
+        mysqlAdminPassword="${MYSQL_ADMIN_PASSWORD}" \
+        mysqlDatabaseName="${MYSQL_DB_NAME}" \
+        appDbUser="${APP_DB_USER}" \
+        appDbPassword="${APP_DB_PASSWORD}" \
+        enableSmtp="${ENABLE_SMTP}" \
+        smtpUsername="${SMTP_USERNAME}" \
+        smtpPassword="${SMTP_PASSWORD}" \
+        smtpFrom="${SMTP_FROM}" \
+        webrtcAdminApiUrl="${WEBRTC_ADMIN_API_URL}" \
+        webrtcPublicBaseUrl="${WEBRTC_PUBLIC_BASE_URL}" \
+        webrtcAdminApiKey="${WEBRTC_ADMIN_API_KEY}" \
+        webrtcAdminUpsertPath="${WEBRTC_ADMIN_UPSERT_PATH}" \
+        webrtcAdminUpdatePath="${WEBRTC_ADMIN_UPDATE_PATH}" \
+        webrtcAdminDeletePath="${WEBRTC_ADMIN_DELETE_PATH}" \
+        deployMediaMtx="${DEPLOY_MEDIA_MTX}" \
+        mediamtxApiUser="${MEDIAMTX_API_USER}" \
+        mediamtxApiPass="${MEDIAMTX_API_PASS}" \
+      --query "properties.outputs.appUrl.value" \
+      -o tsv); then
+    write_error "Bicep deployment command failed."
+    return 1
+  fi
+
+  if [[ -z "${app_fqdn}" ]]; then
+    write_error "Bicep deployment completed without an appUrl output."
+    return 1
+  fi
 
   echo "${app_fqdn}"
 }
@@ -254,6 +280,7 @@ function main() {
 
   validate_prerequisites
   ensure_subscription_context
+  ensure_subscription_is_writable
   ensure_resource_group
   ensure_acr_exists
   ensure_keyvault_exists
@@ -263,7 +290,10 @@ function main() {
 
   # Deploy using Bicep
   local app_fqdn
-  app_fqdn=$(deploy_infrastructure)
+  if ! app_fqdn="$(deploy_infrastructure)"; then
+    write_error "Infrastructure deployment failed."
+    exit 1
+  fi
   if [[ -z "${app_fqdn}" ]]; then
     write_error "Failed to get App FQDN from Bicep deployment output."
     exit 1
