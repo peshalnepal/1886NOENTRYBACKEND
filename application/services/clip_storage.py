@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from azure.storage.blob import BlobSasPermissions, ContentSettings, generate_blob_sas
@@ -37,6 +38,18 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     return max(minimum, value)
 
 
+def _env_csv(name: str) -> List[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return []
+    items: List[str] = []
+    for part in str(raw).replace("\n", ",").split(","):
+        value = str(part or "").strip()
+        if value:
+            items.append(value)
+    return items
+
+
 def _parse_connection_string(raw: str) -> Dict[str, str]:
     parts: Dict[str, str] = {}
     for item in str(raw or "").split(";"):
@@ -62,6 +75,45 @@ def _parse_ts(raw: Any) -> Optional[datetime]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _normalize_url_base(raw: str) -> str:
+    return str(raw or "").strip().rstrip("/")
+
+
+def _append_unique_url(target: List[str], raw: str) -> None:
+    value = _normalize_url_base(raw)
+    if value and value not in target:
+        target.append(value)
+
+
+def _derive_direct_playback_base(raw: str) -> str:
+    base = _normalize_url_base(raw)
+    if not base:
+        return ""
+    parsed = urlsplit(base)
+    if not parsed.hostname:
+        return ""
+    host = parsed.hostname
+    port = 9996
+    if parsed.username:
+        auth = parsed.username
+        if parsed.password:
+            auth = f"{auth}:{parsed.password}"
+        host = f"{auth}@{host}"
+    netloc = f"{host}:{port}"
+    return urlunsplit(("http", netloc, "", "", ""))
+
+
+def _truncate_message(raw: Any, limit: int = 240) -> str:
+    text = str(raw or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 3)]}..."
+
+
+class PlaybackUnavailableError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -98,7 +150,11 @@ class EventClipService:
         public_base = (os.getenv("WEBRTC_PUBLIC_BASE_URL") or "").strip().rstrip("/")
         conn_str = (os.getenv("VIDEO_CLIP_BLOB_CONNECTION_STRING") or "").strip()
 
-        self.playback_base_url = playback_base or (f"{public_base}/playback" if public_base else "")
+        self.playback_base_urls = self._resolve_playback_base_urls(
+            playback_base=playback_base,
+            public_base=public_base,
+        )
+        self.playback_base_url = self.playback_base_urls[0] if self.playback_base_urls else ""
         self.connection_string = conn_str
         self.container_name = (os.getenv("VIDEO_CLIP_BLOB_CONTAINER") or "event-clips").strip() or "event-clips"
         self.duration_s = int(_env_float("VIDEO_CLIP_DURATION_S", 120.0, minimum=5.0))
@@ -106,7 +162,7 @@ class EventClipService:
         self.minimum_duration_s = int(_env_float("VIDEO_CLIP_MIN_DURATION_S", 10.0, minimum=1.0))
         self.sas_ttl_hours = int(_env_float("VIDEO_CLIP_SAS_TTL_HOURS", 168.0, minimum=1.0))
         self.download_format = (os.getenv("VIDEO_CLIP_DOWNLOAD_FORMAT") or "mp4").strip() or "mp4"
-        self.enabled = _env_bool("VIDEO_CLIP_CAPTURE_ENABLED", True) and bool(self.playback_base_url and self.connection_string)
+        self.enabled = _env_bool("VIDEO_CLIP_CAPTURE_ENABLED", True) and bool(self.playback_base_urls and self.connection_string)
 
         timeout_s = _env_float("VIDEO_CLIP_HTTP_TIMEOUT_S", 180.0, minimum=10.0)
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=min(10.0, timeout_s)))
@@ -114,10 +170,30 @@ class EventClipService:
         self._session_factory: Optional[SessionFactory] = None
         self._camera_locks: Dict[str, asyncio.Lock] = {}
         self._recent_by_camera: Dict[str, Tuple[float, ClipCaptureResult]] = {}
+        self._playback_warn_interval_s = _env_float("VIDEO_CLIP_PLAYBACK_WARN_INTERVAL_S", 60.0, minimum=1.0)
+        self._playback_backoff_s = _env_float("VIDEO_CLIP_PLAYBACK_BACKOFF_S", 60.0, minimum=1.0)
+        self._playback_last_warn_at = 0.0
+        self._playback_unavailable_until = 0.0
 
         conn_parts = _parse_connection_string(self.connection_string)
         self._sas_account_name = conn_parts.get("accountname", "")
         self._sas_account_key = conn_parts.get("accountkey", "")
+
+    def _resolve_playback_base_urls(self, *, playback_base: str, public_base: str) -> Tuple[str, ...]:
+        urls: List[str] = []
+        for name in ("MEDIAMTX_PLAYBACK_BASE_URLS", "VIDEO_CLIP_PLAYBACK_BASE_URLS"):
+            for value in _env_csv(name):
+                _append_unique_url(urls, value)
+
+        primary = playback_base or (f"{public_base}/playback" if public_base else "")
+        _append_unique_url(urls, primary)
+        _append_unique_url(urls, os.getenv("MEDIAMTX_PLAYBACK_FALLBACK_BASE_URL") or "")
+        _append_unique_url(urls, os.getenv("VIDEO_CLIP_PLAYBACK_FALLBACK_BASE_URL") or "")
+
+        if _env_bool("VIDEO_CLIP_ALLOW_DIRECT_PLAYBACK_FALLBACK", False):
+            _append_unique_url(urls, _derive_direct_playback_base(primary or public_base))
+
+        return tuple(urls)
 
     def set_session_factory(self, session_factory: SessionFactory) -> None:
         self._session_factory = session_factory
@@ -144,6 +220,56 @@ class EventClipService:
             self._blob_service = BlobServiceClient.from_connection_string(self.connection_string)
         return self._blob_service
 
+    async def _playback_get(
+        self,
+        endpoint: str,
+        *,
+        params: Dict[str, Any],
+    ) -> httpx.Response:
+        errors: List[str] = []
+        for base_url in self.playback_base_urls:
+            url = f"{base_url}{endpoint}"
+            try:
+                resp = await self._http.get(url, params=params)
+            except httpx.RequestError as exc:
+                errors.append(f"{url} -> {_truncate_message(exc)}")
+                continue
+
+            if resp.status_code >= 500:
+                errors.append(f"{url} -> HTTP {resp.status_code}")
+                continue
+
+            return resp
+
+        detail = "; ".join(errors) if errors else "Playback base URL is not configured"
+        raise PlaybackUnavailableError(_truncate_message(detail, limit=600))
+
+    def _mark_playback_unavailable(self) -> None:
+        self._playback_unavailable_until = time.monotonic() + self._playback_backoff_s
+
+    def _warn_playback_unavailable(
+        self,
+        *,
+        camera_uuid: str,
+        path: str,
+        trigger: Optional[str],
+        event_ts_ms: Optional[int],
+        detail: str,
+    ) -> None:
+        now = time.monotonic()
+        if (now - self._playback_last_warn_at) < self._playback_warn_interval_s:
+            return
+        self._playback_last_warn_at = now
+        logger.warning(
+            "Skipping clip capture; playback endpoint unavailable camera=%s path=%s trigger=%s event_ts_ms=%s playback_urls=%s detail=%s",
+            camera_uuid,
+            path,
+            trigger,
+            event_ts_ms,
+            ",".join(self.playback_base_urls),
+            _truncate_message(detail, limit=600),
+        )
+
     async def _fetch_recording_spans(
         self,
         *,
@@ -151,13 +277,12 @@ class EventClipService:
         start_time: datetime,
         end_time: datetime,
     ) -> List[Dict[str, Any]]:
-        url = f"{self.playback_base_url}/list"
         params = {
             "path": path,
             "start": self._iso_utc(start_time),
             "end": self._iso_utc(end_time),
         }
-        resp = await self._http.get(url, params=params)
+        resp = await self._playback_get("/list", params=params)
         if resp.status_code in {400, 404}:
             return []
         resp.raise_for_status()
@@ -202,14 +327,13 @@ class EventClipService:
         start_time: datetime,
         duration_s: int,
     ) -> bytes:
-        url = f"{self.playback_base_url}/get"
         params = {
             "path": path,
             "start": self._iso_utc(start_time),
             "duration": f"{int(duration_s)}s",
             "format": self.download_format,
         }
-        resp = await self._http.get(url, params=params)
+        resp = await self._playback_get("/get", params=params)
         if resp.status_code in {400, 404}:
             return b""
         resp.raise_for_status()
@@ -296,6 +420,9 @@ class EventClipService:
         camera_key = str(camera_uuid)
         lock = self._camera_lock(camera_key)
         async with lock:
+            if time.monotonic() < self._playback_unavailable_until:
+                return None
+
             now_mono = time.monotonic()
             cached = self._recent_by_camera.get(camera_key)
             if cached and (now_mono - cached[0]) <= self.cooldown_s:
@@ -360,6 +487,16 @@ class EventClipService:
                 )
                 self._recent_by_camera[camera_key] = (time.monotonic(), result)
                 return result.to_payload()
+            except PlaybackUnavailableError as exc:
+                self._mark_playback_unavailable()
+                self._warn_playback_unavailable(
+                    camera_uuid=camera_key,
+                    path=path,
+                    trigger=trigger,
+                    event_ts_ms=event_ts_ms,
+                    detail=str(exc),
+                )
+                return None
             except Exception as exc:
                 logger.exception(
                     "Failed to capture pre-event clip camera=%s path=%s trigger=%s event_ts_ms=%s",
