@@ -218,6 +218,12 @@ resource caddyDataFileShare 'Microsoft.Storage/storageAccounts/fileServices/shar
     shareQuota: 1
   }
 }
+resource caddyConfigFileShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-05-01' = if (deployMediaMtx) {
+  name: '${clipStorage.name}/default/caddy-config'
+  properties: {
+    shareQuota: 1
+  }
+}
 // ----------------------------
 // Backend API (Container App)
 // ----------------------------
@@ -482,6 +488,15 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
           readOnly: false
         }
       }
+      {
+        name: 'caddy-config'
+        azureFile: {
+          shareName: 'caddy-config'
+          storageAccountName: clipStorage.name
+          storageAccountKey: clipStorageKey
+          readOnly: false
+        }
+      }
     ]
 
     containers: [
@@ -528,6 +543,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
           volumeMounts: [
             { name: 'caddy', mountPath: '/etc/caddy', readOnly: true }
             { name: 'caddy-data', mountPath: '/data', readOnly: false }
+            { name: 'caddy-config', mountPath: '/config', readOnly: false }
           ]
           command: [
             'caddy'
@@ -536,6 +552,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
             '/etc/caddy/Caddyfile'
             '--adapter'
             'caddyfile'
+            '--resume'
           ]
         }
       }
@@ -543,6 +560,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
   }
   dependsOn: [
     caddyDataFileShare
+    caddyConfigFileShare
   ]
 }
 
