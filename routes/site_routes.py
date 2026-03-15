@@ -7,10 +7,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.database_orm import Site, Device, SiteDevice  # adjust import path
-from dependencies import get_db, get_async_db, get_current_user, get_manager
+from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice  # adjust import path
+from dependencies import get_db, get_async_db, get_current_user
 from routes.device_routes import DeviceOut
-from application.services.manager import Manager
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -199,12 +198,25 @@ async def unlink_device_from_site(
     device_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    manager: Manager = Depends(get_manager),
-
 ):
     site = await _get_site_or_404(db, user.id, site_uuid)
-    active_pipeline=manager.get_activepipeline(user_id=user.id)
-    await manager.cleanup_site_resources(user_id=user.id,site_uuid=site_uuid,active=active_pipeline)
+
+    camera_using_device = (
+        await db.execute(
+            select(Camera.camera_uuid)
+            .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
+            .where(
+                Camera.site_uuid == site.site_uuid,
+                CameraDevice.device_uuid == device_uuid,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if camera_using_device is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot unlink device while cameras in this site are assigned to it. Move or delete those cameras first.",
+        )
 
     stmt = delete(SiteDevice).where(
         SiteDevice.site_uuid == site.site_uuid,

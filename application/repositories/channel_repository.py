@@ -203,23 +203,42 @@ class ChannelRepository:
         *,
         camera_uuid: uuid.UUID,
         required: bool = False,
+        relaxed: bool = False,
     ) -> Optional[Device]:
         """
         ✅ With new rule, there should be exactly 1 device.
         """
-        q = (
-            select(Device)
-            .join(CameraDevice, CameraDevice.device_uuid == Device.device_uuid)
-            .where(CameraDevice.camera_uuid == camera_uuid)
-        )
-        devices = (await db.execute(q)).scalars().all()
+        devices = await self.list_devices(db, camera_uuid=camera_uuid)
 
         if len(devices) == 1:
             return devices[0]
         if len(devices) == 0 and not required:
             return None
+        if relaxed and devices:
+            chosen = devices[0]
+            logger.warning(
+                "Camera %s has %s linked devices; using most recent device %s for legacy compatibility",
+                camera_uuid,
+                len(devices),
+                getattr(chosen, "device_uuid", None),
+            )
+            return chosen
 
         raise ValueError(f"Camera {camera_uuid} must have exactly 1 device, found {len(devices)}")
+
+    async def list_devices(
+        self,
+        db: AsyncSession,
+        *,
+        camera_uuid: uuid.UUID,
+    ) -> List[Device]:
+        q = (
+            select(Device)
+            .join(CameraDevice, CameraDevice.device_uuid == Device.device_uuid)
+            .where(CameraDevice.camera_uuid == camera_uuid)
+            .order_by(CameraDevice.created_at.desc(), CameraDevice.id.desc())
+        )
+        return (await db.execute(q)).scalars().all()
 
     async def delete_camera(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> None:
         """

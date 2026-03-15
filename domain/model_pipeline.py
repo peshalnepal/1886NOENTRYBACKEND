@@ -210,7 +210,7 @@ class ModelPipeline:
         self._device_fetch_limits: Dict[str, asyncio.Semaphore] = {}
         self._max_concurrent_fetch_per_device = max(
             1,
-            int(os.getenv("DETECTION_MAX_CONCURRENT_FETCH_PER_DEVICE", "4")),
+            int(os.getenv("DETECTION_MAX_CONCURRENT_FETCH_PER_DEVICE", "8")),
         )
         self._startup_jitter_ms = max(
             0,

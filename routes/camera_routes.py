@@ -186,8 +186,7 @@ async def list_cameras(
 
     out: List[CameraSchema] = []
     for cam in cams:
-        # New rule: exactly 1 device per camera, but for list we won't hard-fail old data
-        dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=False)
+        dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=False, relaxed=True)
 
         out.append(
             CameraSchema(
@@ -222,17 +221,13 @@ async def get_camera(
     cam, cfg, _pid = full
     _ensure_user_owns_camera(cam, user.id)
 
-    # New rule: must have exactly 1 device
-    try:
-        dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=True)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+    dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=False, relaxed=True)
 
     return CameraWithConfigSchema(
         camera_uuid=cam.camera_uuid,
         camera_code=cam.camera_code,
         site_uuid=cam.site_uuid,
-        device_uuid=dev.device_uuid,
+        device_uuid=(dev.device_uuid if dev else None),
         rtsp_url=cam.rtsp_url,
         webrtc_url=getattr(cam, "webrtc_url", None),
         is_enabled=cam.is_enabled,

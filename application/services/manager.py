@@ -314,12 +314,7 @@ class Manager:
         """
         Returns the single Device assigned to this camera (enforces exactly one).
         """
-        q = (
-            select(Device)
-            .join(CameraDevice, CameraDevice.device_uuid == Device.device_uuid)
-            .where(CameraDevice.camera_uuid == camera_uuid)
-        )
-        devices = (await db.execute(q)).scalars().all()
+        devices = await self._get_camera_devices(db, camera_uuid)
 
         if len(devices) == 1:
             dev = devices[0]
@@ -331,6 +326,15 @@ class Manager:
             return None
 
         raise ValueError(f"Camera {camera_uuid} must have exactly 1 device assigned, found {len(devices)}")
+
+    async def _get_camera_devices(self, db: AsyncSession, camera_uuid: uuid.UUID) -> List[Device]:
+        q = (
+            select(Device)
+            .join(CameraDevice, CameraDevice.device_uuid == Device.device_uuid)
+            .where(CameraDevice.camera_uuid == camera_uuid)
+            .order_by(CameraDevice.created_at.desc(), CameraDevice.id.desc())
+        )
+        return (await db.execute(q)).scalars().all()
 
     async def _set_single_camera_device(self, db: AsyncSession, camera_uuid: uuid.UUID, device_uuid: uuid.UUID) -> None:
         """
@@ -374,17 +378,20 @@ class Manager:
                         enabled = bool(getattr(cam, "is_enabled", True))
                         det_enabled = bool(getattr(cam, "is_detection_enabled", True))
 
-                        devices = list(getattr(cam, "devices", None) or [])
-                        if len(devices) != 1:
-                            if enabled and det_enabled:
-                                raise ValueError(
-                                    f"Camera {cam.camera_uuid} must have exactly 1 device assigned, found {len(devices)}"
-                                )
+                        devices = await self._get_camera_devices(db, cam.camera_uuid)
+                        if len(devices) == 0:
                             logger.warning(
                                 "Skipping camera %s (enabled=%s detection=%s) because device count=%s",
                                 cam.camera_uuid, enabled, det_enabled, len(devices)
                             )
                             continue
+                        if len(devices) > 1:
+                            logger.warning(
+                                "Camera %s has %s linked devices; using most recent device %s for runtime compatibility",
+                                cam.camera_uuid,
+                                len(devices),
+                                getattr(devices[0], "device_uuid", None),
+                            )
 
                         device = devices[0]
                         d_url = getattr(device, "device_url", None)
@@ -873,7 +880,19 @@ class Manager:
         old_rtsp = cam_db.rtsp_url
         old_webrtc = cam_db.webrtc_url
 
-        old_dev = await self._get_single_camera_device(db, cam_uuid, required=True)
+        old_devices = await self._get_camera_devices(db, cam_uuid)
+        if not old_devices:
+            raise ValueError(f"Camera {cam_uuid} must have at least 1 device assigned")
+        if len(old_devices) > 1:
+            logger.warning(
+                "Camera %s has %s linked devices during edit; using most recent device %s",
+                cam_uuid,
+                len(old_devices),
+                getattr(old_devices[0], "device_uuid", None),
+            )
+        old_dev = old_devices[0]
+        if not getattr(old_dev, "device_url", None):
+            raise ValueError(f"Assigned device has no device_url for camera {cam_uuid}")
 
         patch = self._patch_to_dict(getattr(ev, "configs", None))
         patch.pop("webrtc_url", None)
@@ -907,12 +926,18 @@ class Manager:
             device_uuid=new_device_uuid,  # ok if repo uses it
         )
 
-        if old_dev.device_uuid != new_device_uuid:
+        stale_old_devices = [
+            dev for dev in old_devices
+            if getattr(dev, "device_uuid", None) != new_device_uuid and getattr(dev, "device_url", None)
+        ]
+        if stale_old_devices:
             try:
-                await self._edge.delete_camera(device_url=old_dev.device_url, camera_uuid=str(cam_uuid))
+                for dev in stale_old_devices:
+                    await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid))
             except Exception:
                 logger.warning("Failed removing camera from old device during reassignment", exc_info=True)
 
+        if len(old_devices) != 1 or old_dev.device_uuid != new_device_uuid:
             await self._set_single_camera_device(db, cam_uuid, new_device_uuid)
 
         if cam2.rtsp_url != old_rtsp and cam2.camera_code:
@@ -1021,9 +1046,14 @@ class Manager:
                 raise ValueError("Camera does not belong to provided pipeline_id")
 
             try:
-                dev = await self._get_single_camera_device(db, cam_uuid, required=False)
-                if dev and dev.device_url:
-                    await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid))
+                devices = await self._get_camera_devices(db, cam_uuid)
+                seen_urls: Set[str] = set()
+                for dev in devices:
+                    dev_url = str(getattr(dev, "device_url", "") or "").strip()
+                    if not dev_url or dev_url in seen_urls:
+                        continue
+                    seen_urls.add(dev_url)
+                    await self._edge.delete_camera(device_url=dev_url, camera_uuid=str(cam_uuid))
             except Exception:
                 logger.warning("Edge delete failed during camera removal", exc_info=True)
             try:
@@ -1181,9 +1211,13 @@ class Manager:
             cameras_on_site = (await db.execute(q)).scalars().all()
 
             for cam in cameras_on_site:
-
-                if cam.devices and cam.devices[0].device_url:
-                    await self._edge.delete_camera(device_url=cam.devices[0].device_url, camera_uuid=str(cam.camera_uuid))    
+                seen_urls: Set[str] = set()
+                for dev in list(getattr(cam, "devices", None) or []):
+                    dev_url = str(getattr(dev, "device_url", "") or "").strip()
+                    if not dev_url or dev_url in seen_urls:
+                        continue
+                    seen_urls.add(dev_url)
+                    await self._edge.delete_camera(device_url=dev_url, camera_uuid=str(cam.camera_uuid))
                 if cam.camera_code:
                     await self._webrtc.delete_stream(stream_key=str(cam.camera_code))
                 await self.channel_repo.delete_camera(db, camera_uuid=cam.camera_uuid)
