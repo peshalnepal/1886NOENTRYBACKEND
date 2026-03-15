@@ -620,7 +620,7 @@ class NotificationService:
         clip_service = self._clip_service
         if clip_service is None:
             return extra_payload
-        if msg.alert_type not in {"item_detected", "roi_enter", "detection_summary"}:
+        if msg.alert_type != "roi_enter":
             return extra_payload
 
         clip = await clip_service.capture_pre_event_clip(
@@ -935,6 +935,11 @@ class NotificationService:
 
     def _clamp_unit_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         return [(max(0.0, min(1.0, x)), max(0.0, min(1.0, y))) for (x, y) in points]
+
+    def invalidate_camera_roi_state(self, camera_uuid: str) -> None:
+        cam = str(camera_uuid)
+        self._roi_cache.pop(cam, None)
+        self._roi_engine.reset_camera(cam)
 
     async def _get_rois(self, camera_uuid: str) -> List[ROI]:
         if not self._session_factory:

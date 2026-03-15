@@ -181,6 +181,41 @@ class Manager:
         for mp in list(self._pipelines_by_user.values()):
             self._wire_pipeline(mp)
 
+    def _event_includes_roi_patch(self, ev: VideoChannelEvent) -> bool:
+        configs = getattr(ev, "configs", None)
+        if isinstance(configs, dict):
+            return "roi" in configs
+
+        fields_set = getattr(configs, "model_fields_set", None)
+        if fields_set is None:
+            fields_set = getattr(configs, "__fields_set__", None)
+        if fields_set is not None:
+            return "roi" in fields_set
+
+        return False
+
+    def _invalidate_camera_roi_state(self, camera_uuid: uuid.UUID) -> None:
+        cam = str(camera_uuid)
+
+        svc = self._notification_service
+        invalidate = getattr(svc, "invalidate_camera_roi_state", None) if svc is not None else None
+        if callable(invalidate):
+            try:
+                invalidate(cam)
+            except Exception:
+                logger.exception("Failed invalidating notification ROI state camera=%s", cam)
+
+        for mp in list(self._pipelines_by_user.values()):
+            if mp is None:
+                continue
+            invalidate_mp = getattr(mp, "invalidate_camera_roi_state", None)
+            if not callable(invalidate_mp):
+                continue
+            try:
+                invalidate_mp(cam)
+            except Exception:
+                logger.exception("Failed invalidating pipeline ROI state camera=%s", cam)
+
     async def shutdown(self) -> None:
         async with self._lock:
             pipelines = list(self._pipelines_by_user.values())
@@ -499,6 +534,7 @@ class Manager:
 
                 cameras_out: List[CameraOut] = []
                 events_out: List[Dict[str, Any]] = []
+                roi_reset_camera_ids: Set[uuid.UUID] = set()
 
                 for ev in (channel_events or []):
                     et = getattr(ev, "event_type", None)
@@ -512,6 +548,10 @@ class Manager:
                             camera_code_prefix=camera_code_prefix, active=active
                         )
                     elif et_norm == "edit_channel" or isinstance(ev, ChannelEditEvent):
+                        if self._event_includes_roi_patch(ev):
+                            cam_uuid = getattr(ev, "channel_id", None) or getattr(ev, "camera_uuid", None)
+                            if cam_uuid is not None:
+                                roi_reset_camera_ids.add(self._as_uuid(cam_uuid, "camera_uuid"))
                         cams, evs = await self._edit_channel(db, pid=pid, ev=ev, user_id=uid, active=active)
                     elif et_norm == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
                         cams, evs = await self._remove_channel(db, pid=pid, ev=ev, user_id=uid, active=active)
@@ -523,6 +563,8 @@ class Manager:
                     events_out.extend(evs)
 
                 await db.commit()
+                for cam_uuid in roi_reset_camera_ids:
+                    self._invalidate_camera_roi_state(cam_uuid)
 
                 return PipelineUpdateResult(
                     pipeline_id=pid,

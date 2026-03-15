@@ -306,6 +306,11 @@ class ModelPipeline:
             except Exception:
                 logger.exception("Failed to set session factory on NotificationService")
 
+    def invalidate_camera_roi_state(self, camera_uuid: str) -> None:
+        """
+        Clear per-camera ROI edge-trigger state so ROI edits take effect immediately.
+        """
+        self._roi_engine.reset_camera(str(camera_uuid))
 
     async def _get_site_name(self, site_uuid: Optional[str]) -> str:
         if not site_uuid:
