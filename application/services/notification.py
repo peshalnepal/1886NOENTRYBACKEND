@@ -933,6 +933,22 @@ class NotificationService:
             return True
         return all(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for (x, y) in points)
 
+    def _coerce_positive_int(self, raw_value: Any) -> Optional[int]:
+        try:
+            value = int(raw_value)
+        except Exception:
+            return None
+        return value if value > 0 else None
+
+    def _parse_roi_frame_size(self, raw_roi: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+        frame_w = self._coerce_positive_int(
+            raw_roi.get("frame_w") or raw_roi.get("frameWidth") or raw_roi.get("width")
+        )
+        frame_h = self._coerce_positive_int(
+            raw_roi.get("frame_h") or raw_roi.get("frameHeight") or raw_roi.get("height")
+        )
+        return frame_w, frame_h
+
     def _clamp_unit_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         return [(max(0.0, min(1.0, x)), max(0.0, min(1.0, y))) for (x, y) in points]
 
@@ -969,6 +985,7 @@ class NotificationService:
 
             points = self._parse_roi_points(row.get("points", []))
             normalized = self._coerce_roi_normalized(row.get("normalized"), points)
+            roi_frame_w, roi_frame_h = self._parse_roi_frame_size(row)
 
             if not points or len(points) < 3:
                 rois = []
@@ -976,7 +993,15 @@ class NotificationService:
                 return rois
 
             roi_points = self._clamp_unit_points(points) if normalized else points
-            rois = [ROI(roi_id=f"{camera_uuid}-roi", points=roi_points, normalized=normalized)]
+            rois = [
+                ROI(
+                    roi_id=f"{camera_uuid}-roi",
+                    points=roi_points,
+                    normalized=normalized,
+                    frame_w=roi_frame_w,
+                    frame_h=roi_frame_h,
+                )
+            ]
             self._roi_cache[camera_uuid] = (now + self._roi_ttl_s, rois)
             return rois
 

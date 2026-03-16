@@ -16,6 +16,8 @@ class ROISchema(BaseModel):
     
     points: List[List[float]] = Field(..., description="List of [x, y] polygon vertices")
     normalized: bool = Field(default=True, description="If true, points are 0-1 normalized; if false, pixel coordinates")
+    frame_w: Optional[int] = Field(default=None, gt=0, description="Frame width used when ROI was authored")
+    frame_h: Optional[int] = Field(default=None, gt=0, description="Frame height used when ROI was authored")
 
 
 # -------------------------

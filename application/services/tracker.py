@@ -248,6 +248,8 @@ class ROI:
     roi_id: str
     points: List[Tuple[float, float]]
     normalized: bool = False
+    frame_w: Optional[int] = None
+    frame_h: Optional[int] = None
 
 
 def _point_in_poly(x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
@@ -337,9 +339,44 @@ def _bbox_intersects_poly(b: List[float], poly: List[Tuple[float, float]]) -> bo
     return False
 
 
+def _contain_rect(outer_w: float, outer_h: float, inner_aspect: float) -> Tuple[float, float, float, float]:
+    outer_aspect = float(outer_w) / max(float(outer_h), 1e-9)
+    if outer_aspect > inner_aspect:
+        active_h = float(outer_h)
+        active_w = active_h * inner_aspect
+        offset_x = (float(outer_w) - active_w) / 2.0
+        offset_y = 0.0
+    else:
+        active_w = float(outer_w)
+        active_h = active_w / max(inner_aspect, 1e-9)
+        offset_x = 0.0
+        offset_y = (float(outer_h) - active_h) / 2.0
+    return offset_x, offset_y, active_w, active_h
+
+
 def _roi_points_px(roi: ROI, frame_w: int, frame_h: int) -> List[Tuple[float, float]]:
     if not roi.normalized:
         return roi.points
+    if roi.frame_w and roi.frame_h and (int(roi.frame_w) != int(frame_w) or int(roi.frame_h) != int(frame_h)):
+        src_w = float(roi.frame_w)
+        src_h = float(roi.frame_h)
+        dst_w = float(frame_w)
+        dst_h = float(frame_h)
+        dst_aspect = dst_w / max(dst_h, 1e-9)
+        offset_x, offset_y, active_w, active_h = _contain_rect(src_w, src_h, dst_aspect)
+        out: List[Tuple[float, float]] = []
+        for (px, py) in roi.points:
+            src_x = float(px) * src_w
+            src_y = float(py) * src_h
+            dst_x_norm = (src_x - offset_x) / max(active_w, 1e-9)
+            dst_y_norm = (src_y - offset_y) / max(active_h, 1e-9)
+            out.append(
+                (
+                    max(0.0, min(1.0, dst_x_norm)) * dst_w,
+                    max(0.0, min(1.0, dst_y_norm)) * dst_h,
+                )
+            )
+        return out
     return [(px * frame_w, py * frame_h) for (px, py) in roi.points]
 
 

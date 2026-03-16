@@ -149,6 +149,17 @@ def clamp_xyxy(x1, y1, x2, y2, W, H):
     return x1, y1, x2, y2
 
 
+def box_norm_xyxy(x1, y1, x2, y2, W, H):
+    w = max(1.0, float(x2) - float(x1))
+    h = max(1.0, float(y2) - float(y1))
+    return {
+        "x": max(0.0, min(1.0, float(x1) / max(float(W), 1.0))),
+        "y": max(0.0, min(1.0, float(y1) / max(float(H), 1.0))),
+        "w": max(0.0, min(1.0, w / max(float(W), 1.0))),
+        "h": max(0.0, min(1.0, h / max(float(H), 1.0))),
+    }
+
+
 # -----------------------------
 # TensorRT engine wrapper
 # -----------------------------
@@ -320,6 +331,7 @@ class YoloV8DetTRT(object):
                 "cls_name": labels[i],
                 "conf": float(score[i]),
                 "box": {"x1": x1o, "y1": y1o, "x2": x2o, "y2": y2o},
+                "box_norm": box_norm_xyxy(x1o, y1o, x2o, y2o, W0, H0),
             })
 
         return out
@@ -400,6 +412,7 @@ class YoloV8PoseTRT(object):
                 "cls_name": "skeleton",
                 "conf": float(score[i]),
                 "box": {"x1": x1o, "y1": y1o, "x2": x2o, "y2": y2o},
+                "box_norm": box_norm_xyxy(x1o, y1o, x2o, y2o, W0, H0),
             })
 
             skeletons.append({
