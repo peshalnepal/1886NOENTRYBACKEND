@@ -8,6 +8,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
+from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobSasPermissions, ContentSettings, generate_blob_sas
 from azure.storage.blob.aio import BlobServiceClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -304,6 +305,21 @@ class EventClipService:
             content_settings=ContentSettings(content_type="video/mp4"),
         )
         return self._signed_url(blob_name=blob_name, blob_url=blob.url)
+
+    async def delete_blob(self, *, blob_name: str) -> bool:
+        blob_key = str(blob_name or "").strip()
+        if not blob_key or not self.connection_string:
+            return False
+
+        blob_service = await self._get_blob_service()
+        blob = blob_service.get_blob_client(container=self.container_name, blob=blob_key)
+
+        try:
+            await blob.delete_blob(delete_snapshots="include")
+        except ResourceNotFoundError:
+            return False
+
+        return True
 
     async def _save_video_record(
         self,
