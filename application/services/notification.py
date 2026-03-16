@@ -509,7 +509,7 @@ class NotificationService:
         enable_tracking: bool = True,
         tracker_cfg: Optional[dict] = None,
         roi_provider=None,
-        notify_on_confirmed: bool = True,
+        notify_on_confirmed: bool = False,
         notify_on_roi_enter: bool = True,
         clip_service: Optional[EventClipService] = None,
     ):

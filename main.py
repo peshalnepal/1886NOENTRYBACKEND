@@ -11,6 +11,7 @@ from routes.site_routes import router as sites_router
 from routes.device_routes import router as devices_router
 from routes.notifications_routes import router as notifications_router
 from routes.notification_email_routes import router as notification_emails_router
+from routes.clips_routes import router as clips_router
 from routes.auth import router as auth_router
 from routes.user_routes import router as users_router
 
@@ -174,6 +175,7 @@ app.add_middleware(
 
 # Routers
 app.include_router(cameras_router, prefix="/api")
+app.include_router(clips_router, prefix="/api")
 app.include_router(sites_router,prefix="/api")
 app.include_router(devices_router,prefix="/api")
 app.include_router(notifications_router, prefix="/api")

@@ -492,7 +492,7 @@ async def edit_camera(
     _ensure_user_owns_camera(cam, user.id)
 
     pipeline = await manager.get_activepipeline(user_id=user.id)
-    patch_payload = payload.model_dump(exclude_none=True)
+    patch_payload = payload.model_dump(exclude_unset=True)
     patch_payload.pop("user_id", None)
 
     ev = ChannelEditEvent(

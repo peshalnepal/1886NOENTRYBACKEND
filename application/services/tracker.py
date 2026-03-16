@@ -77,7 +77,7 @@ class Track:
         dt = max(1e-3, now_ts - self.last_ts)
         return self.bbox + self.vel * dt
 
-    def update(self, det_bbox: BBox, det_score: float, now_ts: float, alpha: float = 0.85) -> None:
+    def update(self, det_bbox: BBox, det_score: float, now_ts: float, alpha: float = 0.65) -> None:
         dt = max(1e-3, now_ts - self.last_ts)
         new_vel = (det_bbox - self.bbox) / dt
         self.vel = alpha * self.vel + (1.0 - alpha) * new_vel
@@ -102,13 +102,13 @@ class ByteTrackLite:
     """
     def __init__(
         self,
-        high_th: float = 0.6,
+        high_th: float = 0.45,
         low_th: float = 0.1,
         min_iou_high: float = 0.30,
         min_iou_low: float = 0.20,
-        min_hits: int = 3,
+        min_hits: int = 2,
         max_misses: int = 15,
-        max_stale_s: float = 2.5,
+        max_stale_s: float = 3.0,
         match_same_class: bool = True,
     ) -> None:
         self.high_th = float(high_th)
@@ -262,9 +262,79 @@ def _point_in_poly(x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
     return inside
 
 
-def _bbox_center(b: List[float]) -> Tuple[float, float]:
+def _point_in_rect(x: float, y: float, rect: List[float]) -> bool:
+    x1, y1, x2, y2 = rect
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def _cross(a: Tuple[float, float], b: Tuple[float, float], c: Tuple[float, float]) -> float:
+    return ((b[0] - a[0]) * (c[1] - a[1])) - ((b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _on_segment(a: Tuple[float, float], b: Tuple[float, float], c: Tuple[float, float]) -> bool:
+    return (
+        min(a[0], c[0]) - 1e-9 <= b[0] <= max(a[0], c[0]) + 1e-9
+        and min(a[1], c[1]) - 1e-9 <= b[1] <= max(a[1], c[1]) + 1e-9
+    )
+
+
+def _segments_intersect(
+    a1: Tuple[float, float],
+    a2: Tuple[float, float],
+    b1: Tuple[float, float],
+    b2: Tuple[float, float],
+) -> bool:
+    d1 = _cross(a1, a2, b1)
+    d2 = _cross(a1, a2, b2)
+    d3 = _cross(b1, b2, a1)
+    d4 = _cross(b1, b2, a2)
+
+    if (d1 > 0 > d2 or d1 < 0 < d2) and (d3 > 0 > d4 or d3 < 0 < d4):
+        return True
+
+    if abs(d1) < 1e-9 and _on_segment(a1, b1, a2):
+        return True
+    if abs(d2) < 1e-9 and _on_segment(a1, b2, a2):
+        return True
+    if abs(d3) < 1e-9 and _on_segment(b1, a1, b2):
+        return True
+    if abs(d4) < 1e-9 and _on_segment(b1, a2, b2):
+        return True
+
+    return False
+
+
+def _bbox_intersects_poly(b: List[float], poly: List[Tuple[float, float]]) -> bool:
+    if len(poly) < 3:
+        return False
+
     x1, y1, x2, y2 = b
-    return (0.5 * (x1 + x2), 0.5 * (y1 + y2))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+
+    rect = [x1, y1, x2, y2]
+    corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    if any(_point_in_poly(px, py, poly) for (px, py) in corners):
+        return True
+
+    if any(_point_in_rect(px, py, rect) for (px, py) in poly):
+        return True
+
+    rect_edges = [
+        (corners[0], corners[1]),
+        (corners[1], corners[2]),
+        (corners[2], corners[3]),
+        (corners[3], corners[0]),
+    ]
+    poly_edges = [(poly[i], poly[(i + 1) % len(poly)]) for i in range(len(poly))]
+    for rect_edge in rect_edges:
+        for poly_edge in poly_edges:
+            if _segments_intersect(rect_edge[0], rect_edge[1], poly_edge[0], poly_edge[1]):
+                return True
+
+    return False
 
 
 def _roi_points_px(roi: ROI, frame_w: int, frame_h: int) -> List[Tuple[float, float]]:
@@ -306,11 +376,15 @@ class ROIAlertEngine:
                 track_id = int(t["track_id"])
                 key = (camera_uuid, roi.roi_id, track_id)
 
-                cx, cy = _bbox_center(t["bbox"])
-                inside = _point_in_poly(cx, cy, poly)
+                inside = _bbox_intersects_poly(t["bbox"], poly)
 
                 prev_inside = self._in_roi.get(key, False)
                 self._in_roi[key] = inside
+
+                if not inside:
+                    if prev_inside:
+                        self._notified.pop(key, None)
+                    continue
 
                 # ROI enter = edge: False -> True
                 if inside and not prev_inside:

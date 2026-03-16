@@ -71,6 +71,7 @@ class ChannelRepository:
         enabled = d.get("enabled", d.get("is_enabled", True))
         detection_enabled = d.get("detection_enabled", d.get("is_detection_enabled", True))
         notification_enabled = d.get("notification_enabled", d.get("is_notification_enabled", True))
+        has_roi = "roi" in d
         roi = d.get("roi")
 
         if not rtsp_url:
@@ -85,7 +86,8 @@ class ChannelRepository:
             cam.is_enabled = bool(enabled)
             cam.is_detection_enabled = bool(detection_enabled)
             cam.is_notification_enabled = bool(notification_enabled)
-            cam.roi = roi
+            if has_roi:
+                cam.roi = roi
 
             if webrtc_url is not None:
                 if cam.webrtc_url is None:

@@ -291,9 +291,15 @@ class Manager:
         if obj is None:
             out: Dict[str, Any] = {}
         elif hasattr(obj, "model_dump"):
-            out = obj.model_dump(exclude_unset=True, exclude_none=True)
+            out = obj.model_dump(exclude_unset=True)
+            fields_set = getattr(obj, "model_fields_set", None)
+            if fields_set is None:
+                fields_set = getattr(obj, "__fields_set__", None)
+            if fields_set is not None and "roi" in fields_set and "roi" not in out:
+                out["roi"] = None
+            out = {k: v for k, v in out.items() if v is not None or k == "roi"}
         elif isinstance(obj, dict):
-            out = {k: v for k, v in obj.items() if v is not None}
+            out = {k: v for k, v in obj.items() if v is not None or k == "roi"}
         else:
             out = {}
 
