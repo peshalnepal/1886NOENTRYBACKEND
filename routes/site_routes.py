@@ -1,17 +1,18 @@
 # routes/sites.py
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice  # adjust import path
-from dependencies import get_db, get_async_db, get_current_user
+from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, SiteSettings
+from dependencies import get_async_db, get_current_user
 from routes.device_routes import DeviceOut
 
 router = APIRouter(prefix="/sites", tags=["sites"])
+SITE_PRERECORD_TRIGGER_MODE = "roi_enter"
 
 
 # -----------------------
@@ -29,6 +30,32 @@ async def _get_site_or_404(db: AsyncSession, user_id: int, site_uuid: uuid.UUID)
     if not site:
         raise HTTPException(status_code=404, detail="Site not found")
     return site
+
+
+def _dedupe_uuid_list(values: Optional[List[uuid.UUID]]) -> List[uuid.UUID]:
+    seen = set()
+    out: List[uuid.UUID] = []
+    for value in values or []:
+        parsed = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+        key = str(parsed)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(parsed)
+    return out
+
+
+async def _get_site_settings_row(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    site_uuid: uuid.UUID,
+) -> Optional[SiteSettings]:
+    stmt = select(SiteSettings).where(
+        SiteSettings.user_id == int(user_id),
+        SiteSettings.site_uuid == site_uuid,
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
 
 
 # -----------------------
@@ -64,6 +91,85 @@ class LinkDeviceRequest(BaseModel):
     device_uuid: uuid.UUID
 
 
+class SiteMultiCameraPrerecordRule(BaseModel):
+    enabled: bool = False
+    camera_uuids: List[uuid.UUID] = Field(default_factory=list)
+    trigger_mode: str = SITE_PRERECORD_TRIGGER_MODE
+
+
+class SiteMultiCameraPrerecordRuleUpdate(BaseModel):
+    enabled: bool = False
+    camera_uuids: List[uuid.UUID] = Field(default_factory=list)
+
+
+class SiteSettingsOut(BaseModel):
+    site_uuid: uuid.UUID
+    multi_camera_prerecord: SiteMultiCameraPrerecordRule = Field(
+        default_factory=SiteMultiCameraPrerecordRule
+    )
+
+
+class SiteSettingsUpdate(BaseModel):
+    multi_camera_prerecord: SiteMultiCameraPrerecordRuleUpdate = Field(
+        default_factory=SiteMultiCameraPrerecordRuleUpdate
+    )
+
+
+async def _validate_site_prerecord_camera_uuids(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    site_uuid: uuid.UUID,
+    camera_uuids: List[uuid.UUID],
+) -> List[uuid.UUID]:
+    normalized = _dedupe_uuid_list(camera_uuids)
+    if not normalized:
+        return []
+
+    stmt = select(Camera.camera_uuid).where(
+        Camera.user_id == int(user_id),
+        Camera.site_uuid == site_uuid,
+        Camera.camera_uuid.in_(normalized),
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    found = {str(value) for value in rows}
+    missing = [str(value) for value in normalized if str(value) not in found]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Some selected cameras do not belong to this site.",
+                "camera_uuids": missing,
+            },
+        )
+
+    return normalized
+
+
+def _serialize_site_settings(site_uuid: uuid.UUID, row: Optional[SiteSettings]) -> SiteSettingsOut:
+    config: Dict[str, Any] = row.config if isinstance(getattr(row, "config", None), dict) else {}
+    prerecord = config.get("multi_camera_prerecord")
+    if not isinstance(prerecord, dict):
+        prerecord = {}
+
+    camera_uuids: List[uuid.UUID] = []
+    for value in prerecord.get("camera_uuids") or []:
+        try:
+            camera_uuids.append(uuid.UUID(str(value)))
+        except Exception:
+            continue
+    camera_uuids = _dedupe_uuid_list(camera_uuids)
+
+    return SiteSettingsOut(
+        site_uuid=site_uuid,
+        multi_camera_prerecord=SiteMultiCameraPrerecordRule(
+            enabled=bool(prerecord.get("enabled")),
+            camera_uuids=camera_uuids,
+            trigger_mode=SITE_PRERECORD_TRIGGER_MODE,
+        ),
+    )
+
+
 # -----------------------
 # Routes
 # -----------------------
@@ -90,6 +196,62 @@ async def list_site_devices(
         .order_by(Device.created_at.desc())
     )
     return (await db.execute(q)).scalars().all()
+
+
+@router.get("/{site_uuid}/settings", response_model=SiteSettingsOut)
+async def get_site_settings(
+    site_uuid: uuid.UUID,
+    db: AsyncSession = Depends(get_async_db),
+    user=Depends(get_current_user),
+):
+    site = await _get_site_or_404(db, user.id, site_uuid)
+    row = await _get_site_settings_row(db, user_id=int(user.id), site_uuid=site.site_uuid)
+    return _serialize_site_settings(site.site_uuid, row)
+
+
+@router.patch("/{site_uuid}/settings", response_model=SiteSettingsOut)
+async def update_site_settings(
+    site_uuid: uuid.UUID,
+    payload: SiteSettingsUpdate,
+    db: AsyncSession = Depends(get_async_db),
+    user=Depends(get_current_user),
+):
+    site = await _get_site_or_404(db, user.id, site_uuid)
+    rule = payload.multi_camera_prerecord or SiteMultiCameraPrerecordRuleUpdate()
+    camera_uuids = await _validate_site_prerecord_camera_uuids(
+        db,
+        user_id=int(user.id),
+        site_uuid=site.site_uuid,
+        camera_uuids=rule.camera_uuids,
+    )
+
+    if rule.enabled and not camera_uuids:
+        raise HTTPException(
+            status_code=422,
+            detail="Select at least one site camera before enabling multi-camera prerecord.",
+        )
+
+    row = await _get_site_settings_row(db, user_id=int(user.id), site_uuid=site.site_uuid)
+    config = dict(row.config or {}) if row and isinstance(row.config, dict) else {}
+    config["multi_camera_prerecord"] = {
+        "enabled": bool(rule.enabled),
+        "camera_uuids": [str(value) for value in camera_uuids],
+        "trigger_mode": SITE_PRERECORD_TRIGGER_MODE,
+    }
+
+    if row is None:
+        row = SiteSettings(
+            user_id=int(user.id),
+            site_uuid=site.site_uuid,
+            config=config,
+        )
+        db.add(row)
+    else:
+        row.config = config
+
+    await db.commit()
+    await db.refresh(row)
+    return _serialize_site_settings(site.site_uuid, row)
 
 
 @router.post("", response_model=SiteOut, status_code=status.HTTP_201_CREATED)

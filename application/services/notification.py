@@ -610,6 +610,125 @@ class NotificationService:
             except Exception:
                 logger.exception("Event clip service shutdown failed")
 
+    def _site_prerecord_clip_payload(
+        self,
+        *,
+        camera_uuid: str,
+        camera_ctx: CameraContext,
+        clip: Dict[str, Any],
+        trigger_camera_uuid: str,
+    ) -> Dict[str, Any]:
+        payload = dict(clip or {})
+        payload["camera_uuid"] = str(camera_uuid)
+        payload["camera_name"] = camera_ctx.camera_name
+        payload["camera_code"] = camera_ctx.camera_code
+        payload["site_uuid"] = str(camera_ctx.site_uuid)
+        payload["is_trigger_camera"] = str(camera_uuid) == str(trigger_camera_uuid)
+        return payload
+
+    async def _capture_site_prerecord_clips(
+        self,
+        *,
+        msg: NotificationMessage,
+        ctx: CameraContext,
+        trigger_clip: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        clip_service = self._clip_service
+        if clip_service is None or self._session_factory is None:
+            return []
+        if msg.alert_type != "roi_enter":
+            return []
+
+        try:
+            trigger_camera_uuid = uuid.UUID(str(msg.camera_uuid))
+        except Exception:
+            return []
+
+        async with self._session_factory() as db:
+            settings = await self._repo.get_site_prerecord_settings(
+                db,
+                user_id=int(ctx.user_id),
+                site_uuid=ctx.site_uuid,
+            )
+            if not settings.enabled or trigger_camera_uuid not in set(settings.camera_uuids):
+                return []
+
+            contexts_by_camera = await self._repo.list_camera_contexts(
+                db,
+                user_id=int(ctx.user_id),
+                camera_uuids=settings.camera_uuids,
+            )
+
+        if not contexts_by_camera:
+            return []
+
+        ordered_camera_uuids = [
+            camera_uuid
+            for camera_uuid in settings.camera_uuids
+            if camera_uuid in contexts_by_camera
+        ]
+        if not ordered_camera_uuids:
+            return []
+
+        out: List[Dict[str, Any]] = []
+        pending_camera_uuids: List[uuid.UUID] = []
+        pending_tasks: List[asyncio.Future] = []
+
+        for camera_uuid in ordered_camera_uuids:
+            camera_uuid_str = str(camera_uuid)
+            camera_ctx = contexts_by_camera.get(camera_uuid)
+            if camera_ctx is None:
+                continue
+
+            if camera_uuid_str == str(msg.camera_uuid) and trigger_clip:
+                out.append(
+                    self._site_prerecord_clip_payload(
+                        camera_uuid=camera_uuid_str,
+                        camera_ctx=camera_ctx,
+                        clip=trigger_clip,
+                        trigger_camera_uuid=msg.camera_uuid,
+                    )
+                )
+                continue
+
+            pending_camera_uuids.append(camera_uuid)
+            pending_tasks.append(
+                clip_service.capture_pre_event_clip(
+                    camera_uuid=camera_uuid_str,
+                    ctx=camera_ctx,
+                    event_ts_ms=msg.ts_ms,
+                    trigger=f"site_prerecord:{msg.camera_uuid}:{msg.alert_type}",
+                )
+            )
+
+        if pending_tasks:
+            results = await asyncio.gather(*pending_tasks, return_exceptions=True)
+            for camera_uuid, result in zip(pending_camera_uuids, results):
+                camera_uuid_str = str(camera_uuid)
+                if isinstance(result, Exception):
+                    logger.exception(
+                        "Failed capturing site prerecord clip trigger_camera=%s target_camera=%s",
+                        msg.camera_uuid,
+                        camera_uuid_str,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+                    continue
+                if not result:
+                    continue
+                camera_ctx = contexts_by_camera.get(camera_uuid)
+                if camera_ctx is None:
+                    continue
+                out.append(
+                    self._site_prerecord_clip_payload(
+                        camera_uuid=camera_uuid_str,
+                        camera_ctx=camera_ctx,
+                        clip=result,
+                        trigger_camera_uuid=msg.camera_uuid,
+                    )
+                )
+
+        return out
+
     async def _attach_clip_payload(
         self,
         *,
@@ -623,18 +742,26 @@ class NotificationService:
         if msg.alert_type != "roi_enter":
             return extra_payload
 
+        merged = dict(extra_payload or {})
+
         clip = await clip_service.capture_pre_event_clip(
             camera_uuid=msg.camera_uuid,
             ctx=ctx,
             event_ts_ms=msg.ts_ms,
             trigger=msg.alert_type,
         )
-        if not clip:
-            return extra_payload
+        if clip:
+            merged["clip"] = clip
 
-        merged = dict(extra_payload or {})
-        merged["clip"] = clip
-        return merged
+        multi_clips = await self._capture_site_prerecord_clips(
+            msg=msg,
+            ctx=ctx,
+            trigger_clip=clip,
+        )
+        if multi_clips:
+            merged["multi_camera_prerecordings"] = multi_clips
+
+        return merged or extra_payload
 
     async def _flush_loop(self) -> None:
         while True:

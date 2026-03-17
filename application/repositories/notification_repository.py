@@ -16,6 +16,7 @@ from core.database_orm import (
     Device,
     Notification,
     NotificationEmail,
+    SiteSettings,
 )
 
 
@@ -40,6 +41,34 @@ class CameraContext:
     camera_name: Optional[str]
     device_uuid: Optional[uuid.UUID]
     device_name: Optional[str]
+
+
+@dataclass(frozen=True)
+class SitePrerecordSettings:
+    enabled: bool
+    camera_uuids: List[uuid.UUID]
+    trigger_mode: str = "roi_enter"
+
+
+def _normalize_uuid_list(raw: Any) -> List[uuid.UUID]:
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+
+    seen = set()
+    out: List[uuid.UUID] = []
+    for item in raw:
+        try:
+            parsed = _as_uuid(item)
+        except Exception:
+            parsed = None
+        if parsed is None:
+            continue
+        key = str(parsed)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(parsed)
+    return out
 
 
 class NotificationRepository:
@@ -90,6 +119,87 @@ class NotificationRepository:
             camera_name=display_camera_name,
             device_uuid=device_uuid,
             device_name=device_name,
+        )
+
+    async def list_camera_contexts(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        camera_uuids: List[uuid.UUID],
+    ) -> Dict[uuid.UUID, CameraContext]:
+        camera_uuid_values = _normalize_uuid_list(camera_uuids or [])
+        if not camera_uuid_values:
+            return {}
+
+        stmt = (
+            select(
+                Camera.camera_uuid,
+                Camera.user_id,
+                Camera.site_uuid,
+                Site.name,
+                Camera.name,
+                Camera.camera_code,
+                Device.device_uuid,
+                Device.name,
+            )
+            .select_from(Camera)
+            .join(Site, Site.site_uuid == Camera.site_uuid)
+            .outerjoin(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
+            .outerjoin(Device, Device.device_uuid == CameraDevice.device_uuid)
+            .where(
+                Camera.user_id == int(user_id),
+                Camera.camera_uuid.in_(camera_uuid_values),
+            )
+        )
+
+        rows = (await db.execute(stmt)).all()
+        out: Dict[uuid.UUID, CameraContext] = {}
+        for (
+            camera_uuid,
+            camera_user_id,
+            site_uuid,
+            site_name,
+            camera_name,
+            camera_code,
+            device_uuid,
+            device_name,
+        ) in rows:
+            display_camera_name = camera_name or camera_code
+            out[camera_uuid] = CameraContext(
+                user_id=int(camera_user_id),
+                site_uuid=site_uuid,
+                site_name=site_name or "Unknown Site",
+                camera_code=str(camera_code) if camera_code else None,
+                camera_name=display_camera_name,
+                device_uuid=device_uuid,
+                device_name=device_name,
+            )
+        return out
+
+    async def get_site_prerecord_settings(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        site_uuid: uuid.UUID,
+    ) -> SitePrerecordSettings:
+        stmt = select(SiteSettings.config).where(
+            SiteSettings.user_id == int(user_id),
+            SiteSettings.site_uuid == _as_uuid(site_uuid),
+        )
+        config = (await db.execute(stmt)).scalar_one_or_none()
+        if not isinstance(config, dict):
+            return SitePrerecordSettings(enabled=False, camera_uuids=[])
+
+        block = config.get("multi_camera_prerecord")
+        if not isinstance(block, dict):
+            return SitePrerecordSettings(enabled=False, camera_uuids=[])
+
+        return SitePrerecordSettings(
+            enabled=bool(block.get("enabled")),
+            camera_uuids=_normalize_uuid_list(block.get("camera_uuids")),
+            trigger_mode="roi_enter",
         )
 
     async def list_notification_emails_for_site(

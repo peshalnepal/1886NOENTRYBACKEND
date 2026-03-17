@@ -229,6 +229,14 @@ class Site(Base):
         passive_deletes=True,
     )
 
+    settings = relationship(
+        "SiteSettings",
+        back_populates="site",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        uselist=False,
+    )
+
     __table_args__ = (
         UniqueConstraint("user_id", "site_code", name="uq_site_user_site_code"),
     )
@@ -302,6 +310,31 @@ class SiteDevice(Base):
     __table_args__ = (
         UniqueConstraint("site_uuid", "device_uuid", name="uq_site_device_pair"),
     )
+
+
+# =========================
+# SITE SETTINGS
+# =========================
+class SiteSettings(Base):
+    __tablename__ = "site_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    site_uuid = Column(
+        GUID,
+        ForeignKey("sites.site_uuid", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    config = Column(JSONDict, nullable=False, default=dict)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    site = relationship("Site", back_populates="settings")
 
 
 # =========================
