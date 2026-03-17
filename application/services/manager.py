@@ -606,8 +606,21 @@ class Manager:
             cams = (await db.execute(q)).scalars().all()
 
         device_url = dev.device_url
-        edge_set = await self._edge.list_cameras(device_url=device_url)
-        webrtc_list = await self._webrtc.list_webrtc_cameras()
+        try:
+            edge_set = await self._edge.list_cameras(device_url=device_url)
+        except Exception as e:
+            logger.warning("Cannot reach edge device %s during reconcile: %s", device_url, e)
+            return {
+                "to_add": [], "to_remove": [],
+                "to_add_stream": [], "to_remove_stream": [],
+                "added": [], "removed": [],
+                "errors": [f"Edge device unreachable ({device_url}): {e}"],
+            }
+        try:
+            webrtc_list = await self._webrtc.list_webrtc_cameras()
+        except Exception as e:
+            logger.warning("Cannot reach WebRTC gateway during reconcile: %s", e)
+            webrtc_list = []
         webrtc_set = {
             str(c.get("stream_key"))
             for c in webrtc_list
@@ -644,12 +657,13 @@ class Manager:
                 continue
             cfg = (cam.channel_configuration.configuration or {}) if cam.channel_configuration else {}
             payload = {
+                **_only_jetson_config(cfg),
+                # Explicit fields last so they always win over whatever is in channel config
                 "camera_uuid": cu,
                 "rtsp_url": cam.rtsp_url,
                 "enabled": True,
                 "detection_enabled": True,
                 "notification_enabled": bool(cam.is_notification_enabled),
-                **_only_jetson_config(cfg),
             }
             try:
                 await self._edge.upsert_camera(device_url=device_url, payload=payload)
@@ -686,7 +700,11 @@ class Manager:
             for cu in to_remove_stream:
                 try:
                     await self._webrtc.delete_stream(stream_key=cu)
-                    out["removed"].append(cu)
+                    # Append camera_uuid (not stream_key/camera_code) to stay consistent with
+                    # the Jetson removal path and the `added` list which also uses camera UUIDs
+                    removed_cam = cams_by_code.get(cu)
+                    removed_uuid = str(removed_cam.camera_uuid) if removed_cam else cu
+                    out["removed"].append(removed_uuid)
                 except Exception as e:
                     logger.warning("Edge delete failed during reconcile for camera %s", cu, exc_info=True)
                     out["errors"].append(f"Failed to remove {cu}: {e}")

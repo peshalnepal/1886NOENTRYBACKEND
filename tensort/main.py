@@ -169,14 +169,20 @@ class PipelineRuntime(object):
                         cfg_data["camera_uuid"] = camera_uuid
                         cfg_data["channel_id"] = cam_config.channel_id
                         cfg_data["rtsp_url"] = cam_config.rtsp_url
-                        
-                        # Store in memory
-                        with self._lock:
-                            self._cameras[camera_uuid] = cfg_data
-                        
-                        # Add to pipeline if enabled
+
+                        # Build config first — if this raises (bad stored JSON) we
+                        # must NOT add the camera to self._cameras, otherwise it
+                        # appears in list_cameras() as "on device" but has no active
+                        # pipeline channel (ghost camera that blocks future syncs).
+                        cfg = None
                         if cfg_data.get("enabled", True):
                             cfg = VideoChannelConfig(**cfg_data)
+
+                        # Only register in memory after config is validated
+                        with self._lock:
+                            self._cameras[camera_uuid] = cfg_data
+
+                        if cfg is not None:
                             self._call(self.pipeline.add_channel(cfg), timeout_s=15.0)
                             restored_count += 1
                             logger.info(f"Restored camera {camera_uuid} from database")

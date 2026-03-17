@@ -250,7 +250,12 @@ class SimpleInferencePipeline(object):
                 pass
 
         if should_start:
-            self._start_channel_task(camera_key)
+            # Record the task inside the lock so that a concurrent remove_channel
+            # that runs between the lock release above and here sees the task and
+            # can cancel it instead of letting it run orphaned.
+            async with self._lock:
+                if camera_key in self._channels and not self._closing:
+                    self._start_channel_task(camera_key)
 
     async def remove_channel(self, camera_uuid):
         camera_key = str(camera_uuid)

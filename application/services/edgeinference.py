@@ -104,7 +104,7 @@ class EdgeInferenceClient:
 
         items = []
         if isinstance(data, dict):
-            items = data.get("cameras") 
+            items = data.get("cameras") or []
         elif isinstance(data, list):
             items = data
 
