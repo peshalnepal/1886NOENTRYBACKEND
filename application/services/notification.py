@@ -26,6 +26,7 @@ from application.services.tracker import MultiCameraByteTrack, ROIAlertEngine, R
 from application.repositories.notification_repository import (
     NotificationRepository,
     CameraContext,
+    SitePrerecordSettings,
     dt_from_ts_ms,
 )
 from application.services.clip_storage import EventClipService
@@ -104,6 +105,13 @@ class BufferedNotification:
     msg: NotificationMessage
     ctx: CameraContext
     extra_payload: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class SitePrerecordPlan:
+    settings: SitePrerecordSettings
+    ordered_camera_uuids: List[uuid.UUID]
+    contexts_by_camera: Dict[uuid.UUID, CameraContext]
 
 
 class WebNotificationHub:
@@ -626,23 +634,33 @@ class NotificationService:
         payload["is_trigger_camera"] = str(camera_uuid) == str(trigger_camera_uuid)
         return payload
 
-    async def _capture_site_prerecord_clips(
+    def _site_prerecord_trigger_matches(
+        self,
+        *,
+        trigger_mode: str,
+        alert_type: str,
+    ) -> bool:
+        normalized_mode = str(trigger_mode or "").strip().lower()
+        normalized_alert = str(alert_type or "").strip().lower()
+
+        if normalized_mode == "any_detection":
+            return normalized_alert in {"roi_enter", "item_detected", "detection_summary"}
+
+        return normalized_alert == "roi_enter"
+
+    async def _load_site_prerecord_plan(
         self,
         *,
         msg: NotificationMessage,
         ctx: CameraContext,
-        trigger_clip: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        clip_service = self._clip_service
-        if clip_service is None or self._session_factory is None:
-            return []
-        if msg.alert_type != "roi_enter":
-            return []
+    ) -> Optional[SitePrerecordPlan]:
+        if self._session_factory is None:
+            return None
 
         try:
             trigger_camera_uuid = uuid.UUID(str(msg.camera_uuid))
         except Exception:
-            return []
+            return None
 
         async with self._session_factory() as db:
             settings = await self._repo.get_site_prerecord_settings(
@@ -650,33 +668,57 @@ class NotificationService:
                 user_id=int(ctx.user_id),
                 site_uuid=ctx.site_uuid,
             )
-            if not settings.enabled or trigger_camera_uuid not in set(settings.camera_uuids):
-                return []
+            if not settings.enabled:
+                return None
+            if not self._site_prerecord_trigger_matches(
+                trigger_mode=settings.trigger_mode,
+                alert_type=msg.alert_type,
+            ):
+                return None
+
+            selected_camera_uuids = list(settings.camera_uuids or [])
+            if trigger_camera_uuid not in set(selected_camera_uuids):
+                return None
 
             contexts_by_camera = await self._repo.list_camera_contexts(
                 db,
                 user_id=int(ctx.user_id),
-                camera_uuids=settings.camera_uuids,
+                camera_uuids=selected_camera_uuids,
             )
-
-        if not contexts_by_camera:
-            return []
 
         ordered_camera_uuids = [
             camera_uuid
             for camera_uuid in settings.camera_uuids
             if camera_uuid in contexts_by_camera
         ]
-        if not ordered_camera_uuids:
+        if not ordered_camera_uuids or trigger_camera_uuid not in contexts_by_camera:
+            return None
+
+        return SitePrerecordPlan(
+            settings=settings,
+            ordered_camera_uuids=ordered_camera_uuids,
+            contexts_by_camera=contexts_by_camera,
+        )
+
+    async def _capture_site_prerecord_clips(
+        self,
+        *,
+        msg: NotificationMessage,
+        ctx: CameraContext,
+        plan: SitePrerecordPlan,
+        trigger_clip: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        clip_service = self._clip_service
+        if clip_service is None:
             return []
 
         out: List[Dict[str, Any]] = []
         pending_camera_uuids: List[uuid.UUID] = []
         pending_tasks: List[asyncio.Future] = []
 
-        for camera_uuid in ordered_camera_uuids:
+        for camera_uuid in plan.ordered_camera_uuids:
             camera_uuid_str = str(camera_uuid)
-            camera_ctx = contexts_by_camera.get(camera_uuid)
+            camera_ctx = plan.contexts_by_camera.get(camera_uuid)
             if camera_ctx is None:
                 continue
 
@@ -697,7 +739,7 @@ class NotificationService:
                     camera_uuid=camera_uuid_str,
                     ctx=camera_ctx,
                     event_ts_ms=msg.ts_ms,
-                    trigger=f"site_prerecord:{msg.camera_uuid}:{msg.alert_type}",
+                    trigger=f"site_prerecord:{msg.camera_uuid}:{plan.settings.trigger_mode}:{msg.alert_type}",
                 )
             )
 
@@ -715,7 +757,7 @@ class NotificationService:
                     continue
                 if not result:
                     continue
-                camera_ctx = contexts_by_camera.get(camera_uuid)
+                camera_ctx = plan.contexts_by_camera.get(camera_uuid)
                 if camera_ctx is None:
                     continue
                 out.append(
@@ -739,16 +781,23 @@ class NotificationService:
         clip_service = self._clip_service
         if clip_service is None:
             return extra_payload
-        if msg.alert_type != "roi_enter":
+
+        plan = await self._load_site_prerecord_plan(msg=msg, ctx=ctx)
+        if plan is None:
             return extra_payload
 
         merged = dict(extra_payload or {})
+        try:
+            trigger_camera_uuid = uuid.UUID(str(msg.camera_uuid))
+        except Exception:
+            trigger_camera_uuid = None
+        trigger_ctx = plan.contexts_by_camera.get(trigger_camera_uuid) if trigger_camera_uuid else None
 
         clip = await clip_service.capture_pre_event_clip(
             camera_uuid=msg.camera_uuid,
-            ctx=ctx,
+            ctx=trigger_ctx or ctx,
             event_ts_ms=msg.ts_ms,
-            trigger=msg.alert_type,
+            trigger=f"site_prerecord:{msg.camera_uuid}:{plan.settings.trigger_mode}:{msg.alert_type}",
         )
         if clip:
             merged["clip"] = clip
@@ -756,6 +805,7 @@ class NotificationService:
         multi_clips = await self._capture_site_prerecord_clips(
             msg=msg,
             ctx=ctx,
+            plan=plan,
             trigger_clip=clip,
         )
         if multi_clips:

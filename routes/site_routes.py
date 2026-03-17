@@ -1,6 +1,6 @@
 # routes/sites.py
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -12,7 +12,12 @@ from dependencies import get_async_db, get_current_user
 from routes.device_routes import DeviceOut
 
 router = APIRouter(prefix="/sites", tags=["sites"])
-SITE_PRERECORD_TRIGGER_MODE = "roi_enter"
+SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER = "roi_enter"
+SITE_PRERECORD_TRIGGER_MODE_ANY_DETECTION = "any_detection"
+SITE_PRERECORD_TRIGGER_MODES = {
+    SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER,
+    SITE_PRERECORD_TRIGGER_MODE_ANY_DETECTION,
+}
 
 
 # -----------------------
@@ -23,6 +28,13 @@ def _is_blank(s: Optional[str]) -> bool:
 
 def _gen_code(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:6]}"
+
+
+def _normalize_trigger_mode(value: Optional[str]) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in SITE_PRERECORD_TRIGGER_MODES:
+        return normalized
+    return SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
 
 async def _get_site_or_404(db: AsyncSession, user_id: int, site_uuid: uuid.UUID) -> Site:
     q = select(Site).where(Site.site_uuid == site_uuid, Site.user_id == user_id)
@@ -94,12 +106,13 @@ class LinkDeviceRequest(BaseModel):
 class SiteMultiCameraPrerecordRule(BaseModel):
     enabled: bool = False
     camera_uuids: List[uuid.UUID] = Field(default_factory=list)
-    trigger_mode: str = SITE_PRERECORD_TRIGGER_MODE
+    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
 
 
 class SiteMultiCameraPrerecordRuleUpdate(BaseModel):
     enabled: bool = False
     camera_uuids: List[uuid.UUID] = Field(default_factory=list)
+    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
 
 
 class SiteSettingsOut(BaseModel):
@@ -165,7 +178,7 @@ def _serialize_site_settings(site_uuid: uuid.UUID, row: Optional[SiteSettings]) 
         multi_camera_prerecord=SiteMultiCameraPrerecordRule(
             enabled=bool(prerecord.get("enabled")),
             camera_uuids=camera_uuids,
-            trigger_mode=SITE_PRERECORD_TRIGGER_MODE,
+            trigger_mode=_normalize_trigger_mode(prerecord.get("trigger_mode")),
         ),
     )
 
@@ -218,6 +231,7 @@ async def update_site_settings(
 ):
     site = await _get_site_or_404(db, user.id, site_uuid)
     rule = payload.multi_camera_prerecord or SiteMultiCameraPrerecordRuleUpdate()
+    trigger_mode = _normalize_trigger_mode(rule.trigger_mode)
     camera_uuids = await _validate_site_prerecord_camera_uuids(
         db,
         user_id=int(user.id),
@@ -236,7 +250,7 @@ async def update_site_settings(
     config["multi_camera_prerecord"] = {
         "enabled": bool(rule.enabled),
         "camera_uuids": [str(value) for value in camera_uuids],
-        "trigger_mode": SITE_PRERECORD_TRIGGER_MODE,
+        "trigger_mode": trigger_mode,
     }
 
     if row is None:

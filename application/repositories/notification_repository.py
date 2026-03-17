@@ -50,6 +50,13 @@ class SitePrerecordSettings:
     trigger_mode: str = "roi_enter"
 
 
+def _normalize_trigger_mode(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if value == "any_detection":
+        return "any_detection"
+    return "roi_enter"
+
+
 def _normalize_uuid_list(raw: Any) -> List[uuid.UUID]:
     if not isinstance(raw, (list, tuple, set)):
         return []
@@ -199,7 +206,7 @@ class NotificationRepository:
         return SitePrerecordSettings(
             enabled=bool(block.get("enabled")),
             camera_uuids=_normalize_uuid_list(block.get("camera_uuids")),
-            trigger_mode="roi_enter",
+            trigger_mode=_normalize_trigger_mode(block.get("trigger_mode")),
         )
 
     async def list_notification_emails_for_site(
