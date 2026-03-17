@@ -66,7 +66,10 @@ class EdgeDeviceUnavailableError(RuntimeError):
     def __init__(self, device_url: str, cause: Exception):
         self.device_url = device_url
         self.cause = cause
-        super().__init__(f"Edge device unreachable ({device_url}): {cause}")
+        cause_name = type(cause).__name__
+        cause_msg = str(cause).strip()
+        detail = f"{cause_name}: {cause_msg}" if cause_msg else cause_name
+        super().__init__(f"Edge device unreachable ({device_url}): {detail}")
 
 
 # -------------------------
@@ -616,7 +619,13 @@ class Manager:
         try:
             edge_set = await self._edge.list_cameras(device_url=device_url)
         except Exception as e:
-            logger.warning("Cannot reach edge device %s during reconcile: %s", device_url, e)
+            logger.warning(
+                "Cannot reach edge device %s during reconcile (%s): %s",
+                device_url,
+                type(e).__name__,
+                e,
+                exc_info=True,
+            )
             raise EdgeDeviceUnavailableError(device_url, e) from e
         try:
             webrtc_list = await self._webrtc.list_webrtc_cameras()

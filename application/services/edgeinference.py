@@ -1,11 +1,14 @@
 import os
 import httpx
 import asyncio
+import logging
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 import uuid
 from datetime import datetime, date
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 def to_jsonable(obj):
@@ -25,6 +28,13 @@ def to_jsonable(obj):
     if isinstance(obj, (list, tuple, set)):
         return [to_jsonable(v) for v in obj]
     return obj
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 class EdgeInferenceClient:
     """
@@ -48,8 +58,15 @@ class EdgeInferenceClient:
         self.delete_path = os.getenv("EDGE_DELETE_PATH", "/cameras/{camera_uuid}")
         self.api_key = os.getenv("EDGE_API_KEY")
         self.list_path = os.getenv("EDGE_LIST_PATH", self.add_path)
+        self.request_timeout_s = float(os.getenv("EDGE_TIMEOUT_S", "15"))
+        self.connect_timeout_s = float(os.getenv("EDGE_CONNECT_TIMEOUT_S", "10"))
+        self.retry_count = max(1, int(os.getenv("EDGE_HTTP_RETRIES", "3")))
+        self.trust_env = _env_bool("EDGE_HTTP_TRUST_ENV", True)
 
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=10.0))
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(self.request_timeout_s, connect=self.connect_timeout_s),
+            trust_env=self.trust_env,
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -61,6 +78,35 @@ class EdgeInferenceClient:
         if self.api_key:
             h["x-api-key"] = self.api_key
         return h
+
+    def _format_request_error(self, method: str, url: str, exc: Exception) -> str:
+        if isinstance(exc, RuntimeError):
+            msg = str(exc).strip()
+            if msg:
+                return msg
+        exc_name = type(exc).__name__
+        msg = str(exc).strip()
+        if msg:
+            return f"{exc_name} during {method} {url}: {msg}"
+        return f"{exc_name} during {method} {url}"
+
+    async def _request_json(self, method: str, url: str) -> Any:
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.retry_count):
+            try:
+                r = await self._client.request(method, url, headers=self._headers())
+                if r.status_code >= 400:
+                    raise RuntimeError(f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}")
+                return r.json()
+            except Exception as exc:
+                last_exc = exc
+                if attempt + 1 >= self.retry_count:
+                    break
+                await asyncio.sleep(0.2 * (2 ** attempt))
+
+        if last_exc is not None:
+            raise RuntimeError(self._format_request_error(method, url, last_exc)) from last_exc
+        raise RuntimeError(f"Edge service request failed for {method} {url}")
 
     async def get_health(self, *, device_url: str) -> Optional[Dict[str, Any]]:
         """
@@ -96,11 +142,22 @@ class EdgeInferenceClient:
           - ["uuid1", "uuid2", ...]
         """
         url = f"{device_url.rstrip('/')}{self.list_path}"
-        r = await self._client.get(url, headers=self._headers())
-        if r.status_code >= 400:
-            raise RuntimeError(f"Edge list_cameras error {r.status_code}: {r.text[:300]}")
-
-        data = r.json()
+        try:
+            data = await self._request_json("GET", url)
+        except Exception as exc:
+            health = await self.get_health(device_url=device_url)
+            if isinstance(health, dict):
+                health_bits = []
+                if "ok" in health:
+                    health_bits.append(f"ok={health.get('ok')}")
+                if "pipeline_ready" in health:
+                    health_bits.append(f"pipeline_ready={health.get('pipeline_ready')}")
+                startup_error = health.get("startup_error")
+                if startup_error:
+                    health_bits.append(f"startup_error={startup_error}")
+                if health_bits:
+                    raise RuntimeError(f"{exc} (health: {', '.join(health_bits)})") from exc
+            raise
 
         items = []
         if isinstance(data, dict):
@@ -164,15 +221,19 @@ class EdgeInferenceClient:
     async def _request(self, method: str, url: str, *, json: Optional[dict] = None) -> None:
         last_exc: Optional[Exception] = None
         json_payload = to_jsonable(json) if json is not None else None
-        for attempt in range(3):
+        for attempt in range(self.retry_count):
             try:
                 r = await self._client.request(method, url, headers=self._headers(), json=json_payload)
                 if method == "DELETE" and r.status_code == 404:
                     return
                 if r.status_code >= 400:
-                    raise RuntimeError(f"Edge service error {r.status_code}: {r.text[:300]}")
+                    raise RuntimeError(f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}")
                 return
             except Exception as e:
                 last_exc = e
+                if attempt + 1 >= self.retry_count:
+                    break
                 await asyncio.sleep(0.2 * (2 ** attempt))
-        raise last_exc or RuntimeError("Edge service request failed")
+        if last_exc is not None:
+            raise RuntimeError(self._format_request_error(method, url, last_exc)) from last_exc
+        raise RuntimeError(f"Edge service request failed for {method} {url}")
