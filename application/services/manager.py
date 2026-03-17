@@ -62,6 +62,13 @@ class PipelineUpdateResult(BaseModel):
     events: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class EdgeDeviceUnavailableError(RuntimeError):
+    def __init__(self, device_url: str, cause: Exception):
+        self.device_url = device_url
+        self.cause = cause
+        super().__init__(f"Edge device unreachable ({device_url}): {cause}")
+
+
 # -------------------------
 # External clients
 # -------------------------
@@ -610,12 +617,7 @@ class Manager:
             edge_set = await self._edge.list_cameras(device_url=device_url)
         except Exception as e:
             logger.warning("Cannot reach edge device %s during reconcile: %s", device_url, e)
-            return {
-                "to_add": [], "to_remove": [],
-                "to_add_stream": [], "to_remove_stream": [],
-                "added": [], "removed": [],
-                "errors": [f"Edge device unreachable ({device_url}): {e}"],
-            }
+            raise EdgeDeviceUnavailableError(device_url, e) from e
         try:
             webrtc_list = await self._webrtc.list_webrtc_cameras()
         except Exception as e:

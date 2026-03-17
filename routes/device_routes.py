@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import Device  # adjust import path
 from dependencies import get_db, get_async_db, get_current_user, get_manager
-from application.services.manager import Manager
+from application.services.manager import EdgeDeviceUnavailableError, Manager
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
@@ -170,12 +170,18 @@ async def reconcile_edge_cameras(
 ):
     device = await _get_device_or_404(db, user.id, device_uuid)
 
-    result = await manager.reconcile_device_edge_simple(
-        device_uuid=device_uuid,
-        user_id=user.id,
-        dry_run=dry_run,
-        delete_unknown=delete_unknown,
-    )
+    try:
+        result = await manager.reconcile_device_edge_simple(
+            device_uuid=device_uuid,
+            user_id=user.id,
+            dry_run=dry_run,
+            delete_unknown=delete_unknown,
+        )
+    except EdgeDeviceUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
     return EdgeReconcileOut(
         device_uuid=device.device_uuid,
