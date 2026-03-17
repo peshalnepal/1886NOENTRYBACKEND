@@ -1,5 +1,6 @@
 # routes/sites.py
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -8,7 +9,10 @@ from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, SiteSettings
-from dependencies import get_async_db, get_current_user
+from dependencies import get_async_db, get_current_user, get_manager
+from domain.events import ChannelCreateEvent
+from application.services.manager import Manager
+from core.schemas import CameraWithConfigSchema
 from routes.device_routes import DeviceOut
 
 router = APIRouter(prefix="/sites", tags=["sites"])
@@ -103,6 +107,17 @@ class LinkDeviceRequest(BaseModel):
     device_uuid: uuid.UUID
 
 
+class SiteCameraCreate(BaseModel):
+    device_uuid: uuid.UUID
+    rtsp_url: str = Field(..., min_length=1, max_length=2048)
+    name: Optional[str] = Field(default=None, max_length=255)
+    location: Optional[str] = Field(default=None, max_length=255)
+    is_enabled: bool = True
+    is_detection_enabled: bool = True
+    is_notification_enabled: bool = True
+    sample_fps: float = Field(default=5.0, ge=0.1)
+
+
 class SiteMultiCameraPrerecordRule(BaseModel):
     enabled: bool = False
     camera_uuids: List[uuid.UUID] = Field(default_factory=list)
@@ -183,6 +198,26 @@ def _serialize_site_settings(site_uuid: uuid.UUID, row: Optional[SiteSettings]) 
     )
 
 
+def _camera_out_to_response(cam_out) -> CameraWithConfigSchema:
+    now = datetime.now(timezone.utc)
+    return CameraWithConfigSchema(
+        camera_uuid=cam_out.camera_uuid,
+        camera_code=cam_out.camera_code,
+        site_uuid=cam_out.site_uuid,
+        device_uuid=cam_out.device_uuid,
+        rtsp_url=cam_out.rtsp_url,
+        webrtc_url=cam_out.webrtc_url,
+        is_enabled=cam_out.enabled,
+        is_detection_enabled=cam_out.detection_enabled,
+        is_notification_enabled=cam_out.notification_enabled,
+        roi=cam_out.roi,
+        configuration=cam_out.configuration,
+        timezone=cam_out.timezone,
+        created_at=getattr(cam_out, "created_at", now),
+        updated_at=getattr(cam_out, "updated_at", now),
+    )
+
+
 # -----------------------
 # Routes
 # -----------------------
@@ -220,6 +255,64 @@ async def get_site_settings(
     site = await _get_site_or_404(db, user.id, site_uuid)
     row = await _get_site_settings_row(db, user_id=int(user.id), site_uuid=site.site_uuid)
     return _serialize_site_settings(site.site_uuid, row)
+
+
+@router.post("/{site_uuid}/cameras", response_model=CameraWithConfigSchema, status_code=status.HTTP_201_CREATED)
+async def create_site_camera(
+    site_uuid: uuid.UUID,
+    payload: SiteCameraCreate,
+    db: AsyncSession = Depends(get_async_db),
+    user=Depends(get_current_user),
+    manager: Manager = Depends(get_manager),
+):
+    site = await _get_site_or_404(db, user.id, site_uuid)
+
+    device = (
+        await db.execute(
+            select(Device)
+            .join(SiteDevice, SiteDevice.device_uuid == Device.device_uuid)
+            .where(
+                Device.user_id == int(user.id),
+                Device.device_uuid == payload.device_uuid,
+                SiteDevice.site_uuid == site.site_uuid,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if device is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Select a device already linked to this site before adding a camera.",
+        )
+    if not str(getattr(device, "device_url", "")).strip():
+        raise HTTPException(status_code=422, detail="Selected device is missing device_url.")
+
+    data = payload.model_dump(exclude_none=True)
+    data["site_uuid"] = site.site_uuid
+    data["device_url"] = device.device_url
+    data["user_id"] = int(user.id)
+
+    try:
+        pipeline = await manager.get_activepipeline(user_id=user.id)
+        ev = ChannelCreateEvent(
+            channel_id=None,
+            configs=data,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        result = await manager.update_pipeline(
+            pipeline.pipeline_id,
+            [ev],
+            user_id=user.id,
+            camera_code_prefix="cam",
+        )
+        if not result or not result.cameras:
+            raise HTTPException(status_code=500, detail="Operation failed to create camera record")
+        return _camera_out_to_response(result.cameras[0])
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create camera: {str(exc)}") from exc
 
 
 @router.patch("/{site_uuid}/settings", response_model=SiteSettingsOut)
