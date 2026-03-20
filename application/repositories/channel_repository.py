@@ -68,6 +68,14 @@ class ChannelRepository:
             device_uuid = device_uuid if isinstance(device_uuid, uuid.UUID) else uuid.UUID(str(device_uuid))
 
         rtsp_url = rtsp_url or d.get("rtsp_url")
+        if name is None:
+            name = d.get("name")
+        if location is None:
+            location = d.get("location")
+        if isinstance(name, str):
+            name = name.strip() or None
+        if isinstance(location, str):
+            location = location.strip() or None
         enabled = d.get("enabled", d.get("is_enabled", True))
         detection_enabled = d.get("detection_enabled", d.get("is_detection_enabled", True))
         notification_enabled = d.get("notification_enabled", d.get("is_notification_enabled", True))
