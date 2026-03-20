@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import uuid
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 class CameraOut(BaseModel):
     camera_uuid: uuid.UUID
     camera_code: Optional[str] = None
+    name: Optional[str] = None
+    location: Optional[str] = None
     site_uuid: uuid.UUID
 
     rtsp_url: str
@@ -53,6 +56,8 @@ class CameraOut(BaseModel):
     resize: Optional[Tuple[int, int]] = None
     emit_format: str = Field(default="raw")
     jpeg_quality: int = Field(default=80, ge=1, le=100)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class PipelineUpdateResult(BaseModel):
@@ -898,6 +903,8 @@ class Manager:
             CameraOut(
                 camera_uuid=cam.camera_uuid,
                 camera_code=getattr(cam, "camera_code", None),
+                name=getattr(cam, "name", None),
+                location=getattr(cam, "location", None),
                 site_uuid=cam.site_uuid,
                 rtsp_url=cam.rtsp_url,
                 webrtc_url=cam.webrtc_url,
@@ -914,6 +921,8 @@ class Manager:
                 roi=cam.roi,
                 configuration=cfg_json or {},
                 timezone=tz,
+                created_at=getattr(cam, "created_at", None),
+                updated_at=getattr(cam, "updated_at", None),
             )
         ]
 
@@ -1069,6 +1078,8 @@ class Manager:
             CameraOut(
                 camera_uuid=cam2.camera_uuid,
                 camera_code=getattr(cam2, "camera_code", None),
+                name=getattr(cam2, "name", None),
+                location=getattr(cam2, "location", None),
                 site_uuid=cam2.site_uuid,
                 rtsp_url=cam2.rtsp_url,
                 webrtc_url=cam2.webrtc_url,
@@ -1085,6 +1096,8 @@ class Manager:
                 roi=cam2.roi,
                 configuration=cfg_json or {},
                 timezone=tz,
+                created_at=getattr(cam2, "created_at", None),
+                updated_at=getattr(cam2, "updated_at", None),
             )
         ]
 

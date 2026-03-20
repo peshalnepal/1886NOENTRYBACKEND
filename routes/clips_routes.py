@@ -1,4 +1,5 @@
 import uuid
+import logging
 from datetime import datetime
 from typing import List, Optional
 
@@ -13,11 +14,13 @@ from dependencies import get_async_db, get_current_user
 
 
 router = APIRouter(prefix="/clips", tags=["clips"])
+logger = logging.getLogger(__name__)
 
 
 class ClipOut(BaseModel):
     id: int
     camera_uuid: str
+    camera_name: Optional[str] = None
     camera_code: Optional[str] = None
     site_uuid: Optional[str] = None
     site_name: Optional[str] = None
@@ -48,6 +51,7 @@ async def list_clips(
     stmt = (
         select(
             VideoRecord,
+            Camera.name,
             Camera.camera_code,
             Site.site_uuid,
             Site.name,
@@ -74,6 +78,7 @@ async def list_clips(
         ClipOut(
             id=int(record.id),
             camera_uuid=str(record.camera_uuid),
+            camera_name=camera_name,
             camera_code=camera_code,
             site_uuid=str(record_site_uuid) if record_site_uuid is not None else None,
             site_name=site_name,
@@ -88,7 +93,7 @@ async def list_clips(
             error=record.error,
             created_at=record.created_at,
         )
-        for record, camera_code, record_site_uuid, site_name, site_code in rows
+        for record, camera_name, camera_code, record_site_uuid, site_name, site_code in rows
     ]
 
 
@@ -116,7 +121,10 @@ async def delete_clip(
     if storage_key:
         clip_service = EventClipService()
         try:
-            await clip_service.delete_blob(blob_name=storage_key)
+            try:
+                await clip_service.delete_blob(blob_name=storage_key)
+            except Exception:
+                logger.warning("Failed deleting clip blob %s; removing DB record anyway", storage_key, exc_info=True)
         finally:
             await clip_service.close()
 

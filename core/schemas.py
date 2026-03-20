@@ -170,6 +170,8 @@ class CameraSchema(BaseModel):
 
     camera_uuid: uuid.UUID
     camera_code: str
+    name: Optional[str] = None
+    location: Optional[str] = None
 
     site_uuid: uuid.UUID
     device_uuid: Optional[uuid.UUID] = None

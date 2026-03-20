@@ -192,6 +192,8 @@ async def list_cameras(
             CameraSchema(
                 camera_uuid=cam.camera_uuid,
                 camera_code=cam.camera_code,
+                name=getattr(cam, "name", None),
+                location=getattr(cam, "location", None),
                 site_uuid=cam.site_uuid,
                 device_uuid=(dev.device_uuid if dev else None),
                 rtsp_url=cam.rtsp_url,
@@ -226,6 +228,8 @@ async def get_camera(
     return CameraWithConfigSchema(
         camera_uuid=cam.camera_uuid,
         camera_code=cam.camera_code,
+        name=getattr(cam, "name", None),
+        location=getattr(cam, "location", None),
         site_uuid=cam.site_uuid,
         device_uuid=(dev.device_uuid if dev else None),
         rtsp_url=cam.rtsp_url,
@@ -456,6 +460,8 @@ async def create_camera(
         return CameraWithConfigSchema(
             camera_uuid=cam_out.camera_uuid,
             camera_code=cam_out.camera_code,
+            name=getattr(cam_out, "name", None),
+            location=getattr(cam_out, "location", None),
             site_uuid=cam_out.site_uuid,
             device_uuid=cam_out.device_uuid,
             rtsp_url=cam_out.rtsp_url,
@@ -466,8 +472,8 @@ async def create_camera(
             roi=cam_out.roi,
             configuration=cam_out.configuration,
             timezone=cam_out.timezone,
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
+            created_at=getattr(cam_out, "created_at", None) or datetime.now(timezone.utc),
+            updated_at=getattr(cam_out, "updated_at", None) or datetime.now(timezone.utc),
         )
     except HTTPException:
         raise
@@ -509,6 +515,8 @@ async def edit_camera(
     return CameraWithConfigSchema(
         camera_uuid=cam_out.camera_uuid,
         camera_code=cam_out.camera_code,
+        name=getattr(cam_out, "name", None),
+        location=getattr(cam_out, "location", None),
         site_uuid=cam_out.site_uuid,
         device_uuid=cam_out.device_uuid,
         rtsp_url=cam_out.rtsp_url,
@@ -519,8 +527,8 @@ async def edit_camera(
         roi=cam_out.roi,
         configuration=cam_out.configuration,
         timezone=cam_out.timezone,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+        created_at=getattr(cam_out, "created_at", None) or datetime.now(timezone.utc),
+        updated_at=getattr(cam_out, "updated_at", None) or datetime.now(timezone.utc),
     )
 
 
