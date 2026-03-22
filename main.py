@@ -32,7 +32,7 @@ SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL") or os.environ.get("SMTP_FROM", "noreply@1886noentry.com")
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "")
-RECONCILE_INTERVAL_S = max(0, int(os.environ.get("EDGE_RECONCILE_INTERVAL_S", "90")))
+RECONCILE_INTERVAL_S = max(0, int(os.environ.get("EDGE_RECONCILE_INTERVAL_S", "30")))
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

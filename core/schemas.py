@@ -244,6 +244,7 @@ class CameraSchema(BaseModel):
     is_enabled: bool
     is_detection_enabled: bool
     is_notification_enabled: bool
+    use_site_schedule: bool = True
 
     roi: Optional[Dict[str, Any]] = None
 

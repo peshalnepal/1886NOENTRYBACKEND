@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, SiteSettings
 from dependencies import get_async_db, get_current_user, get_manager
+from application.channels.channel_config import VideoChannelConfig
+from application.repositories.channel_repository import ChannelRepository
 from domain.events import ChannelCreateEvent
 from application.services.manager import Manager
 from core.schemas import CameraWithConfigSchema
@@ -22,6 +24,7 @@ SITE_PRERECORD_TRIGGER_MODES = {
     SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER,
     SITE_PRERECORD_TRIGGER_MODE_ANY_DETECTION,
 }
+SUNDAY_TO_SATURDAY = [6, 0, 1, 2, 3, 4, 5]
 SCHEDULE_TIME_PATTERN = r"^\d{2}:\d{2}(:\d{2})?$"
 
 
@@ -83,6 +86,90 @@ def _normalize_camera_schedule_inputs(model: BaseModel) -> BaseModel:
             raise ValueError("start_time must be earlier than end_time.")
 
     return model
+
+
+def _sort_days_sunday_first(values: List[int]) -> List[int]:
+    order_index = {day: idx for idx, day in enumerate(SUNDAY_TO_SATURDAY)}
+    return sorted(values, key=lambda day: order_index.get(int(day), 999))
+
+
+def _time_to_schedule_str(value: Any, default: dt_time) -> str:
+    if value is None:
+        return default.strftime("%H:%M:%S")
+    if isinstance(value, dt_time):
+        return value.strftime("%H:%M:%S")
+    return dt_time.fromisoformat(str(value)).strftime("%H:%M:%S")
+
+
+def _default_site_schedule_payload(timezone_name: Optional[str]) -> Dict[str, Any]:
+    return {
+        "timezone": str(timezone_name or "UTC"),
+        "day_of_week": list(SUNDAY_TO_SATURDAY),
+        "start_time": "00:00:00",
+        "end_time": "23:59:59",
+    }
+
+
+def _site_schedule_payload_from_row(
+    row: Optional[SiteSettings],
+    *,
+    fallback_timezone: Optional[str],
+) -> Dict[str, Any]:
+    config = dict(row.config or {}) if row and isinstance(getattr(row, "config", None), dict) else {}
+    schedule = VideoChannelConfig.normalize_schedule(config.get("schedule"))
+
+    if not schedule and row is not None:
+        schedule = [
+            {
+                "day_of_week": int(getattr(row, "day_of_week", 6)),
+                "start_time": _time_to_schedule_str(getattr(row, "start_time", None), dt_time(0, 0, 0)),
+                "end_time": _time_to_schedule_str(getattr(row, "end_time", None), dt_time(23, 59, 59)),
+                "is_enabled": bool(getattr(row, "is_enabled", True)),
+            }
+        ]
+
+    if not schedule:
+        return _default_site_schedule_payload(config.get("timezone") or fallback_timezone)
+
+    enabled_entries = [entry for entry in schedule if bool(entry.get("is_enabled", True))]
+    visible_entries = enabled_entries or schedule
+    selected_days = _sort_days_sunday_first(
+        list(
+            {
+                int(entry.get("day_of_week"))
+                for entry in visible_entries
+                if isinstance(entry, dict) and entry.get("day_of_week") is not None
+            }
+        )
+    )
+
+    template = visible_entries[0]
+    return {
+        "timezone": str(config.get("timezone") or fallback_timezone or "UTC"),
+        "day_of_week": selected_days or list(SUNDAY_TO_SATURDAY),
+        "start_time": _time_to_schedule_str(template.get("start_time"), dt_time(0, 0, 0)),
+        "end_time": _time_to_schedule_str(template.get("end_time"), dt_time(23, 59, 59)),
+    }
+
+
+def _build_schedule_windows(
+    *,
+    day_of_week: List[int],
+    start_time: str,
+    end_time: str,
+) -> List[Dict[str, Any]]:
+    normalized = VideoChannelConfig.normalize_schedule(
+        [
+            {
+                "day_of_week": int(day),
+                "start_time": _time_to_schedule_str(start_time, dt_time(0, 0, 0)),
+                "end_time": _time_to_schedule_str(end_time, dt_time(23, 59, 59)),
+                "is_enabled": True,
+            }
+            for day in _sort_days_sunday_first(day_of_week)
+        ]
+    )
+    return normalized or VideoChannelConfig.default_schedule()
 
 async def _get_site_or_404(db: AsyncSession, user_id: int, site_uuid: uuid.UUID) -> Site:
     q = select(Site).where(Site.site_uuid == site_uuid, Site.user_id == user_id)
@@ -183,17 +270,35 @@ class SiteMultiCameraPrerecordRuleUpdate(BaseModel):
     trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
 
 
+class SiteScheduleRule(BaseModel):
+    timezone: str = Field(default="UTC", max_length=50)
+    day_of_week: List[int] = Field(default_factory=lambda: list(SUNDAY_TO_SATURDAY))
+    start_time: str = Field(default="00:00:00", pattern=SCHEDULE_TIME_PATTERN)
+    end_time: str = Field(default="23:59:59", pattern=SCHEDULE_TIME_PATTERN)
+
+
+class SiteScheduleRuleUpdate(BaseModel):
+    timezone: Optional[str] = Field(default=None, max_length=50)
+    day_of_week: Optional[List[int]] = None
+    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+
+    @model_validator(mode="after")
+    def _validate_schedule(self):
+        return _normalize_camera_schedule_inputs(self)
+
+
 class SiteSettingsOut(BaseModel):
     site_uuid: uuid.UUID
+    schedule: SiteScheduleRule = Field(default_factory=SiteScheduleRule)
     multi_camera_prerecord: SiteMultiCameraPrerecordRule = Field(
         default_factory=SiteMultiCameraPrerecordRule
     )
 
 
 class SiteSettingsUpdate(BaseModel):
-    multi_camera_prerecord: SiteMultiCameraPrerecordRuleUpdate = Field(
-        default_factory=SiteMultiCameraPrerecordRuleUpdate
-    )
+    schedule: Optional[SiteScheduleRuleUpdate] = None
+    multi_camera_prerecord: Optional[SiteMultiCameraPrerecordRuleUpdate] = None
 
 
 async def _validate_site_prerecord_camera_uuids(
@@ -227,7 +332,12 @@ async def _validate_site_prerecord_camera_uuids(
     return normalized
 
 
-def _serialize_site_settings(site_uuid: uuid.UUID, row: Optional[SiteSettings]) -> SiteSettingsOut:
+def _serialize_site_settings(
+    site_uuid: uuid.UUID,
+    row: Optional[SiteSettings],
+    *,
+    fallback_timezone: Optional[str],
+) -> SiteSettingsOut:
     config: Dict[str, Any] = row.config if isinstance(getattr(row, "config", None), dict) else {}
     prerecord = config.get("multi_camera_prerecord")
     if not isinstance(prerecord, dict):
@@ -240,9 +350,16 @@ def _serialize_site_settings(site_uuid: uuid.UUID, row: Optional[SiteSettings]) 
         except Exception:
             continue
     camera_uuids = _dedupe_uuid_list(camera_uuids)
+    schedule = _site_schedule_payload_from_row(row, fallback_timezone=fallback_timezone)
 
     return SiteSettingsOut(
         site_uuid=site_uuid,
+        schedule=SiteScheduleRule(
+            timezone=str(schedule.get("timezone") or fallback_timezone or "UTC"),
+            day_of_week=[int(value) for value in schedule.get("day_of_week") or list(SUNDAY_TO_SATURDAY)],
+            start_time=str(schedule.get("start_time") or "00:00:00"),
+            end_time=str(schedule.get("end_time") or "23:59:59"),
+        ),
         multi_camera_prerecord=SiteMultiCameraPrerecordRule(
             enabled=bool(prerecord.get("enabled")),
             camera_uuids=camera_uuids,
@@ -265,6 +382,7 @@ def _camera_out_to_response(cam_out) -> CameraWithConfigSchema:
         is_enabled=cam_out.enabled,
         is_detection_enabled=cam_out.detection_enabled,
         is_notification_enabled=cam_out.notification_enabled,
+        use_site_schedule=bool(getattr(cam_out, "use_site_schedule", True)),
         roi=cam_out.roi,
         configuration=cam_out.configuration,
         timezone=cam_out.timezone,
@@ -309,7 +427,7 @@ async def get_site_settings(
 ):
     site = await _get_site_or_404(db, user.id, site_uuid)
     row = await _get_site_settings_row(db, user_id=int(user.id), site_uuid=site.site_uuid)
-    return _serialize_site_settings(site.site_uuid, row)
+    return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
 
 
 @router.post("/{site_uuid}/cameras", response_model=CameraWithConfigSchema, status_code=status.HTTP_201_CREATED)
@@ -378,42 +496,63 @@ async def update_site_settings(
     user=Depends(get_current_user),
 ):
     site = await _get_site_or_404(db, user.id, site_uuid)
-    rule = payload.multi_camera_prerecord or SiteMultiCameraPrerecordRuleUpdate()
-    trigger_mode = _normalize_trigger_mode(rule.trigger_mode)
-    camera_uuids = await _validate_site_prerecord_camera_uuids(
+    row = await _get_site_settings_row(db, user_id=int(user.id), site_uuid=site.site_uuid)
+    config = dict(row.config or {}) if row and isinstance(row.config, dict) else {}
+    schedule_payload = _site_schedule_payload_from_row(row, fallback_timezone=site.timezone)
+
+    if payload.multi_camera_prerecord is not None:
+        rule = payload.multi_camera_prerecord
+        trigger_mode = _normalize_trigger_mode(rule.trigger_mode)
+        camera_uuids = await _validate_site_prerecord_camera_uuids(
+            db,
+            user_id=int(user.id),
+            site_uuid=site.site_uuid,
+            camera_uuids=rule.camera_uuids,
+        )
+
+        if rule.enabled and not camera_uuids:
+            raise HTTPException(
+                status_code=422,
+                detail="Select at least one site camera before enabling multi-camera prerecord.",
+            )
+
+        config["multi_camera_prerecord"] = {
+            "enabled": bool(rule.enabled),
+            "camera_uuids": [str(value) for value in camera_uuids],
+            "trigger_mode": trigger_mode,
+        }
+
+    if payload.schedule is not None:
+        schedule_payload = {
+            "timezone": str(payload.schedule.timezone or schedule_payload.get("timezone") or site.timezone or "UTC"),
+            "day_of_week": list(payload.schedule.day_of_week or schedule_payload.get("day_of_week") or list(SUNDAY_TO_SATURDAY)),
+            "start_time": str(payload.schedule.start_time or schedule_payload.get("start_time") or "00:00:00"),
+            "end_time": str(payload.schedule.end_time or schedule_payload.get("end_time") or "23:59:59"),
+        }
+        config["timezone"] = schedule_payload["timezone"]
+        config["schedule"] = _build_schedule_windows(
+            day_of_week=list(schedule_payload["day_of_week"]),
+            start_time=str(schedule_payload["start_time"]),
+            end_time=str(schedule_payload["end_time"]),
+        )
+
+    if payload.schedule is None and payload.multi_camera_prerecord is None:
+        return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
+
+    repo = ChannelRepository()
+    row = await repo.upsert_site_settings(
         db,
         user_id=int(user.id),
         site_uuid=site.site_uuid,
-        camera_uuids=rule.camera_uuids,
+        config=config,
+        day_of_week=list(schedule_payload.get("day_of_week") or list(SUNDAY_TO_SATURDAY)),
+        start_time=dt_time.fromisoformat(str(schedule_payload.get("start_time") or "00:00:00")),
+        end_time=dt_time.fromisoformat(str(schedule_payload.get("end_time") or "23:59:59")),
+        is_enabled=True,
     )
-
-    if rule.enabled and not camera_uuids:
-        raise HTTPException(
-            status_code=422,
-            detail="Select at least one site camera before enabling multi-camera prerecord.",
-        )
-
-    row = await _get_site_settings_row(db, user_id=int(user.id), site_uuid=site.site_uuid)
-    config = dict(row.config or {}) if row and isinstance(row.config, dict) else {}
-    config["multi_camera_prerecord"] = {
-        "enabled": bool(rule.enabled),
-        "camera_uuids": [str(value) for value in camera_uuids],
-        "trigger_mode": trigger_mode,
-    }
-
-    if row is None:
-        row = SiteSettings(
-            user_id=int(user.id),
-            site_uuid=site.site_uuid,
-            config=config,
-        )
-        db.add(row)
-    else:
-        row.config = config
-
     await db.commit()
     await db.refresh(row)
-    return _serialize_site_settings(site.site_uuid, row)
+    return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
 
 
 @router.post("", response_model=SiteOut, status_code=status.HTTP_201_CREATED)
