@@ -119,14 +119,18 @@ def _site_schedule_payload_from_row(
     schedule = VideoChannelConfig.normalize_schedule(config.get("schedule"))
 
     if not schedule and row is not None:
-        schedule = [
-            {
-                "day_of_week": int(getattr(row, "day_of_week", 6)),
-                "start_time": _time_to_schedule_str(getattr(row, "start_time", None), dt_time(0, 0, 0)),
-                "end_time": _time_to_schedule_str(getattr(row, "end_time", None), dt_time(23, 59, 59)),
-                "is_enabled": bool(getattr(row, "is_enabled", True)),
-            }
-        ]
+        row_day = getattr(row, "day_of_week", None)
+        row_start = getattr(row, "start_time", None)
+        row_end = getattr(row, "end_time", None)
+        if row_day is not None or row_start is not None or row_end is not None:
+            schedule = [
+                {
+                    "day_of_week": int(row_day if row_day is not None else 6),
+                    "start_time": _time_to_schedule_str(row_start, dt_time(0, 0, 0)),
+                    "end_time": _time_to_schedule_str(row_end, dt_time(23, 59, 59)),
+                    "is_enabled": bool(getattr(row, "is_enabled", True)),
+                }
+            ]
 
     if not schedule:
         return _default_site_schedule_payload(config.get("timezone") or fallback_timezone)
