@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from typing import Any, Dict, List, Optional, Tuple, Literal
 import uuid
 
@@ -18,6 +18,53 @@ class ROISchema(BaseModel):
     normalized: bool = Field(default=True, description="If true, points are 0-1 normalized; if false, pixel coordinates")
     frame_w: Optional[int] = Field(default=None, gt=0, description="Frame width used when ROI was authored")
     frame_h: Optional[int] = Field(default=None, gt=0, description="Frame height used when ROI was authored")
+
+
+SCHEDULE_TIME_PATTERN = r"^\d{2}:\d{2}(:\d{2})?$"
+
+
+def _normalize_schedule_fields(model: BaseModel) -> BaseModel:
+    raw_days = getattr(model, "day_of_week", None)
+    if raw_days is not None:
+        normalized_days: List[int] = []
+        seen_days = set()
+        for value in raw_days:
+            try:
+                day = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("day_of_week values must be integers from 0 to 6.") from exc
+            if day < 0 or day > 6:
+                raise ValueError("day_of_week values must be between 0 and 6.")
+            if day in seen_days:
+                continue
+            seen_days.add(day)
+            normalized_days.append(day)
+        setattr(model, "day_of_week", normalized_days)
+
+    for attr in ("timezone", "start_time", "end_time"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            setattr(model, attr, cleaned or None)
+
+    day_of_week = getattr(model, "day_of_week", None)
+    start_time = getattr(model, "start_time", None)
+    end_time = getattr(model, "end_time", None)
+
+    if any(value is not None for value in (day_of_week, start_time, end_time)):
+        if not day_of_week:
+            raise ValueError("Select at least one day when providing a schedule.")
+        if not start_time or not end_time:
+            raise ValueError("start_time and end_time are required when providing a schedule.")
+        try:
+            start_obj = dt_time.fromisoformat(str(start_time))
+            end_obj = dt_time.fromisoformat(str(end_time))
+        except ValueError as exc:
+            raise ValueError("start_time and end_time must use HH:MM or HH:MM:SS format.") from exc
+        if start_obj >= end_obj:
+            raise ValueError("start_time must be earlier than end_time.")
+
+    return model
 
 
 # -------------------------
@@ -46,6 +93,11 @@ class CameraBaseSchema(BaseModel):
     poll_interval_ms: Optional[int] = Field(default=500, ge=10)
     request_timeout_s: Optional[float] = Field(default=3.0, ge=0.1)
     detection_path_template: Optional[str] = Field(default="/detection/{camera_uuid}")
+    timezone: Optional[str] = None
+    day_of_week: Optional[List[int]] = None
+    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    use_site_schedule: Optional[bool] = None
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
@@ -55,7 +107,7 @@ class CameraBaseSchema(BaseModel):
                 setattr(self, attr, None)
         if not self.rtsp_url:
             raise ValueError("rtsp_url must not be empty.")
-        return self
+        return _normalize_schedule_fields(self)
 
 
 class CameraCreateSchema(BaseModel):
@@ -92,16 +144,21 @@ class CameraCreateSchema(BaseModel):
     poll_interval_ms: int = Field(default=500, ge=10)
     request_timeout_s: float = Field(default=3.0, ge=0.1)
     detection_path_template: Optional[str] = Field(default="/detection/{camera_uuid}")
+    timezone: Optional[str] = None
+    day_of_week: Optional[List[int]] = None
+    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    use_site_schedule: Optional[bool] = None
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("rtsp_url", "name", "location", "detection_path_template"):
+        for attr in ("rtsp_url", "name", "location", "detection_path_template", "timezone"):
             v = getattr(self, attr, None)
             if isinstance(v, str) and not v.strip():
                 setattr(self, attr, None)
         if not self.rtsp_url:
             raise ValueError("rtsp_url is required.")
-        return self
+        return _normalize_schedule_fields(self)
 
 
 # -------------------------
@@ -147,14 +204,19 @@ class CameraEditSchema(BaseModel):
     poll_interval_ms: Optional[int] = Field(default=None, ge=10)
     request_timeout_s: Optional[float] = Field(default=None, ge=0.1)
     detection_path_template: Optional[str] = None
+    timezone: Optional[str] = None
+    day_of_week: Optional[List[int]] = None
+    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    use_site_schedule: Optional[bool] = None
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("rtsp_url", "name", "location", "detection_path_template"):
+        for attr in ("rtsp_url", "name", "location", "detection_path_template", "timezone"):
             v = getattr(self, attr, None)
             if isinstance(v, str) and not v.strip():
                 setattr(self, attr, None)
-        return self
+        return _normalize_schedule_fields(self)
 
 
 # -------------------------

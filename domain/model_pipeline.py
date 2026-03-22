@@ -789,6 +789,9 @@ class ModelPipeline:
             if not cfg.enabled:
                 await asyncio.sleep(0.5)
                 continue
+            if hasattr(cfg, "is_scheduled_now") and not cfg.is_scheduled_now():
+                await asyncio.sleep(15.0)
+                continue
             
             if getattr(cfg, "detection_enabled", True) is False:
                 await asyncio.sleep(0.5)

@@ -1,6 +1,6 @@
-# application/repositories/channel_repository.py
-
 import uuid
+import logging
+from datetime import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi.encoders import jsonable_encoder
@@ -8,8 +8,6 @@ from sqlalchemy import delete, select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-
-import logging
 
 from core.database_orm import (
     Camera,
@@ -19,20 +17,35 @@ from core.database_orm import (
     Pipeline,
     PipelineCamera,
     Site,
+    SiteSettings,
 )
 
 logger = logging.getLogger(__name__)
 
 ChannelConfigLike = Union[Dict[str, Any], Any]
 
+DAY_NAME_BY_VALUE = {
+    0: "Monday",
+    1: "Tuesday",
+    2: "Wednesday",
+    3: "Thursday",
+    4: "Friday",
+    5: "Saturday",
+    6: "Sunday",
+}
+
+# Sunday -> Saturday order, while still respecting ORM mapping 0=Mon ... 6=Sun
+SUNDAY_TO_SATURDAY = [6, 0, 1, 2, 3, 4, 5]
+
+DEFAULT_START_TIME = time(0, 0, 0)
+DEFAULT_END_TIME = time(23, 59, 59)
+
 
 class ChannelRepository:
     """
     Camera + ChannelConfiguration + PipelineCamera consistency.
 
-    ✅ New rule:
-      - each camera MUST have exactly 1 device assigned (camera_devices has 1 row per camera_uuid)
-      - no "primary device"
+    each camera MUST have exactly 1 device assigned
     """
 
     async def upsert_camera_from_channel_config(
@@ -51,6 +64,10 @@ class ChannelRepository:
         name: Optional[str] = None,
         location: Optional[str] = None,
         timezone: Optional[str] = None,
+        day_of_week: Optional[List[int]] = None,
+        start_time: Optional[time] = None,
+        end_time: Optional[time] = None,
+        is_enabled: bool = True,
     ) -> Tuple[Camera, Dict[str, Any], Optional[str]]:
 
         await self._ensure_pipeline_exists(db, pipeline_id)
@@ -72,13 +89,17 @@ class ChannelRepository:
             name = d.get("name")
         if location is None:
             location = d.get("location")
+
         if isinstance(name, str):
             name = name.strip() or None
         if isinstance(location, str):
             location = location.strip() or None
+
         enabled = d.get("enabled", d.get("is_enabled", True))
         detection_enabled = d.get("detection_enabled", d.get("is_detection_enabled", True))
         notification_enabled = d.get("notification_enabled", d.get("is_notification_enabled", True))
+        use_site_schedule = d.get("use_site_schedule", True)
+
         has_roi = "roi" in d
         roi = d.get("roi")
 
@@ -94,6 +115,8 @@ class ChannelRepository:
             cam.is_enabled = bool(enabled)
             cam.is_detection_enabled = bool(detection_enabled)
             cam.is_notification_enabled = bool(notification_enabled)
+            cam.use_site_schedule = bool(use_site_schedule)
+
             if has_roi:
                 cam.roi = roi
 
@@ -122,6 +145,7 @@ class ChannelRepository:
                 cam.location = location
 
             await db.flush()
+
             if device_uuid is not None:
                 await self._set_camera_device(db, camera_uuid=cam.camera_uuid, device_uuid=device_uuid)
             else:
@@ -152,6 +176,7 @@ class ChannelRepository:
                 is_enabled=bool(enabled),
                 is_detection_enabled=bool(detection_enabled),
                 is_notification_enabled=bool(notification_enabled),
+                use_site_schedule=bool(use_site_schedule),
                 roi=roi,
             )
             if cam_uuid is not None:
@@ -168,18 +193,102 @@ class ChannelRepository:
             await self._set_camera_device(db, camera_uuid=cam.camera_uuid, device_uuid=device_uuid)
 
         cfg_json = self._build_channel_configuration_json(d)
-        tz = self._extract_timezone(d, fallback=timezone)
+        tz = d.get("timezone") or timezone
+
+        schedule = self._resolve_schedule(
+            raw_schedule=d.get("schedule"),
+            day_of_week=day_of_week,
+            start_time=start_time,
+            end_time=end_time,
+            is_enabled=is_enabled,
+        )
+
+        cfg_json["schedule"] = schedule
+        cfg_json["use_site_schedule"] = bool(use_site_schedule)
+        if tz is not None:
+            cfg_json["timezone"] = tz
+
+        # mirror one default window into ORM scalar columns
+        first_window = schedule[0]
+        scalar_day = int(first_window["day_of_week"])
+        scalar_start = self._coerce_time(first_window["start_time"], DEFAULT_START_TIME)
+        scalar_end = self._coerce_time(first_window["end_time"], DEFAULT_END_TIME)
 
         await self._upsert_channel_configuration(
             db,
             camera_uuid=cam.camera_uuid,
             configuration=cfg_json,
             timezone=tz,
+            day_of_week=scalar_day,
+            start_time=scalar_start,
+            end_time=scalar_end,
         )
 
         await self._set_pipeline_membership(db, camera_uuid=cam.camera_uuid, pipeline_id=pipeline_id)
 
         return cam, cfg_json, tz
+
+    async def upsert_site_settings(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        site_uuid: uuid.UUID,
+        config: Optional[Dict[str, Any]] = None,
+        day_of_week: Optional[List[int]] = None,
+        start_time: Optional[time] = None,
+        end_time: Optional[time] = None,
+        is_enabled: bool = True,
+    ) -> SiteSettings:
+        await self._ensure_site_exists(db, site_uuid)
+
+        incoming_config = jsonable_encoder(config or {}, exclude_none=True)
+
+        schedule = self._resolve_schedule(
+            raw_schedule=incoming_config.get("schedule"),
+            day_of_week=day_of_week,
+            start_time=start_time,
+            end_time=end_time,
+            is_enabled=is_enabled,
+        )
+        incoming_config["schedule"] = schedule
+
+        first_window = schedule[0]
+        scalar_day = int(first_window["day_of_week"])
+        scalar_start = self._coerce_time(first_window["start_time"], DEFAULT_START_TIME)
+        scalar_end = self._coerce_time(first_window["end_time"], DEFAULT_END_TIME)
+
+        row = (
+            await db.execute(select(SiteSettings).where(SiteSettings.site_uuid == site_uuid))
+        ).scalar_one_or_none()
+
+        if row is None:
+            row = SiteSettings(
+                user_id=user_id,
+                site_uuid=site_uuid,
+                config=incoming_config,
+                day_of_week=scalar_day,
+                start_time=scalar_start,
+                end_time=scalar_end,
+                is_enabled=bool(is_enabled),
+            )
+            db.add(row)
+            await db.flush()
+            return row
+
+        merged = dict(row.config or {})
+        merged.update(incoming_config)
+        merged["schedule"] = incoming_config.get("schedule", merged.get("schedule", self._default_weekly_schedule()))
+
+
+        row.config = merged
+        row.day_of_week = scalar_day
+        row.start_time = scalar_start
+        row.end_time = scalar_end
+        row.is_enabled = bool(is_enabled)
+
+        await db.flush()
+        return row
 
     async def get_camera_full(
         self,
@@ -215,9 +324,6 @@ class ChannelRepository:
         required: bool = False,
         relaxed: bool = False,
     ) -> Optional[Device]:
-        """
-        ✅ With new rule, there should be exactly 1 device.
-        """
         devices = await self.list_devices(db, camera_uuid=camera_uuid)
 
         if len(devices) == 1:
@@ -251,18 +357,11 @@ class ChannelRepository:
         return (await db.execute(q)).scalars().all()
 
     async def delete_camera(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> None:
-        """
-        Deletes a camera and its associated configurations.
-        """
         await db.execute(delete(PipelineCamera).where(PipelineCamera.camera_uuid == camera_uuid))
         await db.execute(delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
         await db.execute(delete(CameraDevice).where(CameraDevice.camera_uuid == camera_uuid))
         await db.execute(delete(Camera).where(Camera.camera_uuid == camera_uuid))
         await db.flush()
-
-    # -------------------------
-    # Internal helpers (NEW/FIXED)
-    # -------------------------
 
     async def _ensure_device_exists(self, db: AsyncSession, device_uuid: uuid.UUID) -> None:
         exists = (await db.execute(select(Device.device_uuid).where(Device.device_uuid == device_uuid))).scalar_one_or_none()
@@ -285,7 +384,6 @@ class ChannelRepository:
         camera_uuid: uuid.UUID,
         device_uuid: uuid.UUID,
     ) -> None:
-
         clean = device_uuid if isinstance(device_uuid, uuid.UUID) else uuid.UUID(str(device_uuid))
         await self._ensure_device_exists(db, clean)
 
@@ -293,7 +391,6 @@ class ChannelRepository:
         db.add(CameraDevice(camera_uuid=camera_uuid, device_uuid=clean))
         await db.flush()
 
-    # (keep your existing helpers below unchanged)
     async def _ensure_pipeline_exists(self, db: AsyncSession, pipeline_id: uuid.UUID) -> None:
         exists = (await db.execute(select(Pipeline.id).where(Pipeline.id == pipeline_id))).scalar_one_or_none()
         if exists is None:
@@ -319,9 +416,6 @@ class ChannelRepository:
             return jsonable_encoder(dict(obj), exclude_none=True)
         return jsonable_encoder({k: getattr(obj, k) for k in dir(obj) if not k.startswith("_")}, exclude_none=True)
 
-    def _extract_timezone(self, d: Dict[str, Any], fallback: Optional[str]) -> Optional[str]:
-        return d.get("timezone", fallback)
-
     def _build_channel_configuration_json(self, d: Dict[str, Any]) -> Dict[str, Any]:
         cfg = dict(d)
         for k in (
@@ -333,6 +427,7 @@ class ChannelRepository:
             "camera_code", "name", "location", "timezone",
             "is_enabled", "is_detection_enabled", "is_notification_enabled",
             "roi",
+            "day_of_week", "start_time", "end_time",
         ):
             cfg.pop(k, None)
         return cfg
@@ -344,21 +439,40 @@ class ChannelRepository:
         camera_uuid: uuid.UUID,
         configuration: Dict[str, Any],
         timezone: Optional[str],
+        day_of_week: int,
+        start_time: time,
+        end_time: time,
     ) -> ChannelConfiguration:
         configuration = jsonable_encoder(configuration, exclude_none=True)
+
         row = (
             await db.execute(select(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
         ).scalar_one_or_none()
 
         if row is None:
-            row = ChannelConfiguration(camera_uuid=camera_uuid, configuration=configuration, timezone=timezone)
+            row = ChannelConfiguration(
+                camera_uuid=camera_uuid,
+                configuration=configuration,
+                timezone=timezone,
+                day_of_week=day_of_week,
+                start_time=start_time,
+                end_time=end_time,
+            )
             db.add(row)
             await db.flush()
             return row
 
-        row.configuration = configuration
+        merged = dict(row.configuration or {})
+        merged.update(configuration)
+        merged["schedule"] = configuration.get("schedule", merged.get("schedule", self._default_weekly_schedule()))
+
+        row.configuration = merged
         if timezone is not None:
             row.timezone = timezone
+        row.day_of_week = day_of_week
+        row.start_time = start_time
+        row.end_time = end_time
+
         await db.flush()
         return row
 
@@ -372,3 +486,71 @@ class ChannelRepository:
         await db.execute(delete(PipelineCamera).where(PipelineCamera.camera_uuid == camera_uuid))
         db.add(PipelineCamera(pipeline_id=pipeline_id, camera_uuid=camera_uuid))
         await db.flush()
+
+    def _default_weekly_schedule(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "day_of_week": day,
+                "day_name": DAY_NAME_BY_VALUE[day],
+                "start_time": DEFAULT_START_TIME.strftime("%H:%M:%S"),
+                "end_time": DEFAULT_END_TIME.strftime("%H:%M:%S"),
+                "is_enabled": True,
+            }
+            for day in SUNDAY_TO_SATURDAY
+        ]
+
+    def _resolve_schedule(
+        self,
+        *,
+        raw_schedule: Optional[List[Dict[str, Any]]],
+        day_of_week: Optional[List[int]],
+        start_time: Optional[time],
+        end_time: Optional[time],
+        is_enabled: bool,
+    ) -> List[Dict[str, Any]]:
+        if raw_schedule:
+            normalized: List[Dict[str, Any]] = []
+            for item in raw_schedule:
+                day = int(item["day_of_week"])
+                start_val = self._coerce_time(item.get("start_time"), DEFAULT_START_TIME)
+                end_val = self._coerce_time(item.get("end_time"), DEFAULT_END_TIME)
+
+                normalized.append(
+                    {
+                        "day_of_week": day,
+                        "day_name": DAY_NAME_BY_VALUE[day],
+                        "start_time": start_val.strftime("%H:%M:%S"),
+                        "end_time": end_val.strftime("%H:%M:%S"),
+                        "is_enabled": bool(item.get("is_enabled", True)),
+                    }
+                )
+            return self._sort_schedule_sunday_first(normalized)
+
+        selected_days = SUNDAY_TO_SATURDAY if day_of_week is None else day_of_week
+        st = self._coerce_time(start_time, DEFAULT_START_TIME)
+        et = self._coerce_time(end_time, DEFAULT_END_TIME)
+
+        normalized = [
+            {
+                "day_of_week": int(day),
+                "day_name": DAY_NAME_BY_VALUE[int(day)],
+                "start_time": st.strftime("%H:%M:%S"),
+                "end_time": et.strftime("%H:%M:%S"),
+                "is_enabled": bool(is_enabled),
+            }
+            for day in selected_days
+        ]
+        return self._sort_schedule_sunday_first(normalized)
+
+    def _sort_schedule_sunday_first(self, schedule: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        order_index = {day: idx for idx, day in enumerate(SUNDAY_TO_SATURDAY)}
+        return sorted(schedule, key=lambda x: order_index.get(int(x["day_of_week"]), 999))
+
+    def _coerce_time(self, value: Any, default: time) -> time:
+        if value is None:
+            return default
+        if isinstance(value, time):
+            return value
+        if isinstance(value, str):
+            return time.fromisoformat(value)
+        raise ValueError(f"Unsupported time value: {value!r}")

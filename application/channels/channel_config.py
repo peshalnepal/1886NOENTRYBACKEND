@@ -1,8 +1,33 @@
-from typing import Optional, Literal, Tuple, Any, Dict
+from datetime import datetime, time as dt_time, timezone as dt_timezone
+from typing import Optional, Literal, Tuple, Any, Dict, List
 import uuid
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from zoneinfo import ZoneInfo
 
 from dto import ChannelConfig
+
+DAY_NAME_BY_VALUE = {
+    0: "Monday",
+    1: "Tuesday",
+    2: "Wednesday",
+    3: "Thursday",
+    4: "Friday",
+    5: "Saturday",
+    6: "Sunday",
+}
+SUNDAY_TO_SATURDAY = [6, 0, 1, 2, 3, 4, 5]
+DEFAULT_START_TIME = dt_time(0, 0, 0)
+DEFAULT_END_TIME = dt_time(23, 59, 59)
+
+
+def _coerce_schedule_time(value: Any, default: dt_time) -> dt_time:
+    if value is None:
+        return default
+    if isinstance(value, dt_time):
+        return value
+    if isinstance(value, str):
+        return dt_time.fromisoformat(value)
+    raise ValueError(f"Unsupported schedule time value: {value!r}")
 
 
 class VideoChannelConfig(BaseModel, ChannelConfig):
@@ -54,6 +79,8 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
     name: Optional[str] = None
     location: Optional[str] = None
     timezone: Optional[str] = None
+    schedule: Optional[List[Dict[str, Any]]] = None
+    use_site_schedule: Optional[bool] = None
     enabled: Optional[bool] = Field(default=True)
     detection_enabled: Optional[bool] = Field(default=True)
     notification_enabled: Optional[bool] = Field(default=True)
@@ -74,6 +101,103 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
     )
     jpeg_quality: Optional[int] = Field(default=None, ge=1, le=100)
 
+    @staticmethod
+    def default_schedule() -> List[Dict[str, Any]]:
+        return [
+            {
+                "day_of_week": day,
+                "day_name": DAY_NAME_BY_VALUE[day],
+                "start_time": DEFAULT_START_TIME.strftime("%H:%M:%S"),
+                "end_time": DEFAULT_END_TIME.strftime("%H:%M:%S"),
+                "is_enabled": True,
+            }
+            for day in SUNDAY_TO_SATURDAY
+        ]
+
+    @staticmethod
+    def normalize_schedule(raw_schedule: Any) -> List[Dict[str, Any]]:
+        if not isinstance(raw_schedule, list):
+            return []
+
+        normalized: List[Dict[str, Any]] = []
+        seen = set()
+        order_index = {day: idx for idx, day in enumerate(SUNDAY_TO_SATURDAY)}
+
+        for item in raw_schedule:
+            if not isinstance(item, dict):
+                continue
+            try:
+                day = int(item.get("day_of_week"))
+            except (TypeError, ValueError):
+                continue
+            if day < 0 or day > 6:
+                continue
+
+            try:
+                start_time = _coerce_schedule_time(item.get("start_time"), DEFAULT_START_TIME)
+                end_time = _coerce_schedule_time(item.get("end_time"), DEFAULT_END_TIME)
+            except ValueError:
+                continue
+            if start_time >= end_time:
+                continue
+
+            enabled = bool(item.get("is_enabled", True))
+            signature = (day, start_time.isoformat(), end_time.isoformat(), enabled)
+            if signature in seen:
+                continue
+            seen.add(signature)
+
+            normalized.append(
+                {
+                    "day_of_week": day,
+                    "day_name": DAY_NAME_BY_VALUE[day],
+                    "start_time": start_time.strftime("%H:%M:%S"),
+                    "end_time": end_time.strftime("%H:%M:%S"),
+                    "is_enabled": enabled,
+                }
+            )
+
+        return sorted(normalized, key=lambda item: order_index.get(int(item["day_of_week"]), 999))
+
+    @staticmethod
+    def schedule_is_active(
+        raw_schedule: Any,
+        timezone_name: Optional[str] = None,
+        *,
+        now_utc: Optional[datetime] = None,
+    ) -> bool:
+        schedule = VideoChannelConfig.normalize_schedule(raw_schedule)
+        if not schedule:
+            return True
+
+        now = now_utc or datetime.now(dt_timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=dt_timezone.utc)
+
+        try:
+            tz = ZoneInfo(str(timezone_name or "UTC"))
+        except Exception:
+            tz = dt_timezone.utc
+
+        local_now = now.astimezone(tz)
+        local_day = int(local_now.weekday())
+        local_time = local_now.time()
+
+        for window in schedule:
+            if not bool(window.get("is_enabled", True)):
+                continue
+            if int(window.get("day_of_week", -1)) != local_day:
+                continue
+            start_time = _coerce_schedule_time(window.get("start_time"), DEFAULT_START_TIME)
+            end_time = _coerce_schedule_time(window.get("end_time"), DEFAULT_END_TIME)
+            if start_time <= local_time < end_time:
+                return True
+
+        return False
+
+    def is_scheduled_now(self, *, now_utc: Optional[datetime] = None) -> bool:
+        return self.schedule_is_active(self.schedule, self.timezone, now_utc=now_utc)
+
     @model_validator(mode="after")
     def _validate_and_normalize(self):
         for attr in (
@@ -92,6 +216,9 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
 
         if self.channel_id is None and self.camera_uuid is not None:
             self.channel_id = str(self.camera_uuid)
+
+        if self.schedule is not None:
+            self.schedule = self.normalize_schedule(self.schedule) or None
 
         if self.camera_uuid is None:
             if not self.rtsp_url:

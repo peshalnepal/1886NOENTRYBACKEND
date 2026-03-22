@@ -1,10 +1,10 @@
 # routes/sites.py
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from typing import Any, Dict, List, Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +22,7 @@ SITE_PRERECORD_TRIGGER_MODES = {
     SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER,
     SITE_PRERECORD_TRIGGER_MODE_ANY_DETECTION,
 }
+SCHEDULE_TIME_PATTERN = r"^\d{2}:\d{2}(:\d{2})?$"
 
 
 # -----------------------
@@ -39,6 +40,49 @@ def _normalize_trigger_mode(value: Optional[str]) -> str:
     if normalized in SITE_PRERECORD_TRIGGER_MODES:
         return normalized
     return SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
+
+
+def _normalize_camera_schedule_inputs(model: BaseModel) -> BaseModel:
+    raw_days = getattr(model, "day_of_week", None)
+    if raw_days is not None:
+        normalized_days: List[int] = []
+        seen_days = set()
+        for value in raw_days:
+            try:
+                day = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("day_of_week values must be integers from 0 to 6.") from exc
+            if day < 0 or day > 6:
+                raise ValueError("day_of_week values must be between 0 and 6.")
+            if day in seen_days:
+                continue
+            seen_days.add(day)
+            normalized_days.append(day)
+        setattr(model, "day_of_week", normalized_days)
+
+    for attr in ("timezone", "start_time", "end_time"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            setattr(model, attr, cleaned or None)
+
+    day_of_week = getattr(model, "day_of_week", None)
+    start_time = getattr(model, "start_time", None)
+    end_time = getattr(model, "end_time", None)
+    if any(value is not None for value in (day_of_week, start_time, end_time)):
+        if not day_of_week:
+            raise ValueError("Select at least one day when providing a schedule.")
+        if not start_time or not end_time:
+            raise ValueError("start_time and end_time are required when providing a schedule.")
+        try:
+            start_obj = dt_time.fromisoformat(str(start_time))
+            end_obj = dt_time.fromisoformat(str(end_time))
+        except ValueError as exc:
+            raise ValueError("start_time and end_time must use HH:MM or HH:MM:SS format.") from exc
+        if start_obj >= end_obj:
+            raise ValueError("start_time must be earlier than end_time.")
+
+    return model
 
 async def _get_site_or_404(db: AsyncSession, user_id: int, site_uuid: uuid.UUID) -> Site:
     q = select(Site).where(Site.site_uuid == site_uuid, Site.user_id == user_id)
@@ -116,6 +160,15 @@ class SiteCameraCreate(BaseModel):
     is_detection_enabled: bool = True
     is_notification_enabled: bool = True
     sample_fps: float = Field(default=5.0, ge=0.1)
+    timezone: Optional[str] = None
+    day_of_week: Optional[List[int]] = None
+    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    use_site_schedule: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _validate_schedule(self):
+        return _normalize_camera_schedule_inputs(self)
 
 
 class SiteMultiCameraPrerecordRule(BaseModel):

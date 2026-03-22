@@ -6,12 +6,14 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
     Integer,
     String,
     Text,
+    Time,
     TypeDecorator,
     UniqueConstraint,
 )
@@ -20,7 +22,6 @@ from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.types import CHAR
 from sqlalchemy.dialects.mysql import BINARY
 from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
-
 try:
     from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 except Exception:
@@ -213,7 +214,6 @@ class Site(Base):
         back_populates="sites",
     )
 
-    # site-scoped email recipients
     notification_emails = relationship(
         "NotificationEmail",
         back_populates="site",
@@ -221,7 +221,6 @@ class Site(Base):
         passive_deletes=True,
     )
 
-    # stored notification events
     notifications = relationship(
         "Notification",
         back_populates="site",
@@ -237,10 +236,12 @@ class Site(Base):
         uselist=False,
     )
 
+
     __table_args__ = (
         UniqueConstraint("user_id", "site_code", name="uq_site_user_site_code"),
     )
-
+    
+    
 # =========================
 # DEVICE
 # =========================
@@ -330,30 +331,31 @@ class SiteSettings(Base):
     )
 
     config = Column(JSONDict, nullable=False, default=dict)
-
+    day_of_week = Column(Integer, nullable=False, index=True)  # 0=Mon ... 6=Sun
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
+    is_enabled = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     site = relationship("Site", back_populates="settings")
-
+    __table_args__ = (
+        CheckConstraint("day_of_week >= 0 AND day_of_week <= 6", name="ck_site_schedule_day"),
+        CheckConstraint("start_time < end_time", name="ck_site_schedule_time"),
+        UniqueConstraint(
+            "site_uuid", "day_of_week", "start_time", "end_time",
+            name="uq_site_schedule_window",
+        ),
+    )
 
 # =========================
 # CAMERA
 # =========================
 class Camera(Base):
-    """
-    Camera metadata.
-
-    - Belongs to ONE site (site_uuid NOT NULL)
-    - Can be linked to MANY devices (M:N) via CameraDevice
-      (so you can assign/reassign which Jetson runs inference)
-    """
     __tablename__ = "camera"
 
     id = Column(Integer, primary_key=True, index=True)
-
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-
     site_uuid = Column(GUID, ForeignKey("sites.site_uuid", ondelete="CASCADE"), nullable=False, index=True)
 
     camera_uuid = Column(GUID, default=uuid.uuid4, unique=True, nullable=False, index=True)
@@ -363,25 +365,21 @@ class Camera(Base):
     location = Column(String(255), nullable=True)
 
     rtsp_url = Column(String(2048), nullable=False)
-
-    # WebRTC playback URL (frontend uses this)
     webrtc_url = Column(String(2048), nullable=True)
 
     is_enabled = Column(Boolean, default=True)
     is_detection_enabled = Column(Boolean, default=True)
     is_notification_enabled = Column(Boolean, default=True)
 
-    # ROI (Region of Interest) for detection alerts
-    # Format: {"points": [[x1,y1], [x2,y2], ...], "normalized": true/false}
     roi = Column(JSONDict, nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    use_site_schedule = Column(Boolean, nullable=False, default=True)
 
     user = relationship("User", back_populates="cameras")
     site = relationship("Site", back_populates="cameras")
 
-    # Camera <-> Devices (M:N)
     devices = relationship(
         "Device",
         secondary="camera_devices",
@@ -494,12 +492,22 @@ class ChannelConfiguration(Base):
 
     configuration = Column(JSONDict, nullable=True)
     timezone = Column(String(50), nullable=True, default="UTC")
-
+    day_of_week = Column(Integer, nullable=False, index=True)  # 0=Mon ... 6=Sun
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     camera = relationship("Camera", back_populates="channel_configuration")
-
+    __table_args__ = (
+        CheckConstraint("day_of_week >= 0 AND day_of_week <= 6", name="ck_camera_schedule_day"),
+        CheckConstraint("start_time < end_time", name="ck_camera_schedule_time"),
+        UniqueConstraint(
+            "camera_uuid", "day_of_week", "start_time", "end_time",
+            name="uq_camera_schedule_window",
+        ),
+    )
+    
 
 # =========================
 # VIDEO RECORD

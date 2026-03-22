@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
@@ -16,7 +16,7 @@ from fastapi import HTTPException
 
 from application.repositories.pipeline_repository import PipelineRepository
 from application.repositories.channel_repository import ChannelRepository
-from core.database_orm import Site,Device, Camera, CameraDevice
+from core.database_orm import Site, SiteSettings, Device, Camera, CameraDevice
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent, VideoChannelEvent
 from domain.model_pipeline import ModelPipeline
 from application.channels.channel_config import VideoChannelConfig
@@ -406,6 +406,81 @@ class Manager:
         payload.update({"camera_uuid": camera_uuid, "rtsp_url": rtsp_url})
         return payload
 
+    async def _load_site_schedule_state(
+        self,
+        db: AsyncSession,
+        *,
+        site_uuid: uuid.UUID,
+        cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        cache_key = str(site_uuid)
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
+        site_timezone = (
+            await db.execute(select(Site.timezone).where(Site.site_uuid == site_uuid))
+        ).scalar_one_or_none()
+        settings_row = (
+            await db.execute(select(SiteSettings).where(SiteSettings.site_uuid == site_uuid))
+        ).scalar_one_or_none()
+
+        config = (
+            dict(settings_row.config or {})
+            if settings_row is not None and isinstance(getattr(settings_row, "config", None), dict)
+            else {}
+        )
+        state = {
+            "schedule": VideoChannelConfig.normalize_schedule(config.get("schedule")),
+            "timezone": str(config.get("timezone") or site_timezone or "UTC"),
+        }
+        if cache is not None:
+            cache[cache_key] = state
+        return state
+
+    async def _resolve_runtime_schedule(
+        self,
+        db: AsyncSession,
+        *,
+        cam: Camera,
+        cfg_json: Optional[Dict[str, Any]] = None,
+        cfg_timezone: Optional[str] = None,
+        site_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        cfg = dict(cfg_json or {})
+        use_site_schedule = bool(cfg.get("use_site_schedule", getattr(cam, "use_site_schedule", True)))
+
+        schedule = VideoChannelConfig.normalize_schedule(cfg.get("schedule"))
+        timezone_name = str(
+            cfg.get("timezone")
+            or cfg_timezone
+            or getattr(getattr(cam, "channel_configuration", None), "timezone", None)
+            or "UTC"
+        )
+
+        if use_site_schedule:
+            site_state = await self._load_site_schedule_state(
+                db,
+                site_uuid=cam.site_uuid,
+                cache=site_cache,
+            )
+            if site_state.get("schedule"):
+                schedule = site_state["schedule"]
+            timezone_name = str(site_state.get("timezone") or timezone_name or "UTC")
+
+        if not schedule:
+            schedule = VideoChannelConfig.default_schedule()
+
+        return {
+            "schedule": schedule,
+            "timezone": timezone_name or "UTC",
+            "use_site_schedule": use_site_schedule,
+            "active": VideoChannelConfig.schedule_is_active(
+                schedule,
+                timezone_name or "UTC",
+                now_utc=datetime.now(timezone.utc),
+            ),
+        }
+
 
     async def create_pipeline(self, user_id: int | None = None) -> ModelPipeline:
         """
@@ -430,6 +505,7 @@ class Manager:
                 self._wire_pipeline(mp)
 
                 if full_pl and getattr(full_pl, "cameras", None):
+                    site_schedule_cache: Dict[str, Dict[str, Any]] = {}
                     for cam in full_pl.cameras:
                         enabled = bool(getattr(cam, "is_enabled", True))
                         det_enabled = bool(getattr(cam, "is_detection_enabled", True))
@@ -458,10 +534,24 @@ class Manager:
                         cfg_json = {}
                         if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None):
                             cfg_json = cam.channel_configuration.configuration or {}
+                        schedule_state = await self._resolve_runtime_schedule(
+                            db,
+                            cam=cam,
+                            cfg_json=cfg_json,
+                            cfg_timezone=getattr(getattr(cam, "channel_configuration", None), "timezone", None),
+                            site_cache=site_schedule_cache,
+                        )
 
                         runtime_overrides = _runtime_config_overrides(
                             cfg_json,
-                            extra_forbidden={"sample_fps", "decode_backend", "request_timeout_s"},
+                            extra_forbidden={
+                                "sample_fps",
+                                "decode_backend",
+                                "request_timeout_s",
+                                "schedule",
+                                "timezone",
+                                "use_site_schedule",
+                            },
                         )
 
                         vcc = VideoChannelConfig(
@@ -479,6 +569,9 @@ class Manager:
                             request_timeout_s=float(
                                 cfg_json.get("request_timeout_s", self._default_request_timeout_s)
                             ),
+                            timezone=schedule_state["timezone"],
+                            schedule=schedule_state["schedule"],
+                            use_site_schedule=schedule_state["use_site_schedule"],
                             **runtime_overrides,
                         )
                         await mp.add_channel(VideoChannel(config=vcc))
@@ -619,6 +712,26 @@ class Manager:
                 .options(selectinload(Camera.channel_configuration))
             )
             cams = (await db.execute(q)).scalars().all()
+            site_schedule_cache: Dict[str, Dict[str, Any]] = {}
+            desired_set: Set[str] = set()
+            active_streams: Set[str] = set()
+            for cam in cams:
+                cfg = (
+                    cam.channel_configuration.configuration or {}
+                    if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None)
+                    else {}
+                )
+                schedule_state = await self._resolve_runtime_schedule(
+                    db,
+                    cam=cam,
+                    cfg_json=cfg,
+                    cfg_timezone=getattr(getattr(cam, "channel_configuration", None), "timezone", None),
+                    site_cache=site_schedule_cache,
+                )
+                if bool(cam.is_enabled) and bool(cam.is_detection_enabled) and bool(schedule_state["active"]):
+                    desired_set.add(str(cam.camera_uuid))
+                if bool(cam.is_enabled) and bool(schedule_state["active"]) and getattr(cam, "camera_code", None):
+                    active_streams.add(str(cam.camera_code))
 
         device_url = dev.device_url
         try:
@@ -643,9 +756,7 @@ class Manager:
             if isinstance(c, dict) and c.get("stream_key")
         }
 
-        desired_set = {str(c.camera_uuid) for c in cams if c.is_enabled and c.is_detection_enabled}
         known_streams = {str(c.camera_code) for c in cams if c.camera_code}
-        active_streams = {str(c.camera_code) for c in cams if c.is_enabled and c.camera_code}
         to_add = sorted(desired_set - edge_set)
         to_remove = sorted(edge_set - desired_set)
         to_add_stream = sorted(active_streams - webrtc_set)
@@ -847,6 +958,12 @@ class Manager:
 
         enabled = bool(getattr(cam, "is_enabled", True))
         det_enabled = bool(getattr(cam, "is_detection_enabled", True))
+        schedule_state = await self._resolve_runtime_schedule(
+            db,
+            cam=cam,
+            cfg_json=cfg_json,
+            cfg_timezone=tz,
+        )
 
         edge_payload = self._edge_payload_from_config(
             camera_uuid=str(cam.camera_uuid),
@@ -863,7 +980,7 @@ class Manager:
         # If Jetson is unreachable the 3-retry × 15s timeout would hold
         # self._lock for up to 45s, blocking all other operations.
         # The background reconcile loop (every 90s) will catch any failure.
-        if enabled and det_enabled:
+        if enabled and det_enabled and schedule_state["active"]:
             asyncio.create_task(
                 self._bg_edge_upsert(device_url=dev.device_url, payload=edge_payload)
             )
@@ -875,7 +992,14 @@ class Manager:
         if active:
             runtime_overrides = _runtime_config_overrides(
                 cfg_json or {},
-                extra_forbidden={"sample_fps", "decode_backend", "request_timeout_s"},
+                extra_forbidden={
+                    "sample_fps",
+                    "decode_backend",
+                    "request_timeout_s",
+                    "schedule",
+                    "timezone",
+                    "use_site_schedule",
+                },
             )
             vcc = VideoChannelConfig(
                 camera_uuid=cam.camera_uuid,
@@ -895,6 +1019,9 @@ class Manager:
                         patch.get("request_timeout_s", self._default_request_timeout_s),
                     )
                 ),
+                timezone=schedule_state["timezone"],
+                schedule=schedule_state["schedule"],
+                use_site_schedule=schedule_state["use_site_schedule"],
                 **runtime_overrides,
             )
             await active.add_channel(VideoChannel(config=vcc))
@@ -1031,9 +1158,15 @@ class Manager:
 
         enabled = bool(cam2.is_enabled)
         det_enabled = bool(cam2.is_detection_enabled)
+        schedule_state = await self._resolve_runtime_schedule(
+            db,
+            cam=cam2,
+            cfg_json=cfg_json,
+            cfg_timezone=tz,
+        )
 
         try:
-            if enabled and det_enabled:
+            if enabled and det_enabled and schedule_state["active"]:
                 if old_dev.device_uuid != new_device_uuid:
                     edge_payload = self._edge_payload_from_config(
                         camera_uuid=str(cam_uuid),
@@ -1059,7 +1192,10 @@ class Manager:
             logger.warning("Edge sync failed during camera edit", exc_info=True)
 
         if active:
-            runtime_overrides = _runtime_config_overrides(merged_cfg)
+            runtime_overrides = _runtime_config_overrides(
+                merged_cfg,
+                extra_forbidden={"schedule", "timezone", "use_site_schedule"},
+            )
             vcc = VideoChannelConfig(
                 camera_uuid=cam2.camera_uuid,
                 rtsp_url=cam2.rtsp_url,
@@ -1070,6 +1206,9 @@ class Manager:
                 enabled=enabled,
                 detection_enabled=det_enabled,
                 notification_enabled=bool(cam2.is_notification_enabled),
+                timezone=schedule_state["timezone"],
+                schedule=schedule_state["schedule"],
+                use_site_schedule=schedule_state["use_site_schedule"],
                 **runtime_overrides,
             )
             await active.edit_channel(VideoChannel(config=vcc))
