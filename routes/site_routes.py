@@ -416,7 +416,7 @@ async def list_site_devices(
     user=Depends(get_current_user),
 ):
     site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user.id, site_uuid)
+    site = await site_repo.get_site(db,user_id=user.id,site_uuid= site_uuid)
     q = (
         select(Device)
         .join(SiteDevice, SiteDevice.device_uuid == Device.device_uuid)
@@ -433,7 +433,7 @@ async def get_site_settings(
     user=Depends(get_current_user),
 ):
     site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user.id, site_uuid)
+    site = await site_repo.get_site(db, user_id=user.id,site_uuid= site_uuid)
     row = await site_repo.get_site_settings(db, user_id=int(user.id), site_uuid=site.site_uuid)
     return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
 
@@ -447,7 +447,7 @@ async def create_site_camera(
     manager: Manager = Depends(get_manager),
 ):
     site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user.id, site_uuid)
+    site = await site_repo.get_site(db,user_id=user.id,site_uuid= site_uuid)
 
     device = (
         await db.execute(
@@ -506,7 +506,7 @@ async def update_site_settings(
     manager: Manager = Depends(get_manager),
 ):
     site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user.id, site_uuid)
+    site = await site_repo.get_site(db, user_id=user.id,site_uuid=site_uuid)
     row = await site_repo.get_site_settings(db, user_id=int(user.id), site_uuid=site.site_uuid)
     config = dict(row.config or {}) if row and isinstance(row.config, dict) else {}
     schedule_payload = _site_schedule_payload_from_row(row, fallback_timezone=site.timezone)
@@ -603,7 +603,7 @@ async def get_site(
     user=Depends(get_current_user),
 ):
     site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user.id, site_uuid)
+    site = await site_repo.get_site(db,user_id=user.id,site_uuid=site_uuid)
     return site
 
 @router.patch("/{site_uuid}", response_model=SiteOut)
@@ -615,7 +615,7 @@ async def update_site(
     manager: Manager = Depends(get_manager),
 ):
     site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user.id, site_uuid)
+    site = await site_repo.get_site(db,user_id=user.id,site_uuid=site_uuid)
 
 
     data = payload.model_dump(exclude_unset=True)
@@ -647,7 +647,7 @@ async def delete_site(
     user=Depends(get_current_user),
 ):
     site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user.id, site_uuid)
+    site = await site_repo.get_site(db,user_id=user.id, site_uuid=site_uuid)
     await db.delete(site)
     await db.commit()
     return None
@@ -664,7 +664,7 @@ async def link_device_to_site(
     user=Depends(get_current_user),
 ):
     site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user.id, site_uuid)
+    site = await site_repo.get_site(db,user_id=user.id,site_uuid=site_uuid)
 
 
     qd = select(Device).where(Device.device_uuid == payload.device_uuid, Device.user_id == user.id)
@@ -693,7 +693,7 @@ async def unlink_device_from_site(
     user=Depends(get_current_user),
 ):
     site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user.id, site_uuid)
+    site = await site_repo.get_site(db,user_id=user.id,site_uuid=site_uuid)
 
 
     camera_using_device = (
