@@ -1,4 +1,5 @@
 # routes/sites.py
+import asyncio
 import uuid
 from datetime import datetime, time as dt_time, timezone
 from typing import Any, Dict, List, Optional, Literal
@@ -12,6 +13,7 @@ from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, Si
 from dependencies import get_async_db, get_current_user, get_manager
 from application.channels.channel_config import VideoChannelConfig
 from application.repositories.channel_repository import ChannelRepository
+from application.repositories.site_repository import SiteRepository
 from domain.events import ChannelCreateEvent
 from application.services.manager import Manager
 from core.schemas import CameraWithConfigSchema
@@ -175,13 +177,6 @@ def _build_schedule_windows(
     )
     return normalized or VideoChannelConfig.default_schedule()
 
-async def _get_site_or_404(db: AsyncSession, user_id: int, site_uuid: uuid.UUID) -> Site:
-    q = select(Site).where(Site.site_uuid == site_uuid, Site.user_id == user_id)
-    site = (await db.execute(q)).scalar_one_or_none()
-    if not site:
-        raise HTTPException(status_code=404, detail="Site not found")
-    return site
-
 
 def _dedupe_uuid_list(values: Optional[List[uuid.UUID]]) -> List[uuid.UUID]:
     seen = set()
@@ -196,17 +191,24 @@ def _dedupe_uuid_list(values: Optional[List[uuid.UUID]]) -> List[uuid.UUID]:
     return out
 
 
-async def _get_site_settings_row(
-    db: AsyncSession,
+
+async def _refresh_site_schedule_runtime(
     *,
+    manager: Manager,
     user_id: int,
     site_uuid: uuid.UUID,
-) -> Optional[SiteSettings]:
-    stmt = select(SiteSettings).where(
-        SiteSettings.user_id == int(user_id),
-        SiteSettings.site_uuid == site_uuid,
+) -> None:
+    sync_summary = await manager.sync_site_schedule_runtime(
+        user_id=int(user_id),
+        site_uuid=site_uuid,
     )
-    return (await db.execute(stmt)).scalar_one_or_none()
+    if sync_summary.get("device_uuids"):
+        asyncio.create_task(
+            manager.reconcile_devices_best_effort(
+                user_id=int(user_id),
+                device_uuids=sync_summary["device_uuids"],
+            )
+        )
 
 
 # -----------------------
@@ -403,8 +405,9 @@ async def list_sites(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    q = select(Site).where(Site.user_id == user.id).order_by(Site.created_at.desc())
-    return (await db.execute(q)).scalars().all()
+    site_repo=SiteRepository()
+    sites = await site_repo.get_sites(db, user.id)
+    return sites
 
 @router.get("/{site_uuid}/devices", response_model=List[DeviceOut])
 async def list_site_devices(
@@ -412,8 +415,8 @@ async def list_site_devices(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    site = await _get_site_or_404(db, user.id, site_uuid)
-
+    site_repo=SiteRepository()
+    site = await site_repo.get_site(db, user.id, site_uuid)
     q = (
         select(Device)
         .join(SiteDevice, SiteDevice.device_uuid == Device.device_uuid)
@@ -429,8 +432,9 @@ async def get_site_settings(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    site = await _get_site_or_404(db, user.id, site_uuid)
-    row = await _get_site_settings_row(db, user_id=int(user.id), site_uuid=site.site_uuid)
+    site_repo=SiteRepository()
+    site = await site_repo.get_site(db, user.id, site_uuid)
+    row = await site_repo.get_site_settings(db, user_id=int(user.id), site_uuid=site.site_uuid)
     return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
 
 
@@ -442,7 +446,8 @@ async def create_site_camera(
     user=Depends(get_current_user),
     manager: Manager = Depends(get_manager),
 ):
-    site = await _get_site_or_404(db, user.id, site_uuid)
+    site_repo=SiteRepository()
+    site = await site_repo.get_site(db, user.id, site_uuid)
 
     device = (
         await db.execute(
@@ -498,9 +503,11 @@ async def update_site_settings(
     payload: SiteSettingsUpdate,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
+    manager: Manager = Depends(get_manager),
 ):
-    site = await _get_site_or_404(db, user.id, site_uuid)
-    row = await _get_site_settings_row(db, user_id=int(user.id), site_uuid=site.site_uuid)
+    site_repo=SiteRepository()
+    site = await site_repo.get_site(db, user.id, site_uuid)
+    row = await site_repo.get_site_settings(db, user_id=int(user.id), site_uuid=site.site_uuid)
     config = dict(row.config or {}) if row and isinstance(row.config, dict) else {}
     schedule_payload = _site_schedule_payload_from_row(row, fallback_timezone=site.timezone)
 
@@ -556,6 +563,12 @@ async def update_site_settings(
     )
     await db.commit()
     await db.refresh(row)
+    if payload.schedule is not None:
+        await _refresh_site_schedule_runtime(
+            manager=manager,
+            user_id=int(user.id),
+            site_uuid=site.site_uuid,
+        )
     return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
 
 
@@ -589,8 +602,9 @@ async def get_site(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    return await _get_site_or_404(db, user.id, site_uuid)
-
+    site_repo=SiteRepository()
+    site = await site_repo.get_site(db, user.id, site_uuid)
+    return site
 
 @router.patch("/{site_uuid}", response_model=SiteOut)
 async def update_site(
@@ -598,8 +612,11 @@ async def update_site(
     payload: SiteUpdate,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
+    manager: Manager = Depends(get_manager),
 ):
-    site = await _get_site_or_404(db, user.id, site_uuid)
+    site_repo=SiteRepository()
+    site = await site_repo.get_site(db, user.id, site_uuid)
+
 
     data = payload.model_dump(exclude_unset=True)
 
@@ -614,6 +631,12 @@ async def update_site(
 
     await db.commit()
     await db.refresh(site)
+    if data.get("timezone") is not None:
+        await _refresh_site_schedule_runtime(
+            manager=manager,
+            user_id=int(user.id),
+            site_uuid=site.site_uuid,
+        )
     return site
 
 
@@ -623,7 +646,8 @@ async def delete_site(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    site = await _get_site_or_404(db, user.id, site_uuid)
+    site_repo=SiteRepository()
+    site = await site_repo.get_site(db, user.id, site_uuid)
     await db.delete(site)
     await db.commit()
     return None
@@ -639,7 +663,9 @@ async def link_device_to_site(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    site = await _get_site_or_404(db, user.id, site_uuid)
+    site_repo=SiteRepository()
+    site = await site_repo.get_site(db, user.id, site_uuid)
+
 
     qd = select(Device).where(Device.device_uuid == payload.device_uuid, Device.user_id == user.id)
     device = (await db.execute(qd)).scalar_one_or_none()
@@ -666,7 +692,9 @@ async def unlink_device_from_site(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    site = await _get_site_or_404(db, user.id, site_uuid)
+    site_repo=SiteRepository()
+    site = await site_repo.get_site(db, user.id, site_uuid)
+
 
     camera_using_device = (
         await db.execute(

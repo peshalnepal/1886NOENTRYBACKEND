@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, PositiveInt
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +34,86 @@ class ClipOut(BaseModel):
     storage_key: Optional[str] = None
     error: Optional[str] = None
     created_at: datetime
+
+
+class BulkClipDeleteRequest(BaseModel):
+    clip_ids: List[PositiveInt] = Field(..., min_length=1)
+
+
+class BulkClipDeleteResponse(BaseModel):
+    requested: int
+    deleted: int
+    deleted_ids: List[int] = Field(default_factory=list)
+
+
+def _normalize_clip_ids(raw_ids: List[int]) -> List[int]:
+    ordered_ids: List[int] = []
+    seen: set[int] = set()
+
+    for raw_id in raw_ids:
+        clip_id = int(raw_id)
+        if clip_id <= 0 or clip_id in seen:
+            continue
+        seen.add(clip_id)
+        ordered_ids.append(clip_id)
+
+    return ordered_ids
+
+
+async def _fetch_owned_clips(
+    *,
+    db: AsyncSession,
+    user_id: int,
+    clip_ids: List[int],
+) -> List[VideoRecord]:
+    ordered_ids = _normalize_clip_ids(clip_ids)
+    if not ordered_ids:
+        return []
+
+    rows = (
+        await db.execute(
+            select(VideoRecord)
+            .join(Camera, Camera.camera_uuid == VideoRecord.camera_uuid)
+            .where(
+                VideoRecord.id.in_(ordered_ids),
+                Camera.user_id == int(user_id),
+            )
+        )
+    ).scalars().all()
+
+    clips_by_id = {int(clip.id): clip for clip in rows}
+    return [clips_by_id[clip_id] for clip_id in ordered_ids if clip_id in clips_by_id]
+
+
+async def _delete_clip_records(
+    *,
+    db: AsyncSession,
+    clips: List[VideoRecord],
+) -> int:
+    if not clips:
+        return 0
+
+    clip_service = EventClipService()
+    try:
+        for clip in clips:
+            storage_key = str(clip.storage_key or "").strip()
+            if storage_key:
+                try:
+                    await clip_service.delete_blob(blob_name=storage_key)
+                except Exception:
+                    logger.warning(
+                        "Failed deleting clip blob %s; removing DB record anyway",
+                        storage_key,
+                        exc_info=True,
+                    )
+
+            await db.delete(clip)
+
+        await db.commit()
+    finally:
+        await clip_service.close()
+
+    return len(clips)
 
 
 @router.get("", response_model=List[ClipOut])
@@ -97,37 +177,34 @@ async def list_clips(
     ]
 
 
+@router.delete("", response_model=BulkClipDeleteResponse)
+async def delete_clips(
+    payload: BulkClipDeleteRequest,
+    db: AsyncSession = Depends(get_async_db),
+    user: User = Depends(get_current_user),
+):
+    clip_ids = _normalize_clip_ids([int(value) for value in payload.clip_ids])
+    if not clip_ids:
+        raise HTTPException(status_code=422, detail="Select at least one clip to delete")
+
+    clips = await _fetch_owned_clips(db=db, user_id=int(user.id), clip_ids=clip_ids)
+    deleted = await _delete_clip_records(db=db, clips=clips)
+    return BulkClipDeleteResponse(
+        requested=len(clip_ids),
+        deleted=deleted,
+        deleted_ids=[int(clip.id) for clip in clips],
+    )
+
+
 @router.delete("/{clip_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_clip(
     clip_id: int,
     db: AsyncSession = Depends(get_async_db),
     user: User = Depends(get_current_user),
 ):
-    clip = (
-        await db.execute(
-            select(VideoRecord)
-            .join(Camera, Camera.camera_uuid == VideoRecord.camera_uuid)
-            .where(
-                VideoRecord.id == int(clip_id),
-                Camera.user_id == int(user.id),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if clip is None:
+    clips = await _fetch_owned_clips(db=db, user_id=int(user.id), clip_ids=[clip_id])
+    if not clips:
         raise HTTPException(status_code=404, detail="Clip not found")
 
-    storage_key = str(clip.storage_key or "").strip()
-    if storage_key:
-        clip_service = EventClipService()
-        try:
-            try:
-                await clip_service.delete_blob(blob_name=storage_key)
-            except Exception:
-                logger.warning("Failed deleting clip blob %s; removing DB record anyway", storage_key, exc_info=True)
-        finally:
-            await clip_service.close()
-
-    await db.delete(clip)
-    await db.commit()
+    await _delete_clip_records(db=db, clips=clips)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

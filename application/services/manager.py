@@ -481,6 +481,161 @@ class Manager:
             ),
         }
 
+    async def sync_site_schedule_runtime(
+        self,
+        *,
+        user_id: int,
+        site_uuid: uuid.UUID,
+    ) -> Dict[str, Any]:
+        """
+        Rebuild in-memory runtime configs for site cameras that inherit the site schedule.
+
+        Returns the affected device UUIDs so callers can trigger best-effort edge reconcile
+        without coupling route code to camera/device lookup details.
+        """
+        uid = int(user_id)
+        active = self._pipelines_by_user.get(uid)
+        refreshed = 0
+        skipped = 0
+        device_uuids: Set[uuid.UUID] = set()
+
+        async with self._session_factory() as db:
+            stmt = (
+                select(Camera)
+                .where(
+                    Camera.user_id == uid,
+                    Camera.site_uuid == site_uuid,
+                )
+                .options(selectinload(Camera.channel_configuration))
+            )
+            cams = (await db.execute(stmt)).scalars().all()
+            site_schedule_cache: Dict[str, Dict[str, Any]] = {}
+
+            for cam in cams:
+                cfg_json = {}
+                if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None):
+                    cfg_json = cam.channel_configuration.configuration or {}
+
+                use_site_schedule = bool(
+                    cfg_json.get("use_site_schedule", getattr(cam, "use_site_schedule", True))
+                )
+                if not use_site_schedule:
+                    skipped += 1
+                    continue
+
+                devices = await self._get_camera_devices(db, cam.camera_uuid)
+                if len(devices) == 0:
+                    logger.warning(
+                        "Skipping site schedule refresh for camera %s because device count=%s",
+                        cam.camera_uuid,
+                        len(devices),
+                    )
+                    skipped += 1
+                    continue
+                if len(devices) > 1:
+                    logger.warning(
+                        "Camera %s has %s linked devices during site schedule refresh; using most recent device %s",
+                        cam.camera_uuid,
+                        len(devices),
+                        getattr(devices[0], "device_uuid", None),
+                    )
+
+                device = devices[0]
+                if getattr(device, "device_uuid", None) is not None:
+                    device_uuids.add(device.device_uuid)
+
+                if active is None:
+                    continue
+
+                schedule_state = await self._resolve_runtime_schedule(
+                    db,
+                    cam=cam,
+                    cfg_json=cfg_json,
+                    cfg_timezone=getattr(getattr(cam, "channel_configuration", None), "timezone", None),
+                    site_cache=site_schedule_cache,
+                )
+                runtime_overrides = _runtime_config_overrides(
+                    cfg_json,
+                    extra_forbidden={
+                        "sample_fps",
+                        "decode_backend",
+                        "request_timeout_s",
+                        "schedule",
+                        "timezone",
+                        "use_site_schedule",
+                    },
+                )
+                vcc = VideoChannelConfig(
+                    camera_uuid=cam.camera_uuid,
+                    rtsp_url=cam.rtsp_url,
+                    webrtc_url=cam.webrtc_url or "",
+                    site_uuid=cam.site_uuid,
+                    device_uuid=device.device_uuid,
+                    device_url=device.device_url,
+                    enabled=bool(getattr(cam, "is_enabled", True)),
+                    detection_enabled=bool(getattr(cam, "is_detection_enabled", True)),
+                    notification_enabled=bool(getattr(cam, "is_notification_enabled", True)),
+                    sample_fps=float(cfg_json.get("sample_fps", 5.0)),
+                    decode_backend=str(cfg_json.get("decode_backend", "gstreamer")),
+                    request_timeout_s=float(
+                        cfg_json.get("request_timeout_s", self._default_request_timeout_s)
+                    ),
+                    timezone=schedule_state["timezone"],
+                    schedule=schedule_state["schedule"],
+                    use_site_schedule=schedule_state["use_site_schedule"],
+                    **runtime_overrides,
+                )
+                await active.edit_channel(VideoChannel(config=vcc))
+                refreshed += 1
+
+        return {
+            "refreshed": refreshed,
+            "skipped": skipped,
+            "device_uuids": sorted(device_uuids, key=str),
+        }
+
+    async def reconcile_devices_best_effort(
+        self,
+        *,
+        user_id: int,
+        device_uuids: List[Union[str, uuid.UUID]],
+    ) -> None:
+        """
+        Best-effort targeted reconcile for devices affected by a site schedule change.
+
+        We explicitly allow removal here so cameras that become inactive due to schedule
+        changes are removed from edge/WebRTC immediately instead of waiting for the next
+        full reconcile cycle.
+        """
+        uid = int(user_id)
+        seen: Set[str] = set()
+
+        for raw_device_uuid in device_uuids or []:
+            try:
+                device_uuid = self._as_uuid(raw_device_uuid, "device_uuid")
+            except Exception:
+                logger.warning("Skipping invalid device UUID during best-effort reconcile: %r", raw_device_uuid)
+                continue
+
+            key = str(device_uuid)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            try:
+                await self.reconcile_device_edge_simple(
+                    device_uuid=device_uuid,
+                    user_id=uid,
+                    dry_run=False,
+                    delete_unknown=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Best-effort reconcile failed after site schedule update device=%s",
+                    key,
+                    exc_info=True,
+                )
+
 
     async def create_pipeline(self, user_id: int | None = None) -> ModelPipeline:
         """
@@ -698,11 +853,6 @@ class Manager:
         delete_unknown: bool = True,
     ) -> Dict[str, List[str]]:
         uid = int(user_id) if user_id is not None else None
-
-        # No self._lock here: reconcile only reads DB state and calls external
-        # HTTP APIs — it never touches self._pipelines_by_user.  Holding the
-        # lock across 3×15s Jetson retries was blocking manual Sync whenever
-        # the background reconcile loop was already running.
         async with self._session_factory() as db:
             dev = await self._get_device(db, device_uuid, user_id=uid)
             q = (

@@ -792,7 +792,7 @@ class NotificationService:
         except Exception:
             trigger_camera_uuid = None
         trigger_ctx = plan.contexts_by_camera.get(trigger_camera_uuid) if trigger_camera_uuid else None
-
+        #TODO Check From Here 
         clip = await clip_service.capture_pre_event_clip(
             camera_uuid=msg.camera_uuid,
             ctx=trigger_ctx or ctx,

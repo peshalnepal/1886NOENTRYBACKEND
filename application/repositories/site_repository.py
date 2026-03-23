@@ -7,8 +7,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from core.database_orm import Camera, ChannelConfiguration, Device, CameraDevice
+from core.database_orm import Camera, ChannelConfiguration, Device, CameraDevice,Site,SiteSettings
 
+from fastapi import APIRouter, Depends, HTTPException, status
 
 class SiteRepository:
     """
@@ -133,3 +134,38 @@ class SiteRepository:
             )
 
         return out
+    
+    async def get_site(self,db:AsyncSession,*,site_uuid: uuid.UUID,user_id:int=None)->Optional[Site]:
+        smt = select(Site).where(Site.site_uuid == site_uuid)
+        if user_id:
+            smt=smt.where(Site.user_id==int(user_id))
+        site = (await db.execute(smt)).scalar_one_or_none()
+        if not site:
+            raise HTTPException(status_code=404, detail="Site not found")
+        return site
+    
+    async def get_sites(self,db:AsyncSession,*,user_id:int)->Optional[List[Site]]:
+        if not user_id:
+            raise HTTPException(status_code=404, detail="No User not found")
+        smt = select(Site).where(Site.user_id == user_id).order_by(Site.created_at.desc())
+        sites = (await db.execute(smt)).scalars().all()
+        if type(sites)!=list:
+            
+            return list(sites)
+        return sites
+    
+    async def get_site_settings(self,db: AsyncSession,*,site_uuid: uuid.UUID,user_id: int=None) -> Optional[SiteSettings]:
+        smt = select(SiteSettings).where(
+            
+            SiteSettings.site_uuid == site_uuid,
+        )
+        if user_id:
+            smt=smt.where(SiteSettings.user_id == int(user_id),)
+        site_settings = (await db.execute(smt)).scalar_one_or_none()
+
+        if not site_settings:
+            raise HTTPException(status_code=404, detail="Site setting doesn't exist")
+        return site_settings
+
+    async def create_site(self,db: AsyncSession):
+        pass
