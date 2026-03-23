@@ -406,7 +406,7 @@ async def list_sites(
     user=Depends(get_current_user),
 ):
     site_repo=SiteRepository()
-    sites = await site_repo.get_sites(db, user.id)
+    sites = await site_repo.get_sites(db, user_id=user.id)
     return sites
 
 @router.get("/{site_uuid}/devices", response_model=List[DeviceOut])
