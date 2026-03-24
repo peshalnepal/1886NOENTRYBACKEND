@@ -73,6 +73,13 @@ class WebRTCGatewayClient:
     def _derive_public_webrtc_url(self, stream_key: str) -> str:
         return f"{self.public_base}/{stream_key}"
 
+    def _response_error_message(self, *, action: str, response: httpx.Response) -> str:
+        body = (response.text or "").strip().replace("\n", " ")
+        if len(body) > 200:
+            body = body[:200] + "..."
+        if body:
+            return f"{action} returned HTTP {response.status_code}: {body}"
+        return f"{action} returned HTTP {response.status_code}"
 
     async def ensure_stream(self, *, stream_key: str, rtsp_url: str) -> Optional[str]:
         """
@@ -84,14 +91,18 @@ class WebRTCGatewayClient:
         safe_name = quote(stream_key, safe="")
         add_url = f"{self.admin_api_url}/v3/config/paths/add/{safe_name}"
         payload = {"source": rtsp_url, "rtspTransport": "tcp"}
+        add_error: Optional[str] = None
 
         # 1. Try Add
         try:
             r = await self._client.post(add_url, json=payload, auth=self._auth())
             if r.status_code == 200:
                 return self._derive_public_webrtc_url(stream_key)
+            add_error = self._response_error_message(action="MediaMTX add", response=r)
+            logger.warning("%s. stream_key=%s admin_api=%s", add_error, stream_key, self.admin_api_url)
         except Exception as exc:
             if self._is_timeout_or_network_error(exc):
+                add_error = f"MediaMTX add timed out/unreachable: {type(exc).__name__}: {exc}"
                 self._warn_throttled(
                     "ensure_stream_add_timeout",
                     "MediaMTX add timed out/unreachable. stream_key=%s admin_api=%s",
@@ -99,15 +110,20 @@ class WebRTCGatewayClient:
                     self.admin_api_url,
                 )
             else:
+                add_error = f"MediaMTX add request failed: {type(exc).__name__}: {exc}"
                 logger.warning("MediaMTX add request failed, trying patch. stream_key=%s", stream_key, exc_info=True)
 
         patch_url = f"{self.admin_api_url}/v3/config/paths/patch/{safe_name}"
+        patch_error: Optional[str] = None
         try:
             r = await self._client.patch(patch_url, json=payload, auth=self._auth())
             if r.status_code == 200:
                 return self._derive_public_webrtc_url(stream_key)
+            patch_error = self._response_error_message(action="MediaMTX patch", response=r)
+            logger.error("%s. stream_key=%s admin_api=%s", patch_error, stream_key, self.admin_api_url)
         except Exception as exc:
             if self._is_timeout_or_network_error(exc):
+                patch_error = f"MediaMTX patch timed out/unreachable: {type(exc).__name__}: {exc}"
                 self._warn_throttled(
                     "ensure_stream_patch_timeout",
                     "MediaMTX patch timed out/unreachable. stream_key=%s admin_api=%s",
@@ -115,9 +131,16 @@ class WebRTCGatewayClient:
                     self.admin_api_url,
                 )
             else:
+                patch_error = f"MediaMTX patch request failed: {type(exc).__name__}: {exc}"
                 logger.error("MediaMTX patch request failed. stream_key=%s", stream_key, exc_info=True)
-            
-        return self._derive_public_webrtc_url(stream_key)
+
+        raise RuntimeError(
+            "Failed to provision MediaMTX stream '{}'. add_error={}; patch_error={}".format(
+                stream_key,
+                add_error or "unknown",
+                patch_error or "unknown",
+            )
+        )
 
     async def update_stream(self, *, stream_key: str, rtsp_url: str) -> None:
         if not self.admin_api_url:
