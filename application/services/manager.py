@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -437,6 +437,20 @@ class Manager:
             cache[cache_key] = state
         return state
 
+    def _get_loaded_channel_configuration(self, cam: Camera) -> Optional[Any]:
+        try:
+            state = inspect(cam)
+        except Exception:
+            return None
+
+        if "channel_configuration" in getattr(state, "unloaded", set()):
+            return None
+
+        try:
+            return getattr(cam, "channel_configuration", None)
+        except Exception:
+            return None
+
     async def _resolve_runtime_schedule(
         self,
         db: AsyncSession,
@@ -448,12 +462,13 @@ class Manager:
     ) -> Dict[str, Any]:
         cfg = dict(cfg_json or {})
         use_site_schedule = bool(cfg.get("use_site_schedule", getattr(cam, "use_site_schedule", True)))
+        loaded_channel_cfg = self._get_loaded_channel_configuration(cam)
 
         schedule = VideoChannelConfig.normalize_schedule(cfg.get("schedule"))
         timezone_name = str(
             cfg.get("timezone")
             or cfg_timezone
-            or getattr(getattr(cam, "channel_configuration", None), "timezone", None)
+            or getattr(loaded_channel_cfg, "timezone", None)
             or "UTC"
         )
 
