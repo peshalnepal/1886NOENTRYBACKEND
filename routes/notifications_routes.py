@@ -289,11 +289,16 @@ async def list_notifications(
     camera_uuid: Optional[str] = None,
     unread_only: bool = False,
     limit: int = 100,
+    offset: int = 0,
     user: User = Depends(get_current_user),
 ):
     sf = _session_factory_from_app(request)
     if sf is None:
         raise HTTPException(status_code=503, detail="Database not available")
+    if limit <= 0:
+        raise HTTPException(status_code=422, detail="limit must be positive")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be non-negative")
 
     su = None
     cu = None
@@ -319,7 +324,11 @@ async def list_notifications(
         if unread_only:
             stmt = stmt.where(Notification.read_at.is_(None))
 
-        stmt = stmt.order_by(desc(Notification.detected_at)).limit(max(1, min(int(limit), 500)))
+        stmt = (
+            stmt.order_by(desc(Notification.detected_at))
+            .offset(int(offset))
+            .limit(min(int(limit), 500))
+        )
         rows = (await db.execute(stmt)).scalars().all()
 
     return [_to_out(n) for n in rows]

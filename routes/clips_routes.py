@@ -122,11 +122,14 @@ async def list_clips(
     camera_uuid: Optional[uuid.UUID] = None,
     status: Optional[str] = None,
     limit: int = 100,
+    offset: int = 0,
     db: AsyncSession = Depends(get_async_db),
     user: User = Depends(get_current_user),
 ):
     if limit <= 0:
         raise HTTPException(status_code=422, detail="limit must be positive")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be non-negative")
 
     stmt = (
         select(
@@ -141,6 +144,7 @@ async def list_clips(
         .join(Site, Site.site_uuid == Camera.site_uuid)
         .where(Camera.user_id == int(user.id))
         .order_by(desc(VideoRecord.created_at), desc(VideoRecord.id))
+        .offset(int(offset))
         .limit(min(int(limit), 200))
     )
 
