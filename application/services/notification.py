@@ -100,6 +100,8 @@ class NotificationMessage(BaseModel):
     roi_id: Optional[str] = None
     track_id: Optional[int] = None
     image_url: Optional[str] = None
+    clip_url: Optional[str] = None
+    clip_status: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1102,6 +1104,29 @@ class NotificationService:
             return
 
         extra_payload = await self._attach_clip_payload(msg=msg, ctx=ctx, extra_payload=extra_payload)
+        extra_payload, stored_image_url, _stored_image_key = await self._materialize_alert_image_payload(
+            msg=msg,
+            extra_payload=extra_payload,
+        )
+
+        updated_fields: Dict[str, Any] = {}
+        next_image_url = str(stored_image_url or "").strip()
+        if next_image_url and next_image_url != str(msg.image_url or "").strip():
+            updated_fields["image_url"] = next_image_url
+
+        clip_payload = extra_payload.get("clip") if isinstance(extra_payload, dict) else None
+        if isinstance(clip_payload, dict):
+            next_clip_url = str(clip_payload.get("recording_url") or "").strip()
+            next_clip_status = str(clip_payload.get("status") or "").strip()
+            if next_clip_url and next_clip_url != str(msg.clip_url or "").strip():
+                updated_fields["clip_url"] = next_clip_url
+            if next_clip_status and next_clip_status != str(msg.clip_status or "").strip():
+                updated_fields["clip_status"] = next_clip_status
+
+        if updated_fields:
+            msg = msg.model_copy(update=updated_fields)
+            await self.hub.publish(msg)
+
         self._ensure_flush_task()
         user_id = int(ctx.user_id)
         item = BufferedNotification(
