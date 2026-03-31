@@ -628,10 +628,21 @@ async def snapshot_jpg(
     access_token: Optional[str] = None,
     db: AsyncSession = Depends(get_async_db),
 ):
-    user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+    try:
+        user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+    except HTTPException as e:
+        if e.status_code == 401:
+            logger.warning(f"Snapshot access denied for camera {camera_uuid}: {e.detail}")
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required. Please ensure you are logged in and have a valid token."
+            )
+        raise
+    
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
+        logger.warning(f"Camera {camera_uuid} not found for user {user.id}")
         raise HTTPException(status_code=404, detail="Camera not found")
 
     cam, _cfg, _pid = full
@@ -640,7 +651,11 @@ async def snapshot_jpg(
     dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=False, relaxed=True)
     device_url = str(getattr(dev, "device_url", "") or "").strip() if dev is not None else ""
     if not device_url:
-        raise HTTPException(status_code=409, detail="Assigned Jetson device is missing device_url.")
+        logger.warning(f"Camera {camera_uuid} has no device assigned or device_url missing")
+        raise HTTPException(
+            status_code=409, 
+            detail="Camera is not properly configured. Device URL is missing. Please contact administrator."
+        )
 
     return await _fetch_device_snapshot(device_url=device_url, camera_uuid=cam.camera_uuid)
 
