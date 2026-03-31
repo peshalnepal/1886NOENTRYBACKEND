@@ -895,7 +895,10 @@ class Manager:
                 )
                 if bool(cam.is_enabled) and bool(cam.is_detection_enabled) and bool(schedule_state["active"]):
                     desired_set.add(str(cam.camera_uuid))
-                if bool(cam.is_enabled) and bool(schedule_state["active"]) and getattr(cam, "camera_code", None):
+                # Keep playback paths provisioned for enabled cameras even when the
+                # detection schedule is currently inactive. Scheduling controls edge
+                # inference, but removing the MediaMTX path makes live view flap.
+                if bool(cam.is_enabled) and getattr(cam, "camera_code", None):
                     active_streams.add(str(cam.camera_code))
 
         device_url = dev.device_url
