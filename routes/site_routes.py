@@ -550,8 +550,7 @@ async def update_site_settings(
     if payload.schedule is None and payload.multi_camera_prerecord is None:
         return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
 
-    repo = ChannelRepository()
-    row = await repo.upsert_site_settings(
+    row = await site_repo.upsert_site_settings(
         db,
         user_id=int(user.id),
         site_uuid=site.site_uuid,

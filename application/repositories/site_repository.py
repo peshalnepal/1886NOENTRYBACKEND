@@ -6,6 +6,8 @@ from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from datetime import time as dt_time
+from typing import Any, Dict, List, Optional
 
 from core.database_orm import Camera, ChannelConfiguration, Device, CameraDevice,Site,SiteSettings
 
@@ -162,10 +164,68 @@ class SiteRepository:
         if user_id:
             smt=smt.where(SiteSettings.user_id == int(user_id),)
         site_settings = (await db.execute(smt)).scalar_one_or_none()
-
-        if not site_settings:
-            raise HTTPException(status_code=404, detail="Site setting doesn't exist")
         return site_settings
 
+    async def upsert_site_settings(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        site_uuid: uuid.UUID,
+        config: Optional[Dict[str, Any]] = None,
+        day_of_week: Optional[List[int]] = None,
+        start_time: Optional[dt_time] = None,
+        end_time: Optional[dt_time] = None,
+        is_enabled: bool = True,
+    ) -> SiteSettings:
+        """
+        Persist one SiteSettings row per site.
+
+        Real multi-day schedule is stored in config["schedule"].
+        Scalar columns are stored as representative values for backward compatibility.
+        """
+        row = await self.get_site_settings(
+            db,
+            site_uuid=site_uuid,
+            user_id=user_id,
+        )
+
+        normalized_days = [int(v) for v in (day_of_week or [6, 0, 1, 2, 3, 4, 5])]
+        if not normalized_days:
+            normalized_days = [6, 0, 1, 2, 3, 4, 5]
+
+        representative_day = normalized_days[0]
+        resolved_start = start_time or dt_time(0, 0, 0)
+        resolved_end = end_time or dt_time(23, 59, 59)
+
+        if resolved_start == resolved_end:
+            raise HTTPException(
+                status_code=422,
+                detail="start_time and end_time must be different.",
+            )
+
+        if row is None:
+            row = SiteSettings(
+                user_id=int(user_id),
+                site_uuid=site_uuid,
+                config=config or {},
+                day_of_week=representative_day,
+                start_time=resolved_start,
+                end_time=resolved_end,
+                is_enabled=bool(is_enabled),
+            )
+            db.add(row)
+            await db.flush()
+            return row
+
+        row.config = config or {}
+        row.day_of_week = representative_day
+        row.start_time = resolved_start
+        row.end_time = resolved_end
+        row.is_enabled = bool(is_enabled)
+
+        await db.flush()
+        return row
+    
     async def create_site(self,db: AsyncSession):
         pass
