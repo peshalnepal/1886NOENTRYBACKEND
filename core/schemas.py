@@ -61,8 +61,8 @@ def _normalize_schedule_fields(model: BaseModel) -> BaseModel:
             end_obj = dt_time.fromisoformat(str(end_time))
         except ValueError as exc:
             raise ValueError("start_time and end_time must use HH:MM or HH:MM:SS format.") from exc
-        if start_obj >= end_obj:
-            raise ValueError("start_time must be earlier than end_time.")
+        if start_obj == end_obj:
+            raise ValueError("start_time and end_time must be different.")
 
     return model
 

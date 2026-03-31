@@ -1,0 +1,753 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.40.2.10011",
+      "templateHash": "3453773471436505303"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "environmentName": {
+      "type": "string"
+    },
+    "keyVaultName": {
+      "type": "string"
+    },
+    "acrName": {
+      "type": "string"
+    },
+    "appName": {
+      "type": "string"
+    },
+    "namePrefix": {
+      "type": "string",
+      "defaultValue": "noentry"
+    },
+    "appImageTag": {
+      "type": "string",
+      "defaultValue": "latest"
+    },
+    "revisionSuffix": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "deployStamp": {
+      "type": "string",
+      "defaultValue": "[utcNow()]"
+    },
+    "revisionMode": {
+      "type": "string",
+      "defaultValue": "Single"
+    },
+    "mysqlLocation": {
+      "type": "string",
+      "defaultValue": "[parameters('location')]"
+    },
+    "deployMediaMtx": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "createMysqlDatabase": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "videoClipStorageAccountName": {
+      "type": "string",
+      "defaultValue": "1886noentry"
+    },
+    "videoClipContainerName": {
+      "type": "string",
+      "defaultValue": "event-clips"
+    },
+    "mediamtxImageRepo": {
+      "type": "string",
+      "defaultValue": "mediamtx"
+    },
+    "mediamtxImageTag": {
+      "type": "string",
+      "defaultValue": "1.16.1"
+    },
+    "acrUsername": {
+      "type": "string"
+    },
+    "caddyImageRepo": {
+      "type": "string",
+      "defaultValue": "caddy"
+    },
+    "caddyImageTag": {
+      "type": "string",
+      "defaultValue": "2.8.4"
+    },
+    "acrPassword": {
+      "type": "securestring"
+    },
+    "webrtcAdminApiUrl": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "webrtcPublicBaseUrl": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "webrtcAdminApiKey": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "webrtcAdminUpsertPath": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "webrtcAdminUpdatePath": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "webrtcAdminDeletePath": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "enableSmtp": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "smtpUsername": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "smtpPassword": {
+      "type": "securestring",
+      "defaultValue": ""
+    },
+    "smtpFrom": {
+      "type": "string",
+      "defaultValue": "no-reply@1886noentry.com"
+    },
+    "mysqlAdminUser": {
+      "type": "string",
+      "defaultValue": "mysqladmin"
+    },
+    "mysqlAdminPassword": {
+      "type": "securestring"
+    },
+    "mysqlDatabaseName": {
+      "type": "string",
+      "defaultValue": "appdb"
+    },
+    "appDbUser": {
+      "type": "string",
+      "defaultValue": "appuser"
+    },
+    "appDbPassword": {
+      "type": "securestring"
+    },
+    "mediamtxApiUser": {
+      "type": "string",
+      "defaultValue": "api"
+    },
+    "mediamtxApiPass": {
+      "type": "securestring",
+      "defaultValue": ""
+    },
+    "mediamtxHostOverride": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional host override for public URL advertised by MediaMTX (custom domain). Leave blank to use ACI FQDN."
+      }
+    },
+    "caddyEmail": {
+      "type": "string",
+      "defaultValue": "peshalnepal3@gmail.com"
+    }
+  },
+  "variables": {
+    "stamp": "[toLower(replace(replace(replace(parameters('deployStamp'), ':', ''), 't', '-'), 'z', ''))]",
+    "rsBase": "[if(empty(parameters('revisionSuffix')), 'rev', toLower(parameters('revisionSuffix')))]",
+    "rsRaw": "[format('{0}-{1}', variables('rsBase'), variables('stamp'))]",
+    "revisionSuffixFinal": "[substring(variables('rsRaw'), 0, min(length(variables('rsRaw')), 40))]",
+    "suffix": "[toLower(substring(uniqueString(resourceGroup().id, parameters('namePrefix'), parameters('acrName'), parameters('environmentName')), 0, 6))]",
+    "mysqlSuffix": "[toLower(substring(uniqueString(resourceGroup().id, parameters('namePrefix'), parameters('environmentName'), parameters('mysqlLocation')), 0, 6))]",
+    "mysqlServerName": "[toLower(format('{0}-mysql-{1}', parameters('namePrefix'), variables('mysqlSuffix')))]",
+    "mysqlFqdn": "[format('{0}.mysql.database.azure.com', variables('mysqlServerName'))]",
+    "clipStorageName": "[if(not(equals(parameters('videoClipStorageAccountName'), '')), toLower(parameters('videoClipStorageAccountName')), toLower(substring(replace(format('{0}clips{1}', parameters('namePrefix'), variables('suffix')), '-', ''), 0, 24)))]",
+    "databaseUrl": "[format('Driver={{MySQL ODBC 8.0 Unicode Driver}};Server={0};Port=3306;Database={1};User={2};Password={3};Option=3;', variables('mysqlFqdn'), parameters('mysqlDatabaseName'), parameters('appDbUser'), parameters('appDbPassword'))]",
+    "mediamtxName": "[format('{0}-mtx-{1}', parameters('namePrefix'), variables('suffix'))]",
+    "mediamtxDns": "[format('{0}mtx{1}', parameters('namePrefix'), variables('suffix'))]",
+    "regionForHost": "[toLower(replace(parameters('location'), ' ', ''))]",
+    "mediamtxPublicHost": "[format('{0}.{1}.azurecontainer.io', variables('mediamtxDns'), variables('regionForHost'))]",
+    "proxyHost": "[if(not(equals(parameters('mediamtxHostOverride'), '')), parameters('mediamtxHostOverride'), variables('mediamtxPublicHost'))]",
+    "mediamtxYaml": "[format('logLevel: info\nlogDestinations: [stdout]\nwriteQueueSize: 1024\nudpReadBufferSize: 0\n\nauthMethod: internal\nauthInternalUsers:\n  - user: any\n    pass: \"\"\n    ips: []\n    permissions:\n      - action: publish\n        path:\n      - action: read\n        path:\n      - action: playback\n        path:\n  - user: \"{0}\"\n    pass: \"{1}\"\n    ips: []\n    permissions:\n      - action: api\n\napi: yes\napiAddress: :9997\napiAllowOrigins: [''*'']\n\nplayback: yes\nplaybackAddress: :9996\nplaybackAllowOrigins: [''*'']\n\nwebrtc: yes\nwebrtcAddress: :8889\n\nwebrtcLocalUDPAddress: :8189\nwebrtcLocalTCPAddress: ''''\nwebrtcAllowOrigins: [''*'']\n\nwebrtcIPsFromInterfaces: no\nwebrtcAdditionalHosts: [''{2}'']\n\nwebrtcICEServers2:\n  - url: stun:stun.l.google.com:19302\n\npathDefaults:\n  record: yes\n  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f\n  recordFormat: fmp4\n  recordPartDuration: 1s\n  recordSegmentDuration: 15s\n  recordDeleteAfter: 7m\n\nhls: false\nrtmp: false\nsrt: false\n\npaths:\n  all_others: {{}}\n', parameters('mediamtxApiUser'), parameters('mediamtxApiPass'), variables('proxyHost'))]",
+    "caddyfile": "[format('{{\n  email {0}\n}}\n\n{1} {{\n  encode gzip\n\n  handle_path /playback/* {{\n    reverse_proxy 127.0.0.1:9996\n  }}\n\n  @api path /v3/*\n  reverse_proxy @api 127.0.0.1:9997\n\n  reverse_proxy 127.0.0.1:8889\n}}\n', parameters('caddyEmail'), variables('proxyHost'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2022-10-01",
+      "name": "[format('{0}-prod-logs-{1}', parameters('namePrefix'), variables('suffix'))]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('environmentName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-prod-logs-{1}', parameters('namePrefix'), variables('suffix'))), '2022-10-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-prod-logs-{1}', parameters('namePrefix'), variables('suffix'))), '2022-10-01').primarySharedKey]"
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-prod-logs-{1}', parameters('namePrefix'), variables('suffix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.DBforMySQL/flexibleServers",
+      "apiVersion": "2024-12-30",
+      "name": "[variables('mysqlServerName')]",
+      "location": "[parameters('mysqlLocation')]",
+      "sku": {
+        "name": "Standard_B1ms",
+        "tier": "Burstable"
+      },
+      "properties": {
+        "administratorLogin": "[parameters('mysqlAdminUser')]",
+        "administratorLoginPassword": "[parameters('mysqlAdminPassword')]",
+        "version": "8.0.21",
+        "storage": {
+          "storageSizeGB": 32,
+          "autoGrow": "Enabled"
+        },
+        "backup": {
+          "backupRetentionDays": 7,
+          "geoRedundantBackup": "Disabled"
+        },
+        "network": {
+          "publicNetworkAccess": "Enabled"
+        },
+        "highAvailability": {
+          "mode": "Disabled"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.DBforMySQL/flexibleServers/firewallRules",
+      "apiVersion": "2024-12-30",
+      "name": "[format('{0}/AllowAzureServices', variables('mysqlServerName'))]",
+      "properties": {
+        "startIpAddress": "0.0.0.0",
+        "endIpAddress": "0.0.0.0"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.DBforMySQL/flexibleServers', variables('mysqlServerName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.DBforMySQL/flexibleServers/configurations",
+      "apiVersion": "2024-12-30",
+      "name": "[format('{0}/require_secure_transport', variables('mysqlServerName'))]",
+      "properties": {
+        "value": "OFF",
+        "source": "user-override"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.DBforMySQL/flexibleServers', variables('mysqlServerName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('createMysqlDatabase')]",
+      "type": "Microsoft.DBforMySQL/flexibleServers/databases",
+      "apiVersion": "2024-12-30",
+      "name": "[format('{0}/{1}', variables('mysqlServerName'), parameters('mysqlDatabaseName'))]",
+      "properties": {
+        "charset": "utf8mb4",
+        "collation": "utf8mb4_unicode_ci"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.DBforMySQL/flexibleServers', variables('mysqlServerName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('clipStorageName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "accessTier": "Hot",
+        "allowBlobPublicAccess": false,
+        "minimumTlsVersion": "TLS1_2",
+        "supportsHttpsTrafficOnly": true
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/blobServices",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/default', variables('clipStorageName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/default/{1}', variables('clipStorageName'), parameters('videoClipContainerName'))]",
+      "properties": {
+        "publicAccess": "None"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('deployMediaMtx')]",
+      "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/default/caddy-tls', variables('clipStorageName'))]",
+      "properties": {
+        "shareQuota": 1
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('deployMediaMtx')]",
+      "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+      "apiVersion": "2023-05-01",
+      "name": "[format('{0}/default/caddy-config', variables('clipStorageName'))]",
+      "properties": {
+        "shareQuota": 1
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('appName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]",
+        "configuration": {
+          "activeRevisionsMode": "[parameters('revisionMode')]",
+          "ingress": {
+            "external": true,
+            "targetPort": 8080,
+            "transport": "auto",
+            "allowInsecure": false,
+            "corsPolicy": {
+              "allowedOrigins": [
+                "*"
+              ],
+              "allowedMethods": [
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+                "OPTIONS"
+              ],
+              "allowedHeaders": [
+                "*"
+              ],
+              "allowCredentials": true
+            }
+          },
+          "secrets": [
+            {
+              "name": "acr-password",
+              "value": "[parameters('acrPassword')]"
+            },
+            {
+              "name": "video-clip-blob-connection-string",
+              "value": "[format('DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1};EndpointSuffix=core.windows.net', variables('clipStorageName'), listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName')), '2023-05-01').keys[0].value)]"
+            }
+          ],
+          "registries": [
+            {
+              "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), '2023-01-01-preview').loginServer]",
+              "username": "[parameters('acrUsername')]",
+              "passwordSecretRef": "acr-password"
+            }
+          ]
+        },
+        "template": {
+          "revisionSuffix": "[variables('revisionSuffixFinal')]",
+          "containers": [
+            {
+              "name": "notentapi",
+              "image": "[format('{0}/{1}:{2}', reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), '2023-01-01-preview').loginServer, parameters('appName'), parameters('appImageTag'))]",
+              "resources": {
+                "cpu": "[json('0.5')]",
+                "memory": "1.0Gi"
+              },
+              "env": [
+                {
+                  "name": "ENVIRONMENT",
+                  "value": "production"
+                },
+                {
+                  "name": "DEBUG",
+                  "value": "false"
+                },
+                {
+                  "name": "PORT",
+                  "value": "8080"
+                },
+                {
+                  "name": "DATABASE_URL",
+                  "value": "[variables('databaseUrl')]"
+                },
+                {
+                  "name": "SMTP_USERNAME",
+                  "value": "[parameters('smtpUsername')]"
+                },
+                {
+                  "name": "SMTP_PASSWORD",
+                  "value": "[parameters('smtpPassword')]"
+                },
+                {
+                  "name": "SMTP_FROM",
+                  "value": "[parameters('smtpFrom')]"
+                },
+                {
+                  "name": "DEFAULT_SAMPLE_FPS",
+                  "value": "3.0"
+                },
+                {
+                  "name": "INFER_QUEUE_MAX",
+                  "value": "8"
+                },
+                {
+                  "name": "CHANNEL_OUT_Q_MAX",
+                  "value": "4"
+                },
+                {
+                  "name": "PIPELINE_OUT_QUEUE_MAX",
+                  "value": "500"
+                },
+                {
+                  "name": "PENDING_KEY_MAX",
+                  "value": "1000"
+                },
+                {
+                  "name": "PIPELINE_LOG_EVERY_N_FRAMES",
+                  "value": "0"
+                },
+                {
+                  "name": "WEBRTC_ADMIN_API_URL",
+                  "value": "[parameters('webrtcAdminApiUrl')]"
+                },
+                {
+                  "name": "WEBRTC_PUBLIC_BASE_URL",
+                  "value": "[parameters('webrtcPublicBaseUrl')]"
+                },
+                {
+                  "name": "WEBRTC_ADMIN_API_KEY",
+                  "value": "[parameters('webrtcAdminApiKey')]"
+                },
+                {
+                  "name": "WEBRTC_ADMIN_UPSERT_PATH",
+                  "value": "[parameters('webrtcAdminUpsertPath')]"
+                },
+                {
+                  "name": "WEBRTC_ADMIN_UPDATE_PATH",
+                  "value": "[parameters('webrtcAdminUpdatePath')]"
+                },
+                {
+                  "name": "WEBRTC_ADMIN_DELETE_PATH",
+                  "value": "[parameters('webrtcAdminDeletePath')]"
+                },
+                {
+                  "name": "MTX_API_USER",
+                  "value": "[parameters('mediamtxApiUser')]"
+                },
+                {
+                  "name": "MTX_API_PASS",
+                  "value": "[parameters('mediamtxApiPass')]"
+                },
+                {
+                  "name": "VIDEO_CLIP_CAPTURE_ENABLED",
+                  "value": "true"
+                },
+                {
+                  "name": "VIDEO_CLIP_DURATION_S",
+                  "value": "120"
+                },
+                {
+                  "name": "VIDEO_CLIP_COOLDOWN_S",
+                  "value": "120"
+                },
+                {
+                  "name": "VIDEO_CLIP_MIN_DURATION_S",
+                  "value": "10"
+                },
+                {
+                  "name": "VIDEO_CLIP_SAS_TTL_HOURS",
+                  "value": "168"
+                },
+                {
+                  "name": "VIDEO_CLIP_HTTP_TIMEOUT_S",
+                  "value": "180"
+                },
+                {
+                  "name": "VIDEO_CLIP_BLOB_CONTAINER",
+                  "value": "[parameters('videoClipContainerName')]"
+                },
+                {
+                  "name": "MEDIAMTX_PLAYBACK_BASE_URL",
+                  "value": "[if(parameters('deployMediaMtx'), format('https://{0}/playback', variables('proxyHost')), '')]"
+                },
+                {
+                  "name": "VIDEO_CLIP_BLOB_CONNECTION_STRING",
+                  "secretRef": "video-clip-blob-connection-string"
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 3
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', split(format('{0}/default/{1}', variables('clipStorageName'), parameters('videoClipContainerName')), '/')[0], split(format('{0}/default/{1}', variables('clipStorageName'), parameters('videoClipContainerName')), '/')[1], split(format('{0}/default/{1}', variables('clipStorageName'), parameters('videoClipContainerName')), '/')[2])]",
+        "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]",
+        "[resourceId('Microsoft.DBforMySQL/flexibleServers/databases', variables('mysqlServerName'), parameters('mysqlDatabaseName'))]",
+        "[resourceId('Microsoft.DBforMySQL/flexibleServers/firewallRules', split(format('{0}/AllowAzureServices', variables('mysqlServerName')), '/')[0], split(format('{0}/AllowAzureServices', variables('mysqlServerName')), '/')[1])]",
+        "[resourceId('Microsoft.DBforMySQL/flexibleServers/configurations', split(format('{0}/require_secure_transport', variables('mysqlServerName')), '/')[0], split(format('{0}/require_secure_transport', variables('mysqlServerName')), '/')[1])]"
+      ]
+    },
+    {
+      "condition": "[parameters('deployMediaMtx')]",
+      "type": "Microsoft.ContainerInstance/containerGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[variables('mediamtxName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "osType": "Linux",
+        "restartPolicy": "Always",
+        "imageRegistryCredentials": [
+          {
+            "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), '2023-01-01-preview').loginServer]",
+            "username": "[parameters('acrUsername')]",
+            "password": "[parameters('acrPassword')]"
+          }
+        ],
+        "ipAddress": {
+          "type": "Public",
+          "dnsNameLabel": "[variables('mediamtxDns')]",
+          "ports": [
+            {
+              "port": 80,
+              "protocol": "TCP"
+            },
+            {
+              "port": 443,
+              "protocol": "TCP"
+            },
+            {
+              "port": 8189,
+              "protocol": "UDP"
+            }
+          ]
+        },
+        "volumes": [
+          {
+            "name": "cfg",
+            "secret": {
+              "mediamtx.yml": "[base64(variables('mediamtxYaml'))]"
+            }
+          },
+          {
+            "name": "caddy",
+            "secret": {
+              "Caddyfile": "[base64(variables('caddyfile'))]"
+            }
+          },
+          {
+            "name": "caddy-data",
+            "azureFile": {
+              "shareName": "caddy-tls",
+              "storageAccountName": "[variables('clipStorageName')]",
+              "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName')), '2023-05-01').keys[0].value]",
+              "readOnly": false
+            }
+          },
+          {
+            "name": "caddy-config",
+            "azureFile": {
+              "shareName": "caddy-config",
+              "storageAccountName": "[variables('clipStorageName')]",
+              "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName')), '2023-05-01').keys[0].value]",
+              "readOnly": false
+            }
+          }
+        ],
+        "containers": [
+          {
+            "name": "mediamtx",
+            "properties": {
+              "image": "[format('{0}/{1}:{2}', reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), '2023-01-01-preview').loginServer, parameters('mediamtxImageRepo'), parameters('mediamtxImageTag'))]",
+              "ports": [
+                {
+                  "port": 9996,
+                  "protocol": "TCP"
+                },
+                {
+                  "port": 8889,
+                  "protocol": "TCP"
+                },
+                {
+                  "port": 9997,
+                  "protocol": "TCP"
+                },
+                {
+                  "port": 8189,
+                  "protocol": "UDP"
+                }
+              ],
+              "resources": {
+                "requests": {
+                  "cpu": 2,
+                  "memoryInGB": "[json('4')]"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "cfg",
+                  "mountPath": "/cfg",
+                  "readOnly": true
+                }
+              ],
+              "command": [
+                "/mediamtx",
+                "/cfg/mediamtx.yml"
+              ]
+            }
+          },
+          {
+            "name": "caddy",
+            "properties": {
+              "image": "[format('{0}/{1}:{2}', reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), '2023-01-01-preview').loginServer, parameters('caddyImageRepo'), parameters('caddyImageTag'))]",
+              "ports": [
+                {
+                  "port": 80,
+                  "protocol": "TCP"
+                },
+                {
+                  "port": 443,
+                  "protocol": "TCP"
+                }
+              ],
+              "resources": {
+                "requests": {
+                  "cpu": "[json('0.5')]",
+                  "memoryInGB": "[json('1')]"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "caddy",
+                  "mountPath": "/etc/caddy",
+                  "readOnly": true
+                },
+                {
+                  "name": "caddy-data",
+                  "mountPath": "/data",
+                  "readOnly": false
+                },
+                {
+                  "name": "caddy-config",
+                  "mountPath": "/config",
+                  "readOnly": false
+                }
+              ],
+              "command": [
+                "caddy",
+                "run",
+                "--config",
+                "/etc/caddy/Caddyfile",
+                "--adapter",
+                "caddyfile",
+                "--resume"
+              ]
+            }
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', split(format('{0}/default/caddy-config', variables('clipStorageName')), '/')[0], split(format('{0}/default/caddy-config', variables('clipStorageName')), '/')[1], split(format('{0}/default/caddy-config', variables('clipStorageName')), '/')[2])]",
+        "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', split(format('{0}/default/caddy-tls', variables('clipStorageName')), '/')[0], split(format('{0}/default/caddy-tls', variables('clipStorageName')), '/')[1], split(format('{0}/default/caddy-tls', variables('clipStorageName')), '/')[2])]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "appUrl": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('appName')), '2023-05-01').configuration.ingress.fqdn]"
+    },
+    "mysqlServerName": {
+      "type": "string",
+      "value": "[variables('mysqlServerName')]"
+    },
+    "mysqlHost": {
+      "type": "string",
+      "value": "[variables('mysqlFqdn')]"
+    },
+    "mysqlDatabase": {
+      "type": "string",
+      "value": "[parameters('mysqlDatabaseName')]"
+    },
+    "mediamtxFqdn": {
+      "type": "string",
+      "value": "[if(parameters('deployMediaMtx'), variables('proxyHost'), '')]"
+    },
+    "mediamtxHttpsBase": {
+      "type": "string",
+      "value": "[if(parameters('deployMediaMtx'), format('https://{0}', variables('proxyHost')), '')]"
+    },
+    "mediamtxPlaybackUrl": {
+      "type": "string",
+      "value": "[if(parameters('deployMediaMtx'), format('https://{0}/playback', variables('proxyHost')), '')]"
+    },
+    "mediamtxWebrtcBase": {
+      "type": "string",
+      "value": "[if(parameters('deployMediaMtx'), format('https://{0}', variables('proxyHost')), '')]"
+    },
+    "mediamtxRecordingPath": {
+      "type": "string",
+      "value": "/recordings/<stream_key>/<YYYY-MM-DD_HH-MM-SS>"
+    },
+    "clipStorageAccount": {
+      "type": "string",
+      "value": "[variables('clipStorageName')]"
+    },
+    "clipBlobContainer": {
+      "type": "string",
+      "value": "[parameters('videoClipContainerName')]"
+    }
+  }
+}

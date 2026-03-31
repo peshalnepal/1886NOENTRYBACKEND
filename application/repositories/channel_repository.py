@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from application.channels.channel_config import VideoChannelConfig
 from core.database_orm import (
     Camera,
     CameraDevice,
@@ -208,11 +209,8 @@ class ChannelRepository:
         if tz is not None:
             cfg_json["timezone"] = tz
 
-        # mirror one default window into ORM scalar columns
-        first_window = schedule[0]
-        scalar_day = int(first_window["day_of_week"])
-        scalar_start = self._coerce_time(first_window["start_time"], DEFAULT_START_TIME)
-        scalar_end = self._coerce_time(first_window["end_time"], DEFAULT_END_TIME)
+        # Keep legacy scalar schedule columns populated with a valid same-day segment.
+        scalar_day, scalar_start, scalar_end = self._scalar_schedule_window(schedule)
 
         await self._upsert_channel_configuration(
             db,
@@ -253,10 +251,7 @@ class ChannelRepository:
         )
         incoming_config["schedule"] = schedule
 
-        first_window = schedule[0]
-        scalar_day = int(first_window["day_of_week"])
-        scalar_start = self._coerce_time(first_window["start_time"], DEFAULT_START_TIME)
-        scalar_end = self._coerce_time(first_window["end_time"], DEFAULT_END_TIME)
+        scalar_day, scalar_start, scalar_end = self._scalar_schedule_window(schedule)
 
         row = (
             await db.execute(select(SiteSettings).where(SiteSettings.site_uuid == site_uuid))
@@ -509,22 +504,8 @@ class ChannelRepository:
         is_enabled: bool,
     ) -> List[Dict[str, Any]]:
         if raw_schedule:
-            normalized: List[Dict[str, Any]] = []
-            for item in raw_schedule:
-                day = int(item["day_of_week"])
-                start_val = self._coerce_time(item.get("start_time"), DEFAULT_START_TIME)
-                end_val = self._coerce_time(item.get("end_time"), DEFAULT_END_TIME)
-
-                normalized.append(
-                    {
-                        "day_of_week": day,
-                        "day_name": DAY_NAME_BY_VALUE[day],
-                        "start_time": start_val.strftime("%H:%M:%S"),
-                        "end_time": end_val.strftime("%H:%M:%S"),
-                        "is_enabled": bool(item.get("is_enabled", True)),
-                    }
-                )
-            return self._sort_schedule_sunday_first(normalized)
+            normalized = VideoChannelConfig.normalize_schedule(raw_schedule)
+            return normalized or self._default_weekly_schedule()
 
         selected_days = SUNDAY_TO_SATURDAY if day_of_week is None else day_of_week
         st = self._coerce_time(start_time, DEFAULT_START_TIME)
@@ -545,6 +526,30 @@ class ChannelRepository:
     def _sort_schedule_sunday_first(self, schedule: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         order_index = {day: idx for idx, day in enumerate(SUNDAY_TO_SATURDAY)}
         return sorted(schedule, key=lambda x: order_index.get(int(x["day_of_week"]), 999))
+
+    def _scalar_schedule_window(self, schedule: List[Dict[str, Any]]) -> Tuple[int, time, time]:
+        for window in schedule or []:
+            day = int(window["day_of_week"])
+            start_time = self._coerce_time(window.get("start_time"), DEFAULT_START_TIME)
+            end_time = self._coerce_time(window.get("end_time"), DEFAULT_END_TIME)
+            if start_time < end_time:
+                return day, start_time, end_time
+
+        if not schedule:
+            return 6, DEFAULT_START_TIME, DEFAULT_END_TIME
+
+        first_window = schedule[0]
+        day = int(first_window["day_of_week"])
+        start_time = self._coerce_time(first_window.get("start_time"), DEFAULT_START_TIME)
+        end_time = self._coerce_time(first_window.get("end_time"), DEFAULT_END_TIME)
+
+        if start_time < DEFAULT_END_TIME:
+            return day, start_time, DEFAULT_END_TIME
+
+        if end_time > DEFAULT_START_TIME:
+            return (day + 1) % 7, DEFAULT_START_TIME, end_time
+
+        return day, DEFAULT_START_TIME, DEFAULT_END_TIME
 
     def _coerce_time(self, value: Any, default: time) -> time:
         if value is None:

@@ -356,6 +356,7 @@ class EventClipService:
             )
             db.add(row)
             await db.commit()
+            await db.refresh()
 
     async def capture_pre_event_clip(
         self,

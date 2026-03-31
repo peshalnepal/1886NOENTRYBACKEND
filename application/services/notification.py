@@ -29,6 +29,7 @@ from application.repositories.notification_repository import (
     SitePrerecordSettings,
     dt_from_ts_ms,
 )
+from application.services.alert_image_storage import AlertImageStorageService
 from application.services.clip_storage import EventClipService
 
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
@@ -98,6 +99,7 @@ class NotificationMessage(BaseModel):
     camera_name: Optional[str] = None
     roi_id: Optional[str] = None
     track_id: Optional[int] = None
+    image_url: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -520,6 +522,7 @@ class NotificationService:
         notify_on_confirmed: bool = False,
         notify_on_roi_enter: bool = True,
         clip_service: Optional[EventClipService] = None,
+        image_service: Optional[AlertImageStorageService] = None,
     ):
         self.hub = hub
         self.email = email
@@ -557,6 +560,7 @@ class NotificationService:
         self._buffer_max_age_s = _env_float("NOTIFICATION_BUFFER_MAX_AGE_S", 60.0, minimum=1.0)
         self._buffer_poll_s = _env_float("NOTIFICATION_BUFFER_POLL_S", 1.0, minimum=0.2)
         self._clip_service = clip_service or EventClipService()
+        self._image_service = image_service or AlertImageStorageService()
 
     def set_session_factory(self, session_factory):
         self._session_factory = session_factory
@@ -617,6 +621,45 @@ class NotificationService:
                 await clip_service.close()
             except Exception:
                 logger.exception("Event clip service shutdown failed")
+        image_service = self._image_service
+        if image_service is not None:
+            try:
+                await image_service.close()
+            except Exception:
+                logger.exception("Alert image service shutdown failed")
+
+    async def _materialize_alert_image_payload(
+        self,
+        *,
+        msg: NotificationMessage,
+        extra_payload: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
+        payload = dict(extra_payload or {})
+        image_url = str(payload.get("image_url") or msg.image_url or "").strip()
+        if not image_url:
+            return payload, msg.image_url, None
+
+        image_service = self._image_service
+        if image_service is None:
+            return payload, image_url, str(payload.get("image_storage_key") or "").strip() or None
+
+        if not image_url.startswith("data:"):
+            return payload, image_url, str(payload.get("image_storage_key") or "").strip() or None
+
+        stored = await image_service.store_image_data_url(
+            image_data_url=image_url,
+            camera_uuid=str(msg.camera_uuid),
+            ts_ms=int(msg.ts_ms),
+        )
+        if not stored:
+            return payload, image_url, None
+
+        stored_url = str(stored.get("image_url") or "").strip() or image_url
+        stored_key = str(stored.get("image_storage_key") or "").strip() or None
+        payload["image_url"] = stored_url
+        if stored_key:
+            payload["image_storage_key"] = stored_key
+        return payload, stored_url, stored_key
 
     def _site_prerecord_clip_payload(
         self,
@@ -927,6 +970,15 @@ class NotificationService:
         site_groups: Dict[uuid.UUID, List[int]] = defaultdict(list)
         create_rows: List[Dict[str, Any]] = []
         for idx, item in enumerate(items):
+            stored_extra_payload, stored_image_url, stored_image_key = await self._materialize_alert_image_payload(
+                msg=item.msg,
+                extra_payload=item.extra_payload,
+            )
+            msg_payload = item.msg.model_dump()
+            if stored_image_url:
+                msg_payload["image_url"] = stored_image_url
+            if stored_image_key:
+                msg_payload["image_storage_key"] = stored_image_key
             site_groups[item.ctx.site_uuid].append(idx)
             create_rows.append(
                 {
@@ -939,8 +991,8 @@ class NotificationService:
                     "message": item.msg.body,
                     "payload": _json_safe(
                         {
-                            "msg": item.msg.model_dump(),
-                            "extra": item.extra_payload or {},
+                            "msg": msg_payload,
+                            "extra": stored_extra_payload,
                         }
                     ),
                     "detected_at": dt_from_ts_ms(item.msg.ts_ms),
@@ -1196,6 +1248,7 @@ class NotificationService:
         camera_mode: CameraMode,
         frame_w: Optional[int] = None,
         frame_h: Optional[int] = None,
+        extra_payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not camera_mode.notification_enabled or not camera_mode.detection_enabled:
             return
@@ -1216,6 +1269,7 @@ class NotificationService:
         site_uuid_str = str(ctx.site_uuid)
         device_name = ctx.device_name
         camera_name = ctx.camera_name
+        image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
 
         # -------------------------
         # Tracking path
@@ -1267,17 +1321,22 @@ class NotificationService:
                         track_id=int(track_id),
                         device_name=device_name,
                         camera_name=camera_name,
+                        image_url=image_url,
                     )
 
                     await self.hub.publish(msg)
 
                     self._fire_and_forget(
                         self._persist_and_send(
-                            msg,
-                            ctx,
-                            extra_payload={"track": _json_safe(tr), "event": "track_confirmed"},
+                                msg,
+                                ctx,
+                                extra_payload={
+                                    **(extra_payload or {}),
+                                    "track": _json_safe(tr),
+                                    "event": "track_confirmed",
+                                },
+                            )
                         )
-                    )
 
             # B) notify-on-ROI-enter
             if self.notify_on_roi_enter:
@@ -1311,6 +1370,7 @@ class NotificationService:
                             track_id=int(a["track_id"]),
                             device_name=device_name,
                             camera_name=camera_name,
+                            image_url=image_url,
                         )
 
                         await self.hub.publish(msg)
@@ -1319,7 +1379,11 @@ class NotificationService:
                             self._persist_and_send(
                                 msg,
                                 ctx,
-                                extra_payload={"alert": _json_safe(a), "event": "roi_enter"},
+                                extra_payload={
+                                    **(extra_payload or {}),
+                                    "alert": _json_safe(a),
+                                    "event": "roi_enter",
+                                },
                             )
                         )
 
@@ -1354,6 +1418,7 @@ class NotificationService:
             max_conf=float(max_conf),
             device_name=device_name,
             camera_name=camera_name,
+            image_url=image_url,
         )
 
         await self.hub.publish(msg)
@@ -1363,6 +1428,7 @@ class NotificationService:
                 msg,
                 ctx,
                 extra_payload={
+                    **(extra_payload or {}),
                     "detections": _json_safe(
                         [
                             {

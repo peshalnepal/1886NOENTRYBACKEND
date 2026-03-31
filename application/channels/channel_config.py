@@ -123,28 +123,15 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
         seen = set()
         order_index = {day: idx for idx, day in enumerate(SUNDAY_TO_SATURDAY)}
 
-        for item in raw_schedule:
-            if not isinstance(item, dict):
-                continue
-            try:
-                day = int(item.get("day_of_week"))
-            except (TypeError, ValueError):
-                continue
-            if day < 0 or day > 6:
-                continue
+        day_start = dt_time(0, 0, 0)
+        day_end = dt_time(23, 59, 59)
 
-            try:
-                start_time = _coerce_schedule_time(item.get("start_time"), DEFAULT_START_TIME)
-                end_time = _coerce_schedule_time(item.get("end_time"), DEFAULT_END_TIME)
-            except ValueError:
-                continue
-            if start_time >= end_time:
-                continue
-
-            enabled = bool(item.get("is_enabled", True))
+        def add_window(day: int, start_time: dt_time, end_time: dt_time, enabled: bool) -> None:
+            if start_time == end_time:
+                return
             signature = (day, start_time.isoformat(), end_time.isoformat(), enabled)
             if signature in seen:
-                continue
+                return
             seen.add(signature)
 
             normalized.append(
@@ -157,8 +144,47 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
                 }
             )
 
-        return sorted(normalized, key=lambda item: order_index.get(int(item["day_of_week"]), 999))
+        for item in raw_schedule:
+            if not isinstance(item, dict):
+                continue
 
+            try:
+                day = int(item.get("day_of_week"))
+            except (TypeError, ValueError):
+                continue
+
+            if day < 0 or day > 6:
+                continue
+
+            try:
+                start_time = _coerce_schedule_time(
+                    item.get("start_time"), DEFAULT_START_TIME
+                )
+                end_time = _coerce_schedule_time(
+                    item.get("end_time"), DEFAULT_END_TIME
+                )
+            except ValueError:
+                continue
+
+            enabled = bool(item.get("is_enabled", True))
+
+            # Normal same-day window
+            if start_time < end_time:
+                add_window(day, start_time, end_time, enabled)
+                continue
+
+            # Overnight window, e.g. 18:00:00 -> 06:00:00
+            next_day = (day + 1) % 7
+            add_window(day, start_time, day_end, enabled)
+            add_window(next_day, day_start, end_time, enabled)
+
+        return sorted(
+            normalized,
+            key=lambda item: (
+                order_index.get(int(item["day_of_week"]), 999),
+                item["start_time"],
+            ),
+        )
     @staticmethod
     def schedule_is_active(
         raw_schedule: Any,
@@ -186,10 +212,26 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
         for window in schedule:
             if not bool(window.get("is_enabled", True)):
                 continue
-            if int(window.get("day_of_week", -1)) != local_day:
+            try:
+                window_day = int(window.get("day_of_week", -1))
+            except (TypeError, ValueError):
                 continue
-            start_time = _coerce_schedule_time(window.get("start_time"), DEFAULT_START_TIME)
-            end_time = _coerce_schedule_time(window.get("end_time"), DEFAULT_END_TIME)
+
+            if window_day != local_day:
+                continue
+
+            try:
+                start_time = _coerce_schedule_time(
+                    window.get("start_time"), DEFAULT_START_TIME
+                )
+                end_time = _coerce_schedule_time(
+                    window.get("end_time"), DEFAULT_END_TIME
+                )
+            except ValueError:
+                continue
+
+            if start_time == end_time:
+                continue
             if start_time <= local_time < end_time:
                 return True
 

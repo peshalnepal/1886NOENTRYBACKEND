@@ -14,8 +14,14 @@ from sqlalchemy import and_, desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
+from application.channels.channel_config import VideoChannelConfig
+from application.services.alert_image_storage import (
+    AlertImageStorageService,
+    extract_image_storage_key,
+    strip_image_fields,
+)
 from application.services.notification import CameraMode, WebNotificationHub
-from core.database_orm import Camera, Notification, User
+from core.database_orm import Camera, ChannelConfiguration, Notification, Site, SiteSettings, User
 from core.security.tokens import decode_access_token
 from dependencies import get_current_user
 from domain.events import DetectionBox, DetectionItem, DetectionsProducedEvent
@@ -125,6 +131,7 @@ class AlertRequest(BaseModel):
     frame_seq: int
     frame_w: Optional[int] = None
     frame_h: Optional[int] = None
+    image_url: Optional[str] = None
     detections: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -167,6 +174,60 @@ def _session_factory_from_app(request: Request):
         return sf
     svc = getattr(request.app.state, "notification_service", None)
     return getattr(svc, "_session_factory", None)
+
+
+def _config_dict(raw: Any) -> Dict[str, Any]:
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _camera_mode_with_schedule(
+    *,
+    enabled: Any,
+    detection_enabled: Any,
+    notification_enabled: Any,
+    use_site_schedule: Any,
+    camera_config: Any,
+    camera_timezone: Optional[str],
+    site_config: Any,
+    site_timezone: Optional[str],
+    now_utc: Optional[datetime] = None,
+) -> CameraMode:
+    camera_cfg = _config_dict(camera_config)
+    site_cfg = _config_dict(site_config)
+    inherited = bool(use_site_schedule)
+
+    if inherited:
+        schedule = VideoChannelConfig.normalize_schedule(site_cfg.get("schedule"))
+        timezone_name = str(
+            site_cfg.get("timezone")
+            or site_timezone
+            or camera_cfg.get("timezone")
+            or camera_timezone
+            or "UTC"
+        )
+    else:
+        schedule = VideoChannelConfig.normalize_schedule(camera_cfg.get("schedule"))
+        timezone_name = str(
+            camera_cfg.get("timezone")
+            or camera_timezone
+            or site_cfg.get("timezone")
+            or site_timezone
+            or "UTC"
+        )
+
+    if not schedule:
+        schedule = VideoChannelConfig.default_schedule()
+
+    schedule_active = VideoChannelConfig.schedule_is_active(
+        schedule,
+        timezone_name,
+        now_utc=now_utc or datetime.now(timezone.utc),
+    )
+
+    return CameraMode(
+        detection_enabled=bool(enabled and detection_enabled and schedule_active),
+        notification_enabled=bool(enabled and notification_enabled and schedule_active),
+    )
 
 
 @router.post("/alert")
@@ -217,14 +278,40 @@ async def receive_alert(payload: AlertRequest, request: Request):
                         Camera.is_enabled,
                         Camera.is_detection_enabled,
                         Camera.is_notification_enabled,
-                    ).where(Camera.camera_uuid == cam_uuid_obj)  # FIX: UUID-to-UUID compare
+                        Camera.use_site_schedule,
+                        ChannelConfiguration.configuration,
+                        ChannelConfiguration.timezone,
+                        SiteSettings.config,
+                        Site.timezone,
+                    )
+                    .select_from(Camera)
+                    .outerjoin(ChannelConfiguration, ChannelConfiguration.camera_uuid == Camera.camera_uuid)
+                    .outerjoin(Site, Site.site_uuid == Camera.site_uuid)
+                    .outerjoin(SiteSettings, SiteSettings.site_uuid == Camera.site_uuid)
+                    .where(Camera.camera_uuid == cam_uuid_obj)
                 )
                 row = res.first()
                 if row:
-                    enabled, det_enabled, notif_enabled = row
-                    mode = CameraMode(
-                        detection_enabled=bool(enabled and det_enabled),
-                        notification_enabled=bool(enabled and notif_enabled),
+                    (
+                        enabled,
+                        det_enabled,
+                        notif_enabled,
+                        use_site_schedule,
+                        camera_config,
+                        camera_timezone,
+                        site_config,
+                        site_timezone,
+                    ) = row
+                    mode = _camera_mode_with_schedule(
+                        enabled=enabled,
+                        detection_enabled=det_enabled,
+                        notification_enabled=notif_enabled,
+                        use_site_schedule=use_site_schedule,
+                        camera_config=camera_config,
+                        camera_timezone=camera_timezone,
+                        site_config=site_config,
+                        site_timezone=site_timezone,
+                        now_utc=datetime.now(timezone.utc),
                     )
         except Exception:
             # If DB lookup fails, don’t hard fail ingest; just default to True.
@@ -236,6 +323,9 @@ async def receive_alert(payload: AlertRequest, request: Request):
         camera_mode=mode,
         frame_w=payload.frame_w,
         frame_h=payload.frame_h,
+        extra_payload={
+            "image_url": str(payload.image_url).strip(),
+        } if str(payload.image_url or "").strip() else None,
     )
 
     return {"ok": True}
@@ -414,35 +504,49 @@ async def delete_notifications(
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid camera_uuid")
 
-    async with sf() as db:
-        conds = [Notification.user_id == int(user.id)]
-        if su:
-            conds.append(Notification.site_uuid == su)
-        if cu:
-            conds.append(Notification.camera_uuid == cu)
-        if payload.notification_ids:
-            ids: List[int] = []
-            for raw_id in payload.notification_ids:
-                try:
-                    parsed = int(raw_id)
-                except Exception:
-                    continue
-                if parsed > 0:
-                    ids.append(parsed)
-            ids = sorted(set(ids))
-            if not ids:
-                return {"ok": True, "deleted": 0}
-            conds.append(Notification.id.in_(ids))
+    image_service = AlertImageStorageService()
+    try:
+        async with sf() as db:
+            conds = [Notification.user_id == int(user.id)]
+            if su:
+                conds.append(Notification.site_uuid == su)
+            if cu:
+                conds.append(Notification.camera_uuid == cu)
+            if payload.notification_ids:
+                ids: List[int] = []
+                for raw_id in payload.notification_ids:
+                    try:
+                        parsed = int(raw_id)
+                    except Exception:
+                        continue
+                    if parsed > 0:
+                        ids.append(parsed)
+                ids = sorted(set(ids))
+                if not ids:
+                    return {"ok": True, "deleted": 0}
+                conds.append(Notification.id.in_(ids))
 
-        stmt = (
-            update(Notification)
-            .where(and_(*conds))
-            .values(visible=False)
-        )
-        res = await db.execute(stmt)        
-        await db.commit()
+            rows = (
+                await db.execute(
+                    select(Notification).where(and_(*conds))
+                )
+            ).scalars().all()
 
-    return {"ok": True, "deleted": int(getattr(res, "rowcount", 0) or 0)}
+            for row in rows:
+                storage_key = extract_image_storage_key(getattr(row, "payload", None))
+                if storage_key:
+                    try:
+                        await image_service.delete_blob(blob_name=storage_key)
+                    except Exception:
+                        pass
+                row.payload = strip_image_fields(row.payload)
+                row.visible = False
+
+            await db.commit()
+    finally:
+        await image_service.close()
+
+    return {"ok": True, "deleted": len(rows)}
 
 
 def _as_utc(dt: datetime) -> datetime:

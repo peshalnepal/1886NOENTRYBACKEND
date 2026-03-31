@@ -1,5 +1,6 @@
 # simple_model_pipeline.py  (Python 3.6)
 import asyncio
+import base64
 import logging
 import threading
 import queue
@@ -17,6 +18,35 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 _DONE = object()
+
+
+def _encode_thumbnail_data_url(frame_bgr, *, max_edge: int = 200, jpeg_quality: int = 60) -> Optional[str]:
+    if frame_bgr is None:
+        return None
+
+    try:
+        import cv2
+
+        height, width = frame_bgr.shape[:2]
+        if height <= 0 or width <= 0:
+            return None
+
+        scale = min(float(max_edge) / float(max(height, width)), 1.0)
+        thumb = frame_bgr
+        if scale < 1.0:
+            thumb = cv2.resize(
+                frame_bgr,
+                (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        ok, encoded = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+        if not ok:
+            return None
+
+        return f"data:image/jpeg;base64,{base64.b64encode(encoded.tobytes()).decode('ascii')}"
+    except Exception:
+        return None
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -511,6 +541,9 @@ class SimpleInferencePipeline(object):
                             alert_payload["frame_w"] = int(frame_w)
                         if frame_h is not None:
                             alert_payload["frame_h"] = int(frame_h)
+                        image_url = _encode_thumbnail_data_url(bgr)
+                        if image_url:
+                            alert_payload["image_url"] = image_url
                         loop.run_in_executor(None, _send_alert, notify_url, alert_payload)
 
                 async with self._latest_lock:

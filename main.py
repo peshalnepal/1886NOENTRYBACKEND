@@ -20,6 +20,7 @@ from core.database import db_manager, async_engine
 from application.services.manager import Manager  # adjust if your path is different
 from application.models.yolo_config import YoloModelConfig
 from application.services.notification import WebNotificationHub, NotificationService, EmailNotifier, EmailConfig
+from application.services.retention import RetentionService
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,9 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL") or os.environ.get("SMTP_FROM", "noreply@1886noentry.com")
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "")
 RECONCILE_INTERVAL_S = max(0, int(os.environ.get("EDGE_RECONCILE_INTERVAL_S", "30")))
+RETENTION_CLEANUP_INTERVAL_S = max(0, int(os.environ.get("RETENTION_CLEANUP_INTERVAL_S", "3600")))
+CLIP_RETENTION_DAYS = max(0, int(os.environ.get("CLIP_RETENTION_DAYS", "30")))
+ALERT_RETENTION_DAYS = max(0, int(os.environ.get("ALERT_RETENTION_DAYS", "15")))
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -72,6 +76,30 @@ async def _edge_reconcile_loop(app: FastAPI) -> None:
         await asyncio.sleep(float(RECONCILE_INTERVAL_S))
 
 
+async def _retention_cleanup_loop(app: FastAPI) -> None:
+    svc = app.state.retention_service
+    while True:
+        try:
+            summary = await svc.purge(
+                clip_retention_days=CLIP_RETENTION_DAYS,
+                alert_retention_days=ALERT_RETENTION_DAYS,
+            )
+            if summary.get("clips_deleted") or summary.get("alerts_deleted"):
+                logger.info(
+                    "Retention cleanup removed clips=%s alerts=%s",
+                    summary.get("clips_deleted", 0),
+                    summary.get("alerts_deleted", 0),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Retention cleanup loop failed")
+
+        if RETENTION_CLEANUP_INTERVAL_S <= 0:
+            return
+        await asyncio.sleep(float(RETENTION_CLEANUP_INTERVAL_S))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -109,6 +137,7 @@ async def lifespan(app: FastAPI):
     app.state.notification_hub = hub
     app.state.notification_service = svc
     app.state.manager.set_notification_service(svc)
+    app.state.retention_service = RetentionService(session_factory=SessionLocal)
 
     pipeline_startup = await app.state.manager.start_background_pipelines()
     app.state.pipeline_startup = pipeline_startup
@@ -125,6 +154,10 @@ async def lifespan(app: FastAPI):
         )
 
     app.state.edge_reconcile_task = asyncio.create_task(_edge_reconcile_loop(app), name="edge_reconcile_loop")
+    app.state.retention_cleanup_task = asyncio.create_task(
+        _retention_cleanup_loop(app),
+        name="retention_cleanup_loop",
+    )
 
     yield
     # Shutdown
@@ -138,6 +171,15 @@ async def lifespan(app: FastAPI):
                 pass
             except Exception:
                 logger.exception("Edge reconcile task shutdown failed")
+        retention_task = getattr(app.state, "retention_cleanup_task", None)
+        if retention_task:
+            retention_task.cancel()
+            try:
+                await retention_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Retention cleanup task shutdown failed")
     finally:
         try:
             if hasattr(app.state, "manager") and app.state.manager:
@@ -150,6 +192,12 @@ async def lifespan(app: FastAPI):
                 await svc.shutdown()
         except Exception:
             logger.exception("Notification service shutdown failed")
+        try:
+            retention_svc = getattr(app.state, "retention_service", None)
+            if retention_svc is not None and hasattr(retention_svc, "close"):
+                await retention_svc.close()
+        except Exception:
+            logger.exception("Retention service shutdown failed")
 
 app = FastAPI(debug=DEBUG, lifespan=lifespan)
 
