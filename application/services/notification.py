@@ -1365,52 +1365,60 @@ class NotificationService:
 
             # B) notify-on-ROI-enter
             if self.notify_on_roi_enter:
-                if frame_w is None or frame_h is None:
-                    return
-
                 rois = await self._get_rois(cam)
                 if rois:
-                    alerts = self._roi_engine.process(
-                        camera_uuid=cam,
-                        tracks=tracks,
-                        rois=rois,
-                        frame_w=int(frame_w),
-                        frame_h=int(frame_h),
-                        ts_ms=ts_ms,
-                    )
-                    for a in alerts:
-                        msg = NotificationMessage(
-                            user_id=int(ctx.user_id),
-                            id=f"{cam}-trk{a['track_id']}-roi{a['roi_id']}-{ts_ms}",
-                            ts_ms=ts_ms,
+                    # Use frame dims from the alert payload; fall back to the dimensions
+                    # recorded when the ROI polygon was drawn (stored on the ROI itself).
+                    eff_frame_w = frame_w if frame_w is not None else rois[0].frame_w
+                    eff_frame_h = frame_h if frame_h is not None else rois[0].frame_h
+                    if eff_frame_w is None or eff_frame_h is None:
+                        logger.warning(
+                            "Skipping ROI check: no frame dimensions available camera=%s "
+                            "(send frame_w/frame_h in the alert payload or store them when drawing the ROI)",
+                            cam,
+                        )
+                    else:
+                        roi_alerts = self._roi_engine.process(
                             camera_uuid=cam,
-                            site_uuid=site_uuid_str,
-                            site_name=site_name,
-                            title=f"ROI Enter: {a['cls_name']}",
-                            body=f"{a['cls_name']} entered ROI={a['roi_id']} (track_id={a['track_id']})",
-                            alert_type="roi_enter",
-                            cls_names=[a["cls_name"]],
-                            max_conf=float(a["conf"]),
-                            roi_id=str(a["roi_id"]),
-                            track_id=int(a["track_id"]),
-                            device_name=device_name,
-                            camera_name=camera_name,
-                            image_url=image_url,
+                            tracks=tracks,
+                            rois=rois,
+                            frame_w=int(eff_frame_w),
+                            frame_h=int(eff_frame_h),
+                            ts_ms=ts_ms,
                         )
-
-                        await self.hub.publish(msg)
-
-                        self._fire_and_forget(
-                            self._persist_and_send(
-                                msg,
-                                ctx,
-                                extra_payload={
-                                    **(extra_payload or {}),
-                                    "alert": _json_safe(a),
-                                    "event": "roi_enter",
-                                },
+                        for a in roi_alerts:
+                            msg = NotificationMessage(
+                                user_id=int(ctx.user_id),
+                                id=f"{cam}-trk{a['track_id']}-roi{a['roi_id']}-{ts_ms}",
+                                ts_ms=ts_ms,
+                                camera_uuid=cam,
+                                site_uuid=site_uuid_str,
+                                site_name=site_name,
+                                title=f"ROI Enter: {a['cls_name']}",
+                                body=f"{a['cls_name']} entered ROI={a['roi_id']} (track_id={a['track_id']})",
+                                alert_type="roi_enter",
+                                cls_names=[a["cls_name"]],
+                                max_conf=float(a["conf"]),
+                                roi_id=str(a["roi_id"]),
+                                track_id=int(a["track_id"]),
+                                device_name=device_name,
+                                camera_name=camera_name,
+                                image_url=image_url,
                             )
-                        )
+
+                            await self.hub.publish(msg)
+
+                            self._fire_and_forget(
+                                self._persist_and_send(
+                                    msg,
+                                    ctx,
+                                    extra_payload={
+                                        **(extra_payload or {}),
+                                        "alert": _json_safe(a),
+                                        "event": "roi_enter",
+                                    },
+                                )
+                            )
 
             return
 

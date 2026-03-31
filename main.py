@@ -131,8 +131,11 @@ async def lifespan(app: FastAPI):
     email_notifier = EmailNotifier(email_cfg)
     
     # Create notification service with session factory for DB lookups
-    svc = NotificationService(hub=hub, email=email_notifier)
-    svc.set_session_factory(SessionLocal)  # Enable DB lookups for ROI and emails 
+    # NOTIFY_ON_CONFIRMED=true → emit "item_detected" alerts when a track is confirmed.
+    #   Needed for trigger_mode="any_detection" prerecording to fire without a configured ROI.
+    notify_on_confirmed = _env_bool("NOTIFY_ON_CONFIRMED", False)
+    svc = NotificationService(hub=hub, email=email_notifier, notify_on_confirmed=notify_on_confirmed)
+    svc.set_session_factory(SessionLocal)  # Enable DB lookups for ROI and emails
 
     app.state.notification_hub = hub
     app.state.notification_service = svc

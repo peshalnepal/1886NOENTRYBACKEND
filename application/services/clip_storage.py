@@ -103,7 +103,35 @@ class EventClipService:
         self.playback_base_url = (os.getenv("MEDIAMTX_PLAYBACK_BASE_URL") or "").strip().rstrip("/")
         self.connection_string = (os.getenv("VIDEO_CLIP_BLOB_CONNECTION_STRING") or "").strip()
         self.container_name = (os.getenv("VIDEO_CLIP_BLOB_CONTAINER") or "event-clips").strip() or "event-clips"
-        self.enabled = bool(self.playback_base_url and self.connection_string)
+
+        # Read optional overrides from env (fallback to class constants)
+        capture_enabled_raw = os.getenv("VIDEO_CLIP_CAPTURE_ENABLED", "").strip().lower()
+        capture_enabled = capture_enabled_raw not in {"0", "false", "no", "off"} if capture_enabled_raw else True
+        self.enabled = bool(capture_enabled and self.playback_base_url and self.connection_string)
+
+        try:
+            self.CLIP_DURATION_S = int(os.getenv("VIDEO_CLIP_DURATION_S") or self.CLIP_DURATION_S)
+        except (ValueError, TypeError):
+            pass
+        try:
+            self.COOLDOWN_S = float(os.getenv("VIDEO_CLIP_COOLDOWN_S") or self.COOLDOWN_S)
+        except (ValueError, TypeError):
+            pass
+        try:
+            self.MINIMUM_DURATION_S = int(os.getenv("VIDEO_CLIP_MIN_DURATION_S") or self.MINIMUM_DURATION_S)
+        except (ValueError, TypeError):
+            pass
+        try:
+            self.SAS_TTL_HOURS = int(os.getenv("VIDEO_CLIP_SAS_TTL_HOURS") or self.SAS_TTL_HOURS)
+        except (ValueError, TypeError):
+            pass
+        raw_fmt = (os.getenv("VIDEO_CLIP_DOWNLOAD_FORMAT") or "").strip().lower()
+        if raw_fmt:
+            self.DOWNLOAD_FORMAT = raw_fmt
+        try:
+            self.HTTP_TIMEOUT_S = float(os.getenv("VIDEO_CLIP_HTTP_TIMEOUT_S") or self.HTTP_TIMEOUT_S)
+        except (ValueError, TypeError):
+            pass
 
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(self.HTTP_TIMEOUT_S, connect=min(10.0, self.HTTP_TIMEOUT_S))
@@ -356,7 +384,7 @@ class EventClipService:
             )
             db.add(row)
             await db.commit()
-            await db.refresh()
+            await db.refresh(row)
 
     async def capture_pre_event_clip(
         self,
