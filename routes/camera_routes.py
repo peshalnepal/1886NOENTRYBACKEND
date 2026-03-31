@@ -7,8 +7,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,6 +75,65 @@ def _session_factory_from_app(request: Request):
     if sf is not None:
         return sf
     return getattr(db_manager, "AsyncSessionLocal", None)
+
+
+def _device_snapshot_urls(device_url: str, camera_uuid: uuid.UUID) -> List[str]:
+    base = str(device_url or "").rstrip("/")
+    camera_id = str(camera_uuid)
+
+    urls = [f"{base}/cameras/{camera_id}/snapshot.jpg"]
+    if not base.endswith("/api"):
+        urls.insert(0, f"{base}/api/cameras/{camera_id}/snapshot.jpg")
+    return urls
+
+
+async def _fetch_device_snapshot(*, device_url: str, camera_uuid: uuid.UUID) -> Response:
+    urls = _device_snapshot_urls(device_url, camera_uuid)
+    timeout = httpx.Timeout(8.0, connect=3.0, read=8.0, write=5.0, pool=5.0)
+    last_error: Optional[str] = None
+    saw_not_found = False
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        for url in urls:
+            try:
+                upstream = await client.get(
+                    url,
+                    headers={"Accept": "image/jpeg,image/*;q=0.9,*/*;q=0.1"},
+                )
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Jetson snapshot unavailable: {type(exc).__name__}",
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Jetson snapshot request failed: {type(exc).__name__}",
+                ) from exc
+
+            if upstream.status_code == 404:
+                saw_not_found = True
+                last_error = "No snapshot available yet on Jetson."
+                continue
+
+            if upstream.status_code >= 400:
+                last_error = f"Jetson snapshot request failed with status {upstream.status_code}."
+                continue
+
+            content_type = str(upstream.headers.get("content-type") or "image/jpeg").split(";", 1)[0].strip() or "image/jpeg"
+            if not content_type.startswith("image/"):
+                content_type = "image/jpeg"
+
+            return Response(
+                content=upstream.content,
+                media_type=content_type,
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+            )
+
+    raise HTTPException(
+        status_code=404 if saw_not_found else 502,
+        detail=last_error or "Jetson snapshot request failed.",
+    )
 
 
 # -------------------------
@@ -562,11 +622,27 @@ async def delete_camera(
     return {"ok": True}
 
 @router.get("/{camera_uuid}/snapshot.jpg")
-async def snapshot_jpg(camera_uuid: uuid.UUID):
-    raise HTTPException(
-        status_code=410,
-        detail="Snapshot disabled on Azure service. Use WebRTC playback URL for video.",
-    )
+async def snapshot_jpg(
+    request: Request,
+    camera_uuid: uuid.UUID,
+    access_token: Optional[str] = None,
+    db: AsyncSession = Depends(get_async_db),
+):
+    user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+    repo = ChannelRepository()
+    full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
+    if not full:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    cam, _cfg, _pid = full
+    _ensure_user_owns_camera(cam, user.id)
+
+    dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=False, relaxed=True)
+    device_url = str(getattr(dev, "device_url", "") or "").strip() if dev is not None else ""
+    if not device_url:
+        raise HTTPException(status_code=409, detail="Assigned Jetson device is missing device_url.")
+
+    return await _fetch_device_snapshot(device_url=device_url, camera_uuid=cam.camera_uuid)
 
 
 @router.get("/{camera_uuid}/stream.mjpg")

@@ -25,6 +25,19 @@ def _encode_thumbnail_data_url(frame_bgr, *, max_edge: int = 200, jpeg_quality: 
         return None
 
     try:
+        encoded = _encode_jpeg_bytes(frame_bgr, max_edge=max_edge, jpeg_quality=jpeg_quality)
+        if not encoded:
+            return None
+        return "data:image/jpeg;base64,{}".format(base64.b64encode(encoded).decode("ascii"))
+    except Exception:
+        return None
+
+
+def _encode_jpeg_bytes(frame_bgr, *, max_edge: int = 960, jpeg_quality: int = 75) -> Optional[bytes]:
+    if frame_bgr is None:
+        return None
+
+    try:
         import cv2
 
         height, width = frame_bgr.shape[:2]
@@ -32,19 +45,19 @@ def _encode_thumbnail_data_url(frame_bgr, *, max_edge: int = 200, jpeg_quality: 
             return None
 
         scale = min(float(max_edge) / float(max(height, width)), 1.0)
-        thumb = frame_bgr
+        output = frame_bgr
         if scale < 1.0:
-            thumb = cv2.resize(
+            output = cv2.resize(
                 frame_bgr,
                 (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
                 interpolation=cv2.INTER_AREA,
             )
 
-        ok, encoded = cv2.imencode(".jpg", thumb, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+        ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
         if not ok:
             return None
 
-        return f"data:image/jpeg;base64,{base64.b64encode(encoded.tobytes()).decode('ascii')}"
+        return encoded.tobytes()
     except Exception:
         return None
 
@@ -237,7 +250,12 @@ class SimpleInferencePipeline(object):
         self._out_q = asyncio.Queue(maxsize=out_queue_max)
 
         self._latest = {}
+        self._latest_snapshots = {}
+        self._latest_snapshot_ts_ms = {}
         self._latest_lock = asyncio.Lock()
+        self._snapshot_min_interval_ms = _env_int("SNAPSHOT_MIN_INTERVAL_MS", 1000, minimum=0)
+        self._snapshot_max_edge = _env_int("SNAPSHOT_MAX_EDGE", 960, minimum=64)
+        self._snapshot_jpeg_quality = _env_int("SNAPSHOT_JPEG_QUALITY", 75, minimum=1)
 
         self._lock = asyncio.Lock()
         self._inference_task = None
@@ -309,6 +327,10 @@ class SimpleInferencePipeline(object):
         async with self._latest_lock:
             if camera_key in self._latest:
                 del self._latest[camera_key]
+            if camera_key in self._latest_snapshots:
+                del self._latest_snapshots[camera_key]
+            if camera_key in self._latest_snapshot_ts_ms:
+                del self._latest_snapshot_ts_ms[camera_key]
 
     def list_channels(self):
         return list(self._channels.keys())
@@ -461,6 +483,12 @@ class SimpleInferencePipeline(object):
                     })
                     continue
 
+                await self._cache_snapshot(
+                    camera_uuid=rtsp_ev.camera_uuid,
+                    frame_bgr=bgr,
+                    ts_ms=int(rtsp_ev.ts_ms),
+                )
+
                 meta = {
                     "camera_uuid": str(rtsp_ev.camera_uuid),
                     "channel_id": getattr(rtsp_ev, "channel_id", None),
@@ -571,16 +599,46 @@ class SimpleInferencePipeline(object):
         async with self._latest_lock:
             return self._latest.get(str(camera_uuid))
 
+    async def get_latest_snapshot(self, camera_uuid):
+        async with self._latest_lock:
+            return self._latest_snapshots.get(str(camera_uuid))
+
     async def get_stats(self) -> Dict[str, Any]:
         async with self._lock:
             channel_count = len(self._channels)
         async with self._latest_lock:
             latest_count = len(self._latest)
+            snapshot_count = len(self._latest_snapshots)
         stats = dict(self._stats)
         stats.update({
             "channel_count": int(channel_count),
             "latest_cache_size": int(latest_count),
+            "snapshot_cache_size": int(snapshot_count),
             "infer_queue_max": int(self._infer_q_max),
             "out_queue_max": int(self._out_q.maxsize),
         })
         return stats
+
+    async def _cache_snapshot(self, *, camera_uuid: str, frame_bgr, ts_ms: int) -> None:
+        camera_key = str(camera_uuid)
+        snapshot_ts_ms = int(ts_ms)
+
+        async with self._latest_lock:
+            last_ts = int(self._latest_snapshot_ts_ms.get(camera_key, 0) or 0)
+        if self._snapshot_min_interval_ms and last_ts and (snapshot_ts_ms - last_ts) < self._snapshot_min_interval_ms:
+            return
+
+        encoded = _encode_jpeg_bytes(
+            frame_bgr,
+            max_edge=self._snapshot_max_edge,
+            jpeg_quality=self._snapshot_jpeg_quality,
+        )
+        if not encoded:
+            return
+
+        async with self._latest_lock:
+            last_ts = int(self._latest_snapshot_ts_ms.get(camera_key, 0) or 0)
+            if self._snapshot_min_interval_ms and last_ts and (snapshot_ts_ms - last_ts) < self._snapshot_min_interval_ms:
+                return
+            self._latest_snapshots[camera_key] = encoded
+            self._latest_snapshot_ts_ms[camera_key] = snapshot_ts_ms

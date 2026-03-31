@@ -310,6 +310,10 @@ class PipelineRuntime(object):
         result = self._call(self.pipeline.get_latest(camera_uuid), timeout_s=5.0)
         return result
 
+    def get_snapshot(self, camera_uuid: str):
+        # get_latest_snapshot is async
+        return self._call(self.pipeline.get_latest_snapshot(camera_uuid), timeout_s=5.0)
+
     def get_stats(self) -> Dict[str, Any]:
         if self.loop is None or self.pipeline is None:
             return {}
@@ -435,6 +439,22 @@ def latest(camera_uuid):
         return jsonify(result)
     except Exception as e:
         logger.exception("latest failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/cameras/<camera_uuid>/snapshot.jpg", methods=["GET"])
+@app.route("/api/cameras/<camera_uuid>/snapshot.jpg", methods=["GET"])
+def snapshot(camera_uuid):
+    try:
+        result = runtime.get_snapshot(camera_uuid)
+        if not result:
+            return jsonify({"error": "No snapshot available yet"}), 404
+
+        resp = Response(result, mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+    except Exception as e:
+        logger.exception("snapshot failed: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
