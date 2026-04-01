@@ -171,17 +171,29 @@ class EventClipService:
         now = datetime.now(timezone.utc)
 
         if event_ts_ms is None:
-            end_time = now
+            start_time = now
         else:
             try:
-                end_time = datetime.fromtimestamp(float(event_ts_ms) / 1000.0, tz=timezone.utc)
+                event_time = datetime.fromtimestamp(float(event_ts_ms) / 1000.0, tz=timezone.utc)
             except (TypeError, ValueError, OSError, OverflowError):
-                end_time = now
+                event_time = now
 
+            # Capture POST-event footage: from event time onwards (with 5-second pre-buffer for context)
+            # This ensures we capture the object's actions in the ROI, not stale pre-event footage
+            start_time = event_time - timedelta(seconds=5)  # 5s pre-buffer for context
+
+        # Ensure start_time is not in the future
+        if start_time > now:
+            start_time = now - timedelta(seconds=self.CLIP_DURATION_S)
+
+        # End time should be CLIP_DURATION_S after start_time
+        end_time = start_time + timedelta(seconds=self.CLIP_DURATION_S)
+
+        # If calculated end_time is in the future, adjust both times to capture available footage
         if end_time > now:
             end_time = now
+            start_time = end_time - timedelta(seconds=self.CLIP_DURATION_S)
 
-        start_time = end_time - timedelta(seconds=self.CLIP_DURATION_S)
         return start_time, end_time
 
     async def _get_blob_service(self) -> BlobServiceClient:
@@ -414,6 +426,14 @@ class EventClipService:
 
             start_time, end_time = self._get_capture_window(event_ts_ms)
             external_id = f"{camera_key}-{int(end_time.timestamp())}-{uuid.uuid4().hex[:10]}"
+
+            # ENHANCEMENT: Wait briefly to allow MediaMTX to buffer post-event segments
+            # This ensures the playback endpoint has segments available before we request them
+            # For ROI events, the event_ts_ms is when the object enters the ROI, and we capture
+            # POST-event footage (T to T+120s), so a 1-2 second delay is reasonable to ensure
+            # availability of the first few seconds of the recording window.
+            if event_ts_ms is not None:
+                await asyncio.sleep(1.5)
 
             try:
                 spans = await self._fetch_recording_spans(
