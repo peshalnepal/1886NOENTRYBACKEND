@@ -343,6 +343,8 @@ class NotificationOut(BaseModel):
     title: Optional[str] = None
     message: Optional[str] = None
     payload: Optional[Dict[str, Any]] = None
+    image_url: Optional[str] = None
+    image_storage_key: Optional[str] = None
     detected_at: datetime
     created_at: datetime
     read_at: Optional[datetime] = None
@@ -352,6 +354,17 @@ class NotificationOut(BaseModel):
 
 def _to_out(n: Notification) -> NotificationOut:
     msg = _payload_msg(n.payload)
+    extra = n.payload.get("extra") if isinstance(n.payload, dict) else None
+    image_url = ""
+    image_storage_key = ""
+    if isinstance(extra, dict):
+        image_url = str(extra.get("image_url") or "").strip()
+        image_storage_key = str(extra.get("image_storage_key") or "").strip()
+    if not image_url:
+        image_url = str(msg.get("image_url") or "").strip()
+    if not image_storage_key:
+        image_storage_key = str(msg.get("image_storage_key") or "").strip()
+
     return NotificationOut(
         id=int(n.id),
         user_id=int(n.user_id),
@@ -364,6 +377,8 @@ def _to_out(n: Notification) -> NotificationOut:
         title=n.title,
         message=n.message,
         payload=n.payload,
+        image_url=image_url or None,
+        image_storage_key=image_storage_key or None,
         detected_at=n.detected_at,
         created_at=n.created_at,
         read_at=n.read_at,
