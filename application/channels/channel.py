@@ -22,7 +22,7 @@ import logging
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
-from typing import Any, Dict, Optional,List
+from typing import Any, Dict, Optional,List, Tuple
 from urllib.parse import urljoin
 from application.channels.channel_config import VideoChannelConfig
 logger = logging.getLogger(__name__)
@@ -85,6 +85,17 @@ class VideoChannel:
 
         # Preserve order while removing duplicates.
         return list(dict.fromkeys(urls))
+
+    def snapshot_urls(self) -> List[str]:
+        base = str(self.config.device_url or "").rstrip("/")
+        if not base:
+            return []
+
+        camera_id = str(self.config.camera_uuid)
+        urls = [f"{base}/cameras/{camera_id}/snapshot.jpg"]
+        if not base.endswith("/api"):
+            urls.insert(0, f"{base}/api/cameras/{camera_id}/snapshot.jpg")
+        return list(dict.fromkeys(urls))
         
     async def fetch_detection_json(self) -> Optional[Dict[str, Any]]:
         return await self.stream()
@@ -130,4 +141,46 @@ class VideoChannel:
         if last_err_sig and last_err_sig != self._last_error_sig:
             logger.warning("Jetson detection fetch failed camera=%s tried=%d last=%s", self.key(), len(urls), last_err_sig)
             self._last_error_sig = last_err_sig
+        return None
+
+    async def fetch_snapshot_bytes(self) -> Optional[Tuple[bytes, str]]:
+        if not self.config.enabled:
+            return None
+        if hasattr(self.config, "is_scheduled_now") and not self.config.is_scheduled_now():
+            return None
+        if not self.config.device_url:
+            return None
+
+        timeout_s = float(self.config.request_timeout_s or 6.0)
+        timeout = httpx.Timeout(
+            timeout_s,
+            connect=min(8.0, timeout_s),
+            read=timeout_s,
+            write=timeout_s,
+            pool=timeout_s,
+        )
+
+        for url in self.snapshot_urls():
+            try:
+                resp = await _http.get(
+                    url,
+                    timeout=timeout,
+                    headers={"Accept": "image/jpeg,image/*;q=0.9,*/*;q=0.1"},
+                )
+                if resp.status_code in (404, 405):
+                    continue
+                if resp.status_code >= 400:
+                    continue
+
+                payload = bytes(resp.content or b"")
+                if not payload:
+                    continue
+
+                content_type = str(resp.headers.get("content-type") or "image/jpeg")
+                return payload, content_type
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout):
+                return None
+            except Exception:
+                continue
+
         return None

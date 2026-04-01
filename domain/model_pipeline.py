@@ -9,6 +9,7 @@ It keeps a registry of Camera Channels and maintains an in-memory "latest detect
 cache per camera by polling Jetson: /detection/{camera_uuid}
 """
 
+import base64
 import asyncio
 import logging
 import os
@@ -51,6 +52,7 @@ class ObjDetectResponse:
     pose: Optional[Any] = None
     inference_ms: Optional[int] = None
     model_id: Optional[str] = None
+    image_url: Optional[str] = None
 
     # NEW: tracking + alert scaffolding
     tracks: Tuple[Dict[str, Any], ...] = ()
@@ -589,7 +591,50 @@ class ModelPipeline:
         self._last_detection_summary_s[cam] = now
         return True
 
-    async def _emit_roi_alert_notifications(self, resp: ObjDetectResponse, alerts: List[Dict[str, Any]]) -> None:
+    def _image_bytes_to_data_url(self, payload: bytes, content_type: Optional[str]) -> Optional[str]:
+        if not payload:
+            return None
+
+        mime = str(content_type or "image/jpeg").split(";", 1)[0].strip().lower() or "image/jpeg"
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
+
+        encoded = base64.b64encode(payload).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    async def _build_alert_extra_payload(
+        self,
+        *,
+        resp: ObjDetectResponse,
+        ch: VideoChannel,
+    ) -> Optional[Dict[str, Any]]:
+        image_url = str(getattr(resp, "image_url", "") or "").strip()
+        if image_url:
+            return {"image_url": image_url}
+
+        try:
+            snapshot = await ch.fetch_snapshot_bytes()
+        except Exception:
+            logger.exception("Failed to fetch alert snapshot camera=%s", resp.camera_uuid)
+            return None
+
+        if not snapshot:
+            return None
+
+        payload, content_type = snapshot
+        data_url = self._image_bytes_to_data_url(payload, content_type)
+        if not data_url:
+            return None
+
+        return {"image_url": data_url}
+
+    async def _emit_roi_alert_notifications(
+        self,
+        resp: ObjDetectResponse,
+        alerts: List[Dict[str, Any]],
+        *,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
         svc = self._notification_service
         if svc is None:
             return
@@ -603,6 +648,7 @@ class ModelPipeline:
 
         site_name = ctx.site_name
         site_uuid_str = str(ctx.site_uuid)
+        image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
 
         for a in alerts:
             title = f"ROI Alert ({a.get('type','roi')})"
@@ -630,12 +676,15 @@ class ModelPipeline:
                 track_id=track_id,
                 device_name=ctx.device_name if ctx else None,
                 camera_name=ctx.camera_name if ctx else None,
+                image_url=image_url,
             )
 
             await svc.hub.publish(msg)
 
+            persist_payload = dict(extra_payload or {})
+            persist_payload["alert"] = a
             asyncio.create_task(
-                self._persist_and_maybe_email(ctx=ctx, msg=msg, extra_payload={"alert": a}),
+                self._persist_and_maybe_email(ctx=ctx, msg=msg, extra_payload=persist_payload),
                 name=f"persist_roi_alert:{cam_uuid}",
             )
                 
@@ -644,6 +693,8 @@ class ModelPipeline:
         resp: ObjDetectResponse,
         tracks: Tuple[Dict[str, Any], ...],
         track_events: Tuple[Tuple[str, int], ...],
+        *,
+        extra_payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         svc = self._notification_service
         if svc is None:
@@ -668,6 +719,7 @@ class ModelPipeline:
 
         site_name = ctx.site_name
         site_uuid_str = str(ctx.site_uuid)
+        image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
 
         for track_id in confirmed_track_ids:
             tr = tracks_by_id.get(track_id)
@@ -692,20 +744,29 @@ class ModelPipeline:
                 track_id=track_id,
                 device_name=ctx.device_name if ctx else None,
                 camera_name=ctx.camera_name if ctx else None,
+                image_url=image_url,
             )
 
             await svc.hub.publish(msg)
 
+            persist_payload = dict(extra_payload or {})
+            persist_payload["track"] = tr
+            persist_payload["event"] = "track_confirmed"
             asyncio.create_task(
                 self._persist_and_maybe_email(
                     ctx=ctx,
                     msg=msg,
-                    extra_payload={"track": tr, "event": "track_confirmed"},
+                    extra_payload=persist_payload,
                 ),
                 name=f"persist_track_confirmed:{cam_uuid}:{track_id}",
             )
 
-    async def _emit_detection_summary_notification(self, resp: ObjDetectResponse) -> None:
+    async def _emit_detection_summary_notification(
+        self,
+        resp: ObjDetectResponse,
+        *,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
         svc = self._notification_service
         if svc is None:
             return
@@ -742,6 +803,7 @@ class ModelPipeline:
 
         uniq_classes = sorted(set(classes))
         classes_text = ", ".join(uniq_classes)
+        image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
         msg = NotificationMessage(
             user_id=int(ctx.user_id),
             id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-summary",
@@ -756,15 +818,19 @@ class ModelPipeline:
             max_conf=float(max_conf),
             device_name=ctx.device_name,
             camera_name=ctx.camera_name,
+            image_url=image_url,
         )
 
         await svc.hub.publish(msg)
 
+        persist_payload = dict(extra_payload or {})
+        persist_payload["detections"] = filtered[:20]
+        persist_payload["event"] = "detection_summary"
         asyncio.create_task(
             self._persist_and_maybe_email(
                 ctx=ctx,
                 msg=msg,
-                extra_payload={"detections": filtered[:20], "event": "detection_summary"},
+                extra_payload=persist_payload,
             ),
             name=f"persist_detection_summary:{cam_uuid}",
         )
@@ -843,14 +909,42 @@ class ModelPipeline:
                 await self.detect_store.put(resp2)
                 await self.detection_hub.publish(resp2)
                 if getattr(cfg, "notification_enabled", True) and self._notification_service:
-                    if track_events:
-                        asyncio.create_task(self._emit_item_detected_notifications(resp2, tracks, track_events))
-                    if alerts:
-                        asyncio.create_task(self._emit_roi_alert_notifications(resp2, alerts))
-                    if (not track_events) and (not alerts) and resp2.detections:
-                        cam_uuid = str(resp2.camera_uuid)
-                        if self._reserve_detection_summary_alert(cam_uuid):
-                            asyncio.create_task(self._emit_detection_summary_notification(resp2))
+                    emit_track_notifications = any(
+                        str(ev_type) == "track_confirmed"
+                        for (ev_type, _track_id) in track_events
+                    )
+                    emit_roi_notifications = bool(alerts)
+                    emit_summary_notification = False
+                    if (not emit_track_notifications) and (not emit_roi_notifications) and resp2.detections:
+                        emit_summary_notification = self._reserve_detection_summary_alert(str(resp2.camera_uuid))
+
+                    alert_extra_payload: Optional[Dict[str, Any]] = None
+                    if emit_track_notifications or emit_roi_notifications or emit_summary_notification:
+                        alert_extra_payload = await self._build_alert_extra_payload(resp=resp2, ch=ch)
+                    if emit_track_notifications:
+                        asyncio.create_task(
+                            self._emit_item_detected_notifications(
+                                resp2,
+                                tracks,
+                                track_events,
+                                extra_payload=alert_extra_payload,
+                            )
+                        )
+                    if emit_roi_notifications:
+                        asyncio.create_task(
+                            self._emit_roi_alert_notifications(
+                                resp2,
+                                alerts,
+                                extra_payload=alert_extra_payload,
+                            )
+                        )
+                    if emit_summary_notification:
+                        asyncio.create_task(
+                            self._emit_detection_summary_notification(
+                                resp2,
+                                extra_payload=alert_extra_payload,
+                            )
+                        )
                 backoff_ms = 250
                 await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
 
@@ -877,6 +971,7 @@ class ModelPipeline:
         pose = payload.get("pose")
         inf_ms = payload.get("inference_ms")
         model_id = payload.get("model_id")
+        image_url = payload.get("image_url")
 
         # NEW: frame size (prefer explicit)
         frame_w = payload.get("frame_w") or payload.get("image_w") or payload.get("width")
@@ -896,4 +991,5 @@ class ModelPipeline:
             pose=pose,
             inference_ms=int(inf_ms) if inf_ms is not None else None,
             model_id=str(model_id) if model_id is not None else None,
+            image_url=str(image_url).strip() if image_url is not None else None,
         )
