@@ -74,6 +74,46 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _event_overlay_payload(
+    det_ev: DetectionsProducedEvent,
+    *,
+    frame_w: Optional[int] = None,
+    frame_h: Optional[int] = None,
+) -> Dict[str, Any]:
+    detections: List[Dict[str, Any]] = []
+
+    for d in det_ev.detections or []:
+        box = getattr(d, "box", None)
+        if not box:
+            continue
+
+        detections.append(
+            {
+                "cls_name": str(getattr(d, "cls_name", "") or ""),
+                "conf": float(getattr(d, "conf", 0.0) or 0.0),
+                "box": {
+                    "x1": int(getattr(box, "x1", 0) or 0),
+                    "y1": int(getattr(box, "y1", 0) or 0),
+                    "x2": int(getattr(box, "x2", 0) or 0),
+                    "y2": int(getattr(box, "y2", 0) or 0),
+                },
+            }
+        )
+
+    payload: Dict[str, Any] = {
+        "frame_ts_ms": int(det_ev.frame_ts_ms),
+        "frame_seq": int(det_ev.frame_seq),
+        "detections": detections,
+    }
+
+    if frame_w is not None:
+        payload["frame_w"] = int(frame_w)
+    if frame_h is not None:
+        payload["frame_h"] = int(frame_h)
+
+    return payload
+
+
 @dataclass(frozen=True)
 class CameraMode:
     detection_enabled: bool = True
@@ -94,6 +134,10 @@ class NotificationMessage(BaseModel):
 
     cls_names: List[str] = Field(default_factory=list)
     max_conf: Optional[float] = None
+    frame_w: Optional[int] = None
+    frame_h: Optional[int] = None
+    frame_seq: Optional[int] = None
+    detections: List[Dict[str, Any]] = Field(default_factory=list)
 
     device_name: Optional[str] = None
     camera_name: Optional[str] = None
@@ -1295,6 +1339,15 @@ class NotificationService:
         device_name = ctx.device_name
         camera_name = ctx.camera_name
         image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
+        overlay_payload = _event_overlay_payload(
+            det_ev,
+            frame_w=frame_w,
+            frame_h=frame_h,
+        )
+        msg_frame_w = overlay_payload.get("frame_w")
+        msg_frame_h = overlay_payload.get("frame_h")
+        msg_frame_seq = overlay_payload.get("frame_seq")
+        msg_detections = list(overlay_payload.get("detections") or [])
 
         # -------------------------
         # Tracking path
@@ -1343,6 +1396,10 @@ class NotificationService:
                         alert_type="item_detected",
                         cls_names=[tr["cls_name"]],
                         max_conf=float(tr["conf"]),
+                        frame_w=msg_frame_w,
+                        frame_h=msg_frame_h,
+                        frame_seq=msg_frame_seq,
+                        detections=msg_detections,
                         track_id=int(track_id),
                         device_name=device_name,
                         camera_name=camera_name,
@@ -1356,6 +1413,7 @@ class NotificationService:
                                 msg,
                                 ctx,
                                 extra_payload={
+                                    **overlay_payload,
                                     **(extra_payload or {}),
                                     "track": _json_safe(tr),
                                     "event": "track_confirmed",
@@ -1399,6 +1457,10 @@ class NotificationService:
                                 alert_type="roi_enter",
                                 cls_names=[a["cls_name"]],
                                 max_conf=float(a["conf"]),
+                                frame_w=msg_frame_w,
+                                frame_h=msg_frame_h,
+                                frame_seq=msg_frame_seq,
+                                detections=msg_detections,
                                 roi_id=str(a["roi_id"]),
                                 track_id=int(a["track_id"]),
                                 device_name=device_name,
@@ -1413,6 +1475,7 @@ class NotificationService:
                                     msg,
                                     ctx,
                                     extra_payload={
+                                        **overlay_payload,
                                         **(extra_payload or {}),
                                         "alert": _json_safe(a),
                                         "event": "roi_enter",
@@ -1449,6 +1512,10 @@ class NotificationService:
             alert_type="detection_summary",
             cls_names=sorted(set(send_classes)),
             max_conf=float(max_conf),
+            frame_w=msg_frame_w,
+            frame_h=msg_frame_h,
+            frame_seq=msg_frame_seq,
+            detections=msg_detections,
             device_name=device_name,
             camera_name=camera_name,
             image_url=image_url,
@@ -1461,16 +1528,8 @@ class NotificationService:
                 msg,
                 ctx,
                 extra_payload={
+                    **overlay_payload,
                     **(extra_payload or {}),
-                    "detections": _json_safe(
-                        [
-                            {
-                                "cls_name": cls_name,
-                                "conf": conf,
-                            }
-                            for cls_name, conf in matches
-                        ]
-                    ),
                     "event": "detection_summary",
                 },
             )
