@@ -581,15 +581,41 @@ class ModelPipeline:
             self._device_fetch_limits[key] = sem
         return sem
 
-    def _reserve_detection_summary_alert(self, camera_uuid: str) -> bool:
+    def _reserve_detection_summary_alert(self, camera_uuid: str, cls_names: Optional[List[str]] = None) -> bool:
+        """
+        Check if detection alert should be emitted using per-class cooldown.
+        Uses (camera_uuid, cls_name) tuple instead of just camera_uuid.
+        This allows different object classes to bypass each other's cooldown.
+        """
         cam = str(camera_uuid)
         cooldown_s = float(self._detection_summary_cooldown_s or 0.0)
+        
+        if not cls_names:
+            # Fallback to old behavior if no classes provided
+            now = time.monotonic()
+            last = self._last_detection_summary_s.get(cam, 0.0)
+            if cooldown_s > 0.0 and (now - last) < cooldown_s:
+                return False
+            self._last_detection_summary_s[cam] = now
+            return True
+        
         now = time.monotonic()
-        last = self._last_detection_summary_s.get(cam, 0.0)
-        if cooldown_s > 0.0 and (now - last) < cooldown_s:
-            return False
-        self._last_detection_summary_s[cam] = now
-        return True
+        
+        # Check each class independently
+        for cls_name in cls_names:
+            key = (cam, str(cls_name))  # (camera_uuid, class_name) tuple
+            last = self._last_detection_summary_s.get(key, 0.0)
+            
+            if cooldown_s > 0.0 and (now - last) < cooldown_s:
+                # This class was seen recently, skip it
+                continue
+            
+            # Class is not in cooldown, update and allow alert
+            self._last_detection_summary_s[key] = now
+            return True
+        
+        # All classes are in cooldown
+        return False
 
     def _image_bytes_to_data_url(self, payload: bytes, content_type: Optional[str]) -> Optional[str]:
         if not payload:
@@ -916,7 +942,17 @@ class ModelPipeline:
                     emit_roi_notifications = bool(alerts)
                     emit_summary_notification = False
                     if (not emit_track_notifications) and (not emit_roi_notifications) and resp2.detections:
-                        emit_summary_notification = self._reserve_detection_summary_alert(str(resp2.camera_uuid))
+                        # Extract class names for per-class cooldown
+                        cls_names = []
+                        for d in resp2.detections:
+                            if isinstance(d, dict):
+                                cls_name = d.get("cls_name")
+                                if cls_name:
+                                    cls_names.append(str(cls_name))
+                        emit_summary_notification = self._reserve_detection_summary_alert(
+                            str(resp2.camera_uuid),
+                            cls_names if cls_names else None
+                        )
 
                     alert_extra_payload: Optional[Dict[str, Any]] = None
                     if emit_track_notifications or emit_roi_notifications or emit_summary_notification:

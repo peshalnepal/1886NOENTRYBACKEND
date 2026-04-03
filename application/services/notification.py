@@ -597,7 +597,8 @@ class NotificationService:
 
         self._buffer_lock = asyncio.Lock()
         self._flush_event = asyncio.Event()
-        self._pending_by_user: Dict[int, List[BufferedNotification]] = {}
+        # Changed from flat list to hierarchical: user_id -> site_uuid -> camera_uuid -> alerts
+        self._pending_by_user: Dict[int, Dict[str, Dict[str, List[BufferedNotification]]]] = {}
         self._pending_since: Dict[int, float] = {}
         self._active_flush_users: Set[int] = set()
         self._flush_task: Optional[asyncio.Task] = None
@@ -605,6 +606,8 @@ class NotificationService:
         self._buffer_max_items = _env_int("NOTIFICATION_BUFFER_MAX_ITEMS", 100, minimum=1)
         self._buffer_max_age_s = _env_float("NOTIFICATION_BUFFER_MAX_AGE_S", 60.0, minimum=1.0)
         self._buffer_poll_s = _env_float("NOTIFICATION_BUFFER_POLL_S", 1.0, minimum=0.2)
+        self._site_prerecord_timeout_s = _env_float("SITE_PRERECORD_TIMEOUT_S", 30.0, minimum=1.0)
+        self._trigger_camera_timeout_s = _env_float("TRIGGER_CAMERA_TIMEOUT_S", 15.0, minimum=1.0)
         self._clip_service = clip_service or EventClipService()
         self._image_service = image_service or AlertImageStorageService()
 
@@ -833,7 +836,22 @@ class NotificationService:
             )
 
         if pending_tasks:
-            results = await asyncio.gather(*pending_tasks, return_exceptions=True)
+            results = []
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*pending_tasks, return_exceptions=True),
+                    timeout=self._site_prerecord_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Site prerecord clip capture timed out after %.1fs trigger_camera=%s pending_count=%s",
+                    self._site_prerecord_timeout_s,
+                    msg.camera_uuid,
+                    len(pending_camera_uuids),
+                )
+                # Return partial results; remaining cameras will be skipped
+                return out
+            
             for camera_uuid, result in zip(pending_camera_uuids, results):
                 camera_uuid_str = str(camera_uuid)
                 if isinstance(result, Exception):
@@ -881,13 +899,31 @@ class NotificationService:
         except Exception:
             trigger_camera_uuid = None
         trigger_ctx = plan.contexts_by_camera.get(trigger_camera_uuid) if trigger_camera_uuid else None
-        #TODO Check From Here 
-        clip = await clip_service.capture_pre_event_clip(
-            camera_uuid=msg.camera_uuid,
-            ctx=trigger_ctx or ctx,
-            event_ts_ms=msg.ts_ms,
-            trigger=f"site_prerecord:{msg.camera_uuid}:{plan.settings.trigger_mode}:{msg.alert_type}",
-        )
+        
+        # Capture trigger camera clip with timeout
+        clip = None
+        try:
+            clip = await asyncio.wait_for(
+                clip_service.capture_pre_event_clip(
+                    camera_uuid=msg.camera_uuid,
+                    ctx=trigger_ctx or ctx,
+                    event_ts_ms=msg.ts_ms,
+                    trigger=f"site_prerecord:{msg.camera_uuid}:{plan.settings.trigger_mode}:{msg.alert_type}",
+                ),
+                timeout=self._trigger_camera_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Trigger camera clip capture timed out after %.1fs camera=%s",
+                self._trigger_camera_timeout_s,
+                msg.camera_uuid,
+            )
+        except Exception:
+            logger.exception(
+                "Trigger camera clip capture failed camera=%s",
+                msg.camera_uuid,
+            )
+        
         if clip:
             merged["clip"] = clip
 
@@ -915,17 +951,44 @@ class NotificationService:
             if force_all:
                 return
 
+    async def _flatten_user_alerts_preserving_order(
+        self,
+        hierarchical: Dict[str, Dict[str, List[BufferedNotification]]],
+    ) -> List[BufferedNotification]:
+        """Flatten hierarchical buffer (site -> camera -> alerts) while preserving timestamp order."""
+        all_items: List[BufferedNotification] = []
+        for sites in hierarchical.values():
+            for alerts in sites.values():
+                all_items.extend(alerts)
+        # Sort by timestamp to preserve order across all sites/cameras
+        all_items.sort(key=lambda x: int(x.msg.ts_ms))
+        return all_items
+
     async def _flush_ready_users(self, *, force_all: bool = False) -> None:
         now = time.monotonic()
         ready: Dict[int, List[BufferedNotification]] = {}
 
         async with self._buffer_lock:
-            for user_id, items in list(self._pending_by_user.items()):
+            for user_id, hierarchical in list(self._pending_by_user.items()):
                 if user_id in self._active_flush_users:
                     continue
 
+                # Count total items across all sites/cameras
+                total_items = sum(
+                    len(alerts)
+                    for sites in hierarchical.values()
+                    for alerts in sites.values()
+                )
+                
+                if total_items == 0:
+                    self._pending_by_user.pop(user_id, None)
+                    self._pending_since.pop(user_id, None)
+                    continue
+
                 since = self._pending_since.get(user_id, now)
-                if force_all or len(items) >= self._buffer_max_items or (now - since) >= self._buffer_max_age_s:
+                if force_all or total_items >= self._buffer_max_items or (now - since) >= self._buffer_max_age_s:
+                    # Flatten hierarchical structure while preserving timestamp order
+                    items = await self._flatten_user_alerts_preserving_order(hierarchical)
                     ready[user_id] = items
                     self._pending_by_user.pop(user_id, None)
                     self._pending_since.pop(user_id, None)
@@ -958,16 +1021,32 @@ class NotificationService:
                 self._active_flush_users.discard(user_id)
 
                 if requeue_items:
-                    existing = self._pending_by_user.get(user_id)
-                    if existing:
-                        self._pending_by_user[user_id] = list(items) + existing
-                    else:
-                        self._pending_by_user[user_id] = list(items)
-                        self._pending_since[user_id] = time.monotonic() - self._buffer_max_age_s
+                    # Requeue: restructure flattened items back into hierarchical form
+                    hierarchical: Dict[str, Dict[str, List[BufferedNotification]]] = {}
+                    for item in items:
+                        site_uuid_str = str(item.ctx.site_uuid)
+                        camera_uuid_str = str(item.msg.camera_uuid)
+                        
+                        if site_uuid_str not in hierarchical:
+                            hierarchical[site_uuid_str] = {}
+                        if camera_uuid_str not in hierarchical[site_uuid_str]:
+                            hierarchical[site_uuid_str][camera_uuid_str] = []
+                        
+                        hierarchical[site_uuid_str][camera_uuid_str].append(item)
+                    
+                    self._pending_by_user[user_id] = hierarchical
+                    self._pending_since[user_id] = time.monotonic() - self._buffer_max_age_s
                     self._flush_event.set()
 
-                if user_id in self._pending_by_user and len(self._pending_by_user[user_id]) >= self._buffer_max_items:
-                    self._flush_event.set()
+                # Check if buffer exceeds limit after potential requeue
+                if user_id in self._pending_by_user:
+                    total_items = sum(
+                        len(alerts)
+                        for sites in self._pending_by_user[user_id].values()
+                        for alerts in sites.values()
+                    )
+                    if total_items >= self._buffer_max_items:
+                        self._flush_event.set()
 
     async def _get_recipients_for_sites_cached(
         self,
@@ -1173,6 +1252,9 @@ class NotificationService:
 
         self._ensure_flush_task()
         user_id = int(ctx.user_id)
+        site_uuid_str = str(ctx.site_uuid)
+        camera_uuid_str = str(msg.camera_uuid)
+        
         item = BufferedNotification(
             msg=msg,
             ctx=ctx,
@@ -1180,13 +1262,26 @@ class NotificationService:
         )
 
         async with self._buffer_lock:
-            bucket = self._pending_by_user.get(user_id)
-            if bucket is None:
-                bucket = []
-                self._pending_by_user[user_id] = bucket
+            # Hierarchical insertion: user_id -> site_uuid -> camera_uuid -> alerts
+            if user_id not in self._pending_by_user:
+                self._pending_by_user[user_id] = {}
                 self._pending_since[user_id] = time.monotonic()
-            bucket.append(item)
-            should_flush = len(bucket) >= self._buffer_max_items
+            
+            if site_uuid_str not in self._pending_by_user[user_id]:
+                self._pending_by_user[user_id][site_uuid_str] = {}
+            
+            if camera_uuid_str not in self._pending_by_user[user_id][site_uuid_str]:
+                self._pending_by_user[user_id][site_uuid_str][camera_uuid_str] = []
+            
+            self._pending_by_user[user_id][site_uuid_str][camera_uuid_str].append(item)
+            
+            # Count total items across all sites/cameras for this user
+            total_items = sum(
+                len(alerts)
+                for sites in self._pending_by_user[user_id].values()
+                for alerts in sites.values()
+            )
+            should_flush = total_items >= self._buffer_max_items
 
         if should_flush:
             self._flush_event.set()
