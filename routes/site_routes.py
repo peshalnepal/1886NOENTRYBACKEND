@@ -48,6 +48,21 @@ def _normalize_trigger_mode(value: Optional[str]) -> str:
 
 
 def _normalize_camera_schedule_inputs(model: BaseModel) -> BaseModel:
+    for attr in ("timezone", "start_time", "end_time"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            setattr(model, attr, cleaned or None)
+
+    raw_schedule = getattr(model, "schedule", None)
+    if raw_schedule is not None:
+        normalized_schedule = VideoChannelConfig.normalize_schedule(raw_schedule)
+        if raw_schedule and not normalized_schedule:
+            raise ValueError("schedule must contain at least one valid day/time window.")
+        setattr(model, "schedule", normalized_schedule)
+        if normalized_schedule:
+            return model
+
     raw_days = getattr(model, "day_of_week", None)
     if raw_days is not None:
         normalized_days: List[int] = []
@@ -64,12 +79,6 @@ def _normalize_camera_schedule_inputs(model: BaseModel) -> BaseModel:
             seen_days.add(day)
             normalized_days.append(day)
         setattr(model, "day_of_week", normalized_days)
-
-    for attr in ("timezone", "start_time", "end_time"):
-        value = getattr(model, attr, None)
-        if isinstance(value, str):
-            cleaned = value.strip()
-            setattr(model, attr, cleaned or None)
 
     day_of_week = getattr(model, "day_of_week", None)
     start_time = getattr(model, "start_time", None)
@@ -109,6 +118,27 @@ def _default_site_schedule_payload(timezone_name: Optional[str]) -> Dict[str, An
         "day_of_week": list(SUNDAY_TO_SATURDAY),
         "start_time": "00:00:00",
         "end_time": "23:59:59",
+        "schedule": VideoChannelConfig.default_schedule(),
+    }
+
+
+def _primary_schedule_window_payload(schedule: List[Dict[str, Any]]) -> Dict[str, Any]:
+    windows = VideoChannelConfig.schedule_windows(schedule)
+    if not windows:
+        return {
+            "day_of_week": list(SUNDAY_TO_SATURDAY),
+            "start_time": "00:00:00",
+            "end_time": "23:59:59",
+        }
+
+    template = windows[0]
+    return {
+        "day_of_week": _sort_days_sunday_first(
+            [int(value) for value in template.get("day_of_week") or []]
+        )
+        or list(SUNDAY_TO_SATURDAY),
+        "start_time": _time_to_schedule_str(template.get("start_time"), dt_time(0, 0, 0)),
+        "end_time": _time_to_schedule_str(template.get("end_time"), dt_time(23, 59, 59)),
     }
 
 
@@ -137,24 +167,14 @@ def _site_schedule_payload_from_row(
     if not schedule:
         return _default_site_schedule_payload(config.get("timezone") or fallback_timezone)
 
-    enabled_entries = [entry for entry in schedule if bool(entry.get("is_enabled", True))]
-    visible_entries = enabled_entries or schedule
-    selected_days = _sort_days_sunday_first(
-        list(
-            {
-                int(entry.get("day_of_week"))
-                for entry in visible_entries
-                if isinstance(entry, dict) and entry.get("day_of_week") is not None
-            }
-        )
-    )
+    primary = _primary_schedule_window_payload(schedule)
 
-    template = visible_entries[0]
     return {
         "timezone": str(config.get("timezone") or fallback_timezone or "UTC"),
-        "day_of_week": selected_days or list(SUNDAY_TO_SATURDAY),
-        "start_time": _time_to_schedule_str(template.get("start_time"), dt_time(0, 0, 0)),
-        "end_time": _time_to_schedule_str(template.get("end_time"), dt_time(23, 59, 59)),
+        "day_of_week": list(primary["day_of_week"]),
+        "start_time": str(primary["start_time"]),
+        "end_time": str(primary["end_time"]),
+        "schedule": schedule,
     }
 
 
@@ -163,7 +183,12 @@ def _build_schedule_windows(
     day_of_week: List[int],
     start_time: str,
     end_time: str,
+    schedule: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
+    if schedule is not None:
+        normalized = VideoChannelConfig.normalize_schedule(schedule)
+        return normalized or VideoChannelConfig.default_schedule()
+
     normalized = VideoChannelConfig.normalize_schedule(
         [
             {
@@ -257,6 +282,7 @@ class SiteCameraCreate(BaseModel):
     day_of_week: Optional[List[int]] = None
     start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
     end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    schedule: Optional[List[Dict[str, Any]]] = None
     use_site_schedule: Optional[bool] = None
 
     @model_validator(mode="after")
@@ -281,6 +307,7 @@ class SiteScheduleRule(BaseModel):
     day_of_week: List[int] = Field(default_factory=lambda: list(SUNDAY_TO_SATURDAY))
     start_time: str = Field(default="00:00:00", pattern=SCHEDULE_TIME_PATTERN)
     end_time: str = Field(default="23:59:59", pattern=SCHEDULE_TIME_PATTERN)
+    schedule: List[Dict[str, Any]] = Field(default_factory=VideoChannelConfig.default_schedule)
 
 
 class SiteScheduleRuleUpdate(BaseModel):
@@ -288,6 +315,7 @@ class SiteScheduleRuleUpdate(BaseModel):
     day_of_week: Optional[List[int]] = None
     start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
     end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    schedule: Optional[List[Dict[str, Any]]] = None
 
     @model_validator(mode="after")
     def _validate_schedule(self):
@@ -365,6 +393,8 @@ def _serialize_site_settings(
             day_of_week=[int(value) for value in schedule.get("day_of_week") or list(SUNDAY_TO_SATURDAY)],
             start_time=str(schedule.get("start_time") or "00:00:00"),
             end_time=str(schedule.get("end_time") or "23:59:59"),
+            schedule=VideoChannelConfig.normalize_schedule(schedule.get("schedule"))
+            or VideoChannelConfig.default_schedule(),
         ),
         multi_camera_prerecord=SiteMultiCameraPrerecordRule(
             enabled=bool(prerecord.get("enabled")),
@@ -534,18 +564,22 @@ async def update_site_settings(
         }
 
     if payload.schedule is not None:
+        schedule_windows = _build_schedule_windows(
+            day_of_week=list(payload.schedule.day_of_week or schedule_payload.get("day_of_week") or list(SUNDAY_TO_SATURDAY)),
+            start_time=str(payload.schedule.start_time or schedule_payload.get("start_time") or "00:00:00"),
+            end_time=str(payload.schedule.end_time or schedule_payload.get("end_time") or "23:59:59"),
+            schedule=payload.schedule.schedule,
+        )
+        primary = _primary_schedule_window_payload(schedule_windows)
         schedule_payload = {
             "timezone": str(payload.schedule.timezone or schedule_payload.get("timezone") or site.timezone or "UTC"),
-            "day_of_week": list(payload.schedule.day_of_week or schedule_payload.get("day_of_week") or list(SUNDAY_TO_SATURDAY)),
-            "start_time": str(payload.schedule.start_time or schedule_payload.get("start_time") or "00:00:00"),
-            "end_time": str(payload.schedule.end_time or schedule_payload.get("end_time") or "23:59:59"),
+            "day_of_week": list(primary["day_of_week"]),
+            "start_time": str(primary["start_time"]),
+            "end_time": str(primary["end_time"]),
+            "schedule": schedule_windows,
         }
         config["timezone"] = schedule_payload["timezone"]
-        config["schedule"] = _build_schedule_windows(
-            day_of_week=list(schedule_payload["day_of_week"]),
-            start_time=str(schedule_payload["start_time"]),
-            end_time=str(schedule_payload["end_time"]),
-        )
+        config["schedule"] = schedule_windows
 
     if payload.schedule is None and payload.multi_camera_prerecord is None:
         return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)

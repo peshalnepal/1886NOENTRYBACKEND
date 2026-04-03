@@ -6,6 +6,8 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from application.channels.channel_config import VideoChannelConfig
+
 
 # -------------------------
 # ROI Schema
@@ -24,6 +26,21 @@ SCHEDULE_TIME_PATTERN = r"^\d{2}:\d{2}(:\d{2})?$"
 
 
 def _normalize_schedule_fields(model: BaseModel) -> BaseModel:
+    for attr in ("timezone", "start_time", "end_time"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            setattr(model, attr, cleaned or None)
+
+    raw_schedule = getattr(model, "schedule", None)
+    if raw_schedule is not None:
+        normalized_schedule = VideoChannelConfig.normalize_schedule(raw_schedule)
+        if raw_schedule and not normalized_schedule:
+            raise ValueError("schedule must contain at least one valid day/time window.")
+        setattr(model, "schedule", normalized_schedule)
+        if normalized_schedule:
+            return model
+
     raw_days = getattr(model, "day_of_week", None)
     if raw_days is not None:
         normalized_days: List[int] = []
@@ -40,12 +57,6 @@ def _normalize_schedule_fields(model: BaseModel) -> BaseModel:
             seen_days.add(day)
             normalized_days.append(day)
         setattr(model, "day_of_week", normalized_days)
-
-    for attr in ("timezone", "start_time", "end_time"):
-        value = getattr(model, attr, None)
-        if isinstance(value, str):
-            cleaned = value.strip()
-            setattr(model, attr, cleaned or None)
 
     day_of_week = getattr(model, "day_of_week", None)
     start_time = getattr(model, "start_time", None)
@@ -97,6 +108,7 @@ class CameraBaseSchema(BaseModel):
     day_of_week: Optional[List[int]] = None
     start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
     end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    schedule: Optional[List[Dict[str, Any]]] = None
     use_site_schedule: Optional[bool] = None
 
     @model_validator(mode="after")
@@ -148,6 +160,7 @@ class CameraCreateSchema(BaseModel):
     day_of_week: Optional[List[int]] = None
     start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
     end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    schedule: Optional[List[Dict[str, Any]]] = None
     use_site_schedule: Optional[bool] = None
 
     @model_validator(mode="after")
@@ -208,6 +221,7 @@ class CameraEditSchema(BaseModel):
     day_of_week: Optional[List[int]] = None
     start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
     end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    schedule: Optional[List[Dict[str, Any]]] = None
     use_site_schedule: Optional[bool] = None
 
     @model_validator(mode="after")

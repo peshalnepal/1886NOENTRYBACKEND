@@ -10,6 +10,7 @@ from datetime import time as dt_time
 from typing import Any, Dict, List, Optional
 
 from core.database_orm import Camera, ChannelConfiguration, Device, CameraDevice,Site,SiteSettings
+from application.channels.channel_config import VideoChannelConfig
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -190,25 +191,36 @@ class SiteRepository:
             user_id=user_id,
         )
 
-        normalized_days = [int(v) for v in (day_of_week or [6, 0, 1, 2, 3, 4, 5])]
-        if not normalized_days:
-            normalized_days = [6, 0, 1, 2, 3, 4, 5]
+        merged_config = dict(config or {})
+        normalized_schedule = VideoChannelConfig.normalize_schedule(merged_config.get("schedule"))
+        if not normalized_schedule:
+            normalized_schedule = VideoChannelConfig.normalize_schedule(
+                [
+                    {
+                        "day_of_week": day_of_week or [6, 0, 1, 2, 3, 4, 5],
+                        "start_time": (start_time or dt_time(0, 0, 0)).strftime("%H:%M:%S"),
+                        "end_time": (end_time or dt_time(23, 59, 59)).strftime("%H:%M:%S"),
+                        "is_enabled": bool(is_enabled),
+                    }
+                ]
+            ) or VideoChannelConfig.default_schedule()
 
-        representative_day = normalized_days[0]
-        resolved_start = start_time or dt_time(0, 0, 0)
-        resolved_end = end_time or dt_time(23, 59, 59)
+        merged_config["schedule"] = normalized_schedule
 
-        if resolved_start == resolved_end:
-            raise HTTPException(
-                status_code=422,
-                detail="start_time and end_time must be different.",
-            )
+        representative = normalized_schedule[0]
+        representative_day = int(representative.get("day_of_week", 6))
+        resolved_start = dt_time.fromisoformat(str(representative.get("start_time") or "00:00:00"))
+        resolved_end = dt_time.fromisoformat(str(representative.get("end_time") or "23:59:59"))
+
+        if resolved_start >= resolved_end:
+            resolved_start = dt_time(0, 0, 0)
+            resolved_end = dt_time(23, 59, 59)
 
         if row is None:
             row = SiteSettings(
                 user_id=int(user_id),
                 site_uuid=site_uuid,
-                config=config or {},
+                config=merged_config,
                 day_of_week=representative_day,
                 start_time=resolved_start,
                 end_time=resolved_end,
@@ -218,7 +230,7 @@ class SiteRepository:
             await db.flush()
             return row
 
-        row.config = config or {}
+        row.config = merged_config
         row.day_of_week = representative_day
         row.start_time = resolved_start
         row.end_time = resolved_end

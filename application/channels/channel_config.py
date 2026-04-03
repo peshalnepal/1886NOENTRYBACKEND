@@ -30,6 +30,22 @@ def _coerce_schedule_time(value: Any, default: dt_time) -> dt_time:
     raise ValueError(f"Unsupported schedule time value: {value!r}")
 
 
+def _normalize_schedule_days(raw_days: Any) -> List[int]:
+    values = raw_days if isinstance(raw_days, list) else [raw_days]
+    normalized: List[int] = []
+    seen = set()
+    for value in values:
+        try:
+            day = int(value)
+        except (TypeError, ValueError):
+            continue
+        if day < 0 or day > 6 or day in seen:
+            continue
+        seen.add(day)
+        normalized.append(day)
+    return normalized
+
+
 class VideoChannelConfig(BaseModel, ChannelConfig):
     """
     One unified config for a Video Channel (create/edit/runtime).
@@ -148,12 +164,8 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
             if not isinstance(item, dict):
                 continue
 
-            try:
-                day = int(item.get("day_of_week"))
-            except (TypeError, ValueError):
-                continue
-
-            if day < 0 or day > 6:
+            days = _normalize_schedule_days(item.get("day_of_week"))
+            if not days:
                 continue
 
             try:
@@ -168,21 +180,131 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
 
             enabled = bool(item.get("is_enabled", True))
 
-            # Normal same-day window
-            if start_time < end_time:
-                add_window(day, start_time, end_time, enabled)
-                continue
+            for day in days:
+                # Normal same-day window
+                if start_time < end_time:
+                    add_window(day, start_time, end_time, enabled)
+                    continue
 
-            # Overnight window, e.g. 18:00:00 -> 06:00:00
-            next_day = (day + 1) % 7
-            add_window(day, start_time, day_end, enabled)
-            add_window(next_day, day_start, end_time, enabled)
+                # Overnight window, e.g. 18:00:00 -> 06:00:00
+                next_day = (day + 1) % 7
+                add_window(day, start_time, day_end, enabled)
+                add_window(next_day, day_start, end_time, enabled)
 
         return sorted(
             normalized,
             key=lambda item: (
                 order_index.get(int(item["day_of_week"]), 999),
                 item["start_time"],
+            ),
+        )
+
+    @staticmethod
+    def schedule_windows(raw_schedule: Any) -> List[Dict[str, Any]]:
+        schedule = VideoChannelConfig.normalize_schedule(raw_schedule)
+        if not schedule:
+            return []
+
+        visible = [entry for entry in schedule if bool(entry.get("is_enabled", True))]
+        if not visible:
+            visible = list(schedule)
+
+        parsed: List[Dict[str, Any]] = []
+        for entry in visible:
+            if not isinstance(entry, dict):
+                continue
+            days = _normalize_schedule_days(entry.get("day_of_week"))
+            if not days:
+                continue
+            try:
+                start_time = _coerce_schedule_time(
+                    entry.get("start_time"), DEFAULT_START_TIME
+                )
+                end_time = _coerce_schedule_time(
+                    entry.get("end_time"), DEFAULT_END_TIME
+                )
+            except ValueError:
+                continue
+            if start_time == end_time:
+                continue
+            for day in days:
+                parsed.append(
+                    {
+                        "day_of_week": day,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "is_enabled": bool(entry.get("is_enabled", True)),
+                    }
+                )
+
+        if not parsed:
+            return []
+
+        paired_target_indexes = set()
+        overnight_pairs: Dict[int, int] = {}
+        for idx, entry in enumerate(parsed):
+            if entry["start_time"] <= DEFAULT_START_TIME:
+                continue
+            if entry["end_time"] != DEFAULT_END_TIME:
+                continue
+
+            next_day = (int(entry["day_of_week"]) + 1) % 7
+            for target_idx, target in enumerate(parsed):
+                if target_idx == idx or target_idx in paired_target_indexes:
+                    continue
+                if int(target["day_of_week"]) != next_day:
+                    continue
+                if target["start_time"] != DEFAULT_START_TIME:
+                    continue
+                if target["end_time"] >= DEFAULT_END_TIME:
+                    continue
+                if bool(target["is_enabled"]) != bool(entry["is_enabled"]):
+                    continue
+                overnight_pairs[idx] = target_idx
+                paired_target_indexes.add(target_idx)
+                break
+
+        grouped: Dict[Tuple[str, str, bool], Dict[str, Any]] = {}
+        order_index = {day: idx for idx, day in enumerate(SUNDAY_TO_SATURDAY)}
+
+        for idx, entry in enumerate(parsed):
+            if idx in paired_target_indexes:
+                continue
+
+            end_time = entry["end_time"]
+            if idx in overnight_pairs:
+                end_time = parsed[overnight_pairs[idx]]["end_time"]
+
+            start_str = entry["start_time"].strftime("%H:%M:%S")
+            end_str = end_time.strftime("%H:%M:%S")
+            enabled = bool(entry["is_enabled"])
+            key = (start_str, end_str, enabled)
+            grouped.setdefault(
+                key,
+                {
+                    "day_of_week": [],
+                    "start_time": start_str,
+                    "end_time": end_str,
+                    "is_enabled": enabled,
+                },
+            )
+            day = int(entry["day_of_week"])
+            if day not in grouped[key]["day_of_week"]:
+                grouped[key]["day_of_week"].append(day)
+
+        collapsed = list(grouped.values())
+        for entry in collapsed:
+            entry["day_of_week"] = sorted(
+                entry["day_of_week"],
+                key=lambda day: order_index.get(int(day), 999),
+            )
+
+        return sorted(
+            collapsed,
+            key=lambda entry: (
+                order_index.get(int((entry.get("day_of_week") or [999])[0]), 999),
+                entry.get("start_time") or "",
+                entry.get("end_time") or "",
             ),
         )
     @staticmethod
