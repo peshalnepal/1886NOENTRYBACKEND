@@ -19,6 +19,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 
+# Cache at module load — avoids repeated getattr on every frame
+_BLOB_FROM_IMAGE = getattr(getattr(cv2, "dnn", None), "blobFromImage", None)
+
 import tensorrt as trt
 import pycuda.driver as cuda
 
@@ -100,10 +103,8 @@ def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) 
     return out, r, (left, top)
 
 def _prepare_input_tensor(img_lb: np.ndarray) -> np.ndarray:
-    dnn_mod = getattr(cv2, "dnn", None)
-    blob_from_image = getattr(dnn_mod, "blobFromImage", None) if dnn_mod is not None else None
-    if callable(blob_from_image):
-        return blob_from_image(
+    if _BLOB_FROM_IMAGE is not None:
+        return _BLOB_FROM_IMAGE(
             img_lb,
             scalefactor=1.0 / 255.0,
             size=(img_lb.shape[1], img_lb.shape[0]),
@@ -286,7 +287,7 @@ class YoloV8DetTRT(object):
         self,
         engine_path: str,
         imgsz: int = 640,
-        conf: float = 0.25,
+        conf: float = 0.50,
         iou: float = 0.45,
         allowed=("person", "car", "motorcycle", "truck"),
         topk: int = 100,
@@ -333,10 +334,10 @@ class YoloV8DetTRT(object):
         labels = [COCO_NAMES.get(int(i), str(int(i))) for i in cls_id]
         allowed_mask = np.array([lab in self.allowed for lab in labels], dtype=bool)
 
+        labels = [lab for lab, m in zip(labels, allowed_mask) if m]
         cls_id = cls_id[allowed_mask]
         score = score[allowed_mask]
         boxes_xywh = boxes_xywh[:, allowed_mask]
-        labels = [COCO_NAMES.get(int(i), str(int(i))) for i in cls_id]
 
         if boxes_xywh.size == 0:
             return []
@@ -367,92 +368,6 @@ class YoloV8DetTRT(object):
         return out
 
 
-class YoloV8PoseTRT(object):
-    def __init__(self, engine_path: str, imgsz: int = 640, conf: float = 0.25, iou: float = 0.45, kpts: int = 17, device_id: int = 0):
-        self.trt = TRTEngine(engine_path, device_id=device_id)
-        self.imgsz = int(imgsz)
-        self.conf = float(conf)
-        self.iou = float(iou)
-        self.kpts = int(kpts)
-
-    def run(self, bgr: np.ndarray) -> Tuple[List[Dict], Optional[Dict]]:
-        H0, W0 = bgr.shape[:2]
-        img_lb, r, (padx, pady) = letterbox_bgr(bgr, self.imgsz)
-
-        x = _prepare_input_tensor(img_lb)
-
-        outs = self.trt.infer(x)
-        pred = outs[0]
-
-        if pred.ndim != 3:
-            raise RuntimeError("Unexpected pose output shape: {}".format(pred.shape))
-
-        # normalize to (C, N)
-        if pred.shape[1] < pred.shape[2]:
-            p = pred[0]
-        else:
-            p = pred[0].T
-
-        C, N = p.shape
-        expected_min = 4 + 1 + self.kpts * 3
-        if C < expected_min:
-            raise RuntimeError("Pose output channels too small: C={}, expected>={}".format(C, expected_min))
-
-        boxes_xywh = p[0:4, :]
-        score = p[4, :]
-        kps = p[5:5 + self.kpts * 3, :]
-
-        keep = score >= self.conf
-        score = score[keep]
-        boxes_xywh = boxes_xywh[:, keep]
-        kps = kps[:, keep]
-
-        if boxes_xywh.size == 0:
-            return [], None
-
-        x_c, y_c, w, h = boxes_xywh
-        x1 = x_c - w / 2
-        y1 = y_c - h / 2
-        x2 = x_c + w / 2
-        y2 = y_c + h / 2
-        boxes = np.stack([x1, y1, x2, y2], axis=1)
-
-        keep_idx = nms_xyxy(boxes, score, self.iou)
-
-        det_items = []
-        skeletons = []
-
-        for i in keep_idx:
-            bx = boxes[i]
-            bx0 = (bx - np.array([padx, pady, padx, pady], dtype=np.float32)) / max(r, 1e-9)
-
-            x1o, y1o, x2o, y2o = clamp_xyxy(bx0[0], bx0[1], bx0[2], bx0[3], W0, H0)
-
-            pts = kps[:, i].reshape(self.kpts, 3)
-            kp_list = []
-
-            for (kx, ky, kc) in pts:
-                kx0 = (kx - padx) / max(r, 1e-9)
-                ky0 = (ky - pady) / max(r, 1e-9)
-                kp_list.append({"x": float(kx0), "y": float(ky0), "conf": float(kc)})
-
-            det_items.append({
-                "cls_name": "skeleton",
-                "conf": float(score[i]),
-                "box": {"x1": x1o, "y1": y1o, "x2": x2o, "y2": y2o},
-                "box_norm": box_norm_xyxy(x1o, y1o, x2o, y2o, W0, H0),
-            })
-
-            skeletons.append({
-                "conf": float(score[i]),
-                "box": {"x1": x1o, "y1": y1o, "x2": x2o, "y2": y2o},
-                "keypoints": kp_list,
-            })
-
-        pose = {"format": "xy", "skeletons": skeletons} if skeletons else None
-        return det_items, pose
-
-
 # -----------------------------
 # In-process inference API
 # -----------------------------
@@ -464,20 +379,16 @@ class TRTInfer(object):
     def __init__(
         self,
         det_engine_path: str,
-        pose_engine_path: Optional[str] = None,
         imgsz: int = 512,
-        conf: float = 0.25,
+        conf: float = 0.50,
         iou: float = 0.45,
         allowed=("person", "car", "motorcycle", "truck"),
-        kpts: int = 17,
         model_id: str = "yolo-trt",
         device_id: int = 0,
-        enable_pose: bool = False,
         nms_topk: int = 100,
     ):
         self.model_id = model_id
         self.device_id = int(device_id)
-        self.enable_pose = bool(enable_pose)
 
         # Ensure context exists for this thread before building engines
         ensure_cuda_context(self.device_id)
@@ -490,11 +401,6 @@ class TRTInfer(object):
             topk=nms_topk,
             device_id=self.device_id,
         )
-        self.pose_runner = None
-        if self.enable_pose and pose_engine_path:
-            self.pose_runner = YoloV8PoseTRT(
-                pose_engine_path, imgsz=imgsz, conf=conf, iou=iou, kpts=kpts, device_id=self.device_id
-            )
 
     def infer_multitask(self, bgr: np.ndarray, meta: Dict) -> Dict:
         t0 = time.perf_counter()
@@ -548,19 +454,17 @@ def build_default() -> TRTInfer:
         if os.path.exists(candidate):
             det_engine = candidate
 
-    imgsz = int(os.getenv("IMG_SZ", "512"))
-    conf = float(os.getenv("CONF", "0.25"))
+    imgsz = int(os.getenv("IMG_SZ", "640"))
+    conf = float(os.getenv("CONF", "0.50"))
     iou = float(os.getenv("IOU", "0.45"))
     device_id = int(os.getenv("CUDA_DEVICE", "0"))
     nms_topk = int(os.getenv("NMS_TOPK", "100"))
 
     return TRTInfer(
         det_engine_path=det_engine,
-        pose_engine_path=None,
         imgsz=imgsz,
         conf=conf,
         iou=iou,
         device_id=device_id,
-        enable_pose=False,
         nms_topk=nms_topk,
     )

@@ -1,7 +1,7 @@
 # simple_model_pipeline.py  (Python 3.6)
 import asyncio
-import base64
 import logging
+import re
 import threading
 import queue
 import os
@@ -19,19 +19,6 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 _DONE = object()
-
-
-def _encode_thumbnail_data_url(frame_bgr, *, max_edge: int = 200, jpeg_quality: int = 60) -> Optional[str]:
-    if frame_bgr is None:
-        return None
-
-    try:
-        encoded = _encode_jpeg_bytes(frame_bgr, max_edge=max_edge, jpeg_quality=jpeg_quality)
-        if not encoded:
-            return None
-        return "data:image/jpeg;base64,{}".format(base64.b64encode(encoded).decode("ascii"))
-    except Exception:
-        return None
 
 
 def _encode_jpeg_bytes(frame_bgr, *, max_edge: int = 960, jpeg_quality: int = 75) -> Optional[bytes]:
@@ -257,6 +244,11 @@ class SimpleInferencePipeline(object):
         if infer_q_max is None:
             infer_q_max = _env_int("INFER_QUEUE_MAX", 8, minimum=1)
 
+        self._channels = {}
+        self._channel_tasks = {}
+        self._closing = False
+        self._started = False
+
         self._buffer = CoalescingBuffer(max_pending_keys=_env_int("PENDING_KEY_MAX", 1000, minimum=100))
         self._out_q = asyncio.Queue(maxsize=out_queue_max)
 
@@ -268,6 +260,9 @@ class SimpleInferencePipeline(object):
         self._snapshot_min_interval_ms = _env_int("SNAPSHOT_MIN_INTERVAL_MS", 1000, minimum=0)
         self._snapshot_max_edge = _env_int("SNAPSHOT_MAX_EDGE", 960, minimum=64)
         self._snapshot_jpeg_quality = _env_int("SNAPSHOT_JPEG_QUALITY", 75, minimum=1)
+        self._snapshot_on_detection_only = _env_bool("SNAPSHOT_ON_DETECTION_ONLY", False)
+        self._emit_empty_detections = _env_bool("EMIT_EMPTY_DETECTIONS", False)
+        self._infer_result_timeout_s = _env_float("INFER_RESULT_TIMEOUT_S", 10.0, minimum=0.0)
         self._infer_error_log_interval_s = _env_float("INFER_ERROR_LOG_INTERVAL_S", 10.0, minimum=0.0)
         self._last_infer_error_sig = {}
         self._last_infer_error_ts = {}
@@ -289,7 +284,9 @@ class SimpleInferencePipeline(object):
 
     def _should_log_infer_failure(self, camera_uuid, reason):
         camera_key = str(camera_uuid)
-        sig = "{}|{}".format(camera_key, str(reason or "").strip())
+        normalized_reason = str(reason or "").strip()
+        normalized_reason = re.sub(r"\s+\(after\s+\d+\s+ms\)\s*$", "", normalized_reason)
+        sig = "{}|{}".format(camera_key, normalized_reason)
         now_s = float(time.monotonic())
         last_sig = self._last_infer_error_sig.get(camera_key)
         last_ts = float(self._last_infer_error_ts.get(camera_key, 0.0) or 0.0)
@@ -494,13 +491,6 @@ class SimpleInferencePipeline(object):
                     )
 
                 bgr = getattr(rtsp_ev, "frame", None)
-                if bgr is None:
-                    enc = getattr(rtsp_ev, "encoded", None)
-                    if enc is not None:
-                        import numpy as np
-                        import cv2
-                        arr = np.frombuffer(enc, dtype=np.uint8)
-                        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
                 if bgr is None:
                     self._stats["infer_fail"] += 1
@@ -509,7 +499,7 @@ class SimpleInferencePipeline(object):
                         "camera_uuid": str(rtsp_ev.camera_uuid),
                         "frame_ts_ms": int(rtsp_ev.ts_ms),
                         "frame_seq": int(rtsp_ev.seq),
-                        "reason": "No frame data found (frame=None and encoded=None)",
+                        "reason": "No frame data (emit_format=raw required)",
                     }
 
                     async with self._latest_lock:

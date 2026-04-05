@@ -125,6 +125,12 @@ class PipelineRuntime(object):
         fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
         return fut.result(timeout=timeout_s)
 
+    def _require_pipeline(self):
+        pipeline = self.pipeline
+        if self.loop is None or pipeline is None:
+            raise RuntimeError("Pipeline not ready")
+        return pipeline
+
     # ---------- database operations ----------
     async def _save_camera_to_db_async(self, camera_uuid: str, cfg_data: Dict[str, Any]):
         """
@@ -193,6 +199,12 @@ class PipelineRuntime(object):
         Restore all cameras from SQLite database on startup (sync version for init).
         """
         try:
+            pipeline = self._require_pipeline()
+        except RuntimeError:
+            logger.error("Skipping camera restore because pipeline is not ready")
+            return
+
+        try:
             # Use sync session for startup (before async loop is running heavily)
             session = db_manager.get_session()
             try:
@@ -219,7 +231,7 @@ class PipelineRuntime(object):
                             self._cameras[camera_uuid] = cfg_data
 
                         if cfg is not None:
-                            self._call(self.pipeline.add_channel(cfg), timeout_s=15.0)
+                            self._call(pipeline.add_channel(cfg), timeout_s=15.0)
                             restored_count += 1
                             #logger.info(f"Restored camera {camera_uuid} from database")
                     except Exception as e:
@@ -277,7 +289,8 @@ class PipelineRuntime(object):
         self._save_camera_to_db(cam_id, cfg_data)
 
         # add to pipeline (async)
-        self._call(self.pipeline.add_channel(cfg), timeout_s=15.0)
+        pipeline = self._require_pipeline()
+        self._call(pipeline.add_channel(cfg), timeout_s=15.0)
 
         return {
             "camera_uuid": cam_id,
@@ -293,7 +306,8 @@ class PipelineRuntime(object):
 
         # stop runtime FIRST (prevents “still inferencing after delete” window)
         if existed:
-            self._call(self.pipeline.remove_channel(camera_uuid), timeout_s=10.0)
+            pipeline = self._require_pipeline()
+            self._call(pipeline.remove_channel(camera_uuid), timeout_s=10.0)
 
         # then delete from database
         self._delete_camera_from_db(camera_uuid)
@@ -324,18 +338,21 @@ class PipelineRuntime(object):
         # persist updated config to database
         self._save_camera_to_db(camera_uuid, cfg_data)
 
-        self._call(self.pipeline.add_channel(new_cfg), timeout_s=15.0)
+        pipeline = self._require_pipeline()
+        self._call(pipeline.add_channel(new_cfg), timeout_s=15.0)
 
         return {"camera_uuid": camera_uuid, "config": cfg_data}
 
     def get_latest(self, camera_uuid: str) -> Dict[str, Any]:
         # get_latest is async
-        result = self._call(self.pipeline.get_latest(camera_uuid), timeout_s=5.0)
+        pipeline = self._require_pipeline()
+        result = self._call(pipeline.get_latest(camera_uuid), timeout_s=5.0)
         return result
 
     def get_snapshot(self, camera_uuid: str):
         # get_latest_snapshot is async
-        return self._call(self.pipeline.get_latest_snapshot(camera_uuid), timeout_s=5.0)
+        pipeline = self._require_pipeline()
+        return self._call(pipeline.get_latest_snapshot(camera_uuid), timeout_s=5.0)
 
     def get_stats(self) -> Dict[str, Any]:
         if self.loop is None or self.pipeline is None:
