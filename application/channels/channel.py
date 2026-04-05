@@ -86,6 +86,9 @@ class VideoChannel:
         # Preserve order while removing duplicates.
         return list(dict.fromkeys(urls))
 
+    def _detection_enabled(self) -> bool:
+        return getattr(self.config, "detection_enabled", True) is not False
+
     def snapshot_urls(self) -> List[str]:
         base = str(self.config.device_url or "").rstrip("/")
         if not base:
@@ -101,7 +104,7 @@ class VideoChannel:
         return await self.stream()
     
     async def stream(self) -> Optional[Dict[str, Any]]:
-        if not self.config.enabled:
+        if not self._detection_enabled():
             return None
         if not self.config.device_url:
             logger.warning("Jetson device_url not configured for camera=%s", self.key())
@@ -142,7 +145,7 @@ class VideoChannel:
         return None
 
     async def fetch_snapshot_bytes(self) -> Optional[Tuple[bytes, str]]:
-        if not self.config.enabled:
+        if not self._detection_enabled():
             return None
         if not self.config.device_url:
             return None

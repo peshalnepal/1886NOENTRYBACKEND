@@ -150,7 +150,7 @@ class ChannelRepository:
             if device_uuid is not None:
                 await self._set_camera_device(db, camera_uuid=cam.camera_uuid, device_uuid=device_uuid)
             else:
-                if cam.is_enabled and cam.is_detection_enabled:
+                if cam.is_detection_enabled:
                     await self._ensure_camera_has_exactly_one_device(db, camera_uuid=cam.camera_uuid)
 
         else:

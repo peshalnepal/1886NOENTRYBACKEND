@@ -157,6 +157,15 @@ def _runtime_config_overrides(cfg: Dict[str, Any], *, extra_forbidden: Optional[
         out[k] = v
     return out
 
+
+def _edge_runtime_enabled(*, detection_enabled: bool) -> bool:
+    """
+    Jetson's `enabled` flag currently gates whether the camera remains active in
+    the inference runtime. Playback provisioning is handled separately by
+    Azure-side `Camera.is_enabled`.
+    """
+    return bool(detection_enabled)
+
 class Manager:
     """
     Azure Manager:
@@ -252,16 +261,14 @@ class Manager:
 
     async def start_background_pipelines(self) -> Dict[str, Any]:
         """
-        Start polling pipelines for every user that has at least one enabled
-        detection camera so notifications continue even when nobody is logged in.
+        Start polling pipelines for every user that has at least one
+        detection-enabled camera so notifications continue even when nobody is
+        logged in.
         """
         async with self._session_factory() as db:
             rows = await db.execute(
                 select(Camera.user_id)
-                .where(
-                    Camera.is_enabled.is_(True),
-                    Camera.is_detection_enabled.is_(True),
-                )
+                .where(Camera.is_detection_enabled.is_(True))
                 .distinct()
                 .order_by(Camera.user_id.asc())
             )
@@ -987,7 +994,7 @@ class Manager:
                     site_cache=site_schedule_cache,
                 )
                 # Alert schedules should not tear down active detection runtimes.
-                if bool(cam.is_enabled) and bool(cam.is_detection_enabled):
+                if bool(cam.is_detection_enabled):
                     desired_set.add(str(cam.camera_uuid))
                 # Keep playback paths provisioned for enabled cameras regardless of
                 # alert schedule state so live view remains stable.
@@ -1049,7 +1056,7 @@ class Manager:
                 # Explicit fields last so they always win over whatever is in channel config
                 "camera_uuid": cu,
                 "rtsp_url": cam.rtsp_url,
-                "enabled": True,
+                "enabled": _edge_runtime_enabled(detection_enabled=True),
                 "detection_enabled": True,
                 "notification_enabled": bool(cam.is_notification_enabled),
             }
@@ -1240,7 +1247,7 @@ class Manager:
             rtsp_url=cam.rtsp_url,
             config={
                 **_only_jetson_config(patch),
-                "enabled": enabled,
+                "enabled": _edge_runtime_enabled(detection_enabled=det_enabled),
                 "detection_enabled": det_enabled,
                 "notification_enabled": bool(getattr(cam, "is_notification_enabled", True)),
             },
@@ -1250,7 +1257,7 @@ class Manager:
         # If Jetson is unreachable the 3-retry × 15s timeout would hold
         # self._lock for up to 45s, blocking all other operations.
         # The background reconcile loop (every 90s) will catch any failure.
-        if enabled and det_enabled:
+        if det_enabled:
             asyncio.create_task(
                 self._bg_edge_upsert(device_url=dev.device_url, payload=edge_payload)
             )
@@ -1436,14 +1443,14 @@ class Manager:
         )
 
         try:
-            if enabled and det_enabled:
+            if det_enabled:
                 if old_dev.device_uuid != new_device_uuid:
                     edge_payload = self._edge_payload_from_config(
                         camera_uuid=str(cam_uuid),
                         rtsp_url=cam2.rtsp_url,
                         config={
                             **_only_jetson_config(merged_cfg),
-                            "enabled": enabled,
+                            "enabled": _edge_runtime_enabled(detection_enabled=det_enabled),
                             "detection_enabled": det_enabled,
                             "notification_enabled": bool(cam2.is_notification_enabled),
                         },
@@ -1452,7 +1459,7 @@ class Manager:
                 else:
                     edge_patch = _only_jetson_config(patch)
                     edge_patch.setdefault("rtsp_url", cam2.rtsp_url)
-                    edge_patch["enabled"] = enabled
+                    edge_patch["enabled"] = _edge_runtime_enabled(detection_enabled=det_enabled)
                     edge_patch["detection_enabled"] = det_enabled
                     edge_patch["notification_enabled"] = bool(cam2.is_notification_enabled)
                     await self._edge.patch_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid), patch=edge_patch)

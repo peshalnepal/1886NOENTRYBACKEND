@@ -920,9 +920,6 @@ class ModelPipeline:
                 ch = cur
 
             cfg = ch.config
-            if not cfg.enabled:
-                await asyncio.sleep(0.5)
-                continue
             if getattr(cfg, "detection_enabled", True) is False:
                 await asyncio.sleep(0.5)
                 continue

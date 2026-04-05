@@ -224,9 +224,10 @@ def _camera_mode_with_schedule(
         now_utc=now_utc or datetime.now(timezone.utc),
     )
 
+    # `enabled` controls playback provisioning, not alert ingest.
     return CameraMode(
-        detection_enabled=bool(enabled and detection_enabled and schedule_active),
-        notification_enabled=bool(enabled and notification_enabled and schedule_active),
+        detection_enabled=bool(detection_enabled and schedule_active),
+        notification_enabled=bool(notification_enabled and schedule_active),
     )
 
 
