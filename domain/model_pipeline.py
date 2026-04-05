@@ -60,6 +60,103 @@ class ObjDetectResponse:
     alerts: Tuple[Dict[str, Any], ...] = ()
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed
+
+
+def _normalize_overlay_box(raw_box: Any) -> Optional[Dict[str, int]]:
+    if isinstance(raw_box, dict):
+        keys = ("x1", "y1", "x2", "y2")
+        if not all(key in raw_box for key in keys):
+            return None
+        values = tuple(_coerce_int(raw_box.get(key)) for key in keys)
+        if any(value is None for value in values):
+            return None
+        x1, y1, x2, y2 = values
+        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+    if isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
+        values = tuple(_coerce_int(raw_box[idx]) for idx in range(4))
+        if any(value is None for value in values):
+            return None
+        x1, y1, x2, y2 = values
+        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+    if all(hasattr(raw_box, key) for key in ("x1", "y1", "x2", "y2")):
+        values = tuple(_coerce_int(getattr(raw_box, key, None)) for key in ("x1", "y1", "x2", "y2"))
+        if any(value is None for value in values):
+            return None
+        x1, y1, x2, y2 = values
+        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+    return None
+
+
+def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(raw_detection, dict):
+        box = _normalize_overlay_box(raw_detection.get("box") or raw_detection.get("bbox"))
+        cls_name = str(raw_detection.get("cls_name") or raw_detection.get("class") or "obj")
+        conf = float(raw_detection.get("conf", 0.0) or 0.0)
+    else:
+        box = _normalize_overlay_box(getattr(raw_detection, "box", None) or getattr(raw_detection, "bbox", None))
+        cls_name = str(
+            getattr(raw_detection, "cls_name", None)
+            or getattr(raw_detection, "class_name", None)
+            or getattr(raw_detection, "class", None)
+            or "obj"
+        )
+        conf = float(getattr(raw_detection, "conf", 0.0) or 0.0)
+
+    if box is None:
+        return None
+
+    return {
+        "cls_name": cls_name,
+        "conf": conf,
+        "box": box,
+    }
+
+
+def _overlay_payload_from_resp(
+    resp: ObjDetectResponse,
+    *,
+    fallback_detections: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    detections: List[Dict[str, Any]] = []
+    seen = set()
+
+    for raw_detection in list(resp.detections or ()) + list(fallback_detections or ()):
+        normalized = _normalize_overlay_detection(raw_detection)
+        if normalized is None:
+            continue
+
+        box = normalized["box"]
+        key = (
+            normalized["cls_name"],
+            normalized["conf"],
+            box["x1"],
+            box["y1"],
+            box["x2"],
+            box["y2"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        detections.append(normalized)
+
+    return {
+        "frame_ts_ms": int(resp.frame_ts_ms),
+        "frame_seq": int(resp.frame_seq),
+        "frame_w": _coerce_int(resp.frame_w),
+        "frame_h": _coerce_int(resp.frame_h),
+        "detections": detections,
+    }
+
+
 class ObjDetectStorePort(Protocol):
     async def put(self, resp: ObjDetectResponse) -> None: ...
     async def get_latest(self, camera_uuid: str) -> Optional[ObjDetectResponse]: ...
@@ -719,6 +816,7 @@ class ModelPipeline:
         image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
 
         for a in alerts:
+            overlay_payload = _overlay_payload_from_resp(resp, fallback_detections=[a])
             title = f"ROI Alert ({a.get('type','roi')})"
             body = f"{a.get('cls_name','object')} entered ROI {a.get('roi_id')} (track {a.get('track_id')})"
 
@@ -740,6 +838,10 @@ class ModelPipeline:
                 alert_type="roi_enter",
                 cls_names=[str(a.get("cls_name", "object"))],
                 max_conf=float(a.get("conf", 0.0) or 0.0),
+                frame_w=overlay_payload.get("frame_w"),
+                frame_h=overlay_payload.get("frame_h"),
+                frame_seq=overlay_payload.get("frame_seq"),
+                detections=list(overlay_payload.get("detections") or []),
                 roi_id=str(a.get("roi_id", "")),
                 track_id=track_id,
                 device_name=ctx.device_name if ctx else None,
@@ -749,7 +851,10 @@ class ModelPipeline:
 
             await svc.hub.publish(msg)
 
-            persist_payload = dict(extra_payload or {})
+            persist_payload = {
+                **overlay_payload,
+                **(extra_payload or {}),
+            }
             persist_payload["alert"] = a
             asyncio.create_task(
                 self._persist_and_maybe_email(ctx=ctx, msg=msg, extra_payload=persist_payload),
@@ -794,6 +899,7 @@ class ModelPipeline:
             if tr is None:
                 continue
 
+            overlay_payload = _overlay_payload_from_resp(resp, fallback_detections=[tr])
             cls_name = str(tr.get("cls_name") or "object")
             conf = float(tr.get("conf", 0.0) or 0.0)
 
@@ -809,6 +915,10 @@ class ModelPipeline:
                 alert_type="item_detected",
                 cls_names=[cls_name],
                 max_conf=conf,
+                frame_w=overlay_payload.get("frame_w"),
+                frame_h=overlay_payload.get("frame_h"),
+                frame_seq=overlay_payload.get("frame_seq"),
+                detections=list(overlay_payload.get("detections") or []),
                 track_id=track_id,
                 device_name=ctx.device_name if ctx else None,
                 camera_name=ctx.camera_name if ctx else None,
@@ -817,7 +927,10 @@ class ModelPipeline:
 
             await svc.hub.publish(msg)
 
-            persist_payload = dict(extra_payload or {})
+            persist_payload = {
+                **overlay_payload,
+                **(extra_payload or {}),
+            }
             persist_payload["track"] = tr
             persist_payload["event"] = "track_confirmed"
             asyncio.create_task(
@@ -872,6 +985,7 @@ class ModelPipeline:
         uniq_classes = sorted(set(classes))
         classes_text = ", ".join(uniq_classes)
         image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
+        overlay_payload = _overlay_payload_from_resp(resp)
         msg = NotificationMessage(
             user_id=int(ctx.user_id),
             id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-summary",
@@ -884,6 +998,10 @@ class ModelPipeline:
             alert_type="detection_summary",
             cls_names=uniq_classes,
             max_conf=float(max_conf),
+            frame_w=overlay_payload.get("frame_w"),
+            frame_h=overlay_payload.get("frame_h"),
+            frame_seq=overlay_payload.get("frame_seq"),
+            detections=list(overlay_payload.get("detections") or []),
             device_name=ctx.device_name,
             camera_name=ctx.camera_name,
             image_url=image_url,
@@ -891,7 +1009,10 @@ class ModelPipeline:
 
         await svc.hub.publish(msg)
 
-        persist_payload = dict(extra_payload or {})
+        persist_payload = {
+            **overlay_payload,
+            **(extra_payload or {}),
+        }
         persist_payload["detections"] = filtered[:20]
         persist_payload["event"] = "detection_summary"
         asyncio.create_task(

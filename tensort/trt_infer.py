@@ -287,7 +287,7 @@ class YoloV8DetTRT(object):
         self,
         engine_path: str,
         imgsz: int = 640,
-        conf: float = 0.50,
+        conf: float = 0.35,
         iou: float = 0.45,
         allowed=("person", "car", "motorcycle", "truck"),
         topk: int = 100,
@@ -380,7 +380,7 @@ class TRTInfer(object):
         self,
         det_engine_path: str,
         imgsz: int = 512,
-        conf: float = 0.50,
+        conf: float = 0.35,
         iou: float = 0.45,
         allowed=("person", "car", "motorcycle", "truck"),
         model_id: str = "yolo-trt",
@@ -448,14 +448,14 @@ def build_default() -> TRTInfer:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     det_engine = os.getenv("DET_ENGINE")
     if not det_engine:
-        det_engine = os.path.join(base_dir, "models", "yolov8n.engine")
+        det_engine = os.path.join(base_dir, "models", "yolo26n.engine")
     elif not os.path.isabs(det_engine) and not os.path.exists(det_engine):
         candidate = os.path.join(base_dir, det_engine)
         if os.path.exists(candidate):
             det_engine = candidate
 
     imgsz = int(os.getenv("IMG_SZ", "640"))
-    conf = float(os.getenv("CONF", "0.50"))
+    conf = float(os.getenv("CONF", "0.35"))
     iou = float(os.getenv("IOU", "0.45"))
     device_id = int(os.getenv("CUDA_DEVICE", "0"))
     nms_topk = int(os.getenv("NMS_TOPK", "100"))

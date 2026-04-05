@@ -174,6 +174,15 @@ def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]
     }
 
 
+def _iter_overlay_detection_candidates(*sources: Any):
+    for source in sources:
+        if isinstance(source, list):
+            for item in source:
+                yield item
+        elif isinstance(source, dict):
+            yield source
+
+
 def _extract_clip_overlay_from_notification_payload(
     payload: Any,
     *,
@@ -193,25 +202,30 @@ def _extract_clip_overlay_from_notification_payload(
 
     detections: List[Dict[str, Any]] = []
     seen = set()
-    for raw_detections in (msg.get("detections"), extra.get("detections")):
-        if not isinstance(raw_detections, list):
+    detection_sources = (
+        msg.get("detections"),
+        msg.get("track"),
+        msg.get("alert"),
+        extra.get("detections"),
+        extra.get("track"),
+        extra.get("alert"),
+    )
+    for raw_detection in _iter_overlay_detection_candidates(*detection_sources):
+        normalized = _normalize_overlay_detection(raw_detection)
+        if normalized is None:
             continue
-        for raw_detection in raw_detections:
-            normalized = _normalize_overlay_detection(raw_detection)
-            if normalized is None:
-                continue
-            key = (
-                normalized["cls_name"],
-                normalized["conf"],
-                normalized["box"]["x1"],
-                normalized["box"]["y1"],
-                normalized["box"]["x2"],
-                normalized["box"]["y2"],
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            detections.append(normalized)
+        key = (
+            normalized["cls_name"],
+            normalized["conf"],
+            normalized["box"]["x1"],
+            normalized["box"]["y1"],
+            normalized["box"]["x2"],
+            normalized["box"]["y2"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        detections.append(normalized)
 
     frame_w = _coerce_positive_int(
         extra.get("frame_w")
