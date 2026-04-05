@@ -346,6 +346,8 @@ class NotificationOut(BaseModel):
     payload: Optional[Dict[str, Any]] = None
     image_url: Optional[str] = None
     image_storage_key: Optional[str] = None
+    clip_url: Optional[str] = None
+    clip_status: Optional[str] = None
     detected_at: datetime
     created_at: datetime
     read_at: Optional[datetime] = None
@@ -358,6 +360,9 @@ def _to_out(n: Notification) -> NotificationOut:
     extra = n.payload.get("extra") if isinstance(n.payload, dict) else None
     image_url = ""
     image_storage_key = ""
+    clip_url = ""
+    clip_status = ""
+    
     if isinstance(extra, dict):
         image_url = str(extra.get("image_url") or "").strip()
         image_storage_key = str(extra.get("image_storage_key") or "").strip()
@@ -365,6 +370,13 @@ def _to_out(n: Notification) -> NotificationOut:
         image_url = str(msg.get("image_url") or "").strip()
     if not image_storage_key:
         image_storage_key = str(msg.get("image_storage_key") or "").strip()
+    clip_url = str(msg.get("clip_url") or "").strip()
+    clip_status = str(msg.get("clip_status") or "").strip()
+    if isinstance(extra, dict) and not clip_url:
+        clip_payload = extra.get("clip")
+        if isinstance(clip_payload, dict):
+            clip_url = str(clip_payload.get("recording_url") or "").strip()
+            clip_status = str(clip_payload.get("status") or "").strip()
 
     return NotificationOut(
         id=int(n.id),
@@ -380,12 +392,36 @@ def _to_out(n: Notification) -> NotificationOut:
         payload=n.payload,
         image_url=image_url or None,
         image_storage_key=image_storage_key or None,
+        clip_url=clip_url or None,
+        clip_status=clip_status or None,
         detected_at=n.detected_at,
         created_at=n.created_at,
         read_at=n.read_at,
         sent_at=n.sent_at,
         status=str(n.status),
     )
+
+
+# Response models for chart data
+class ChartPoint(BaseModel):
+    bucket_start: datetime
+    count: int
+
+
+class DetectionsOverTimeOut(BaseModel):
+    user_id: int
+    site_uuid: Optional[str] = None
+    hours: int
+    object_class: Optional[str] = None
+    roi_only: bool
+    bucket_minutes: int
+    from_time: datetime = Field(alias="from")
+    to: datetime
+    total: int
+    points: List[ChartPoint]
+    
+    class Config:
+        populate_by_name = True
 
 
 @router.get("", response_model=List[NotificationOut])
@@ -684,7 +720,7 @@ def _is_roi_notification(event_type: Any, title: Any, message: Any, payload: Any
     return False
 
 
-@router.get("/detections-over-time")
+@router.get("/detections-over-time", response_model=DetectionsOverTimeOut)
 async def detections_over_time(
     request: Request,
     site_uuid: Optional[str] = None,
@@ -756,26 +792,26 @@ async def detections_over_time(
     cursor = aligned_start_ms
     while cursor <= now_ms:
         points.append(
-            {
-                "bucket_start": datetime.fromtimestamp(cursor / 1000.0, tz=timezone.utc),
-                "count": int(counts.get(cursor, 0)),
-            }
+            ChartPoint(
+                bucket_start=datetime.fromtimestamp(cursor / 1000.0, tz=timezone.utc),
+                count=int(counts.get(cursor, 0)),
+            )
         )
         cursor += bucket_ms
 
-    total = sum(p["count"] for p in points)
-    return {
-        "user_id": int(user.id),
-        "site_uuid": str(su) if su else None,
-        "hours": hours_i,
-        "object_class": class_filter,
-        "roi_only": bool(roi_only),
-        "bucket_minutes": bucket_minutes,
-        "from": datetime.fromtimestamp(aligned_start_ms / 1000.0, tz=timezone.utc),
-        "to": now,
-        "total": int(total),
-        "points": points,
-    }
+    total = sum(p.count for p in points)
+    return DetectionsOverTimeOut(
+        user_id=int(user.id),
+        site_uuid=str(su) if su else None,
+        hours=hours_i,
+        object_class=class_filter,
+        roi_only=bool(roi_only),
+        bucket_minutes=bucket_minutes,
+        **{"from": datetime.fromtimestamp(aligned_start_ms / 1000.0, tz=timezone.utc)},
+        to=now,
+        total=int(total),
+        points=points,
+    )
 
 
 @router.get("/unread-count")
