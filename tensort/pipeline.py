@@ -5,6 +5,7 @@ import logging
 import threading
 import queue
 import os
+import time
 from typing import Any, Dict, Optional, List
 
 try:
@@ -68,6 +69,21 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
     except Exception:
         v = int(default)
     return max(minimum, v)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except Exception:
+        value = float(default)
+    return max(float(minimum), float(value))
 
 
 class Broadcaster:
@@ -186,7 +202,7 @@ class InferenceWorker(object):
         from trt_infer import build_default
         try:
             self._infer = build_default()
-            logger.info("TRTInfer initialized inside inference thread.")
+            # logger.info("TRTInfer initialized inside inference thread.")
         except Exception as e:
             logger.exception("Failed to init TRT infer in worker thread: %s", e)
             self._infer = None
@@ -241,11 +257,6 @@ class SimpleInferencePipeline(object):
         if infer_q_max is None:
             infer_q_max = _env_int("INFER_QUEUE_MAX", 8, minimum=1)
 
-        self._channels = {}
-        self._channel_tasks = {}
-        self._closing = False
-        self._started = False
-
         self._buffer = CoalescingBuffer(max_pending_keys=_env_int("PENDING_KEY_MAX", 1000, minimum=100))
         self._out_q = asyncio.Queue(maxsize=out_queue_max)
 
@@ -253,9 +264,13 @@ class SimpleInferencePipeline(object):
         self._latest_snapshots = {}
         self._latest_snapshot_ts_ms = {}
         self._latest_lock = asyncio.Lock()
+        self._snapshot_enabled = _env_bool("ENABLE_SNAPSHOT_CACHE", True)
         self._snapshot_min_interval_ms = _env_int("SNAPSHOT_MIN_INTERVAL_MS", 1000, minimum=0)
         self._snapshot_max_edge = _env_int("SNAPSHOT_MAX_EDGE", 960, minimum=64)
         self._snapshot_jpeg_quality = _env_int("SNAPSHOT_JPEG_QUALITY", 75, minimum=1)
+        self._infer_error_log_interval_s = _env_float("INFER_ERROR_LOG_INTERVAL_S", 10.0, minimum=0.0)
+        self._last_infer_error_sig = {}
+        self._last_infer_error_ts = {}
 
         self._lock = asyncio.Lock()
         self._inference_task = None
@@ -270,8 +285,25 @@ class SimpleInferencePipeline(object):
             "detections_total": 0,
             "alerts_attempted": 0,
         }
-
         self.broadcaster = Broadcaster()
+
+    def _should_log_infer_failure(self, camera_uuid, reason):
+        camera_key = str(camera_uuid)
+        sig = "{}|{}".format(camera_key, str(reason or "").strip())
+        now_s = float(time.monotonic())
+        last_sig = self._last_infer_error_sig.get(camera_key)
+        last_ts = float(self._last_infer_error_ts.get(camera_key, 0.0) or 0.0)
+        if sig != last_sig:
+            self._last_infer_error_sig[camera_key] = sig
+            self._last_infer_error_ts[camera_key] = now_s
+            return True
+        if self._infer_error_log_interval_s <= 0.0:
+            self._last_infer_error_ts[camera_key] = now_s
+            return True
+        if (now_s - last_ts) >= self._infer_error_log_interval_s:
+            self._last_infer_error_ts[camera_key] = now_s
+            return True
+        return False
 
     async def add_channel(self, cfg):
         camera_key = str(cfg.camera_uuid)
@@ -331,6 +363,8 @@ class SimpleInferencePipeline(object):
                 del self._latest_snapshots[camera_key]
             if camera_key in self._latest_snapshot_ts_ms:
                 del self._latest_snapshot_ts_ms[camera_key]
+        self._last_infer_error_sig.pop(camera_key, None)
+        self._last_infer_error_ts.pop(camera_key, None)
 
     def list_channels(self):
         return list(self._channels.keys())
@@ -393,6 +427,8 @@ class SimpleInferencePipeline(object):
             self._channel_tasks = {}
             self._channels = {}
             self._started = False
+        self._last_infer_error_sig = {}
+        self._last_infer_error_ts = {}
 
         await self._put_out(_DONE)
 
@@ -415,7 +451,7 @@ class SimpleInferencePipeline(object):
 
     async def _pump_channel(self, camera_key, ch):
         try:
-            logger.info("[Jetson] Starting pump for camera %s", camera_key)
+            # logger.info("[Jetson] Starting pump for camera %s", camera_key)
             async for ev in ch.stream(event_queue=None):
                 if self._closing:
                     break
@@ -435,27 +471,21 @@ class SimpleInferencePipeline(object):
                 await ch.stop()
             except Exception:
                 pass
-
+            
     async def _pump_inference(self):
         """
-        Sends frames to the TRT inference thread (does NOT call TRT directly here).
-        Receives results and sends significant detections to Azure if configured.
+        Sends frames to the TRT inference thread.
+        Stores latest result per camera.
+        Emits only failures or positive detections by default.
+        No external alert webhook push from Jetson.
         """
         loop = asyncio.get_event_loop()
-        notify_url = os.getenv("AZURE_NOTIFY_URL")
-
-        # helper to send alert without blocking pipeline
-        def _send_alert(url, payload):
-            try:
-                import requests
-                requests.post(url, json=payload, timeout=2.0)
-            except Exception:
-                pass # fire and forget
 
         try:
             while not self._closing:
                 rtsp_ev = await self._buffer.get()
                 self._stats["frames_in"] += 1
+
                 if self._log_every_n and (int(getattr(rtsp_ev, "seq", 0)) % self._log_every_n == 0):
                     logger.debug(
                         "[Jetson] Received frame camera=%s seq=%s",
@@ -474,20 +504,20 @@ class SimpleInferencePipeline(object):
 
                 if bgr is None:
                     self._stats["infer_fail"] += 1
-                    await self._put_out({
+                    result = {
                         "type": "InferenceFailedEvent",
                         "camera_uuid": str(rtsp_ev.camera_uuid),
                         "frame_ts_ms": int(rtsp_ev.ts_ms),
                         "frame_seq": int(rtsp_ev.seq),
                         "reason": "No frame data found (frame=None and encoded=None)",
-                    })
-                    continue
+                    }
 
-                await self._cache_snapshot(
-                    camera_uuid=rtsp_ev.camera_uuid,
-                    frame_bgr=bgr,
-                    ts_ms=int(rtsp_ev.ts_ms),
-                )
+                    async with self._latest_lock:
+                        self._latest[str(rtsp_ev.camera_uuid)] = result
+
+                    await self.broadcaster.broadcast(result)
+                    await self._put_out(result)
+                    continue
 
                 meta = {
                     "camera_uuid": str(rtsp_ev.camera_uuid),
@@ -496,95 +526,88 @@ class SimpleInferencePipeline(object):
                     "frame_seq": int(rtsp_ev.seq),
                 }
 
-                # create an asyncio Future to receive result
-                fut = asyncio.Future()
+                fut = loop.create_future()
 
                 if self._infer_worker is None:
-                    await self._put_out({
+                    result = {
                         "type": "InferenceFailedEvent",
                         "camera_uuid": meta["camera_uuid"],
                         "frame_ts_ms": meta["frame_ts_ms"],
                         "frame_seq": meta["frame_seq"],
                         "reason": "Inference worker not running",
-                    })
-                    continue
-
-                ok = self._infer_worker.submit(bgr, meta, fut)
-                if not ok:
-                    result = await fut
+                    }
                 else:
-                    try:
-                        result = await asyncio.wait_for(fut, timeout=2.0)  # tune
-                    except asyncio.TimeoutError:
-                        result = {
-                            "type": "InferenceFailedEvent",
-                            "camera_uuid": meta["camera_uuid"],
-                            "frame_ts_ms": meta["frame_ts_ms"],
-                            "frame_seq": meta["frame_seq"],
-                            "reason": "Inference timed out",
-                        }
+                    ok = self._infer_worker.submit(bgr, meta, fut)
+
+                    if not ok:
+                        result = await fut
+                    else:
+                        try:
+                            if self._infer_result_timeout_s > 0.0:
+                                result = await asyncio.wait_for(
+                                    fut,
+                                    timeout=self._infer_result_timeout_s,
+                                )
+                            else:
+                                result = await fut
+                        except asyncio.TimeoutError:
+                            result = {
+                                "type": "InferenceFailedEvent",
+                                "camera_uuid": meta["camera_uuid"],
+                                "frame_ts_ms": meta["frame_ts_ms"],
+                                "frame_seq": meta["frame_seq"],
+                                "reason": "Inference timed out",
+                            }
+
+                has_detections = False
+
                 if isinstance(result, dict) and result.get("type") == "InferenceFailedEvent":
                     self._stats["infer_fail"] += 1
                     reason = str(result.get("reason", "") or "")
+
                     if "queue full" in reason.lower():
                         self._stats["infer_dropped"] += 1
-                    logger.warning(
-                        "[Jetson] Inference failed camera=%s seq=%s reason=%s",
-                        rtsp_ev.camera_uuid,
-                        rtsp_ev.seq,
-                        reason or "unknown error",
-                    )
+
+                    if self._should_log_infer_failure(rtsp_ev.camera_uuid, reason):
+                        logger.warning(
+                            "[Jetson] Inference failed camera=%s seq=%s reason=%s",
+                            rtsp_ev.camera_uuid,
+                            rtsp_ev.seq,
+                            reason or "unknown error",
+                        )
                 else:
                     self._stats["infer_ok"] += 1
-                    if isinstance(result, dict):
-                        self._stats["detections_total"] += len(result.get("detections", []) or [])
 
-                if notify_url and result.get("detections"):
-                    dets = []
-                    for d in result["detections"]:
-                        if isinstance(d, dict):
-                             dets.append(d)
-                        elif hasattr(d, "model_dump"):
-                             dets.append(d.model_dump())
-                        else:
-                             dets.append({
-                                 "cls_name": getattr(d, "cls_name", "unknown"),
-                                 "conf": getattr(d, "conf", 0.0),
-                                 "box": getattr(d, "box", [])
-                             })
-                    
-                    if dets:
-                        self._stats["alerts_attempted"] += 1
-                        frame_h = result.get("frame_h")
-                        frame_w = result.get("frame_w")
-                        if (frame_w is None or frame_h is None) and bgr is not None:
-                            frame_h, frame_w = bgr.shape[:2]
-                        alert_payload = {
-                            "camera_uuid": str(meta["camera_uuid"]),
-                            "frame_ts_ms": int(meta["frame_ts_ms"]),
-                            "frame_seq": int(meta["frame_seq"]),
-                            "detections": dets
-                        }
-                        if frame_w is not None:
-                            alert_payload["frame_w"] = int(frame_w)
-                        if frame_h is not None:
-                            alert_payload["frame_h"] = int(frame_h)
-                        image_url = _encode_thumbnail_data_url(bgr)
-                        if image_url:
-                            alert_payload["image_url"] = image_url
-                        loop.run_in_executor(None, _send_alert, notify_url, alert_payload)
+                    detections = []
+                    if isinstance(result, dict):
+                        detections = result.get("detections", []) or []
+
+                    self._stats["detections_total"] += len(detections)
+                    has_detections = bool(detections)
+
+                    # only cache snapshot when needed
+                    if self._snapshot_enabled and ((not self._snapshot_on_detection_only) or has_detections):
+                        await self._cache_snapshot(
+                            camera_uuid=rtsp_ev.camera_uuid,
+                            frame_bgr=bgr,
+                            ts_ms=int(rtsp_ev.ts_ms),
+                        )
 
                 async with self._latest_lock:
                     self._latest[str(rtsp_ev.camera_uuid)] = result
 
-                await self.broadcaster.broadcast(result)
-                await self._put_out(result)
+                should_emit = True
+                if isinstance(result, dict) and result.get("type") != "InferenceFailedEvent":
+                    should_emit = self._emit_empty_detections or has_detections
+
+                if should_emit:
+                    await self.broadcaster.broadcast(result)
+                    await self._put_out(result)
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
             await self._put_out({"type": "InferencePumpFailed", "reason": str(e)})
-
     async def events(self):
         if not self._started:
             await self.start()

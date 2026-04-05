@@ -103,8 +103,6 @@ class VideoChannel:
     async def stream(self) -> Optional[Dict[str, Any]]:
         if not self.config.enabled:
             return None
-        if hasattr(self.config, "is_scheduled_now") and not self.config.is_scheduled_now():
-            return None
         if not self.config.device_url:
             logger.warning("Jetson device_url not configured for camera=%s", self.key())
             return None
@@ -145,8 +143,6 @@ class VideoChannel:
 
     async def fetch_snapshot_bytes(self) -> Optional[Tuple[bytes, str]]:
         if not self.config.enabled:
-            return None
-        if hasattr(self.config, "is_scheduled_now") and not self.config.is_scheduled_now():
             return None
         if not self.config.device_url:
             return None

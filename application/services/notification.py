@@ -588,8 +588,14 @@ class NotificationService:
         self._roi_engine = ROIAlertEngine()
         self._session_factory = None
         self._repo = NotificationRepository()
-        self._ctx_cache: Dict[str, Tuple[float, CameraContext]] = {}
+        self._ctx_cache: Dict[str, Tuple[float, Optional[CameraContext]]] = {}
         self._ctx_ttl_s = 60.0  # reduce DB hits on frequent detections
+        self._ctx_miss_ttl_s = _env_float("NOTIFICATION_CAMERA_CONTEXT_MISS_CACHE_TTL_S", 5.0, minimum=0.0)
+        self._ctx_cache_lock = asyncio.Lock()
+        self._ctx_inflight: Dict[str, asyncio.Future] = {}
+        self._ctx_lookup_limit = asyncio.Semaphore(
+            _env_int("NOTIFICATION_CAMERA_CONTEXT_MAX_CONCURRENT_DB_LOOKUPS", 4, minimum=1)
+        )
         self._roi_cache: Dict[str, Tuple[float, List[ROI]]] = {}
         self._roi_ttl_s = 15.0
         self._recipient_cache: Dict[Tuple[int, str], Tuple[float, List[str]]] = {}
@@ -1200,20 +1206,58 @@ class NotificationService:
             return None
 
         now = time.monotonic()
-        hit = self._ctx_cache.get(camera_uuid_str)
-        if hit and hit[0] > now:
-            return hit[1]
+        leader = False
+        pending: Optional[asyncio.Future] = None
+
+        async with self._ctx_cache_lock:
+            hit = self._ctx_cache.get(camera_uuid_str)
+            if hit and hit[0] > now:
+                return hit[1]
+            pending = self._ctx_inflight.get(camera_uuid_str)
+            if pending is None:
+                pending = asyncio.get_running_loop().create_future()
+                self._ctx_inflight[camera_uuid_str] = pending
+                leader = True
 
         try:
             cam_uuid = uuid.UUID(str(camera_uuid_str))
         except Exception:
+            if leader:
+                async with self._ctx_cache_lock:
+                    future = self._ctx_inflight.pop(camera_uuid_str, None)
+                    if future is not None and not future.done():
+                        future.set_result(None)
             return None
 
-        async with self._session_factory() as db:
-            ctx = await self._repo.get_camera_context(db, camera_uuid=cam_uuid)
+        if not leader and pending is not None:
+            return await pending
 
-        if ctx:
-            self._ctx_cache[camera_uuid_str] = (now + self._ctx_ttl_s, ctx)
+        ctx: Optional[CameraContext] = None
+        cancelled = False
+        try:
+            async with self._ctx_lookup_limit:
+                async with self._session_factory() as db:
+                    ctx = await self._repo.get_camera_context(db, camera_uuid=cam_uuid)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception:
+            logger.exception("Failed to load cached CameraContext camera=%s", camera_uuid_str)
+            ctx = None
+        finally:
+            async with self._ctx_cache_lock:
+                if not cancelled:
+                    ttl_s = self._ctx_ttl_s if ctx else self._ctx_miss_ttl_s
+                    if ttl_s > 0.0:
+                        self._ctx_cache[camera_uuid_str] = (now + ttl_s, ctx)
+                    else:
+                        self._ctx_cache.pop(camera_uuid_str, None)
+                future = self._ctx_inflight.pop(camera_uuid_str, None)
+                if future is not None and not future.done():
+                    if cancelled:
+                        future.cancel()
+                    else:
+                        future.set_result(ctx)
 
         return ctx
 

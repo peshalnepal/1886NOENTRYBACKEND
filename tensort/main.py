@@ -22,9 +22,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jetson-app")
 
 app = Flask(__name__)
-DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "3.0"))
-
-
+DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "1.0"))
+DEFAULT_RESIZE_W = int(os.getenv("DEFAULT_RESIZE_W", "640"))
+DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "360"))
+DEFAULT_JPEG_QUALITY = int(os.getenv("DEFAULT_JPEG_QUALITY", "70"))
+MAX_SAMPLE_FPS = float(os.getenv("MAX_SAMPLE_FPS", "5.0"))
 # -----------------------------
 # Pipeline runtime (async loop in background thread)
 # -----------------------------
@@ -39,7 +41,7 @@ class PipelineRuntime(object):
         self._cameras = {}  # camera_uuid -> dict(config)
         
         # Initialize database tables
-        logger.info("Initializing SQLite database...")
+        #logger.info("Initializing SQLite database...")
         if not db_manager.initialize_tables():
             logger.error("Failed to initialize database tables")
 
@@ -53,6 +55,43 @@ class PipelineRuntime(object):
         # Restore cameras from database after pipeline is ready
         self._restore_cameras_from_db()
 
+
+    def _normalize_camera_cfg(self, cfg_data: Dict[str, Any]) -> Dict[str, Any]:
+        cfg_data = dict(cfg_data or {})
+
+        try:
+            sample_fps = float(cfg_data.get("sample_fps", DEFAULT_SAMPLE_FPS))
+        except Exception:
+            sample_fps = DEFAULT_SAMPLE_FPS
+
+        cfg_data["sample_fps"] = max(0.1, min(sample_fps, MAX_SAMPLE_FPS))
+
+        resize = cfg_data.get("resize")
+        if resize is None and DEFAULT_RESIZE_W > 0 and DEFAULT_RESIZE_H > 0:
+            resize = (DEFAULT_RESIZE_W, DEFAULT_RESIZE_H)
+
+        if resize is not None:
+            if isinstance(resize, (list, tuple)) and len(resize) == 2:
+                try:
+                    resize_w = max(1, int(resize[0]))
+                    resize_h = max(1, int(resize[1]))
+                    cfg_data["resize"] = (resize_w, resize_h)
+                except Exception:
+                    cfg_data["resize"] = None
+            else:
+                cfg_data["resize"] = None
+
+        try:
+            jpeg_quality = int(cfg_data.get("jpeg_quality", DEFAULT_JPEG_QUALITY))
+        except Exception:
+            jpeg_quality = DEFAULT_JPEG_QUALITY
+        cfg_data["jpeg_quality"] = max(30, min(jpeg_quality, 95))
+
+        # force raw path for TRT inference
+        cfg_data["emit_format"] = "raw"
+
+        return cfg_data
+    
     def _run_loop(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -67,7 +106,7 @@ class PipelineRuntime(object):
             self.pipeline = pipeline
             self._ready.set()
 
-            logger.info("Pipeline started in background thread.")
+            #logger.info("Pipeline started in background thread.")
             loop.run_forever()
 
         except Exception as e:
@@ -103,7 +142,7 @@ class PipelineRuntime(object):
                     # Update existing camera
                     existing.rtsp_url = cfg_data.get("rtsp_url", existing.rtsp_url)
                     existing.config_json = cfg_data
-                    logger.info(f"Updated camera {camera_uuid} in database")
+                    #logger.info(f"Updated camera {camera_uuid} in database")
                 else:
                     # Create new camera
                     cam_config = CameraConfig(
@@ -114,7 +153,7 @@ class PipelineRuntime(object):
                         config_json=cfg_data
                     )
                     session.add(cam_config)
-                    logger.info(f"Saved new camera {camera_uuid} to database")
+                    #logger.info(f"Saved new camera {camera_uuid} to database")
                 
                 await session.commit()
         except Exception as e:
@@ -139,7 +178,7 @@ class PipelineRuntime(object):
                 if camera:
                     await session.delete(camera)
                     await session.commit()
-                    logger.info(f"Deleted camera {camera_uuid} from database")
+                    #logger.info(f"Deleted camera {camera_uuid} from database")
         except Exception as e:
             logger.exception(f"Failed to delete camera {camera_uuid} from database: {e}")
     
@@ -166,10 +205,7 @@ class PipelineRuntime(object):
                         camera_uuid = cam_config.camera_uuid
                         
                         # Ensure required fields are present
-                        cfg_data["camera_uuid"] = camera_uuid
-                        cfg_data["channel_id"] = cam_config.channel_id
-                        cfg_data["rtsp_url"] = cam_config.rtsp_url
-
+                        cfg_data = self._normalize_camera_cfg(cfg_data)
                         # Build config first — if this raises (bad stored JSON) we
                         # must NOT add the camera to self._cameras, otherwise it
                         # appears in list_cameras() as "on device" but has no active
@@ -185,7 +221,7 @@ class PipelineRuntime(object):
                         if cfg is not None:
                             self._call(self.pipeline.add_channel(cfg), timeout_s=15.0)
                             restored_count += 1
-                            logger.info(f"Restored camera {camera_uuid} from database")
+                            #logger.info(f"Restored camera {camera_uuid} from database")
                     except Exception as e:
                         logger.exception(f"Failed to restore camera {cam_config.camera_uuid}: {e}")
                 
@@ -216,26 +252,20 @@ class PipelineRuntime(object):
             "detection_enabled": True,
             "notification_enabled": True,
             "sample_fps": DEFAULT_SAMPLE_FPS,
-            "decode_backend": "gstreamer",   # best on Jetson if OpenCV built with GStreamer
-            "resize": None,                 # e.g. (640, 360)
+            "decode_backend": "gstreamer",
+            "resize": (DEFAULT_RESIZE_W, DEFAULT_RESIZE_H) if DEFAULT_RESIZE_W > 0 and DEFAULT_RESIZE_H > 0 else None,
             "reconnect_base_ms": 1000,
             "reconnect_max_ms": 8000,
-            "emit_format": "raw",           # IMPORTANT: raw for TRT inference
-            "jpeg_quality": 80,
+            "emit_format": "raw",
+            "jpeg_quality": DEFAULT_JPEG_QUALITY,
         }
-
+        
         # apply patch from request
         for k, v in (cfg_patch or {}).items():
             if v is not None:
                 cfg_data[k] = v
-
-        # normalize resize if list -> tuple
-        if cfg_data.get("resize") is not None:
-            r = cfg_data["resize"]
-            if isinstance(r, (list, tuple)) and len(r) == 2:
-                cfg_data["resize"] = (int(r[0]), int(r[1]))
-            else:
-                cfg_data["resize"] = None
+                
+        cfg_data = self._normalize_camera_cfg(cfg_data)
 
         cfg = VideoChannelConfig(**cfg_data)  # your simple config class should accept these
 
@@ -282,22 +312,15 @@ class PipelineRuntime(object):
             cfg_data = self._cameras.get(camera_uuid)
             if cfg_data is None:
                 raise KeyError("camera not found")
-
             for k, v in patch.items():
                 if v is not None:
                     cfg_data[k] = v
 
-            # normalize resize
-            if cfg_data.get("resize") is not None:
-                r = cfg_data["resize"]
-                if isinstance(r, (list, tuple)) and len(r) == 2:
-                    cfg_data["resize"] = (int(r[0]), int(r[1]))
-                else:
-                    cfg_data["resize"] = None
+            cfg_data = self._normalize_camera_cfg(cfg_data)
 
             self._cameras[camera_uuid] = cfg_data
             new_cfg = VideoChannelConfig(**cfg_data)
-        
+
         # persist updated config to database
         self._save_camera_to_db(camera_uuid, cfg_data)
 

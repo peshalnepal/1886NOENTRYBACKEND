@@ -17,6 +17,26 @@ logger = logging.getLogger(__name__)
 logging.getLogger("sqlalchemy.engine").setLevel(logging.ERROR)
 
 
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(minimum, value)
+
+
+def _engine_pool_kwargs() -> dict:
+    return {
+        "pool_pre_ping": True,
+        "pool_size": _env_int("DB_POOL_SIZE", 10, minimum=1),
+        "max_overflow": _env_int("DB_MAX_OVERFLOW", 20, minimum=0),
+        "pool_timeout": _env_int("DB_POOL_TIMEOUT_S", 30, minimum=1),
+        "pool_recycle": _env_int("DB_POOL_RECYCLE_S", 1800, minimum=0),
+        "pool_use_lifo": True,
+    }
+
+
 def _parse_odbc(odbc_conn_str: str) -> dict:
     parts = {}
     for part in odbc_conn_str.split(";"):
@@ -61,12 +81,13 @@ class DatabaseManager:
         # Sync (pyodbc)
         params = urllib.parse.quote_plus(self.db_url)
         engine_url = f"mssql+pyodbc:///?odbc_connect={params}"
-        self.engine = create_engine(engine_url, pool_pre_ping=True)
+        pool_kwargs = _engine_pool_kwargs()
+        self.engine = create_engine(engine_url, **pool_kwargs)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
 
         # Async (aioodbc)
         async_url_obj = self._build_mssql_aioodbc_url(conn_parts)
-        self.async_engine = create_async_engine(async_url_obj, pool_pre_ping=True)
+        self.async_engine = create_async_engine(async_url_obj, **pool_kwargs)
         self.AsyncSessionLocal = async_sessionmaker(bind=self.async_engine, class_=AsyncSession, expire_on_commit=False)
 
     def _build_mssql_aioodbc_url(self, conn_parts: dict) -> URL:
@@ -123,10 +144,11 @@ class DatabaseManager:
         sync_url = f"mysql+pymysql://{urllib.parse.quote(uid)}:{urllib.parse.quote(pwd)}@{host}:{port}/{database}"
         async_url = f"mysql+aiomysql://{urllib.parse.quote(uid)}:{urllib.parse.quote(pwd)}@{host}:{port}/{database}"
 
-        self.engine = create_engine(sync_url, pool_pre_ping=True)
+        pool_kwargs = _engine_pool_kwargs()
+        self.engine = create_engine(sync_url, **pool_kwargs)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
 
-        self.async_engine = create_async_engine(async_url, pool_pre_ping=True)
+        self.async_engine = create_async_engine(async_url, **pool_kwargs)
         self.AsyncSessionLocal = async_sessionmaker(bind=self.async_engine, class_=AsyncSession, expire_on_commit=False)
 
 

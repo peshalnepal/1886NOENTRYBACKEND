@@ -85,7 +85,9 @@ def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) 
     h, w = img.shape[:2]
     r = min(float(new_shape) / float(h), float(new_shape) / float(w))
     nh, nw = int(round(h * r)), int(round(w * r))
-    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+    interp = cv2.INTER_AREA if r < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(img, (nw, nh), interpolation=interp)
 
     pad_w = new_shape - nw
     pad_h = new_shape - nh
@@ -97,8 +99,27 @@ def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) 
     out = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
     return out, r, (left, top)
 
+def _prepare_input_tensor(img_lb: np.ndarray) -> np.ndarray:
+    dnn_mod = getattr(cv2, "dnn", None)
+    blob_from_image = getattr(dnn_mod, "blobFromImage", None) if dnn_mod is not None else None
+    if callable(blob_from_image):
+        return blob_from_image(
+            img_lb,
+            scalefactor=1.0 / 255.0,
+            size=(img_lb.shape[1], img_lb.shape[0]),
+            mean=(0.0, 0.0, 0.0),
+            swapRB=True,
+            crop=False,
+        )
 
-def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk: int = 300) -> List[int]:
+    rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
+    x = np.empty((1, 3, img_lb.shape[0], img_lb.shape[1]), dtype=np.float32)
+    x[0] = np.transpose(rgb, (2, 0, 1))
+    x *= (1.0 / 255.0)
+    return x
+
+
+def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk: int = 100) -> List[int]:
     if boxes is None or len(boxes) == 0:
         return []
 
@@ -182,6 +203,7 @@ class TRTEngine(object):
             self.host_mem = []
             self.device_mem = []
             self.binding_names = []
+            self.output_shapes = {}
 
             self.input_index = None
             self.output_indices = []
@@ -211,6 +233,7 @@ class TRTEngine(object):
                     self.input_shape = tuple(shape)
                 else:
                     self.output_indices.append(i)
+                    self.output_shapes[i] = tuple(shape)
 
             if self.input_index is None:
                 raise RuntimeError("No input binding found.")
@@ -240,8 +263,7 @@ class TRTEngine(object):
 
             outs = []
             for oi in self.output_indices:
-                shape = tuple(self.engine.get_binding_shape(oi))
-                out = np.array(self.host_mem[oi], copy=True).reshape(shape)
+                out = self.host_mem[oi].copy().reshape(self.output_shapes[oi])
                 outs.append(out)
 
             return outs
@@ -260,20 +282,28 @@ COCO_NAMES = {
 
 
 class YoloV8DetTRT(object):
-    def __init__(self, engine_path: str, imgsz: int = 640, conf: float = 0.25, iou: float = 0.45, allowed=("person", "car","motorcycle","truck"), device_id: int = 0):
+    def __init__(
+        self,
+        engine_path: str,
+        imgsz: int = 640,
+        conf: float = 0.25,
+        iou: float = 0.45,
+        allowed=("person", "car", "motorcycle", "truck"),
+        topk: int = 100,
+        device_id: int = 0,
+    ):
         self.trt = TRTEngine(engine_path, device_id=device_id)
         self.imgsz = int(imgsz)
         self.conf = float(conf)
         self.iou = float(iou)
         self.allowed = set(allowed)
+        self.topk = int(topk)
 
     def run(self, bgr: np.ndarray) -> List[Dict]:
         H0, W0 = bgr.shape[:2]
         img_lb, r, (padx, pady) = letterbox_bgr(bgr, self.imgsz)
 
-        rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
-        x = rgb.astype(np.float32) / 255.0
-        x = np.transpose(x, (2, 0, 1))[None, ...]
+        x = _prepare_input_tensor(img_lb)
 
         outs = self.trt.infer(x)
         pred = outs[0]
@@ -349,9 +379,7 @@ class YoloV8PoseTRT(object):
         H0, W0 = bgr.shape[:2]
         img_lb, r, (padx, pady) = letterbox_bgr(bgr, self.imgsz)
 
-        rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
-        x = rgb.astype(np.float32) / 255.0
-        x = np.transpose(x, (2, 0, 1))[None, ...]
+        x = _prepare_input_tensor(img_lb)
 
         outs = self.trt.infer(x)
         pred = outs[0]
@@ -437,14 +465,15 @@ class TRTInfer(object):
         self,
         det_engine_path: str,
         pose_engine_path: Optional[str] = None,
-        imgsz: int = 640,
+        imgsz: int = 512,
         conf: float = 0.25,
         iou: float = 0.45,
-        allowed=("person", "car","motorcycle","truck"),
+        allowed=("person", "car", "motorcycle", "truck"),
         kpts: int = 17,
         model_id: str = "yolo-trt",
         device_id: int = 0,
         enable_pose: bool = False,
+        nms_topk: int = 100,
     ):
         self.model_id = model_id
         self.device_id = int(device_id)
@@ -452,9 +481,14 @@ class TRTInfer(object):
 
         # Ensure context exists for this thread before building engines
         ensure_cuda_context(self.device_id)
-
         self.det_runner = YoloV8DetTRT(
-            det_engine_path, imgsz=imgsz, conf=conf, iou=iou, allowed=allowed, device_id=self.device_id
+            det_engine_path,
+            imgsz=imgsz,
+            conf=conf,
+            iou=iou,
+            allowed=allowed,
+            topk=nms_topk,
+            device_id=self.device_id,
         )
         self.pose_runner = None
         if self.enable_pose and pose_engine_path:
@@ -470,7 +504,8 @@ class TRTInfer(object):
         frame_ts_ms = int(meta.get("frame_ts_ms", int(time.time() * 1000)))
         frame_seq = int(meta.get("frame_seq", 0))
 
-        logger.debug("[TRT] Starting inference for %s (seq=%s)", camera_uuid, frame_seq)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[TRT] Starting inference for %s (seq=%s)", camera_uuid, frame_seq)
 
         try:
             dets = self.det_runner.run(bgr)
@@ -513,10 +548,11 @@ def build_default() -> TRTInfer:
         if os.path.exists(candidate):
             det_engine = candidate
 
-    imgsz = int(os.getenv("IMG_SZ", "640"))
+    imgsz = int(os.getenv("IMG_SZ", "512"))
     conf = float(os.getenv("CONF", "0.25"))
     iou = float(os.getenv("IOU", "0.45"))
     device_id = int(os.getenv("CUDA_DEVICE", "0"))
+    nms_topk = int(os.getenv("NMS_TOPK", "100"))
 
     return TRTInfer(
         det_engine_path=det_engine,
@@ -526,4 +562,5 @@ def build_default() -> TRTInfer:
         iou=iou,
         device_id=device_id,
         enable_pose=False,
+        nms_topk=nms_topk,
     )

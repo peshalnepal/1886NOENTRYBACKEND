@@ -288,7 +288,9 @@ class VideoChannel():
                     if frame is None:
                         raise RuntimeError("Frame read failed")
 
-                    frame = self._maybe_resize(frame).copy()
+                    frame = self._maybe_resize(frame)
+                    if self.config.resize is None:
+                        frame = frame.copy()
 
                     self._seq += 1
                     h, w = frame.shape[:2]

@@ -392,6 +392,65 @@ class Manager:
         )
         return (await db.execute(q)).scalars().all()
 
+    def _normalize_device_url(self, device_url: Optional[str]) -> str:
+        return str(device_url or "").strip().rstrip("/")
+
+    async def _list_devices_for_physical_device(self, db: AsyncSession, *, device: Device) -> List[Device]:
+        target_url = self._normalize_device_url(getattr(device, "device_url", None))
+        root_key = str(getattr(device, "device_uuid", ""))
+        if not target_url:
+            return [device]
+
+        rows = (await db.execute(select(Device))).scalars().all()
+
+        out: List[Device] = []
+        seen: Set[str] = set()
+        for row in rows:
+            row_uuid = getattr(row, "device_uuid", None)
+            row_key = str(row_uuid) if row_uuid is not None else ""
+            row_url = self._normalize_device_url(getattr(row, "device_url", None))
+            if not row_key or row_url != target_url:
+                continue
+            if row_key != root_key and not bool(getattr(row, "is_enabled", True)):
+                continue
+            if row_key in seen:
+                continue
+            seen.add(row_key)
+            out.append(row)
+
+        if root_key and root_key not in seen:
+            out.insert(0, device)
+        return out or [device]
+
+    async def _list_cameras_for_device_uuids(
+        self,
+        db: AsyncSession,
+        *,
+        device_uuids: List[uuid.UUID],
+    ) -> List[Camera]:
+        clean_device_uuids = [du for du in device_uuids if du is not None]
+        if not clean_device_uuids:
+            return []
+
+        q = (
+            select(Camera)
+            .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
+            .where(CameraDevice.device_uuid.in_(clean_device_uuids))
+            .options(selectinload(Camera.channel_configuration))
+        )
+        return (await db.execute(q)).scalars().all()
+
+    async def _list_enabled_reconcile_devices(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: Optional[int] = None,
+    ) -> List[Device]:
+        stmt = select(Device).where(Device.is_enabled.is_(True))
+        if user_id is not None:
+            stmt = stmt.where(Device.user_id == int(user_id))
+        return (await db.execute(stmt)).scalars().all()
+
     async def _set_single_camera_device(self, db: AsyncSession, camera_uuid: uuid.UUID, device_uuid: uuid.UUID) -> None:
         """
         Enforces exactly one device link row in camera_devices.
@@ -623,20 +682,41 @@ class Manager:
         full reconcile cycle.
         """
         uid = int(user_id)
-        seen: Set[str] = set()
+        targets: List[uuid.UUID] = []
+        seen_device_keys: Set[str] = set()
+        seen_urls: Set[str] = set()
 
-        for raw_device_uuid in device_uuids or []:
-            try:
-                device_uuid = self._as_uuid(raw_device_uuid, "device_uuid")
-            except Exception:
-                logger.warning("Skipping invalid device UUID during best-effort reconcile: %r", raw_device_uuid)
-                continue
+        async with self._session_factory() as db:
+            for raw_device_uuid in device_uuids or []:
+                try:
+                    device_uuid = self._as_uuid(raw_device_uuid, "device_uuid")
+                except Exception:
+                    logger.warning("Skipping invalid device UUID during best-effort reconcile: %r", raw_device_uuid)
+                    continue
 
+                device_key = str(device_uuid)
+                if device_key in seen_device_keys:
+                    continue
+                seen_device_keys.add(device_key)
+
+                try:
+                    dev = await self._get_device(db, device_uuid, user_id=uid)
+                except Exception:
+                    logger.warning(
+                        "Skipping missing device during best-effort reconcile device=%s",
+                        device_key,
+                        exc_info=True,
+                    )
+                    continue
+
+                target_key = self._normalize_device_url(getattr(dev, "device_url", None)) or device_key
+                if target_key in seen_urls:
+                    continue
+                seen_urls.add(target_key)
+                targets.append(device_uuid)
+
+        for device_uuid in targets:
             key = str(device_uuid)
-            if key in seen:
-                continue
-            seen.add(key)
-
             try:
                 await self.reconcile_device_edge_simple(
                     device_uuid=device_uuid,
@@ -870,13 +950,26 @@ class Manager:
         uid = int(user_id) if user_id is not None else None
         async with self._session_factory() as db:
             dev = await self._get_device(db, device_uuid, user_id=uid)
-            q = (
-                select(Camera)
-                .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
-                .where(CameraDevice.device_uuid == device_uuid)
-                .options(selectinload(Camera.channel_configuration))
+            peer_devices = await self._list_devices_for_physical_device(db, device=dev)
+            reconcile_device_uuids: List[uuid.UUID] = []
+            seen_reconcile_devices: Set[str] = set()
+            for peer in peer_devices:
+                peer_uuid = getattr(peer, "device_uuid", None)
+                if peer_uuid is None:
+                    continue
+                peer_key = str(peer_uuid)
+                if peer_key in seen_reconcile_devices:
+                    continue
+                seen_reconcile_devices.add(peer_key)
+                reconcile_device_uuids.append(peer_uuid)
+
+            if not reconcile_device_uuids:
+                reconcile_device_uuids = [device_uuid]
+
+            cams = await self._list_cameras_for_device_uuids(
+                db,
+                device_uuids=reconcile_device_uuids,
             )
-            cams = (await db.execute(q)).scalars().all()
             site_schedule_cache: Dict[str, Dict[str, Any]] = {}
             desired_set: Set[str] = set()
             active_streams: Set[str] = set()
@@ -893,11 +986,11 @@ class Manager:
                     cfg_timezone=getattr(getattr(cam, "channel_configuration", None), "timezone", None),
                     site_cache=site_schedule_cache,
                 )
-                if bool(cam.is_enabled) and bool(cam.is_detection_enabled) and bool(schedule_state["active"]):
+                # Alert schedules should not tear down active detection runtimes.
+                if bool(cam.is_enabled) and bool(cam.is_detection_enabled):
                     desired_set.add(str(cam.camera_uuid))
-                # Keep playback paths provisioned for enabled cameras even when the
-                # detection schedule is currently inactive. Scheduling controls edge
-                # inference, but removing the MediaMTX path makes live view flap.
+                # Keep playback paths provisioned for enabled cameras regardless of
+                # alert schedule state so live view remains stable.
                 if bool(cam.is_enabled) and getattr(cam, "camera_code", None):
                     active_streams.add(str(cam.camera_code))
 
@@ -1019,15 +1112,24 @@ class Manager:
         """
         uid = int(user_id) if user_id is not None else None
         async with self._session_factory() as db:
-            stmt = select(Device.device_uuid).where(Device.is_enabled.is_(True))
-            if uid is not None:
-                stmt = stmt.where(Device.user_id == uid)
-            rows = await db.execute(stmt)
-            device_uuids = [r[0] for r in rows.all()]
+            device_rows = await self._list_enabled_reconcile_devices(db, user_id=uid)
+
+        device_uuids: List[uuid.UUID] = []
+        seen_targets: Set[str] = set()
+        for dev in device_rows:
+            du = getattr(dev, "device_uuid", None)
+            if du is None:
+                continue
+            key = self._normalize_device_url(getattr(dev, "device_url", None)) or str(du)
+            if key in seen_targets:
+                continue
+            seen_targets.add(key)
+            device_uuids.append(du)
 
         summary: Dict[str, Any] = {
             "user_id": uid,
             "device_count": len(device_uuids),
+            "device_row_count": len(device_rows),
             "devices": {},
             "errors": [],
         }
@@ -1148,7 +1250,7 @@ class Manager:
         # If Jetson is unreachable the 3-retry × 15s timeout would hold
         # self._lock for up to 45s, blocking all other operations.
         # The background reconcile loop (every 90s) will catch any failure.
-        if enabled and det_enabled and schedule_state["active"]:
+        if enabled and det_enabled:
             asyncio.create_task(
                 self._bg_edge_upsert(device_url=dev.device_url, payload=edge_payload)
             )
@@ -1334,7 +1436,7 @@ class Manager:
         )
 
         try:
-            if enabled and det_enabled and schedule_state["active"]:
+            if enabled and det_enabled:
                 if old_dev.device_uuid != new_device_uuid:
                     edge_payload = self._edge_payload_from_config(
                         camera_uuid=str(cam_uuid),

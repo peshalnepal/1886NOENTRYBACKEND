@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
@@ -74,21 +74,35 @@ class RetentionService:
                 if not rows:
                     break
 
-                for row in rows:
-                    storage_key = extract_image_storage_key(getattr(row, "payload", None))
-                    if storage_key:
-                        try:
-                            await self._image_service.delete_blob(blob_name=storage_key)
-                        except Exception:
-                            logger.warning(
-                                "Failed deleting expired alert image blob %s; removing DB row anyway",
-                                storage_key,
-                                exc_info=True,
-                            )
-                    await db.delete(row)
+                batch = [
+                    (
+                        int(row.id),
+                        extract_image_storage_key(getattr(row, "payload", None)),
+                    )
+                    for row in rows
+                    if getattr(row, "id", None) is not None
+                ]
 
+            for _row_id, storage_key in batch:
+                if storage_key:
+                    try:
+                        await self._image_service.delete_blob(blob_name=storage_key)
+                    except Exception:
+                        logger.warning(
+                            "Failed deleting expired alert image blob %s; removing DB row anyway",
+                            storage_key,
+                            exc_info=True,
+                        )
+
+            ids = [row_id for row_id, _storage_key in batch]
+            if not ids:
+                break
+
+            async with self._session_factory() as db:
+                await db.execute(delete(Notification).where(Notification.id.in_(ids)))
                 await db.commit()
-                total_deleted += len(rows)
+
+            total_deleted += len(ids)
 
         return total_deleted
 
@@ -113,20 +127,34 @@ class RetentionService:
                 if not rows:
                     break
 
-                for row in rows:
-                    storage_key = str(getattr(row, "storage_key", "") or "").strip()
-                    if storage_key:
-                        try:
-                            await self._clip_service.delete_blob(blob_name=storage_key)
-                        except Exception:
-                            logger.warning(
-                                "Failed deleting expired clip blob %s; removing DB row anyway",
-                                storage_key,
-                                exc_info=True,
-                            )
-                    await db.delete(row)
+                batch = [
+                    (
+                        int(row.id),
+                        str(getattr(row, "storage_key", "") or "").strip(),
+                    )
+                    for row in rows
+                    if getattr(row, "id", None) is not None
+                ]
 
+            for _row_id, storage_key in batch:
+                if storage_key:
+                    try:
+                        await self._clip_service.delete_blob(blob_name=storage_key)
+                    except Exception:
+                        logger.warning(
+                            "Failed deleting expired clip blob %s; removing DB row anyway",
+                            storage_key,
+                            exc_info=True,
+                        )
+
+            ids = [row_id for row_id, _storage_key in batch]
+            if not ids:
+                break
+
+            async with self._session_factory() as db:
+                await db.execute(delete(VideoRecord).where(VideoRecord.id.in_(ids)))
                 await db.commit()
-                total_deleted += len(rows)
+
+            total_deleted += len(ids)
 
         return total_deleted

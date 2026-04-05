@@ -203,9 +203,20 @@ class ModelPipeline:
             float(os.getenv("DETECTION_ALERT_COOLDOWN_S", "8.0")),
         )
         self._notif_repo = NotificationRepository()
-        self._cam_ctx_cache: Dict[str, Tuple[CameraContext, float]] = {}
+        self._cam_ctx_cache: Dict[str, Tuple[Optional[CameraContext], float]] = {}
         self._cam_ctx_cache_lock = asyncio.Lock()
         self._cam_ctx_ttl_s = 60.0 
+        self._cam_ctx_miss_ttl_s = max(
+            0.0,
+            float(os.getenv("CAMERA_CONTEXT_MISS_CACHE_TTL_S", "5.0")),
+        )
+        self._cam_ctx_inflight: Dict[str, asyncio.Future] = {}
+        self._cam_ctx_lookup_limit = asyncio.Semaphore(
+            max(
+                1,
+                int(os.getenv("CAMERA_CONTEXT_MAX_CONCURRENT_DB_LOOKUPS", "4")),
+            )
+        )
         self._session_factory: Optional[SessionFactory] = None
         self._site_cache: Dict[str, Tuple[str, float]] = {}
         self._site_cache_lock = asyncio.Lock()
@@ -529,27 +540,58 @@ class ModelPipeline:
 
         key = str(camera_uuid)
         now = time.monotonic()
+        leader = False
+        pending: Optional[asyncio.Future] = None
 
         async with self._cam_ctx_cache_lock:
             cached = self._cam_ctx_cache.get(key)
             if cached and cached[1] > now:
                 return cached[0]
+            pending = self._cam_ctx_inflight.get(key)
+            if pending is None:
+                pending = asyncio.get_running_loop().create_future()
+                self._cam_ctx_inflight[key] = pending
+                leader = True
 
         try:
             cam_uuid = UUID(key)
         except Exception:
+            if leader:
+                async with self._cam_ctx_cache_lock:
+                    future = self._cam_ctx_inflight.pop(key, None)
+                    if future is not None and not future.done():
+                        future.set_result(None)
             return None
 
+        if not leader and pending is not None:
+            return await pending
+
+        ctx: Optional[CameraContext] = None
+        cancelled = False
         try:
-            async with sf() as db:
-                ctx = await self._notif_repo.get_camera_context(db, camera_uuid=cam_uuid)
+            async with self._cam_ctx_lookup_limit:
+                async with sf() as db:
+                    ctx = await self._notif_repo.get_camera_context(db, camera_uuid=cam_uuid)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except Exception:
             logger.exception("Failed to load CameraContext for camera=%s", key)
             ctx = None
-
-        if ctx:
+        finally:
             async with self._cam_ctx_cache_lock:
-                self._cam_ctx_cache[key] = (ctx, now + self._cam_ctx_ttl_s)
+                if not cancelled:
+                    ttl_s = self._cam_ctx_ttl_s if ctx else self._cam_ctx_miss_ttl_s
+                    if ttl_s > 0.0:
+                        self._cam_ctx_cache[key] = (ctx, now + ttl_s)
+                    else:
+                        self._cam_ctx_cache.pop(key, None)
+                future = self._cam_ctx_inflight.pop(key, None)
+                if future is not None and not future.done():
+                    if cancelled:
+                        future.cancel()
+                    else:
+                        future.set_result(ctx)
 
         return ctx
 
@@ -881,10 +923,6 @@ class ModelPipeline:
             if not cfg.enabled:
                 await asyncio.sleep(0.5)
                 continue
-            if hasattr(cfg, "is_scheduled_now") and not cfg.is_scheduled_now():
-                await asyncio.sleep(15.0)
-                continue
-            
             if getattr(cfg, "detection_enabled", True) is False:
                 await asyncio.sleep(0.5)
                 continue
@@ -934,7 +972,14 @@ class ModelPipeline:
                 self._last_seq[key] = int(resp2.frame_seq)
                 await self.detect_store.put(resp2)
                 await self.detection_hub.publish(resp2)
-                if getattr(cfg, "notification_enabled", True) and self._notification_service:
+                alerts_allowed = True
+                if hasattr(cfg, "is_scheduled_now"):
+                    try:
+                        alerts_allowed = bool(cfg.is_scheduled_now())
+                    except Exception:
+                        logger.exception("Failed to evaluate alert schedule camera=%s", key)
+                        alerts_allowed = True
+                if alerts_allowed and getattr(cfg, "notification_enabled", True) and self._notification_service:
                     emit_track_notifications = any(
                         str(ev_type) == "track_confirmed"
                         for (ev_type, _track_id) in track_events
