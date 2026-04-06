@@ -178,6 +178,19 @@ def _site_schedule_payload_from_row(
     }
 
 
+def _sync_site_settings_timezone_row(
+    row: Optional[SiteSettings],
+    *,
+    timezone_name: Optional[str],
+) -> None:
+    if row is None:
+        return
+
+    config = dict(row.config or {}) if isinstance(getattr(row, "config", None), dict) else {}
+    config["timezone"] = str(timezone_name or "UTC")
+    row.config = config
+
+
 def _build_schedule_windows(
     *,
     day_of_week: List[int],
@@ -593,6 +606,7 @@ async def update_site_settings(
         }
         config["timezone"] = schedule_payload["timezone"]
         config["schedule"] = schedule_windows
+        site.timezone = schedule_payload["timezone"]
 
     if payload.schedule is None and payload.multi_camera_prerecord is None:
         return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
@@ -676,6 +690,14 @@ async def update_site(
     for k, v in data.items():
         if v is not None:
             setattr(site, k, v)
+
+    if data.get("timezone") is not None:
+        row = await site_repo.get_site_settings(
+            db,
+            user_id=int(user.id),
+            site_uuid=site.site_uuid,
+        )
+        _sync_site_settings_timezone_row(row, timezone_name=site.timezone)
 
     await db.commit()
     if data.get("timezone") is not None:
