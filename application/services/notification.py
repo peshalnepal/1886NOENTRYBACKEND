@@ -1565,6 +1565,8 @@ class NotificationService:
             tracks = res["tracks"]
             events = res["events"]
 
+            _any_notification_fired = False
+
             # A) notify-on-confirmed-track
             if self.notify_on_confirmed:
                 for ev_type, track_id in events:
@@ -1597,6 +1599,7 @@ class NotificationService:
                     )
 
                     await self.hub.publish(msg)
+                    _any_notification_fired = True
 
                     self._fire_and_forget(
                         self._persist_and_send(
@@ -1659,6 +1662,7 @@ class NotificationService:
                             )
 
                             await self.hub.publish(msg)
+                            _any_notification_fired = True
 
                             self._fire_and_forget(
                                 self._persist_and_send(
@@ -1672,6 +1676,54 @@ class NotificationService:
                                     },
                                 )
                             )
+
+            if not _any_notification_fired:
+                now = time.monotonic()
+                async with self._lock:
+                    send_classes: List[str] = []
+                    for cls_name, _conf in matches:
+                        key = (cam, cls_name)
+                        last = self._last_sent.get(key, 0.0)
+                        if (now - last) >= self.cooldown_s:
+                            self._last_sent[key] = now
+                            send_classes.append(cls_name)
+
+                if send_classes:
+                    max_conf = max([c for (_n, c) in matches] or [0.0])
+                    msg = NotificationMessage(
+                        user_id=int(ctx.user_id),
+                        id=f"{cam}-{ts_ms}-summary",
+                        ts_ms=ts_ms,
+                        camera_uuid=cam,
+                        site_uuid=site_uuid_str,
+                        site_name=site_name,
+                        title=f"Detection: {', '.join(sorted(set(send_classes)))}",
+                        body=f"Detected {', '.join(sorted(set(send_classes)))} (max_conf={max_conf:.2f})",
+                        alert_type="detection_summary",
+                        cls_names=sorted(set(send_classes)),
+                        max_conf=float(max_conf),
+                        frame_w=msg_frame_w,
+                        frame_h=msg_frame_h,
+                        frame_seq=msg_frame_seq,
+                        detections=msg_detections,
+                        device_name=device_name,
+                        camera_name=camera_name,
+                        image_url=image_url,
+                    )
+
+                    await self.hub.publish(msg)
+
+                    self._fire_and_forget(
+                        self._persist_and_send(
+                            msg,
+                            ctx,
+                            extra_payload={
+                                **overlay_payload,
+                                **(extra_payload or {}),
+                                "event": "detection_summary",
+                            },
+                        )
+                    )
 
             return
 

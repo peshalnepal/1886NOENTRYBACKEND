@@ -234,6 +234,69 @@ class DatabaseManager:
                         else:
                             raise
 
+            # Migrate: add notification.visible column if missing (added after initial schema).
+            # Backfill existing NULL rows to visible=TRUE so they appear in the list endpoint.
+            if dialect_name.startswith("mysql"):
+                visible_col = (
+                    await conn.execute(
+                        text("""
+                            SELECT 1
+                            FROM information_schema.COLUMNS
+                            WHERE TABLE_SCHEMA = DATABASE()
+                              AND TABLE_NAME   = 'notification'
+                              AND COLUMN_NAME  = 'visible'
+                            LIMIT 1
+                        """)
+                    )
+                ).fetchone()
+                if not visible_col:
+                    try:
+                        await conn.execute(
+                            text("ALTER TABLE notification ADD COLUMN visible TINYINT(1) NOT NULL DEFAULT 1")
+                        )
+                        logger.info("Added notification.visible column.")
+                    except Exception as exc:
+                        if _is_duplicate_column_error(exc):
+                            logger.info("notification.visible column already exists.")
+                        else:
+                            raise
+                else:
+                    try:
+                        await conn.execute(
+                            text("UPDATE notification SET visible = 1 WHERE visible IS NULL")
+                        )
+                    except Exception:
+                        logger.warning("Could not backfill notification.visible nulls.", exc_info=True)
+            elif dialect_name.startswith("mssql"):
+                visible_col = (
+                    await conn.execute(
+                        text("""
+                            SELECT TOP 1 1
+                            FROM INFORMATION_SCHEMA.COLUMNS
+                            WHERE TABLE_NAME  = 'notification'
+                              AND COLUMN_NAME = 'visible'
+                        """)
+                    )
+                ).fetchone()
+                if not visible_col:
+                    try:
+                        await conn.execute(
+                            text("ALTER TABLE notification ADD visible BIT NOT NULL DEFAULT 1")
+                        )
+                        logger.info("Added notification.visible column.")
+                    except Exception as exc:
+                        if _is_duplicate_column_error(exc):
+                            logger.info("notification.visible column already exists.")
+                        else:
+                            raise
+                else:
+                    try:
+                        await conn.execute(
+                            text("UPDATE notification SET visible = 1 WHERE visible IS NULL")
+                        )
+                    except Exception:
+                        logger.warning("Could not backfill notification.visible nulls.", exc_info=True)
+
         # Seed a dev user if DB is empty.
         async with self.AsyncSessionLocal() as db:
             existing = (await db.execute(select(User.id).limit(1))).scalar_one_or_none()
