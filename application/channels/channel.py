@@ -75,7 +75,10 @@ class VideoChannel:
             [
                 "/detections/{camera_uuid}",
                 "/detection/{camera_uuid}",
+                "/api/detection/{camera_uuid}",
+                "/api/detections/{camera_uuid}",
                 "/cameras/{camera_uuid}/latest",
+                "/api/cameras/{camera_uuid}/latest",
             ]
         )
 
@@ -112,8 +115,10 @@ class VideoChannel:
 
         urls = self.detection_urls()
         last_err_sig: Optional[str] = None
+        attempted = 0
 
         for url in urls:
+            attempted += 1
             try:
                 timeout_s = float(self.config.request_timeout_s or 6.0)
                 t = httpx.Timeout(timeout_s, connect=min(8.0, timeout_s), read=timeout_s, write=timeout_s, pool=timeout_s)
@@ -130,17 +135,16 @@ class VideoChannel:
 
             except (httpx.ConnectTimeout, httpx.ConnectError):
                 last_err_sig = f"connect_error:{url}"
-                break  # device likely down; don't try other paths
+                continue
             except httpx.ReadTimeout:
                 last_err_sig = f"read_timeout:{url}"
-                # I'd continue here (server slow on that path; other path might work)
                 continue
             except Exception as e:
                 last_err_sig = f"exc:{type(e).__name__}:{url}"
                 continue
 
         if last_err_sig and last_err_sig != self._last_error_sig:
-            logger.warning("Jetson detection fetch failed camera=%s tried=%d last=%s", self.key(), len(urls), last_err_sig)
+            logger.warning("Jetson detection fetch failed camera=%s tried=%d last=%s", self.key(), attempted, last_err_sig)
             self._last_error_sig = last_err_sig
         return None
 
@@ -178,7 +182,7 @@ class VideoChannel:
                 content_type = str(resp.headers.get("content-type") or "image/jpeg")
                 return payload, content_type
             except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout):
-                return None
+                continue
             except Exception:
                 continue
 

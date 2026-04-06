@@ -109,6 +109,8 @@ async def _fetch_device_snapshot(*, device_url: str, camera_uuid: uuid.UUID) -> 
     timeout = httpx.Timeout(8.0, connect=3.0, read=8.0, write=5.0, pool=5.0)
     last_error: Optional[str] = None
     saw_not_found = False
+    saw_transport_error = False
+    saw_upstream_error = False
 
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for url in urls:
@@ -118,15 +120,13 @@ async def _fetch_device_snapshot(*, device_url: str, camera_uuid: uuid.UUID) -> 
                     headers={"Accept": "image/jpeg,image/*;q=0.9,*/*;q=0.1"},
                 )
             except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Jetson snapshot unavailable: {type(exc).__name__}",
-                ) from exc
+                saw_transport_error = True
+                last_error = f"Jetson snapshot unavailable: {type(exc).__name__}"
+                continue
             except httpx.HTTPError as exc:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Jetson snapshot request failed: {type(exc).__name__}",
-                ) from exc
+                saw_upstream_error = True
+                last_error = f"Jetson snapshot request failed: {type(exc).__name__}"
+                continue
 
             if upstream.status_code == 404:
                 saw_not_found = True
@@ -134,6 +134,7 @@ async def _fetch_device_snapshot(*, device_url: str, camera_uuid: uuid.UUID) -> 
                 continue
 
             if upstream.status_code >= 400:
+                saw_upstream_error = True
                 last_error = f"Jetson snapshot request failed with status {upstream.status_code}."
                 continue
 
@@ -147,8 +148,14 @@ async def _fetch_device_snapshot(*, device_url: str, camera_uuid: uuid.UUID) -> 
                 headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
             )
 
+    if saw_transport_error:
+        raise HTTPException(
+            status_code=503,
+            detail=last_error or "Jetson snapshot unavailable.",
+        )
+
     raise HTTPException(
-        status_code=404 if saw_not_found else 502,
+        status_code=404 if saw_not_found and not saw_upstream_error else 502,
         detail=last_error or "Jetson snapshot request failed.",
     )
 

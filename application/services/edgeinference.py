@@ -3,12 +3,13 @@ import httpx
 import asyncio
 import logging
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Set, Union
 import uuid
 from datetime import datetime, date
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+_ROUTE_FALLBACK_STATUS_CODES = {404, 405}
 
 
 def _health_bits(health: Optional[Dict[str, Any]]) -> List[str]:
@@ -123,23 +124,68 @@ class EdgeInferenceClient:
             return f"{exc_name} during {method} {url}: {msg}"
         return f"{exc_name} during {method} {url}"
 
-    async def _request_json(self, method: str, url: str) -> Any:
+    def _candidate_paths(self, path: str) -> List[str]:
+        raw = str(path or "").strip() or "/"
+        if not raw.startswith("/"):
+            raw = f"/{raw}"
+
+        candidates = [raw]
+        if raw.startswith("/api/"):
+            candidates.append(raw[4:] or "/")
+        elif raw == "/api":
+            candidates.append("/")
+        elif raw != "/":
+            candidates.append(f"/api{raw}")
+        return list(dict.fromkeys(candidates))
+
+    def _candidate_urls(self, *, device_url: str, path: str) -> List[str]:
+        base = device_url.rstrip("/")
+        return [f"{base}{candidate}" for candidate in self._candidate_paths(path)]
+
+    def _normalize_urls(self, url_or_urls: Union[str, Iterable[str]]) -> List[str]:
+        if isinstance(url_or_urls, str):
+            raw_urls = [url_or_urls]
+        else:
+            raw_urls = list(url_or_urls)
+
+        urls: List[str] = []
+        seen: Set[str] = set()
+        for item in raw_urls:
+            url = str(item or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        return urls
+
+    async def _request_json(self, method: str, url_or_urls: Union[str, Iterable[str]]) -> Any:
+        urls = self._normalize_urls(url_or_urls)
         last_exc: Optional[Exception] = None
+        last_url = urls[-1] if urls else ""
         for attempt in range(self.retry_count):
-            try:
-                r = await self._client.request(method, url, headers=self._headers())
-                if r.status_code >= 400:
-                    raise RuntimeError(f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}")
-                return r.json()
-            except Exception as exc:
-                last_exc = exc
-                if attempt + 1 >= self.retry_count:
-                    break
-                await asyncio.sleep(0.2 * (2 ** attempt))
+            for url in urls:
+                try:
+                    r = await self._client.request(method, url, headers=self._headers())
+                    if r.status_code in _ROUTE_FALLBACK_STATUS_CODES and len(urls) > 1:
+                        last_url = url
+                        last_exc = RuntimeError(
+                            f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}"
+                        )
+                        continue
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}")
+                    return r.json()
+                except Exception as exc:
+                    last_url = url
+                    last_exc = exc
+                    continue
+            if attempt + 1 >= self.retry_count:
+                break
+            await asyncio.sleep(0.2 * (2 ** attempt))
 
         if last_exc is not None:
-            raise RuntimeError(self._format_request_error(method, url, last_exc)) from last_exc
-        raise RuntimeError(f"Edge service request failed for {method} {url}")
+            raise RuntimeError(self._format_request_error(method, last_url, last_exc)) from last_exc
+        raise RuntimeError(f"Edge service request failed for {method} {last_url}")
 
     async def get_health(self, *, device_url: str) -> Optional[Dict[str, Any]]:
         """
@@ -174,9 +220,9 @@ class EdgeInferenceClient:
           - {"cameras": ["uuid1", "uuid2", ...]}
           - ["uuid1", "uuid2", ...]
         """
-        url = f"{device_url.rstrip('/')}{self.list_path}"
+        urls = self._candidate_urls(device_url=device_url, path=self.list_path)
         try:
-            data = await self._request_json("GET", url)
+            data = await self._request_json("GET", urls)
         except Exception as exc:
             health = await self.get_health(device_url=device_url)
             raise EdgeCameraInventoryError(str(exc), health=health, cause=exc) from exc
@@ -220,42 +266,67 @@ class EdgeInferenceClient:
             raise RuntimeError("Edge pipeline not ready at {}".format(device_url))
 
     async def upsert_camera(self, *, device_url: str, payload: dict) -> None:
-        url = f"{device_url.rstrip('/')}{self.add_path}"
-        await self._request("POST", url, json=payload)
+        urls = self._candidate_urls(device_url=device_url, path=self.add_path)
+        await self._request("POST", urls, json=payload)
 
     async def patch_camera(self, *, device_url: str, camera_uuid: str, patch: dict) -> None:
         """
         Best-effort patch. If PATCH is not supported by the Jetson service, fallback to POST upsert.
         """
-        url = f"{device_url.rstrip('/')}{self.patch_path.format(camera_uuid=camera_uuid)}"
+        urls = self._candidate_urls(
+            device_url=device_url,
+            path=self.patch_path.format(camera_uuid=camera_uuid),
+        )
         try:
-            await self._request("PATCH", url, json=patch)
+            await self._request("PATCH", urls, json=patch)
         except Exception:
             upsert_payload = dict(patch or {})
             upsert_payload.setdefault("camera_uuid", str(camera_uuid))
-            upsert_url = f"{device_url.rstrip('/')}{self.add_path}"
-            await self._request("POST", upsert_url, json=upsert_payload)
+            upsert_urls = self._candidate_urls(device_url=device_url, path=self.add_path)
+            await self._request("POST", upsert_urls, json=upsert_payload)
 
     async def delete_camera(self, *, device_url: str, camera_uuid: str) -> None:
-        url = f"{device_url.rstrip('/')}{self.delete_path.format(camera_uuid=camera_uuid)}"
-        await self._request("DELETE", url)
+        urls = self._candidate_urls(
+            device_url=device_url,
+            path=self.delete_path.format(camera_uuid=camera_uuid),
+        )
+        await self._request("DELETE", urls)
 
-    async def _request(self, method: str, url: str, *, json: Optional[dict] = None) -> None:
+    async def _request(self, method: str, url_or_urls: Union[str, Iterable[str]], *, json: Optional[dict] = None) -> None:
+        urls = self._normalize_urls(url_or_urls)
         last_exc: Optional[Exception] = None
+        last_url = urls[-1] if urls else ""
         json_payload = to_jsonable(json) if json is not None else None
+        saw_delete_not_found = False
+        saw_non_404_failure = False
         for attempt in range(self.retry_count):
-            try:
-                r = await self._client.request(method, url, headers=self._headers(), json=json_payload)
-                if method == "DELETE" and r.status_code == 404:
+            for url in urls:
+                try:
+                    r = await self._client.request(method, url, headers=self._headers(), json=json_payload)
+                    if method == "DELETE" and r.status_code == 404:
+                        saw_delete_not_found = True
+                        last_url = url
+                        last_exc = RuntimeError(f"Edge service error 404 for {method} {url}: {r.text[:300]}")
+                        continue
+                    if r.status_code in _ROUTE_FALLBACK_STATUS_CODES and len(urls) > 1:
+                        last_url = url
+                        last_exc = RuntimeError(
+                            f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}"
+                        )
+                        continue
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}")
                     return
-                if r.status_code >= 400:
-                    raise RuntimeError(f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}")
-                return
-            except Exception as e:
-                last_exc = e
-                if attempt + 1 >= self.retry_count:
-                    break
-                await asyncio.sleep(0.2 * (2 ** attempt))
+                except Exception as e:
+                    last_url = url
+                    last_exc = e
+                    saw_non_404_failure = True
+                    continue
+            if attempt + 1 >= self.retry_count:
+                break
+            await asyncio.sleep(0.2 * (2 ** attempt))
+        if method == "DELETE" and saw_delete_not_found and not saw_non_404_failure:
+            return
         if last_exc is not None:
-            raise RuntimeError(self._format_request_error(method, url, last_exc)) from last_exc
+            raise RuntimeError(self._format_request_error(method, last_url, last_exc)) from last_exc
         raise RuntimeError(f"Edge service request failed for {method} {url}")
