@@ -331,7 +331,6 @@ async def _load_clip_overlay_payloads(
 
     return overlays
 
-
 @router.get("", response_model=List[ClipOut])
 async def list_clips(
     site_uuid: Optional[uuid.UUID] = None,
@@ -374,38 +373,48 @@ async def list_clips(
         stmt = stmt.where(VideoRecord.status == str(status).strip())
 
     rows = (await db.execute(stmt)).all()
-    clip_overlay_payloads = await _load_clip_overlay_payloads(
-        db=db,
-        user_id=int(user.id),
-        rows=rows,
-    )
-
-    return [
-        ClipOut(
-            id=int(record.id),
-            camera_uuid=str(record.camera_uuid),
-            camera_name=camera_name,
-            camera_code=camera_code,
-            site_uuid=str(record_site_uuid) if record_site_uuid is not None else None,
-            site_name=site_name,
-            site_code=site_code,
-            external_id=str(record.external_id),
-            start_time=record.start_time,
-            end_time=record.end_time,
-            duration=int(record.duration) if record.duration is not None else None,
-            status=str(record.status),
-            recording_url=record.recording_url,
-            overlay_payload=clip_overlay_payloads.get(
-                (str(record.camera_uuid), str(record.recording_url or "").strip())
-            ),
-            storage_key=record.storage_key,
-            error=record.error,
-            created_at=record.created_at,
+    fallback_overlays: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    if any(getattr(record, "overlay_payload", None) is None for record, *_rest in rows):
+        fallback_overlays = await _load_clip_overlay_payloads(
+            db=db,
+            user_id=int(user.id),
+            rows=rows,
         )
-        for record, camera_name, camera_code, record_site_uuid, site_name, site_code in rows
-    ]
 
+    clips: List[ClipOut] = []
+    for record, camera_name, camera_code, record_site_uuid, site_name, site_code in rows:
+        overlay_payload = getattr(record, "overlay_payload", None)
+        if overlay_payload is None:
+            clip_key = (
+                str(getattr(record, "camera_uuid", "") or ""),
+                str(getattr(record, "recording_url", "") or "").strip(),
+            )
+            overlay_payload = fallback_overlays.get(clip_key)
 
+        clips.append(
+            ClipOut(
+                id=int(record.id),
+                camera_uuid=str(record.camera_uuid),
+                camera_name=camera_name,
+                camera_code=camera_code,
+                site_uuid=str(record_site_uuid) if record_site_uuid is not None else None,
+                site_name=site_name,
+                site_code=site_code,
+                external_id=str(record.external_id),
+                start_time=record.start_time,
+                end_time=record.end_time,
+                duration=int(record.duration) if record.duration is not None else None,
+                status=str(record.status),
+                recording_url=record.recording_url,
+                overlay_payload=overlay_payload,
+                storage_key=record.storage_key,
+                error=record.error,
+                created_at=record.created_at,
+            )
+        )
+
+    return clips
+    
 @router.delete("", response_model=BulkClipDeleteResponse)
 async def delete_clips(
     payload: BulkClipDeleteRequest,

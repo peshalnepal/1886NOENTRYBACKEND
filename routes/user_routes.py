@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -13,6 +13,7 @@ from pydantic import (
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from application.services.user_snapshot_cache import UserSnapshotCache
 
 from core.database_orm import User
 from core.security.hashing import get_password_hash, verify_password
@@ -22,6 +23,12 @@ from application.services.manager import Manager
 router = APIRouter(prefix="/users", tags=["users"])
 
 
+def _invalidate_user_snapshot_cache(request: Request, user_id: int) -> None:
+    cache = getattr(request.app.state, "user_snapshot_cache", None)
+    if cache is None:
+        return
+    cache.invalidate(int(user_id))
+    
 class UserOut(BaseModel):
     id: int
     user_name: str
@@ -86,6 +93,7 @@ async def get_me(
 @router.patch("/me", response_model=UserOut)
 async def update_me(
     payload: UserProfileUpdateRequest,
+    request: Request,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -119,6 +127,7 @@ async def update_me(
 
     try:
         await db.commit()
+        _invalidate_user_snapshot_cache(request, int(current_user.id))
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Email is already in use")
@@ -162,6 +171,7 @@ async def change_my_password(
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_my_account(
     payload: DeleteAccountRequest,
+    request: Request,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     manager: Manager = Depends(get_manager),
@@ -182,6 +192,7 @@ async def delete_my_account(
 
         await db.delete(current_user)
         await db.commit()
+        _invalidate_user_snapshot_cache(request, int(current_user.id))
     except HTTPException:
         await db.rollback()
         raise

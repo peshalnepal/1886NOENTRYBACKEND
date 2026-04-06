@@ -625,6 +625,34 @@ class NotificationService:
             except Exception:
                 logger.exception("Failed to set session factory on EventClipService")
 
+    def _build_clip_overlay_payload(
+        self,
+        *,
+        msg: NotificationMessage,
+        extra_payload: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        payload = dict(extra_payload or {})
+
+        detections = list(msg.detections or [])
+        if not detections and isinstance(payload.get("detections"), list):
+            detections = list(payload.get("detections") or [])
+
+        frame_w = msg.frame_w if msg.frame_w is not None else payload.get("frame_w")
+        frame_h = msg.frame_h if msg.frame_h is not None else payload.get("frame_h")
+        frame_seq = msg.frame_seq if msg.frame_seq is not None else payload.get("frame_seq")
+
+        if not detections and frame_w is None and frame_h is None:
+            return None
+
+        return {
+            "camera_uuid": str(msg.camera_uuid),
+            "frame_ts_ms": int(msg.ts_ms),
+            "frame_seq": int(frame_seq or 0),
+            "frame_w": int(frame_w) if frame_w is not None else None,
+            "frame_h": int(frame_h) if frame_h is not None else None,
+            "detections": detections,
+        }
+        
     def invalidate_recipient_cache(
         self,
         *,
@@ -838,6 +866,10 @@ class NotificationService:
                     ctx=camera_ctx,
                     event_ts_ms=msg.ts_ms,
                     trigger=f"site_prerecord:{msg.camera_uuid}:{plan.settings.trigger_mode}:{msg.alert_type}",
+                    overlay_payload=self._build_clip_overlay_payload(
+                        msg=msg,
+                        extra_payload=None,
+                    ),
                 )
             )
 
@@ -894,7 +926,10 @@ class NotificationService:
         clip_service = self._clip_service
         if clip_service is None:
             return extra_payload
-
+        overlay_payload = self._build_clip_overlay_payload(
+            msg=msg,
+            extra_payload=extra_payload,
+        )
         plan = await self._load_site_prerecord_plan(msg=msg, ctx=ctx)
         if plan is None:
             return extra_payload
@@ -915,6 +950,7 @@ class NotificationService:
                     ctx=trigger_ctx or ctx,
                     event_ts_ms=msg.ts_ms,
                     trigger=f"site_prerecord:{msg.camera_uuid}:{plan.settings.trigger_mode}:{msg.alert_type}",
+                    overlay_payload=overlay_payload,
                 ),
                 timeout=self._trigger_camera_timeout_s,
             )
@@ -1105,6 +1141,22 @@ class NotificationService:
                 msg=item.msg,
                 extra_payload=item.extra_payload,
             )
+            if stored_image_url:
+                updated_msg = item.msg.model_copy(update={"image_url": stored_image_url})
+                items[idx] = BufferedNotification(
+                    msg=updated_msg,
+                    ctx=item.ctx,
+                    extra_payload=stored_extra_payload,
+                )
+                item = items[idx]
+            elif stored_extra_payload != (item.extra_payload or {}):
+                items[idx] = BufferedNotification(
+                    msg=item.msg,
+                    ctx=item.ctx,
+                    extra_payload=stored_extra_payload,
+                )
+                item = items[idx]
+
             msg_payload = item.msg.model_dump()
             if stored_image_url:
                 msg_payload["image_url"] = stored_image_url
@@ -1260,7 +1312,7 @@ class NotificationService:
                         future.set_result(ctx)
 
         return ctx
-
+    
     async def enqueue_notification(
         self,
         msg: NotificationMessage,
@@ -1271,15 +1323,13 @@ class NotificationService:
             return
 
         extra_payload = await self._attach_clip_payload(msg=msg, ctx=ctx, extra_payload=extra_payload)
-        extra_payload, stored_image_url, _stored_image_key = await self._materialize_alert_image_payload(
-            msg=msg,
-            extra_payload=extra_payload,
-        )
 
         updated_fields: Dict[str, Any] = {}
-        next_image_url = str(stored_image_url or "").strip()
-        if next_image_url and next_image_url != str(msg.image_url or "").strip():
-            updated_fields["image_url"] = next_image_url
+
+        next_image_url = str((extra_payload or {}).get("image_url") or msg.image_url or "").strip()
+        if next_image_url and not next_image_url.startswith("data:"):
+            if next_image_url != str(msg.image_url or "").strip():
+                updated_fields["image_url"] = next_image_url
 
         clip_payload = extra_payload.get("clip") if isinstance(extra_payload, dict) else None
         if isinstance(clip_payload, dict):
@@ -1298,7 +1348,7 @@ class NotificationService:
         user_id = int(ctx.user_id)
         site_uuid_str = str(ctx.site_uuid)
         camera_uuid_str = str(msg.camera_uuid)
-        
+
         item = BufferedNotification(
             msg=msg,
             ctx=ctx,
@@ -1306,20 +1356,18 @@ class NotificationService:
         )
 
         async with self._buffer_lock:
-            # Hierarchical insertion: user_id -> site_uuid -> camera_uuid -> alerts
             if user_id not in self._pending_by_user:
                 self._pending_by_user[user_id] = {}
                 self._pending_since[user_id] = time.monotonic()
-            
+
             if site_uuid_str not in self._pending_by_user[user_id]:
                 self._pending_by_user[user_id][site_uuid_str] = {}
-            
+
             if camera_uuid_str not in self._pending_by_user[user_id][site_uuid_str]:
                 self._pending_by_user[user_id][site_uuid_str][camera_uuid_str] = []
-            
+
             self._pending_by_user[user_id][site_uuid_str][camera_uuid_str].append(item)
-            
-            # Count total items across all sites/cameras for this user
+
             total_items = sum(
                 len(alerts)
                 for sites in self._pending_by_user[user_id].values()
@@ -1329,7 +1377,7 @@ class NotificationService:
 
         if should_flush:
             self._flush_event.set()
-
+    
     async def _persist_and_send(
         self,
         msg: NotificationMessage,

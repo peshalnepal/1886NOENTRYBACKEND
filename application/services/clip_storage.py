@@ -360,7 +360,6 @@ class EventClipService:
             return False
 
         return True
-
     async def _save_video_record(
         self,
         *,
@@ -372,6 +371,7 @@ class EventClipService:
         status: str,
         storage_key: Optional[str] = None,
         recording_url: Optional[str] = None,
+        overlay_payload: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
     ) -> None:
         if self._session_factory is None:
@@ -392,12 +392,12 @@ class EventClipService:
                 status=status,
                 storage_key=storage_key,
                 recording_url=recording_url,
+                overlay_payload=overlay_payload,
                 error=error,
             )
             db.add(row)
             await db.commit()
-            await db.refresh(row)
-
+              
     async def capture_pre_event_clip(
         self,
         *,
@@ -405,6 +405,7 @@ class EventClipService:
         ctx: CameraContext,
         event_ts_ms: Optional[int] = None,
         trigger: Optional[str] = None,
+        overlay_payload: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not self.enabled:
             return None
@@ -494,6 +495,7 @@ class EventClipService:
                         status="completed",
                         storage_key=storage_key,
                         recording_url=recording_url,
+                        overlay_payload=overlay_payload,
                     )
                 except Exception:
                     logger.exception(

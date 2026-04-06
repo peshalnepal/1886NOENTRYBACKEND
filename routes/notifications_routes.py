@@ -2,18 +2,23 @@
 
 import asyncio
 import json
+import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
-
+from typing import Any, Dict, List, Optional, Set, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
-
+from application.services.user_snapshot_cache import (
+    CachedUserSnapshot,
+    UserSnapshotCache,
+    UserSnapshotLookupError,
+)
 from application.channels.channel_config import VideoChannelConfig
 from application.services.alert_image_storage import (
     AlertImageStorageService,
@@ -29,6 +34,173 @@ from domain.events import DetectionBox, DetectionItem, DetectionsProducedEvent
 router = APIRouter(prefix="/notifications")
 
 
+def _configured_worker_count() -> int:
+    for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS"):
+        raw = str(os.getenv(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            continue
+
+    match = re.search(r"(?:^|\s)(?:-w|--workers)(?:\s+|=)(\d+)", str(os.getenv("GUNICORN_CMD_ARGS") or ""))
+    if match:
+        try:
+            return max(1, int(match.group(1)))
+        except ValueError:
+            return 1
+
+    return 1
+
+
+_CAMERA_MODE_CACHE_TTL_S = 0.0 if _configured_worker_count() > 1 else 15.0
+_CAMERA_MODE_MISS_TTL_S = 0.0 if _configured_worker_count() > 1 else 5.0
+
+
+@dataclass(frozen=True)
+class _CachedCameraModeState:
+    enabled: Any
+    detection_enabled: Any
+    notification_enabled: Any
+    use_site_schedule: Any
+    camera_config: Any
+    camera_timezone: Optional[str]
+    site_config: Any
+    site_timezone: Optional[str]
+
+
+_camera_mode_cache: Dict[str, Tuple[float, Optional[_CachedCameraModeState]]] = {}
+_camera_mode_cache_lock = asyncio.Lock()
+_camera_mode_generation: Dict[str, int] = {}
+_camera_mode_inflight: Dict[str, Tuple[int, asyncio.Future]] = {}
+
+
+def _camera_mode_from_state(
+    state: Optional[_CachedCameraModeState],
+    *,
+    now_utc: Optional[datetime] = None,
+) -> CameraMode:
+    if state is None:
+        return CameraMode(detection_enabled=False, notification_enabled=False)
+
+    return _camera_mode_with_schedule(
+        enabled=state.enabled,
+        detection_enabled=state.detection_enabled,
+        notification_enabled=state.notification_enabled,
+        use_site_schedule=state.use_site_schedule,
+        camera_config=state.camera_config,
+        camera_timezone=state.camera_timezone,
+        site_config=state.site_config,
+        site_timezone=state.site_timezone,
+        now_utc=now_utc,
+    )
+
+
+async def _get_camera_mode_cached(
+    request: Request,
+    *,
+    cam_uuid_obj: uuid.UUID,
+) -> CameraMode:
+    cache_key = str(cam_uuid_obj)
+    now = time.monotonic()
+    now_utc = datetime.now(timezone.utc)
+    leader = False
+    pending: Optional[asyncio.Future] = None
+    generation = 0
+
+    async with _camera_mode_cache_lock:
+        generation = _camera_mode_generation.get(cache_key, 0)
+        hit = _camera_mode_cache.get(cache_key)
+        if hit and hit[0] > now:
+            return _camera_mode_from_state(hit[1], now_utc=now_utc)
+
+        inflight = _camera_mode_inflight.get(cache_key)
+        if inflight is not None and inflight[0] == generation:
+            pending = inflight[1]
+        else:
+            pending = asyncio.get_running_loop().create_future()
+            _camera_mode_inflight[cache_key] = (generation, pending)
+            leader = True
+
+    if not leader and pending is not None:
+        state = await pending
+        return _camera_mode_from_state(state, now_utc=now_utc)
+
+    state: Optional[_CachedCameraModeState] = None
+    cache_ttl_s: Optional[float] = None
+    cancelled = False
+    sf = _session_factory_from_app(request)
+    try:
+        if sf is not None:
+            async with sf() as session:
+                res = await session.execute(
+                    select(
+                        Camera.is_enabled,
+                        Camera.is_detection_enabled,
+                        Camera.is_notification_enabled,
+                        Camera.use_site_schedule,
+                        ChannelConfiguration.configuration,
+                        ChannelConfiguration.timezone,
+                        SiteSettings.config,
+                        Site.timezone,
+                    )
+                    .select_from(Camera)
+                    .outerjoin(ChannelConfiguration, ChannelConfiguration.camera_uuid == Camera.camera_uuid)
+                    .outerjoin(Site, Site.site_uuid == Camera.site_uuid)
+                    .outerjoin(SiteSettings, SiteSettings.site_uuid == Camera.site_uuid)
+                    .where(Camera.camera_uuid == cam_uuid_obj)
+                )
+                row = res.first()
+                if row:
+                    state = _CachedCameraModeState(*row)
+            cache_ttl_s = _CAMERA_MODE_CACHE_TTL_S if state is not None else _CAMERA_MODE_MISS_TTL_S
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    except Exception:
+        cache_ttl_s = None
+    finally:
+        async with _camera_mode_cache_lock:
+            current_generation = _camera_mode_generation.get(cache_key, 0)
+            if not cancelled and current_generation == generation:
+                if cache_ttl_s is not None and cache_ttl_s > 0:
+                    _camera_mode_cache[cache_key] = (
+                        time.monotonic() + cache_ttl_s,
+                        state,
+                    )
+                else:
+                    _camera_mode_cache.pop(cache_key, None)
+
+            current_inflight = _camera_mode_inflight.get(cache_key)
+            if (
+                current_inflight is not None
+                and current_inflight[1] is pending
+            ):
+                _camera_mode_inflight.pop(cache_key, None)
+
+            future = pending
+            if future is not None and not future.done():
+                if cancelled:
+                    future.cancel()
+                else:
+                    future.set_result(state)
+
+    return _camera_mode_from_state(state, now_utc=now_utc)
+
+
+async def invalidate_camera_mode_cache(camera_uuid: Optional[uuid.UUID] = None) -> None:
+    async with _camera_mode_cache_lock:
+        if camera_uuid is not None:
+            key = str(camera_uuid)
+            _camera_mode_generation[key] = _camera_mode_generation.get(key, 0) + 1
+            _camera_mode_cache.pop(key, None)
+            return
+        keys = set(_camera_mode_generation.keys()) | set(_camera_mode_cache.keys()) | set(_camera_mode_inflight.keys())
+        for key in keys:
+            _camera_mode_generation[key] = _camera_mode_generation.get(key, 0) + 1
+        _camera_mode_cache.clear()
+        
 # ---------------------------
 # SSE helpers
 # ---------------------------
@@ -38,13 +210,12 @@ def _sse(data: str, event: Optional[str] = None) -> str:
         return f"event: {event}\ndata: {data}\n\n"
     return f"data: {data}\n\n"
 
-
 async def _resolve_stream_user(
     *,
     request: Request,
     db: AsyncSession,
     access_token: Optional[str],
-) -> User:
+) -> CachedUserSnapshot:
     auth_header = request.headers.get("authorization", "")
     token = ""
     if auth_header.lower().startswith("bearer "):
@@ -65,11 +236,18 @@ async def _resolve_stream_user(
     except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
-    user = (await db.execute(select(User).where(User.id == user_id).limit(1))).scalar_one_or_none()
+    sf = _session_factory_from_app(request)
+    if sf is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    cache = _get_user_snapshot_cache(request)
+    try:
+        user = await cache.get(session_factory=sf, user_id=user_id)
+    except UserSnapshotLookupError:
+        raise HTTPException(status_code=503, detail="Database not available")
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
     return user
-
 
 @router.get("/stream")
 async def notifications_stream(
@@ -175,6 +353,12 @@ def _session_factory_from_app(request: Request):
     svc = getattr(request.app.state, "notification_service", None)
     return getattr(svc, "_session_factory", None)
 
+def _get_user_snapshot_cache(request: Request) -> UserSnapshotCache:
+    cache = getattr(request.app.state, "user_snapshot_cache", None)
+    if cache is None:
+        cache = UserSnapshotCache()
+        request.app.state.user_snapshot_cache = cache
+    return cache
 
 def _config_dict(raw: Any) -> Dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
@@ -269,55 +453,7 @@ async def receive_alert(payload: AlertRequest, request: Request):
         detections=det_items,
     )
 
-    mode = CameraMode(detection_enabled=True, notification_enabled=True)
-    sf = _session_factory_from_app(request)
-    if sf is not None:
-        try:
-            async with sf() as session:
-                res = await session.execute(
-                    select(
-                        Camera.is_enabled,
-                        Camera.is_detection_enabled,
-                        Camera.is_notification_enabled,
-                        Camera.use_site_schedule,
-                        ChannelConfiguration.configuration,
-                        ChannelConfiguration.timezone,
-                        SiteSettings.config,
-                        Site.timezone,
-                    )
-                    .select_from(Camera)
-                    .outerjoin(ChannelConfiguration, ChannelConfiguration.camera_uuid == Camera.camera_uuid)
-                    .outerjoin(Site, Site.site_uuid == Camera.site_uuid)
-                    .outerjoin(SiteSettings, SiteSettings.site_uuid == Camera.site_uuid)
-                    .where(Camera.camera_uuid == cam_uuid_obj)
-                )
-                row = res.first()
-                if row:
-                    (
-                        enabled,
-                        det_enabled,
-                        notif_enabled,
-                        use_site_schedule,
-                        camera_config,
-                        camera_timezone,
-                        site_config,
-                        site_timezone,
-                    ) = row
-                    mode = _camera_mode_with_schedule(
-                        enabled=enabled,
-                        detection_enabled=det_enabled,
-                        notification_enabled=notif_enabled,
-                        use_site_schedule=use_site_schedule,
-                        camera_config=camera_config,
-                        camera_timezone=camera_timezone,
-                        site_config=site_config,
-                        site_timezone=site_timezone,
-                        now_utc=datetime.now(timezone.utc),
-                    )
-        except Exception:
-            # If DB lookup fails, don’t hard fail ingest; just default to True.
-            # (You can flip this to fail-closed if you prefer.)
-            pass
+    mode = await _get_camera_mode_cached(request, cam_uuid_obj=cam_uuid_obj)
 
     await svc.handle_detection_event(
         ev,

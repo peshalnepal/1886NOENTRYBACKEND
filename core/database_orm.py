@@ -527,8 +527,9 @@ class VideoRecord(Base):
     status = Column(String(50), nullable=False)
 
     local_path = Column(String(1024), nullable=True)
-    storage_key = Column(String(1024), nullable=True)
+    storage_key = Column(String(1024), nullable=True)  
     recording_url = Column(String(2048), nullable=True)
+    overlay_payload = Column(JSONDict, nullable=True)
 
     error = Column(Text, nullable=True)
 

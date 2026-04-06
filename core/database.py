@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 logging.getLogger("sqlalchemy.engine").setLevel(logging.ERROR)
 
 
+def _is_duplicate_column_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return (
+        "duplicate column name" in message
+        or "column names in each table must be unique" in message
+        or "already has a column named" in message
+    )
+
+
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     raw = os.getenv(name)
     try:
@@ -156,6 +165,7 @@ class DatabaseManager:
         ...
         async with self.async_engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            dialect_name = str(conn.dialect.name or "").lower()
 
             # Migrate: old schema had a NOT NULL `code` column in email_verifications
             # that stored the plaintext OTP. New schema uses `code_hash` instead.
@@ -175,6 +185,54 @@ class DatabaseManager:
                     text(f"ALTER TABLE email_verifications MODIFY COLUMN `code` {col_type} NULL DEFAULT NULL")
                 )
                 logger.info("Migrated email_verifications.code to nullable.")
+
+            overlay_column = None
+            if dialect_name.startswith("mysql"):
+                overlay_column = (
+                    await conn.execute(
+                        text("""
+                            SELECT 1
+                            FROM information_schema.COLUMNS
+                            WHERE TABLE_SCHEMA = DATABASE()
+                              AND TABLE_NAME   = 'video_record'
+                              AND COLUMN_NAME  = 'overlay_payload'
+                            LIMIT 1
+                        """)
+                    )
+                ).fetchone()
+                if not overlay_column:
+                    try:
+                        await conn.execute(
+                            text("ALTER TABLE video_record ADD COLUMN overlay_payload JSON NULL")
+                        )
+                        logger.info("Added video_record.overlay_payload column.")
+                    except Exception as exc:
+                        if _is_duplicate_column_error(exc):
+                            logger.info("video_record.overlay_payload column already exists.")
+                        else:
+                            raise
+            elif dialect_name.startswith("mssql"):
+                overlay_column = (
+                    await conn.execute(
+                        text("""
+                            SELECT TOP 1 1
+                            FROM INFORMATION_SCHEMA.COLUMNS
+                            WHERE TABLE_NAME  = 'video_record'
+                              AND COLUMN_NAME = 'overlay_payload'
+                        """)
+                    )
+                ).fetchone()
+                if not overlay_column:
+                    try:
+                        await conn.execute(
+                            text("ALTER TABLE video_record ADD overlay_payload NVARCHAR(MAX) NULL")
+                        )
+                        logger.info("Added video_record.overlay_payload column.")
+                    except Exception as exc:
+                        if _is_duplicate_column_error(exc):
+                            logger.info("video_record.overlay_payload column already exists.")
+                        else:
+                            raise
 
         # Seed a dev user if DB is empty.
         async with self.AsyncSessionLocal() as db:

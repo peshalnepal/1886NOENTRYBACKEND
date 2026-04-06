@@ -216,6 +216,19 @@ def _dedupe_uuid_list(values: Optional[List[uuid.UUID]]) -> List[uuid.UUID]:
     return out
 
 
+async def _invalidate_site_camera_mode_cache(
+    *,
+    db: AsyncSession,
+    site_uuid: uuid.UUID,
+) -> None:
+    from routes.notifications_routes import invalidate_camera_mode_cache
+
+    camera_uuids = (
+        await db.execute(select(Camera.camera_uuid).where(Camera.site_uuid == site_uuid))
+    ).scalars().all()
+    for camera_uuid in camera_uuids:
+        await invalidate_camera_mode_cache(camera_uuid)
+
 
 async def _refresh_site_schedule_runtime(
     *,
@@ -595,6 +608,8 @@ async def update_site_settings(
         is_enabled=True,
     )
     await db.commit()
+    if payload.schedule is not None:
+        await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     await db.refresh(row)
     if payload.schedule is not None:
         await _refresh_site_schedule_runtime(
@@ -663,6 +678,8 @@ async def update_site(
             setattr(site, k, v)
 
     await db.commit()
+    if data.get("timezone") is not None:
+        await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     await db.refresh(site)
     if data.get("timezone") is not None:
         await _refresh_site_schedule_runtime(
@@ -679,10 +696,17 @@ async def delete_site(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
+    from routes.notifications_routes import invalidate_camera_mode_cache
+
     site_repo=SiteRepository()
     site = await site_repo.get_site(db,user_id=user.id, site_uuid=site_uuid)
+    camera_uuids = (
+        await db.execute(select(Camera.camera_uuid).where(Camera.site_uuid == site.site_uuid))
+    ).scalars().all()
     await db.delete(site)
     await db.commit()
+    for camera_uuid in camera_uuids:
+        await invalidate_camera_mode_cache(camera_uuid)
     return None
 
 

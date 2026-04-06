@@ -6,7 +6,11 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-
+from application.services.user_snapshot_cache import (
+    CachedUserSnapshot,
+    UserSnapshotCache,
+    UserSnapshotLookupError,
+)
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
@@ -38,12 +42,19 @@ def _ensure_user_owns_camera(cam: Any, user_id: int) -> None:
         raise HTTPException(status_code=404, detail="Camera not found")
 
 
+def _get_user_snapshot_cache(request: Request) -> UserSnapshotCache:
+    cache = getattr(request.app.state, "user_snapshot_cache", None)
+    if cache is None:
+        cache = UserSnapshotCache()
+        request.app.state.user_snapshot_cache = cache
+    return cache
+
 async def _resolve_stream_user(
     *,
     request: Request,
     db: AsyncSession,
     access_token: Optional[str],
-) -> User:
+) -> CachedUserSnapshot:
     auth_header = request.headers.get("authorization", "")
     token = ""
     if auth_header.lower().startswith("bearer "):
@@ -64,11 +75,18 @@ async def _resolve_stream_user(
     except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
-    user = (await db.execute(select(User).where(User.id == user_id).limit(1))).scalar_one_or_none()
+    sf = _session_factory_from_app(request)
+    if sf is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    cache = _get_user_snapshot_cache(request)
+    try:
+        user = await cache.get(session_factory=sf, user_id=user_id)
+    except UserSnapshotLookupError:
+        raise HTTPException(status_code=503, detail="Database not available")
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
     return user
-
 
 def _session_factory_from_app(request: Request):
     sf = getattr(request.app.state, "session_factory", None)
@@ -519,6 +537,9 @@ async def create_camera(
             raise HTTPException(status_code=500, detail="Operation failed to create camera record")
 
         cam_out = result.cameras[0]
+        from routes.notifications_routes import invalidate_camera_mode_cache
+
+        await invalidate_camera_mode_cache(cam_out.camera_uuid)
         return CameraWithConfigSchema(
             camera_uuid=cam_out.camera_uuid,
             camera_code=cam_out.camera_code,
@@ -575,6 +596,9 @@ async def edit_camera(
         raise HTTPException(status_code=500, detail="Failed to edit camera")
 
     cam_out = result.cameras[0]
+    from routes.notifications_routes import invalidate_camera_mode_cache
+
+    await invalidate_camera_mode_cache(cam_out.camera_uuid)
     return CameraWithConfigSchema(
         camera_uuid=cam_out.camera_uuid,
         camera_code=cam_out.camera_code,
@@ -619,6 +643,9 @@ async def delete_camera(
     )
 
     await manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=user.id)
+    from routes.notifications_routes import invalidate_camera_mode_cache
+
+    await invalidate_camera_mode_cache(camera_uuid)
     return {"ok": True}
 
 @router.get("/{camera_uuid}/snapshot.jpg")
