@@ -45,6 +45,7 @@ class EdgeReconcileOut(BaseModel):
     removed: List[str] = Field(default_factory=list)
 
     errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
     
 # -----------------------
 # Schemas

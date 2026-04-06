@@ -21,7 +21,7 @@ from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEve
 from domain.model_pipeline import ModelPipeline
 from application.channels.channel_config import VideoChannelConfig
 from application.channels.channel import VideoChannel
-from application.services.edgeinference import EdgeInferenceClient
+from application.services.edgeinference import EdgeCameraInventoryError, EdgeInferenceClient
 from application.services.webrtcgateway import WebRTCGatewayClient
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,16 @@ class EdgeDeviceUnavailableError(RuntimeError):
         cause_msg = str(cause).strip()
         detail = f"{cause_name}: {cause_msg}" if cause_msg else cause_name
         super().__init__(f"Edge device unreachable ({device_url}): {detail}")
+
+
+def _edge_health_ready(health: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(health, dict):
+        return False
+    if health.get("ok") is False:
+        return False
+    if health.get("pipeline_ready") is False:
+        return False
+    return True
 
 
 # -------------------------
@@ -1002,8 +1012,30 @@ class Manager:
                     active_streams.add(str(cam.camera_code))
 
         device_url = dev.device_url
+        edge_warnings: List[str] = []
         try:
             edge_set = await self._edge.list_cameras(device_url=device_url)
+        except EdgeCameraInventoryError as e:
+            if _edge_health_ready(getattr(e, "health", None)):
+                logger.warning(
+                    "Edge camera inventory unavailable for %s during reconcile; continuing with add-only sync: %s",
+                    device_url,
+                    e,
+                )
+                edge_set = set()
+                edge_warnings.append(
+                    "Edge camera inventory was unavailable, so sync continued in add-only mode. "
+                    "Existing unknown cameras on the edge device were not removed."
+                )
+            else:
+                logger.warning(
+                    "Cannot reach edge device %s during reconcile (%s): %s",
+                    device_url,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
+                raise EdgeDeviceUnavailableError(device_url, e) from e
         except Exception as e:
             logger.warning(
                 "Cannot reach edge device %s during reconcile (%s): %s",
@@ -1038,6 +1070,7 @@ class Manager:
             "added": [],
             "removed": [],
             "errors": [],
+            "warnings": edge_warnings,
         }
 
         if dry_run:
@@ -1139,6 +1172,7 @@ class Manager:
             "device_row_count": len(device_rows),
             "devices": {},
             "errors": [],
+            "warnings": [],
         }
 
         for du in device_uuids:
@@ -1151,6 +1185,8 @@ class Manager:
                     delete_unknown=delete_unknown,
                 )
                 summary["devices"][key] = result
+                for warning in result.get("warnings") or []:
+                    summary["warnings"].append("{}: {}".format(key, warning))
             except Exception as e:
                 logger.warning("Startup reconcile failed for device=%s", key, exc_info=True)
                 summary["errors"].append("{}: {}".format(key, e))

@@ -62,6 +62,12 @@ async def _edge_reconcile_loop(app: FastAPI) -> None:
                     summary.get("device_count"),
                     len(summary.get("errors") or []),
                 )
+            elif summary.get("warnings"):
+                logger.warning(
+                    "Edge reconcile completed with warnings device_count=%s warnings=%s",
+                    summary.get("device_count"),
+                    len(summary.get("warnings") or []),
+                )
             else:
                 logger.info(
                     "Edge reconcile completed device_count=%s",

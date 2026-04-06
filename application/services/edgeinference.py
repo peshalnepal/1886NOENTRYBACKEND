@@ -11,6 +11,39 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
+def _health_bits(health: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(health, dict):
+        return []
+
+    bits: List[str] = []
+    if "ok" in health:
+        bits.append(f"ok={health.get('ok')}")
+    if "pipeline_ready" in health:
+        bits.append(f"pipeline_ready={health.get('pipeline_ready')}")
+    startup_error = health.get("startup_error")
+    if startup_error:
+        bits.append(f"startup_error={startup_error}")
+    return bits
+
+
+class EdgeCameraInventoryError(RuntimeError):
+    def __init__(
+        self,
+        detail: str,
+        *,
+        health: Optional[Dict[str, Any]] = None,
+        cause: Optional[Exception] = None,
+    ) -> None:
+        self.health = dict(health) if isinstance(health, dict) else None
+        self.cause = cause
+
+        msg = str(detail or "").strip() or "Edge camera inventory request failed"
+        bits = _health_bits(self.health)
+        if bits:
+            msg = f"{msg} (health: {', '.join(bits)})"
+        super().__init__(msg)
+
+
 def to_jsonable(obj):
     if isinstance(obj, uuid.UUID):
         return str(obj)
@@ -146,18 +179,7 @@ class EdgeInferenceClient:
             data = await self._request_json("GET", url)
         except Exception as exc:
             health = await self.get_health(device_url=device_url)
-            if isinstance(health, dict):
-                health_bits = []
-                if "ok" in health:
-                    health_bits.append(f"ok={health.get('ok')}")
-                if "pipeline_ready" in health:
-                    health_bits.append(f"pipeline_ready={health.get('pipeline_ready')}")
-                startup_error = health.get("startup_error")
-                if startup_error:
-                    health_bits.append(f"startup_error={startup_error}")
-                if health_bits:
-                    raise RuntimeError(f"{exc} (health: {', '.join(health_bits)})") from exc
-            raise
+            raise EdgeCameraInventoryError(str(exc), health=health, cause=exc) from exc
 
         items = []
         if isinstance(data, dict):

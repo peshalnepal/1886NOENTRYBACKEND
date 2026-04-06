@@ -653,7 +653,7 @@ async def snapshot_jpg(
     db: AsyncSession = Depends(get_async_db),
 ):
     try:
-        user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+        user = await _resolve_stream_user(request=request, access_token=access_token)
     except HTTPException as e:
         if e.status_code == 401:
             logger.warning(f"Snapshot access denied for camera {camera_uuid}: {e.detail}")
