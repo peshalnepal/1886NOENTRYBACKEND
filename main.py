@@ -21,6 +21,7 @@ from application.services.manager import Manager  # adjust if your path is diffe
 from application.models.yolo_config import YoloModelConfig
 from application.services.notification import WebNotificationHub, NotificationService, EmailNotifier, EmailConfig
 from application.services.retention import RetentionService
+from application.services.user_snapshot_cache import UserSnapshotCache
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,7 @@ async def lifespan(app: FastAPI):
 
     app.state.manager = Manager(session_factory=SessionLocal)
     app.state.session_factory = SessionLocal
+    app.state.user_snapshot_cache = UserSnapshotCache()
     hub = WebNotificationHub()
     
     # Configure email notifier with proper SMTP settings

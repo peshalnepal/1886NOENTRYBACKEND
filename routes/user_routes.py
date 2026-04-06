@@ -142,6 +142,7 @@ async def update_me(
 @router.patch("/me/password")
 async def change_my_password(
     payload: ChangePasswordRequest,
+    request: Request,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -161,6 +162,7 @@ async def change_my_password(
 
     try:
         await db.commit()
+        _invalidate_user_snapshot_cache(request, int(current_user.id))
     except Exception:
         await db.rollback()
         raise

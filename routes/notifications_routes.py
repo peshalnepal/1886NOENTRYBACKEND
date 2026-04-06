@@ -213,7 +213,6 @@ def _sse(data: str, event: Optional[str] = None) -> str:
 async def _resolve_stream_user(
     *,
     request: Request,
-    db: AsyncSession,
     access_token: Optional[str],
 ) -> CachedUserSnapshot:
     auth_header = request.headers.get("authorization", "")
@@ -266,8 +265,7 @@ async def notifications_stream(
     if sf is None:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    async with sf() as db:
-        user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
+    user = await _resolve_stream_user(request=request, access_token=access_token)
     user_id = int(user.id)
     q = await hub.subscribe(user_id=user_id)
 

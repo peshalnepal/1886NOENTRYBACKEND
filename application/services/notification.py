@@ -1525,7 +1525,10 @@ class NotificationService:
         site_uuid_str = str(ctx.site_uuid)
         device_name = ctx.device_name
         camera_name = ctx.camera_name
-        image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
+        raw_image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
+        # Don't send base64 data: URLs over SSE — materialization to blob happens during flush.
+        # extra_payload still carries raw_image_url so the flush path can store it correctly.
+        image_url = None if (raw_image_url or "").startswith("data:") else raw_image_url
         overlay_payload = _event_overlay_payload(
             det_ev,
             frame_w=frame_w,

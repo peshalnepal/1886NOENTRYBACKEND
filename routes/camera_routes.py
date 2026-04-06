@@ -52,7 +52,6 @@ def _get_user_snapshot_cache(request: Request) -> UserSnapshotCache:
 async def _resolve_stream_user(
     *,
     request: Request,
-    db: AsyncSession,
     access_token: Optional[str],
 ) -> CachedUserSnapshot:
     auth_header = request.headers.get("authorization", "")
@@ -391,8 +390,8 @@ async def stream_detections_sse(
     if sf is None:
         raise HTTPException(status_code=503, detail="Database not available")
 
+    user = await _resolve_stream_user(request=request, access_token=access_token)
     async with sf() as db:
-        user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
         repo = ChannelRepository()
         full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
         if not full:
@@ -452,9 +451,7 @@ async def stream_all_detections_sse(
     if sf is None:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    async with sf() as db:
-        user = await _resolve_stream_user(request=request, db=db, access_token=access_token)
-
+    user = await _resolve_stream_user(request=request, access_token=access_token)
     pipeline = await manager.get_activepipeline(user_id=user.id)
     hub = pipeline.detection_hub
 
