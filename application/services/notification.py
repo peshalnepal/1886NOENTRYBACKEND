@@ -329,6 +329,7 @@ def _event_overlay_payload(
 
 @dataclass(frozen=True)
 class CameraMode:
+    playback_enabled: bool = True
     detection_enabled: bool = True
     notification_enabled: bool = True
 
@@ -827,10 +828,11 @@ class NotificationService:
         self._buffer_poll_s = _env_float("NOTIFICATION_BUFFER_POLL_S", 1.0, minimum=0.2)
         self._site_prerecord_timeout_s = _env_float("SITE_PRERECORD_TIMEOUT_S", 30.0, minimum=1.0)
         self._trigger_camera_timeout_s = _env_float("TRIGGER_CAMERA_TIMEOUT_S", 15.0, minimum=1.0)
-        self._clip_overlay_history_ttl_s = _env_float("CLIP_OVERLAY_HISTORY_TTL_S", 600.0, minimum=30.0)
+        self._clip_overlay_history_ttl_s = _env_float("CLIP_OVERLAY_HISTORY_TTL_S", 180.0, minimum=30.0)
+        self.overlay_duration = _env_float("VIDEO_CLIP_DURATION_S",120.0, minimum=60.0)+60.0
         self._clip_overlay_history_max_frames = _env_int(
             "CLIP_OVERLAY_HISTORY_MAX_FRAMES_PER_CAMERA",
-            3600,
+            self.overlay_duration* 60,
             minimum=1,
         )
         self._overlay_history_by_camera: Dict[str, deque[Dict[str, Any]]] = {}
@@ -949,6 +951,27 @@ class NotificationService:
             if start_ts_ms <= int(frame.get("frame_ts_ms", -1)) <= end_ts_ms
         ]
 
+    async def _trim_clip_overlay_history(
+        self,
+        *,
+        camera_uuid: str,
+        through_time: Optional[datetime],
+    ) -> None:
+        if through_time is None:
+            return
+
+        through_ts_ms = int(through_time.astimezone(timezone.utc).timestamp() * 1000.0)
+        async with self._overlay_history_lock:
+            bucket = self._overlay_history_by_camera.get(str(camera_uuid))
+            if not bucket:
+                return
+
+            while bucket and int(bucket[0].get("frame_ts_ms", 0)) <= through_ts_ms:
+                bucket.popleft()
+
+            if not bucket:
+                self._overlay_history_by_camera.pop(str(camera_uuid), None)
+
     async def _finalize_captured_clip(
         self,
         *,
@@ -1011,6 +1034,11 @@ class NotificationService:
                     camera_uuid,
                     external_id,
                 )
+
+        await self._trim_clip_overlay_history(
+            camera_uuid=str(camera_uuid),
+            through_time=end_time,
+        )
 
         finalized = dict(clip)
         finalized["overlay_payload"] = overlay_payload
@@ -1900,14 +1928,15 @@ class NotificationService:
         cam = str(det_ev.camera_uuid)
         ts_ms = int(det_ev.frame_ts_ms)
 
-        await self.record_detection_overlay_frame(
-            camera_uuid=cam,
-            frame_ts_ms=ts_ms,
-            frame_seq=int(det_ev.frame_seq),
-            frame_w=frame_w,
-            frame_h=frame_h,
-            detections=list(det_ev.detections or []),
-        )
+        if bool(getattr(camera_mode, "playback_enabled", True)):
+            await self.record_detection_overlay_frame(
+                camera_uuid=cam,
+                frame_ts_ms=ts_ms,
+                frame_seq=int(det_ev.frame_seq),
+                frame_w=frame_w,
+                frame_h=frame_h,
+                detections=list(det_ev.detections or []),
+            )
 
         if not camera_mode.notification_enabled or not camera_mode.detection_enabled:
             return

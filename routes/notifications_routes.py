@@ -437,6 +437,7 @@ def _camera_mode_with_schedule(
 
     # `enabled` controls playback provisioning, not alert ingest.
     return CameraMode(
+        playback_enabled=bool(enabled),
         detection_enabled=bool(detection_enabled and schedule_active),
         notification_enabled=bool(notification_enabled and schedule_active),
     )
