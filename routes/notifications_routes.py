@@ -695,6 +695,9 @@ class DeleteNotificationsRequest(BaseModel):
     notification_ids: Optional[List[int]] = None
 
 
+_DELETE_NOTIFICATIONS_BATCH_SIZE = 500
+
+
 @router.delete("")
 async def delete_notifications(
     payload: DeleteNotificationsRequest,
@@ -702,7 +705,7 @@ async def delete_notifications(
     user: User = Depends(get_current_user),
 ):
     """
-    Hard delete (use sparingly).
+    Hide matching alerts in batches.
     """
     sf = _session_factory_from_app(request)
     if sf is None:
@@ -720,9 +723,13 @@ async def delete_notifications(
         raise HTTPException(status_code=422, detail="Invalid camera_uuid")
 
     image_service = AlertImageStorageService()
+    deleted = 0
     try:
         async with sf() as db:
-            conds = [Notification.user_id == int(user.id)]
+            conds = [
+                Notification.user_id == int(user.id),
+                Notification.visible.is_(True),
+            ]
             if su:
                 conds.append(Notification.site_uuid == su)
             if cu:
@@ -741,27 +748,34 @@ async def delete_notifications(
                     return {"ok": True, "deleted": 0}
                 conds.append(Notification.id.in_(ids))
 
-            rows = (
-                await db.execute(
-                    select(Notification).where(and_(*conds))
-                )
-            ).scalars().all()
+            while True:
+                rows = (
+                    await db.execute(
+                        select(Notification)
+                        .where(and_(*conds))
+                        .order_by(Notification.id.asc())
+                        .limit(_DELETE_NOTIFICATIONS_BATCH_SIZE)
+                    )
+                ).scalars().all()
+                if not rows:
+                    break
 
-            for row in rows:
-                storage_key = extract_image_storage_key(getattr(row, "payload", None))
-                if storage_key:
-                    try:
-                        await image_service.delete_blob(blob_name=storage_key)
-                    except Exception:
-                        pass
-                row.payload = strip_image_fields(row.payload)
-                row.visible = False
+                for row in rows:
+                    storage_key = extract_image_storage_key(getattr(row, "payload", None))
+                    if storage_key:
+                        try:
+                            await image_service.delete_blob(blob_name=storage_key)
+                        except Exception:
+                            pass
+                    row.payload = strip_image_fields(row.payload)
+                    row.visible = False
 
-            await db.commit()
+                deleted += len(rows)
+                await db.commit()
     finally:
         await image_service.close()
 
-    return {"ok": True, "deleted": len(rows)}
+    return {"ok": True, "deleted": deleted}
 
 
 def _as_utc(dt: datetime) -> datetime:
