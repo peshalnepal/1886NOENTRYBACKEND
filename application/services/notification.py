@@ -1,7 +1,7 @@
 # application/notifications/notification_service.py
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 import json
 import logging
 import math
@@ -74,44 +74,257 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    parsed = _coerce_int(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _normalize_overlay_box(raw_box: Any) -> Optional[Dict[str, int]]:
+    if isinstance(raw_box, dict):
+        keys = ("x1", "y1", "x2", "y2")
+        if not all(key in raw_box for key in keys):
+            return None
+        values = tuple(_coerce_int(raw_box.get(key)) for key in keys)
+    elif isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
+        values = tuple(_coerce_int(raw_box[idx]) for idx in range(4))
+    else:
+        values = tuple(_coerce_int(getattr(raw_box, key, None)) for key in ("x1", "y1", "x2", "y2"))
+
+    if any(value is None for value in values):
+        return None
+
+    x1, y1, x2, y2 = values
+    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+
+def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(raw_detection, dict):
+        box = _normalize_overlay_box(raw_detection.get("box") or raw_detection.get("bbox"))
+        cls_name = str(raw_detection.get("cls_name") or raw_detection.get("class") or "obj")
+        conf = float(raw_detection.get("conf", 0.0) or 0.0)
+    else:
+        box = _normalize_overlay_box(getattr(raw_detection, "box", None) or getattr(raw_detection, "bbox", None))
+        cls_name = str(
+            getattr(raw_detection, "cls_name", None)
+            or getattr(raw_detection, "class_name", None)
+            or getattr(raw_detection, "class", None)
+            or "obj"
+        )
+        conf = float(getattr(raw_detection, "conf", 0.0) or 0.0)
+
+    if box is None:
+        return None
+
+    return {
+        "cls_name": cls_name,
+        "conf": conf,
+        "box": box,
+    }
+
+
+def _normalize_overlay_frame(
+    *,
+    camera_uuid: Optional[str],
+    frame_ts_ms: Any,
+    frame_seq: Any,
+    frame_w: Any,
+    frame_h: Any,
+    detections: Any,
+) -> Optional[Dict[str, Any]]:
+    ts_ms = _coerce_int(frame_ts_ms)
+    seq = _coerce_int(frame_seq)
+    if ts_ms is None or seq is None:
+        return None
+
+    normalized_detections: List[Dict[str, Any]] = []
+    seen = set()
+    for raw_detection in list(detections or []):
+        normalized = _normalize_overlay_detection(raw_detection)
+        if normalized is None:
+            continue
+        box = normalized["box"]
+        key = (
+            normalized["cls_name"],
+            normalized["conf"],
+            box["x1"],
+            box["y1"],
+            box["x2"],
+            box["y2"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_detections.append(normalized)
+
+    if not normalized_detections:
+        return None
+
+    frame: Dict[str, Any] = {
+        "frame_ts_ms": int(ts_ms),
+        "frame_seq": int(seq),
+        "detections": normalized_detections,
+    }
+    if camera_uuid:
+        frame["camera_uuid"] = str(camera_uuid)
+    normalized_w = _coerce_positive_int(frame_w)
+    normalized_h = _coerce_positive_int(frame_h)
+    if normalized_w is not None:
+        frame["frame_w"] = normalized_w
+    if normalized_h is not None:
+        frame["frame_h"] = normalized_h
+    return frame
+
+
+def _merge_overlay_frames(*sources: Any) -> List[Dict[str, Any]]:
+    merged: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+    for source in sources:
+        if not isinstance(source, list):
+            continue
+        for raw_frame in source:
+            if not isinstance(raw_frame, dict):
+                continue
+            normalized = _normalize_overlay_frame(
+                camera_uuid=raw_frame.get("camera_uuid"),
+                frame_ts_ms=raw_frame.get("frame_ts_ms"),
+                frame_seq=raw_frame.get("frame_seq"),
+                frame_w=raw_frame.get("frame_w"),
+                frame_h=raw_frame.get("frame_h"),
+                detections=raw_frame.get("detections"),
+            )
+            if normalized is None:
+                continue
+            merged[(normalized["frame_ts_ms"], normalized["frame_seq"])] = normalized
+
+    return sorted(
+        merged.values(),
+        key=lambda item: (int(item.get("frame_ts_ms", 0)), int(item.get("frame_seq", 0))),
+    )
+
+
+def _select_overlay_reference_frame(
+    frames: List[Dict[str, Any]],
+    *,
+    preferred_ts_ms: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    if not frames:
+        return None
+    if preferred_ts_ms is None:
+        return frames[-1]
+    return min(
+        frames,
+        key=lambda item: (
+            abs(int(item.get("frame_ts_ms", 0)) - int(preferred_ts_ms)),
+            abs(int(item.get("frame_seq", 0))),
+            int(item.get("frame_ts_ms", 0)),
+        ),
+    )
+
+
+def _build_overlay_payload_from_frames(
+    *,
+    camera_uuid: str,
+    frames: List[Dict[str, Any]],
+    preferred_ts_ms: Optional[int] = None,
+    clip_start_time: Optional[datetime] = None,
+    clip_end_time: Optional[datetime] = None,
+    timeline_source: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    merged_frames = _merge_overlay_frames(frames)
+    reference = _select_overlay_reference_frame(merged_frames, preferred_ts_ms=preferred_ts_ms)
+    if reference is None:
+        return None
+
+    payload: Dict[str, Any] = {
+        "camera_uuid": str(camera_uuid),
+        "frame_ts_ms": int(reference["frame_ts_ms"]),
+        "frame_seq": int(reference["frame_seq"]),
+        "detections": list(reference.get("detections") or []),
+        "frames": merged_frames,
+    }
+    if reference.get("frame_w") is not None:
+        payload["frame_w"] = int(reference["frame_w"])
+    if reference.get("frame_h") is not None:
+        payload["frame_h"] = int(reference["frame_h"])
+    if clip_start_time is not None:
+        payload["clip_start_time"] = clip_start_time.astimezone(timezone.utc).isoformat()
+    if clip_end_time is not None:
+        payload["clip_end_time"] = clip_end_time.astimezone(timezone.utc).isoformat()
+    if timeline_source:
+        payload["timeline_source"] = str(timeline_source)
+    return payload
+
+
+def _parse_utc_datetime(raw: Any) -> Optional[datetime]:
+    if isinstance(raw, datetime):
+        dt = raw
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _event_overlay_payload(
     det_ev: DetectionsProducedEvent,
     *,
     frame_w: Optional[int] = None,
     frame_h: Optional[int] = None,
 ) -> Dict[str, Any]:
-    detections: List[Dict[str, Any]] = []
+    frame = _normalize_overlay_frame(
+        camera_uuid=str(det_ev.camera_uuid),
+        frame_ts_ms=det_ev.frame_ts_ms,
+        frame_seq=det_ev.frame_seq,
+        frame_w=frame_w,
+        frame_h=frame_h,
+        detections=list(det_ev.detections or []),
+    )
+    if frame is None:
+        payload: Dict[str, Any] = {
+            "camera_uuid": str(det_ev.camera_uuid),
+            "frame_ts_ms": int(det_ev.frame_ts_ms),
+            "frame_seq": int(det_ev.frame_seq),
+            "detections": [],
+            "frames": [],
+        }
+        if frame_w is not None:
+            payload["frame_w"] = int(frame_w)
+        if frame_h is not None:
+            payload["frame_h"] = int(frame_h)
+        return payload
 
-    for d in det_ev.detections or []:
-        box = getattr(d, "box", None)
-        if not box:
-            continue
-
-        detections.append(
-            {
-                "cls_name": str(getattr(d, "cls_name", "") or ""),
-                "conf": float(getattr(d, "conf", 0.0) or 0.0),
-                "box": {
-                    "x1": int(getattr(box, "x1", 0) or 0),
-                    "y1": int(getattr(box, "y1", 0) or 0),
-                    "x2": int(getattr(box, "x2", 0) or 0),
-                    "y2": int(getattr(box, "y2", 0) or 0),
-                },
-            }
-        )
-
-    payload: Dict[str, Any] = {
+    return _build_overlay_payload_from_frames(
+        camera_uuid=str(det_ev.camera_uuid),
+        frames=[frame],
+        preferred_ts_ms=int(det_ev.frame_ts_ms),
+        timeline_source="event",
+    ) or {
+        "camera_uuid": str(det_ev.camera_uuid),
         "frame_ts_ms": int(det_ev.frame_ts_ms),
         "frame_seq": int(det_ev.frame_seq),
-        "detections": detections,
+        "detections": [],
+        "frames": [],
     }
-
-    if frame_w is not None:
-        payload["frame_w"] = int(frame_w)
-    if frame_h is not None:
-        payload["frame_h"] = int(frame_h)
-
-    return payload
 
 
 @dataclass(frozen=True)
@@ -614,6 +827,14 @@ class NotificationService:
         self._buffer_poll_s = _env_float("NOTIFICATION_BUFFER_POLL_S", 1.0, minimum=0.2)
         self._site_prerecord_timeout_s = _env_float("SITE_PRERECORD_TIMEOUT_S", 30.0, minimum=1.0)
         self._trigger_camera_timeout_s = _env_float("TRIGGER_CAMERA_TIMEOUT_S", 15.0, minimum=1.0)
+        self._clip_overlay_history_ttl_s = _env_float("CLIP_OVERLAY_HISTORY_TTL_S", 600.0, minimum=30.0)
+        self._clip_overlay_history_max_frames = _env_int(
+            "CLIP_OVERLAY_HISTORY_MAX_FRAMES_PER_CAMERA",
+            3600,
+            minimum=1,
+        )
+        self._overlay_history_by_camera: Dict[str, deque[Dict[str, Any]]] = {}
+        self._overlay_history_lock = asyncio.Lock()
         self._clip_service = clip_service or EventClipService()
         self._image_service = image_service or AlertImageStorageService()
 
@@ -624,6 +845,48 @@ class NotificationService:
                 self._clip_service.set_session_factory(session_factory)
             except Exception:
                 logger.exception("Failed to set session factory on EventClipService")
+
+    async def record_detection_overlay_frame(
+        self,
+        *,
+        camera_uuid: str,
+        frame_ts_ms: Any,
+        frame_seq: Any,
+        frame_w: Any = None,
+        frame_h: Any = None,
+        detections: Any = None,
+    ) -> None:
+        frame = _normalize_overlay_frame(
+            camera_uuid=str(camera_uuid),
+            frame_ts_ms=frame_ts_ms,
+            frame_seq=frame_seq,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            detections=detections,
+        )
+        if frame is None:
+            return
+
+        history_cutoff_ms = int(frame["frame_ts_ms"]) - int(self._clip_overlay_history_ttl_s * 1000.0)
+        async with self._overlay_history_lock:
+            bucket = self._overlay_history_by_camera.get(str(camera_uuid))
+            if bucket is None:
+                bucket = deque(maxlen=int(self._clip_overlay_history_max_frames))
+                self._overlay_history_by_camera[str(camera_uuid)] = bucket
+
+            while bucket and int(bucket[0].get("frame_ts_ms", 0)) < history_cutoff_ms:
+                bucket.popleft()
+
+            if bucket:
+                last = bucket[-1]
+                if (
+                    int(last.get("frame_ts_ms", -1)) == int(frame["frame_ts_ms"])
+                    and int(last.get("frame_seq", -1)) == int(frame["frame_seq"])
+                ):
+                    bucket[-1] = frame
+                    return
+
+            bucket.append(frame)
 
     def _build_clip_overlay_payload(
         self,
@@ -644,14 +907,114 @@ class NotificationService:
         if not detections and frame_w is None and frame_h is None:
             return None
 
-        return {
-            "camera_uuid": str(msg.camera_uuid),
-            "frame_ts_ms": int(msg.ts_ms),
-            "frame_seq": int(frame_seq or 0),
-            "frame_w": int(frame_w) if frame_w is not None else None,
-            "frame_h": int(frame_h) if frame_h is not None else None,
-            "detections": detections,
-        }
+        frame = _normalize_overlay_frame(
+            camera_uuid=str(msg.camera_uuid),
+            frame_ts_ms=msg.ts_ms,
+            frame_seq=frame_seq or 0,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            detections=detections,
+        )
+        if frame is None:
+            return None
+
+        return _build_overlay_payload_from_frames(
+            camera_uuid=str(msg.camera_uuid),
+            frames=[frame],
+            preferred_ts_ms=int(msg.ts_ms),
+            timeline_source="trigger_frame",
+        )
+
+    async def _clip_overlay_frames_for_window(
+        self,
+        *,
+        camera_uuid: str,
+        start_time: Optional[datetime],
+        end_time: Optional[datetime],
+    ) -> List[Dict[str, Any]]:
+        if start_time is None or end_time is None:
+            return []
+
+        start_ts_ms = int(start_time.astimezone(timezone.utc).timestamp() * 1000.0)
+        end_ts_ms = int(end_time.astimezone(timezone.utc).timestamp() * 1000.0)
+        if end_ts_ms < start_ts_ms:
+            start_ts_ms, end_ts_ms = end_ts_ms, start_ts_ms
+
+        async with self._overlay_history_lock:
+            bucket = list(self._overlay_history_by_camera.get(str(camera_uuid), ()))
+
+        return [
+            dict(frame)
+            for frame in bucket
+            if start_ts_ms <= int(frame.get("frame_ts_ms", -1)) <= end_ts_ms
+        ]
+
+    async def _finalize_captured_clip(
+        self,
+        *,
+        camera_uuid: str,
+        clip: Optional[Dict[str, Any]],
+        preferred_ts_ms: Optional[int],
+        fallback_overlay_payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(clip, dict):
+            return clip
+
+        start_time = _parse_utc_datetime(clip.get("start_time"))
+        end_time = _parse_utc_datetime(clip.get("end_time"))
+        frames = await self._clip_overlay_frames_for_window(
+            camera_uuid=str(camera_uuid),
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+        fallback_frames = list(fallback_overlay_payload.get("frames") or []) if isinstance(fallback_overlay_payload, dict) else []
+        if not fallback_frames and isinstance(fallback_overlay_payload, dict):
+            fallback_frame = _normalize_overlay_frame(
+                camera_uuid=str(camera_uuid),
+                frame_ts_ms=fallback_overlay_payload.get("frame_ts_ms"),
+                frame_seq=fallback_overlay_payload.get("frame_seq"),
+                frame_w=fallback_overlay_payload.get("frame_w"),
+                frame_h=fallback_overlay_payload.get("frame_h"),
+                detections=fallback_overlay_payload.get("detections"),
+            )
+            if fallback_frame is not None:
+                fallback_frames = [fallback_frame]
+
+        overlay_payload = _build_overlay_payload_from_frames(
+            camera_uuid=str(camera_uuid),
+            frames=_merge_overlay_frames(frames, fallback_frames),
+            preferred_ts_ms=preferred_ts_ms,
+            clip_start_time=start_time,
+            clip_end_time=end_time,
+            timeline_source="clip_history",
+        )
+
+        if overlay_payload is None:
+            return dict(clip)
+
+        clip_service = self._clip_service
+        external_id = str(clip.get("external_id") or "").strip()
+        update_overlay = getattr(clip_service, "update_overlay_payload", None) if clip_service is not None else None
+        if callable(update_overlay) and external_id:
+            try:
+                merged_overlay = await update_overlay(
+                    camera_uuid=str(camera_uuid),
+                    external_id=external_id,
+                    overlay_payload=overlay_payload,
+                )
+                if isinstance(merged_overlay, dict):
+                    overlay_payload = merged_overlay
+            except Exception:
+                logger.exception(
+                    "Failed finalizing clip overlay camera=%s external_id=%s",
+                    camera_uuid,
+                    external_id,
+                )
+
+        finalized = dict(clip)
+        finalized["overlay_payload"] = overlay_payload
+        return finalized
         
     def invalidate_recipient_cache(
         self,
@@ -911,11 +1274,21 @@ class NotificationService:
                 camera_ctx = plan.contexts_by_camera.get(camera_uuid)
                 if camera_ctx is None:
                     continue
+                finalized_clip = await self._finalize_captured_clip(
+                    camera_uuid=camera_uuid_str,
+                    clip=result,
+                    preferred_ts_ms=int(msg.ts_ms),
+                    fallback_overlay_payload=(
+                        trigger_overlay_payload
+                        if camera_uuid_str == trigger_camera_uuid_str
+                        else None
+                    ),
+                )
                 out.append(
                     self._site_prerecord_clip_payload(
                         camera_uuid=camera_uuid_str,
                         camera_ctx=camera_ctx,
-                        clip=result,
+                        clip=finalized_clip or result,
                         trigger_camera_uuid=msg.camera_uuid,
                     )
                 )
@@ -937,15 +1310,18 @@ class NotificationService:
             extra_payload=extra_payload,
         )
         plan = await self._load_site_prerecord_plan(msg=msg, ctx=ctx)
-        if plan is None:
-            return extra_payload
 
         merged = dict(extra_payload or {})
         try:
             trigger_camera_uuid = uuid.UUID(str(msg.camera_uuid))
         except Exception:
             trigger_camera_uuid = None
-        trigger_ctx = plan.contexts_by_camera.get(trigger_camera_uuid) if trigger_camera_uuid else None
+        trigger_ctx = (
+            plan.contexts_by_camera.get(trigger_camera_uuid)
+            if plan is not None and trigger_camera_uuid is not None
+            else None
+        )
+        trigger_mode = plan.settings.trigger_mode if plan is not None else "single_camera"
         
         # Capture trigger camera clip with timeout
         clip = None
@@ -955,7 +1331,7 @@ class NotificationService:
                     camera_uuid=msg.camera_uuid,
                     ctx=trigger_ctx or ctx,
                     event_ts_ms=msg.ts_ms,
-                    trigger=f"site_prerecord:{msg.camera_uuid}:{plan.settings.trigger_mode}:{msg.alert_type}",
+                    trigger=f"site_prerecord:{msg.camera_uuid}:{trigger_mode}:{msg.alert_type}",
                     overlay_payload=overlay_payload,
                 ),
                 timeout=self._trigger_camera_timeout_s,
@@ -973,7 +1349,16 @@ class NotificationService:
             )
         
         if clip:
+            clip = await self._finalize_captured_clip(
+                camera_uuid=str(msg.camera_uuid),
+                clip=clip,
+                preferred_ts_ms=int(msg.ts_ms),
+                fallback_overlay_payload=overlay_payload,
+            )
             merged["clip"] = clip
+
+        if plan is None:
+            return merged or extra_payload
 
         multi_clips = await self._capture_site_prerecord_clips(
             msg=msg,
@@ -1512,15 +1897,24 @@ class NotificationService:
         frame_h: Optional[int] = None,
         extra_payload: Optional[Dict[str, Any]] = None,
     ) -> None:
+        cam = str(det_ev.camera_uuid)
+        ts_ms = int(det_ev.frame_ts_ms)
+
+        await self.record_detection_overlay_frame(
+            camera_uuid=cam,
+            frame_ts_ms=ts_ms,
+            frame_seq=int(det_ev.frame_seq),
+            frame_w=frame_w,
+            frame_h=frame_h,
+            detections=list(det_ev.detections or []),
+        )
+
         if not camera_mode.notification_enabled or not camera_mode.detection_enabled:
             return
 
         matches = self._extract_interesting(det_ev.detections)
         if not matches:
             return
-
-        cam = str(det_ev.camera_uuid)
-        ts_ms = int(det_ev.frame_ts_ms)
 
         ctx = await self._get_camera_ctx_cached(cam)
         if ctx is None:

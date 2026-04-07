@@ -1084,6 +1084,28 @@ class ModelPipeline:
                     track_events=track_events,
                     alerts=tuple(alerts),
                 )
+                record_overlay = (
+                    getattr(self._notification_service, "record_detection_overlay_frame", None)
+                    if self._notification_service is not None
+                    else None
+                )
+                if callable(record_overlay):
+                    try:
+                        await record_overlay(
+                            camera_uuid=str(resp2.camera_uuid),
+                            frame_ts_ms=int(resp2.frame_ts_ms),
+                            frame_seq=int(resp2.frame_seq),
+                            frame_w=resp2.frame_w,
+                            frame_h=resp2.frame_h,
+                            detections=list(resp2.detections or []),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to record clip overlay history camera=%s frame_ts_ms=%s frame_seq=%s",
+                            resp2.camera_uuid,
+                            resp2.frame_ts_ms,
+                            resp2.frame_seq,
+                        )
                 now = time.monotonic()
                 self._last_seen[key] = (int(resp2.frame_ts_ms), int(resp2.frame_seq))
                 self._last_ok_s[key] = now

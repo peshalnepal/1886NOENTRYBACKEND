@@ -5,12 +5,14 @@ import logging
 import os
 import time
 import uuid
+from urllib.parse import urlencode
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobSasPermissions, ContentSettings, generate_blob_sas
 from azure.storage.blob.aio import BlobServiceClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.notification_repository import CameraContext
@@ -61,6 +63,236 @@ def _truncate_message(raw: Any, limit: int = 240) -> str:
     return f"{text[: max(0, limit - 3)]}..."
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    parsed = _coerce_int(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _normalize_overlay_box(raw_box: Any) -> Optional[Dict[str, int]]:
+    if isinstance(raw_box, dict):
+        keys = ("x1", "y1", "x2", "y2")
+        if not all(key in raw_box for key in keys):
+            return None
+        values = tuple(_coerce_int(raw_box.get(key)) for key in keys)
+    elif isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
+        values = tuple(_coerce_int(raw_box[idx]) for idx in range(4))
+    else:
+        return None
+
+    if any(value is None for value in values):
+        return None
+
+    x1, y1, x2, y2 = values
+    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+
+def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_detection, dict):
+        return None
+
+    box = _normalize_overlay_box(raw_detection.get("box") or raw_detection.get("bbox"))
+    if box is None:
+        return None
+
+    try:
+        conf = float(raw_detection.get("conf", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+
+    return {
+        "cls_name": str(raw_detection.get("cls_name") or raw_detection.get("class") or "obj"),
+        "conf": conf,
+        "box": box,
+    }
+
+
+def _normalize_overlay_frame(raw_frame: Any, *, default_camera_uuid: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_frame, dict):
+        return None
+
+    frame_ts_ms = _coerce_int(raw_frame.get("frame_ts_ms"))
+    frame_seq = _coerce_int(raw_frame.get("frame_seq"))
+    if frame_ts_ms is None or frame_seq is None:
+        return None
+
+    detections: List[Dict[str, Any]] = []
+    seen = set()
+    for raw_detection in list(raw_frame.get("detections") or []):
+        normalized = _normalize_overlay_detection(raw_detection)
+        if normalized is None:
+            continue
+        box = normalized["box"]
+        key = (
+            normalized["cls_name"],
+            normalized["conf"],
+            box["x1"],
+            box["y1"],
+            box["x2"],
+            box["y2"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        detections.append(normalized)
+
+    if not detections:
+        return None
+
+    frame: Dict[str, Any] = {
+        "frame_ts_ms": int(frame_ts_ms),
+        "frame_seq": int(frame_seq),
+        "detections": detections,
+    }
+    camera_uuid = str(raw_frame.get("camera_uuid") or default_camera_uuid or "").strip()
+    if camera_uuid:
+        frame["camera_uuid"] = camera_uuid
+    frame_w = _coerce_positive_int(raw_frame.get("frame_w"))
+    frame_h = _coerce_positive_int(raw_frame.get("frame_h"))
+    if frame_w is not None:
+        frame["frame_w"] = frame_w
+    if frame_h is not None:
+        frame["frame_h"] = frame_h
+    return frame
+
+
+def _normalize_overlay_payload(
+    raw_payload: Any,
+    *,
+    default_camera_uuid: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_payload, dict):
+        return None
+
+    camera_uuid = str(raw_payload.get("camera_uuid") or default_camera_uuid or "").strip() or None
+    raw_frames = raw_payload.get("frames")
+    frames: List[Dict[str, Any]] = []
+
+    if isinstance(raw_frames, list):
+        for raw_frame in raw_frames:
+            normalized_frame = _normalize_overlay_frame(raw_frame, default_camera_uuid=camera_uuid)
+            if normalized_frame is not None:
+                frames.append(normalized_frame)
+
+    if not frames:
+        root_frame = _normalize_overlay_frame(
+            {
+                "camera_uuid": camera_uuid,
+                "frame_ts_ms": raw_payload.get("frame_ts_ms"),
+                "frame_seq": raw_payload.get("frame_seq"),
+                "frame_w": raw_payload.get("frame_w"),
+                "frame_h": raw_payload.get("frame_h"),
+                "detections": raw_payload.get("detections"),
+            },
+            default_camera_uuid=camera_uuid,
+        )
+        if root_frame is not None:
+            frames.append(root_frame)
+
+    if not frames:
+        return None
+
+    merged_frames: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for frame in frames:
+        merged_frames[(frame["frame_ts_ms"], frame["frame_seq"])] = frame
+    ordered_frames = sorted(
+        merged_frames.values(),
+        key=lambda item: (int(item["frame_ts_ms"]), int(item["frame_seq"])),
+    )
+    reference = ordered_frames[-1]
+
+    payload: Dict[str, Any] = {
+        "camera_uuid": camera_uuid or str(reference.get("camera_uuid") or ""),
+        "frame_ts_ms": int(reference["frame_ts_ms"]),
+        "frame_seq": int(reference["frame_seq"]),
+        "detections": list(reference.get("detections") or []),
+        "frames": ordered_frames,
+    }
+    if reference.get("frame_w") is not None:
+        payload["frame_w"] = int(reference["frame_w"])
+    if reference.get("frame_h") is not None:
+        payload["frame_h"] = int(reference["frame_h"])
+    for key in ("clip_start_time", "clip_end_time", "timeline_source"):
+        if raw_payload.get(key) is not None:
+            payload[key] = raw_payload.get(key)
+    return payload
+
+
+def _merge_overlay_payloads(
+    current_payload: Any,
+    next_payload: Any,
+    *,
+    default_camera_uuid: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    normalized_current = _normalize_overlay_payload(
+        current_payload,
+        default_camera_uuid=default_camera_uuid,
+    )
+    normalized_next = _normalize_overlay_payload(
+        next_payload,
+        default_camera_uuid=default_camera_uuid,
+    )
+
+    if normalized_current is None:
+        return normalized_next
+    if normalized_next is None:
+        return normalized_current
+
+    frames_by_key: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for raw_frame in list(normalized_current.get("frames") or []) + list(normalized_next.get("frames") or []):
+        normalized_frame = _normalize_overlay_frame(raw_frame, default_camera_uuid=default_camera_uuid)
+        if normalized_frame is None:
+            continue
+        frames_by_key[(normalized_frame["frame_ts_ms"], normalized_frame["frame_seq"])] = normalized_frame
+
+    ordered_frames = sorted(
+        frames_by_key.values(),
+        key=lambda item: (int(item["frame_ts_ms"]), int(item["frame_seq"])),
+    )
+    if not ordered_frames:
+        return normalized_next
+
+    reference = ordered_frames[-1]
+    preserved_root = _normalize_overlay_frame(normalized_current, default_camera_uuid=default_camera_uuid)
+    if preserved_root is None:
+        preserved_root = _normalize_overlay_frame(normalized_next, default_camera_uuid=default_camera_uuid)
+    if preserved_root is not None:
+        reference = frames_by_key.get(
+            (preserved_root["frame_ts_ms"], preserved_root["frame_seq"]),
+            preserved_root,
+        )
+
+    merged: Dict[str, Any] = {
+        "camera_uuid": str(
+            normalized_current.get("camera_uuid")
+            or normalized_next.get("camera_uuid")
+            or default_camera_uuid
+            or ""
+        ),
+        "frame_ts_ms": int(reference["frame_ts_ms"]),
+        "frame_seq": int(reference["frame_seq"]),
+        "detections": list(reference.get("detections") or []),
+        "frames": ordered_frames,
+    }
+    if reference.get("frame_w") is not None:
+        merged["frame_w"] = int(reference["frame_w"])
+    if reference.get("frame_h") is not None:
+        merged["frame_h"] = int(reference["frame_h"])
+    for key in ("clip_start_time", "clip_end_time", "timeline_source"):
+        value = normalized_next.get(key) if normalized_next.get(key) is not None else normalized_current.get(key)
+        if value is not None:
+            merged[key] = value
+    return merged
+
+
 class PlaybackUnavailableError(RuntimeError):
     pass
 
@@ -107,7 +339,8 @@ class EventClipService:
         # Read optional overrides from env (fallback to class constants)
         capture_enabled_raw = os.getenv("VIDEO_CLIP_CAPTURE_ENABLED", "").strip().lower()
         capture_enabled = capture_enabled_raw not in {"0", "false", "no", "off"} if capture_enabled_raw else True
-        self.enabled = bool(capture_enabled and self.playback_base_url and self.connection_string)
+        self.storage_enabled = bool(self.connection_string)
+        self.enabled = bool(capture_enabled and self.playback_base_url)
 
         try:
             self.CLIP_DURATION_S = int(os.getenv("VIDEO_CLIP_DURATION_S") or self.CLIP_DURATION_S)
@@ -318,6 +551,23 @@ class EventClipService:
         resp.raise_for_status()
         return resp.content
 
+    def _build_playback_clip_url(
+        self,
+        *,
+        path: str,
+        start_time: datetime,
+        duration_s: int,
+    ) -> str:
+        params = urlencode(
+            {
+                "path": path,
+                "start": self._iso_utc(start_time),
+                "duration": f"{int(duration_s)}s",
+                "format": self.DOWNLOAD_FORMAT,
+            }
+        )
+        return f"{self.playback_base_url}/get?{params}"
+
     def _build_storage_key(self, *, camera_uuid: str, start_time: datetime, external_id: str) -> str:
         day = start_time.astimezone(timezone.utc).strftime("%Y/%m/%d")
         return f"clips/{camera_uuid}/{day}/{external_id}.mp4"
@@ -397,6 +647,45 @@ class EventClipService:
             )
             db.add(row)
             await db.commit()
+
+    async def update_overlay_payload(
+        self,
+        *,
+        camera_uuid: str,
+        external_id: str,
+        overlay_payload: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if self._session_factory is None or not overlay_payload:
+            return overlay_payload
+
+        try:
+            camera_uuid_obj = uuid.UUID(str(camera_uuid))
+        except Exception:
+            return overlay_payload
+
+        async with self._session_factory() as db:
+            row = (
+                await db.execute(
+                    select(VideoRecord)
+                    .where(
+                        VideoRecord.camera_uuid == camera_uuid_obj,
+                        VideoRecord.external_id == str(external_id),
+                    )
+                    .order_by(VideoRecord.id.desc())
+                )
+            ).scalars().first()
+
+            if row is None:
+                return overlay_payload
+
+            merged = _merge_overlay_payloads(
+                getattr(row, "overlay_payload", None),
+                overlay_payload,
+                default_camera_uuid=str(camera_uuid),
+            )
+            row.overlay_payload = merged
+            await db.commit()
+            return merged
               
     async def capture_pre_event_clip(
         self,
@@ -466,6 +755,44 @@ class EventClipService:
                         duration_s,
                     )
                     return None
+
+                if not self.storage_enabled:
+                    recording_url = self._build_playback_clip_url(
+                        path=path,
+                        start_time=clip_start,
+                        duration_s=duration_s,
+                    )
+                    try:
+                        await self._save_video_record(
+                            camera_uuid=camera_key,
+                            external_id=external_id,
+                            start_time=clip_start,
+                            end_time=clip_end,
+                            duration_s=duration_s,
+                            status="completed",
+                            storage_key="",
+                            recording_url=recording_url,
+                            overlay_payload=overlay_payload,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to persist playback-backed video_record camera=%s external_id=%s",
+                            camera_key,
+                            external_id,
+                        )
+
+                    result = ClipCaptureResult(
+                        external_id=external_id,
+                        storage_key="",
+                        recording_url=recording_url,
+                        status="completed",
+                        start_time=clip_start,
+                        end_time=clip_end,
+                        duration=duration_s,
+                        path=path,
+                    )
+                    self._recent_by_camera[camera_key] = (time.monotonic(), result)
+                    return result.to_payload()
 
                 payload = await self._download_clip(
                     path=path,
