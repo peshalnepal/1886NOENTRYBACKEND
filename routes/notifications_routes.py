@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -22,7 +23,6 @@ from application.channels.channel_config import VideoChannelConfig
 from application.services.alert_image_storage import (
     AlertImageStorageService,
     extract_image_storage_key,
-    strip_image_fields,
 )
 from application.services.notification import CameraMode, WebNotificationHub
 from core.database_orm import Camera, ChannelConfiguration, Notification, Site, SiteSettings, User
@@ -31,6 +31,7 @@ from dependencies import get_current_user
 from domain.events import DetectionBox, DetectionItem, DetectionsProducedEvent
 
 router = APIRouter(prefix="/notifications")
+logger = logging.getLogger(__name__)
 
 
 def _configured_worker_count() -> int:
@@ -695,17 +696,61 @@ class DeleteNotificationsRequest(BaseModel):
     notification_ids: Optional[List[int]] = None
 
 
-_DELETE_NOTIFICATIONS_BATCH_SIZE = 500
+async def _delete_alert_blob_keys(storage_keys: List[str]) -> None:
+    unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
+    if not unique_keys:
+        return
+
+    image_service = AlertImageStorageService()
+    try:
+        for storage_key in unique_keys:
+            try:
+                await image_service.delete_blob(blob_name=storage_key)
+            except Exception:
+                logger.warning(
+                    "Failed deleting alert image blob %s after alert removal",
+                    storage_key,
+                    exc_info=True,
+                )
+    finally:
+        await image_service.close()
 
 
-@router.delete("")
-async def delete_notifications(
+def _schedule_alert_blob_cleanup(request: Request, storage_keys: List[str]) -> None:
+    unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
+    if not unique_keys:
+        return
+
+    tasks = getattr(request.app.state, "alert_blob_cleanup_tasks", None)
+    if tasks is None:
+        tasks = set()
+        request.app.state.alert_blob_cleanup_tasks = tasks
+
+    task = asyncio.create_task(
+        _delete_alert_blob_keys(unique_keys),
+        name="alert_blob_cleanup",
+    )
+    tasks.add(task)
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        tasks.discard(done_task)
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Alert blob cleanup task failed")
+
+    task.add_done_callback(_on_done)
+
+
+async def _delete_notifications_impl(
     payload: DeleteNotificationsRequest,
     request: Request,
     user: User = Depends(get_current_user),
 ):
     """
-    Hide matching alerts in batches.
+    Hide matching alerts quickly in the database.
     """
     sf = _session_factory_from_app(request)
     if sf is None:
@@ -722,60 +767,89 @@ async def delete_notifications(
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid camera_uuid")
 
-    image_service = AlertImageStorageService()
-    deleted = 0
-    try:
-        async with sf() as db:
-            conds = [
-                Notification.user_id == int(user.id),
-                Notification.visible.is_(True),
-            ]
-            if su:
-                conds.append(Notification.site_uuid == su)
-            if cu:
-                conds.append(Notification.camera_uuid == cu)
-            if payload.notification_ids:
-                ids: List[int] = []
-                for raw_id in payload.notification_ids:
-                    try:
-                        parsed = int(raw_id)
-                    except Exception:
-                        continue
-                    if parsed > 0:
-                        ids.append(parsed)
-                ids = sorted(set(ids))
-                if not ids:
-                    return {"ok": True, "deleted": 0}
-                conds.append(Notification.id.in_(ids))
+    async with sf() as db:
+        conds = [
+            Notification.user_id == int(user.id),
+            Notification.visible.is_(True),
+        ]
+        if su:
+            conds.append(Notification.site_uuid == su)
+        if cu:
+            conds.append(Notification.camera_uuid == cu)
+        if payload.notification_ids:
+            ids: List[int] = []
+            for raw_id in payload.notification_ids:
+                try:
+                    parsed = int(raw_id)
+                except Exception:
+                    continue
+                if parsed > 0:
+                    ids.append(parsed)
+            ids = sorted(set(ids))
+            if not ids:
+                return {"ok": True, "deleted": 0}
+            conds.append(Notification.id.in_(ids))
 
-            while True:
-                rows = (
-                    await db.execute(
-                        select(Notification)
-                        .where(and_(*conds))
-                        .order_by(Notification.id.asc())
-                        .limit(_DELETE_NOTIFICATIONS_BATCH_SIZE)
-                    )
-                ).scalars().all()
-                if not rows:
-                    break
+        rows = (
+            await db.execute(
+                select(Notification.id, Notification.payload)
+                .where(and_(*conds))
+            )
+        ).all()
 
-                for row in rows:
-                    storage_key = extract_image_storage_key(getattr(row, "payload", None))
-                    if storage_key:
-                        try:
-                            await image_service.delete_blob(blob_name=storage_key)
-                        except Exception:
-                            pass
-                    row.payload = strip_image_fields(row.payload)
-                    row.visible = False
+        matched_ids: List[int] = []
+        storage_keys: List[str] = []
+        for notification_id, notification_payload in rows:
+            try:
+                parsed_id = int(notification_id)
+            except Exception:
+                continue
+            if parsed_id <= 0:
+                continue
+            matched_ids.append(parsed_id)
+            storage_key = extract_image_storage_key(notification_payload)
+            if storage_key:
+                storage_keys.append(storage_key)
 
-                deleted += len(rows)
-                await db.commit()
-    finally:
-        await image_service.close()
+        matched_ids = sorted(set(matched_ids))
+        if not matched_ids:
+            return {"ok": True, "deleted": 0}
+
+        await db.execute(
+            update(Notification)
+            .where(Notification.id.in_(matched_ids))
+            .values(visible=False)
+        )
+        await db.commit()
+
+    _schedule_alert_blob_cleanup(request, storage_keys)
+    deleted = len(matched_ids)
 
     return {"ok": True, "deleted": deleted}
+
+
+@router.post("/delete")
+async def delete_notifications_post(
+    payload: DeleteNotificationsRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """
+    Preferred alert delete route for environments that do not handle DELETE bodies well.
+    """
+    return await _delete_notifications_impl(payload=payload, request=request, user=user)
+
+
+@router.delete("")
+async def delete_notifications(
+    payload: DeleteNotificationsRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """
+    Backward-compatible alias for alert deletion.
+    """
+    return await _delete_notifications_impl(payload=payload, request=request, user=user)
 
 
 def _as_utc(dt: datetime) -> datetime:

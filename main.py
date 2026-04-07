@@ -149,6 +149,7 @@ async def lifespan(app: FastAPI):
     app.state.notification_service = svc
     app.state.manager.set_notification_service(svc)
     app.state.retention_service = RetentionService(session_factory=SessionLocal)
+    app.state.alert_blob_cleanup_tasks = set()
 
     pipeline_startup = await app.state.manager.start_background_pipelines()
     app.state.pipeline_startup = pipeline_startup
@@ -191,6 +192,9 @@ async def lifespan(app: FastAPI):
                 pass
             except Exception:
                 logger.exception("Retention cleanup task shutdown failed")
+        blob_cleanup_tasks = set(getattr(app.state, "alert_blob_cleanup_tasks", set()) or set())
+        if blob_cleanup_tasks:
+            await asyncio.gather(*blob_cleanup_tasks, return_exceptions=True)
     finally:
         try:
             if hasattr(app.state, "manager") and app.state.manager:
