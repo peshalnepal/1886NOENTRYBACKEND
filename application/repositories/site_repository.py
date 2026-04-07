@@ -68,18 +68,19 @@ class SiteRepository:
         stmt = stmt.order_by(Camera.created_at.asc())
 
         return (await db.execute(stmt)).scalars().all()
-
+    
     async def list_camera_uuids_by_site(
         self,
         db: AsyncSession,
         *,
         site_uuid: uuid.UUID,
+        user_id: int,
         only_enabled: Optional[bool] = None,
     ) -> List[uuid.UUID]:
-        """
-        Lightweight version: returns only camera_uuid list for the site.
-        """
-        stmt = select(Camera.camera_uuid).where(Camera.site_uuid == site_uuid)
+        stmt = select(Camera.camera_uuid).where(
+            Camera.site_uuid == site_uuid,
+            Camera.user_id == int(user_id),
+        )
 
         if only_enabled is True:
             stmt = stmt.where(Camera.is_enabled.is_(True))
@@ -87,27 +88,24 @@ class SiteRepository:
             stmt = stmt.where(Camera.is_enabled.is_(False))
 
         stmt = stmt.order_by(Camera.created_at.asc())
-
         return (await db.execute(stmt)).scalars().all()
-
+    
     async def list_cameras_with_device_details_by_site(
         self,
         db: AsyncSession,
         *,
         site_uuid: uuid.UUID,
+        user_id: int,
         only_enabled: Optional[bool] = None,
     ) -> List[dict]:
-        """
-        If you want a ready-to-serialize structure (camera + its single device),
-        this returns a list of dicts.
-
-        Assumption (your new ORM rule): one device per camera enforced by uq_camera_one_device.
-        """
         stmt = (
             select(Camera, Device)
             .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid, isouter=True)
             .join(Device, Device.device_uuid == CameraDevice.device_uuid, isouter=True)
-            .where(Camera.site_uuid == site_uuid)
+            .where(
+                Camera.site_uuid == site_uuid,
+                Camera.user_id == int(user_id),
+            )
             .order_by(Camera.created_at.asc())
         )
 
@@ -137,25 +135,26 @@ class SiteRepository:
             )
 
         return out
-    
+
     async def get_site(self,db:AsyncSession,*,site_uuid: uuid.UUID,user_id:int=None)->Optional[Site]:
         smt = select(Site).where(Site.site_uuid == site_uuid)
-        if user_id:
-            smt=smt.where(Site.user_id==int(user_id))
+        if user_id is not None:
+            smt = smt.where(Site.user_id == int(user_id))
         site = (await db.execute(smt)).scalar_one_or_none()
         if not site:
             raise HTTPException(status_code=404, detail="Site not found")
         return site
     
-    async def get_sites(self,db:AsyncSession,*,user_id:int)->Optional[List[Site]]:
-        if not user_id:
-            raise HTTPException(status_code=404, detail="No User not found")
-        smt = select(Site).where(Site.user_id == user_id).order_by(Site.created_at.desc())
-        sites = (await db.execute(smt)).scalars().all()
-        if type(sites)!=list:
-            
-            return list(sites)
-        return sites
+    async def get_sites(self, db: AsyncSession, *, user_id: int) -> List[Site]:
+        if user_id is None:
+            raise HTTPException(status_code=400, detail="user_id is required")
+
+        stmt = (
+            select(Site)
+            .where(Site.user_id == int(user_id))
+            .order_by(Site.created_at.desc())
+        )
+        return (await db.execute(stmt)).scalars().all()
     
     async def get_site_settings(self,db: AsyncSession,*,site_uuid: uuid.UUID,user_id: int=None) -> Optional[SiteSettings]:
         smt = select(SiteSettings).where(

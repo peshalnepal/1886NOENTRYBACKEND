@@ -16,12 +16,34 @@ from core.database_orm import NotificationEmail, Site, User
 router = APIRouter(prefix="/notification-emails", tags=["notification-emails"])
 
 
-def _invalidate_notification_email_cache(request: Request, *, user_id: int, site_uuid: Optional[uuid.UUID] = None) -> None:
+def _get_notification_service(request: Request):
     svc = getattr(request.app.state, "notification_service", None)
+    if svc is not None:
+        return svc
+
+    manager = getattr(request.app.state, "manager", None)
+    if manager is not None:
+        svc = getattr(manager, "_notification_service", None)
+        if svc is not None:
+            return svc
+
+    return None
+
+
+def _invalidate_notification_email_cache(
+    request: Request,
+    *,
+    user_id: int,
+    site_uuid: Optional[uuid.UUID] = None,
+) -> None:
+    if request is None:
+        return
+
+    svc = _get_notification_service(request)
     if svc is None or not hasattr(svc, "invalidate_recipient_cache"):
         return
-    svc.invalidate_recipient_cache(user_id=int(user_id), site_uuid=site_uuid)
 
+    svc.invalidate_recipient_cache(user_id=int(user_id), site_uuid=site_uuid)
 
 # -------------------------
 # Schemas

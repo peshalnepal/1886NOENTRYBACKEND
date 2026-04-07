@@ -35,7 +35,10 @@ from application.services.manager import Manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/cameras", tags=["cameras"])
-
+_SNAPSHOT_HTTP = httpx.AsyncClient(
+    timeout=httpx.Timeout(8.0, connect=3.0, read=8.0, write=5.0, pool=5.0),
+    follow_redirects=True,
+)
 
 def _ensure_user_owns_camera(cam: Any, user_id: int) -> None:
     if int(getattr(cam, "user_id", -1)) != int(user_id):
@@ -103,62 +106,55 @@ def _device_snapshot_urls(device_url: str, camera_uuid: uuid.UUID) -> List[str]:
         urls.insert(0, f"{base}/api/cameras/{camera_id}/snapshot.jpg")
     return urls
 
-
 async def _fetch_device_snapshot(*, device_url: str, camera_uuid: uuid.UUID) -> Response:
     urls = _device_snapshot_urls(device_url, camera_uuid)
-    timeout = httpx.Timeout(8.0, connect=3.0, read=8.0, write=5.0, pool=5.0)
     last_error: Optional[str] = None
     saw_not_found = False
     saw_transport_error = False
     saw_upstream_error = False
 
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        for url in urls:
-            try:
-                upstream = await client.get(
-                    url,
-                    headers={"Accept": "image/jpeg,image/*;q=0.9,*/*;q=0.1"},
-                )
-            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
-                saw_transport_error = True
-                last_error = f"Jetson snapshot unavailable: {type(exc).__name__}"
-                continue
-            except httpx.HTTPError as exc:
-                saw_upstream_error = True
-                last_error = f"Jetson snapshot request failed: {type(exc).__name__}"
-                continue
-
-            if upstream.status_code == 404:
-                saw_not_found = True
-                last_error = "No snapshot available yet on Jetson."
-                continue
-
-            if upstream.status_code >= 400:
-                saw_upstream_error = True
-                last_error = f"Jetson snapshot request failed with status {upstream.status_code}."
-                continue
-
-            content_type = str(upstream.headers.get("content-type") or "image/jpeg").split(";", 1)[0].strip() or "image/jpeg"
-            if not content_type.startswith("image/"):
-                content_type = "image/jpeg"
-
-            return Response(
-                content=upstream.content,
-                media_type=content_type,
-                headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    for url in urls:
+        try:
+            upstream = await _SNAPSHOT_HTTP.get(
+                url,
+                headers={"Accept": "image/jpeg,image/*;q=0.9,*/*;q=0.1"},
             )
+        except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+            saw_transport_error = True
+            last_error = f"Jetson snapshot unavailable: {type(exc).__name__}"
+            continue
+        except httpx.HTTPError as exc:
+            saw_upstream_error = True
+            last_error = f"Jetson snapshot request failed: {type(exc).__name__}"
+            continue
+
+        if upstream.status_code == 404:
+            saw_not_found = True
+            last_error = "No snapshot available yet on Jetson."
+            continue
+
+        if upstream.status_code >= 400:
+            saw_upstream_error = True
+            last_error = f"Jetson snapshot request failed with status {upstream.status_code}."
+            continue
+
+        content_type = str(upstream.headers.get("content-type") or "image/jpeg").split(";", 1)[0].strip() or "image/jpeg"
+        if not content_type.startswith("image/"):
+            content_type = "image/jpeg"
+
+        return Response(
+            content=upstream.content,
+            media_type=content_type,
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
 
     if saw_transport_error:
-        raise HTTPException(
-            status_code=503,
-            detail=last_error or "Jetson snapshot unavailable.",
-        )
+        raise HTTPException(status_code=503, detail=last_error or "Jetson snapshot unavailable.")
 
     raise HTTPException(
         status_code=404 if saw_not_found and not saw_upstream_error else 502,
         detail=last_error or "Jetson snapshot request failed.",
     )
-
 
 # -------------------------
 # Detection Schemas
@@ -270,7 +266,8 @@ async def list_cameras(
 
     out: List[CameraSchema] = []
     for cam in cams:
-        dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=False, relaxed=True)
+        loaded_devices = list(getattr(cam, "devices", None) or [])
+        dev = loaded_devices[0] if loaded_devices else None
 
         out.append(
             CameraSchema(
@@ -292,7 +289,6 @@ async def list_cameras(
             )
         )
     return out
-
 
 @router.get("/{camera_uuid}", response_model=CameraWithConfigSchema)
 async def get_camera(

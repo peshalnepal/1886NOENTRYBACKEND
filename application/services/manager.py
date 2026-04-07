@@ -411,22 +411,27 @@ class Manager:
 
     def _normalize_device_url(self, device_url: Optional[str]) -> str:
         return str(device_url or "").strip().rstrip("/")
-
+    
     async def _list_devices_for_physical_device(self, db: AsyncSession, *, device: Device) -> List[Device]:
         target_url = self._normalize_device_url(getattr(device, "device_url", None))
         root_key = str(getattr(device, "device_uuid", ""))
+
         if not target_url:
             return [device]
 
-        rows = (await db.execute(select(Device))).scalars().all()
+        rows = (
+            await db.execute(
+                select(Device).where(Device.device_url == target_url)
+            )
+        ).scalars().all()
 
         out: List[Device] = []
         seen: Set[str] = set()
+
         for row in rows:
             row_uuid = getattr(row, "device_uuid", None)
             row_key = str(row_uuid) if row_uuid is not None else ""
-            row_url = self._normalize_device_url(getattr(row, "device_url", None))
-            if not row_key or row_url != target_url:
+            if not row_key:
                 continue
             if row_key != root_key and not bool(getattr(row, "is_enabled", True)):
                 continue
@@ -437,8 +442,9 @@ class Manager:
 
         if root_key and root_key not in seen:
             out.insert(0, device)
-        return out or [device]
 
+        return out or [device]
+    
     async def _list_cameras_for_device_uuids(
         self,
         db: AsyncSession,
@@ -597,7 +603,10 @@ class Manager:
                     Camera.user_id == uid,
                     Camera.site_uuid == site_uuid,
                 )
-                .options(selectinload(Camera.channel_configuration))
+                .options(
+                    selectinload(Camera.channel_configuration),
+                    selectinload(Camera.devices),
+                )
             )
             cams = (await db.execute(stmt)).scalars().all()
             site_schedule_cache: Dict[str, Dict[str, Any]] = {}
@@ -614,7 +623,7 @@ class Manager:
                     skipped += 1
                     continue
 
-                devices = await self._get_camera_devices(db, cam.camera_uuid)
+                devices = list(getattr(cam, "devices", None) or [])
                 if len(devices) == 0:
                     logger.warning(
                         "Skipping site schedule refresh for camera %s because device count=%s",
@@ -776,8 +785,7 @@ class Manager:
                     for cam in full_pl.cameras:
                         enabled = bool(getattr(cam, "is_enabled", True))
                         det_enabled = bool(getattr(cam, "is_detection_enabled", True))
-
-                        devices = await self._get_camera_devices(db, cam.camera_uuid)
+                        devices = list(getattr(cam, "devices", None) or [])
                         if len(devices) == 0:
                             logger.warning(
                                 "Skipping camera %s (enabled=%s detection=%s) because device count=%s",
@@ -786,7 +794,7 @@ class Manager:
                             continue
                         if len(devices) > 1:
                             logger.warning(
-                                "Camera %s has %s linked devices; using most recent device %s for runtime compatibility",
+                                "Camera %s has %s linked devices; using first loaded device %s for runtime compatibility",
                                 cam.camera_uuid,
                                 len(devices),
                                 getattr(devices[0], "device_uuid", None),
@@ -853,7 +861,10 @@ class Manager:
         uid = int(user_id or self._default_user_id)
         mp = self._pipelines_by_user.get(uid)
         if mp is None:
-            mp = await self.create_pipeline(uid)
+            async with self._lock:
+                mp = self._pipelines_by_user.get(uid)
+                if mp is None:
+                    mp = await self.create_pipeline(uid)
         await mp.start()
         return mp
     

@@ -1,5 +1,3 @@
-# routes/notifications_routes.py (or wherever your router lives)
-
 import asyncio
 import json
 import os
@@ -19,6 +17,7 @@ from application.services.user_snapshot_cache import (
     UserSnapshotCache,
     UserSnapshotLookupError,
 )
+from core.database import db_manager
 from application.channels.channel_config import VideoChannelConfig
 from application.services.alert_image_storage import (
     AlertImageStorageService,
@@ -56,6 +55,34 @@ def _configured_worker_count() -> int:
 
 _CAMERA_MODE_CACHE_TTL_S = 0.0 if _configured_worker_count() > 1 else 15.0
 _CAMERA_MODE_MISS_TTL_S = 0.0 if _configured_worker_count() > 1 else 5.0
+
+
+def _get_notification_service(request: Request):
+    svc = getattr(request.app.state, "notification_service", None)
+    if svc is not None:
+        return svc
+
+    manager = getattr(request.app.state, "manager", None)
+    if manager is not None:
+        svc = getattr(manager, "_notification_service", None)
+        if svc is not None:
+            return svc
+
+    return None
+
+
+def _get_notification_hub(request: Request):
+    hub = getattr(request.app.state, "notification_hub", None)
+    if hub is not None:
+        return hub
+
+    svc = _get_notification_service(request)
+    if svc is not None:
+        hub = getattr(svc, "hub", None)
+        if hub is not None:
+            return hub
+
+    return None
 
 
 @dataclass(frozen=True)
@@ -257,10 +284,9 @@ async def notifications_stream(
     User-scoped notifications SSE stream.
     Authentication can be provided via Authorization header or access_token query param.
     """
-    hub: WebNotificationHub = getattr(request.app.state, "notification_hub", None)
+    hub: WebNotificationHub = _get_notification_hub(request)
     if hub is None:
         raise HTTPException(status_code=503, detail="Notification hub not available")
-
     sf = _session_factory_from_app(request)
     if sf is None:
         raise HTTPException(status_code=503, detail="Database not available")
@@ -340,16 +366,19 @@ def _parse_box(raw_box: Any) -> Optional[DetectionBox]:
     return None
 
 
+
 def _session_factory_from_app(request: Request):
-    """
-    Prefer app.state.session_factory if you store it there.
-    Fallback to notification_service._session_factory.
-    """
     sf = getattr(request.app.state, "session_factory", None)
     if sf is not None:
         return sf
-    svc = getattr(request.app.state, "notification_service", None)
-    return getattr(svc, "_session_factory", None)
+
+    svc = _get_notification_service(request)
+    if svc is not None:
+        sf = getattr(svc, "_session_factory", None)
+        if sf is not None:
+            return sf
+
+    return getattr(db_manager, "AsyncSessionLocal", None)
 
 def _get_user_snapshot_cache(request: Request) -> UserSnapshotCache:
     cache = getattr(request.app.state, "user_snapshot_cache", None)
@@ -418,10 +447,9 @@ async def receive_alert(payload: AlertRequest, request: Request):
     """
     Ingest detections from edge devices (Jetson).
     """
-    svc = getattr(request.app.state, "notification_service", None)
+    svc = _get_notification_service(request)
     if svc is None:
         raise HTTPException(status_code=503, detail="Notification service not available")
-
     # validate camera_uuid as UUID string
     try:
         cam_uuid_obj = uuid.UUID(str(payload.camera_uuid))
