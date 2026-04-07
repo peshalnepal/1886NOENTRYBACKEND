@@ -819,6 +819,7 @@ async def _delete_notifications_impl(
             update(Notification)
             .where(Notification.id.in_(matched_ids))
             .values(visible=False)
+            .execution_options(synchronize_session=False)
         )
         await db.commit()
 

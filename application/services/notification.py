@@ -359,6 +359,7 @@ class NotificationMessage(BaseModel):
     image_url: Optional[str] = None
     clip_url: Optional[str] = None
     clip_status: Optional[str] = None
+    db_id: Optional[int] = None  # Set after DB persistence so the frontend can delete by ID
 
 
 @dataclass(frozen=True)
@@ -1622,6 +1623,19 @@ class NotificationService:
                 for idx in indices
                 if idx < len(rows) and getattr(rows[idx], "id", None) is not None
             ]
+
+        # Publish SSE events with DB IDs so the frontend can delete individual alerts.
+        # The original hub.publish() fires immediately (before DB write) so the alert
+        # appears in real-time; this follow-up carries the db_id so the frontend can
+        # update the in-memory record's identity key and enable ID-based deletion.
+        for idx in range(len(items)):
+            if idx >= len(rows):
+                break
+            row_id = getattr(rows[idx], "id", None)
+            if row_id is None:
+                continue
+            item = items[idx]
+            await self.hub.publish(item.msg.model_copy(update={"db_id": int(row_id)}))
 
         if not self.email:
             return True
