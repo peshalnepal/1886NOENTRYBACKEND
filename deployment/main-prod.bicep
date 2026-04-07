@@ -320,6 +320,7 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'VIDEO_CLIP_COOLDOWN_S', value: '120' }
             { name: 'VIDEO_CLIP_MIN_DURATION_S', value: '10' }
             { name: 'VIDEO_CLIP_SAS_TTL_HOURS', value: '168' }
+            { name: 'ALERT_RETENTION_DAYS', value: '7' }
             { name: 'VIDEO_CLIP_HTTP_TIMEOUT_S', value: '180' }
             { name: 'VIDEO_CLIP_BLOB_CONTAINER', value: videoClipContainerName }
             { name: 'MEDIAMTX_PLAYBACK_BASE_URL', value: deployMediaMtx ? 'https://${proxyHost}/playback' : '' }

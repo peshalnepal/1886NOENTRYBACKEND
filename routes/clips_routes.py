@@ -260,7 +260,7 @@ def _extract_clip_overlay_from_notification_payload(
         extra.get("frame_ts_ms")
         or msg.get("frame_ts_ms")
         or msg.get("ts_ms")
-    ) or 0
+    )
     frame_seq = _coerce_positive_int(extra.get("frame_seq") or msg.get("frame_seq")) or 0
 
     if not detections and frame_w is None and frame_h is None:

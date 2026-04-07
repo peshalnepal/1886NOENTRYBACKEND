@@ -995,7 +995,7 @@ async def detections_over_time(
 
     class_filter = _normalize_object_class(object_class)
 
-    hours_i = max(1, min(int(hours), 24 * 90))
+    hours_i = max(1, min(int(hours), 24 * 7))
     # Keep output compact and readable:
     # - 1 day or less => hourly buckets
     # - over 1 day     => daily buckets
@@ -1017,6 +1017,7 @@ async def detections_over_time(
             Notification.payload,
         ).where(
             Notification.user_id == int(user.id),
+            Notification.visible.is_(True),
             Notification.detected_at >= start,
         )
         if su:

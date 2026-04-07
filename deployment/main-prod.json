@@ -506,6 +506,10 @@
                   "value": "168"
                 },
                 {
+                  "name": "ALERT_RETENTION_DAYS",
+                  "value": "7"
+                },
+                {
                   "name": "VIDEO_CLIP_HTTP_TIMEOUT_S",
                   "value": "180"
                 },

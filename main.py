@@ -37,7 +37,7 @@ DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "")
 RECONCILE_INTERVAL_S = max(0, int(os.environ.get("EDGE_RECONCILE_INTERVAL_S", "30")))
 RETENTION_CLEANUP_INTERVAL_S = max(0, int(os.environ.get("RETENTION_CLEANUP_INTERVAL_S", "3600")))
 CLIP_RETENTION_DAYS = max(0, int(os.environ.get("CLIP_RETENTION_DAYS", "30")))
-ALERT_RETENTION_DAYS = max(0, int(os.environ.get("ALERT_RETENTION_DAYS", "15")))
+ALERT_RETENTION_DAYS = max(0, int(os.environ.get("ALERT_RETENTION_DAYS", "7")))
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
