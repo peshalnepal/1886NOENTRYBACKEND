@@ -174,6 +174,22 @@ def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]
     }
 
 
+def _overlay_payload_for_clip_camera(
+    raw_payload: Any,
+    *,
+    camera_uuid: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_payload, dict):
+        return None
+
+    clip_camera_uuid = str(camera_uuid or "").strip()
+    payload_camera_uuid = str(raw_payload.get("camera_uuid") or "").strip()
+    if payload_camera_uuid and clip_camera_uuid and payload_camera_uuid != clip_camera_uuid:
+        return None
+
+    return raw_payload
+
+
 def _iter_overlay_detection_candidates(*sources: Any):
     for source in sources:
         if isinstance(source, list):
@@ -374,7 +390,13 @@ async def list_clips(
 
     rows = (await db.execute(stmt)).all()
     fallback_overlays: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    if any(getattr(record, "overlay_payload", None) is None for record, *_rest in rows):
+    if any(
+        _overlay_payload_for_clip_camera(
+            getattr(record, "overlay_payload", None),
+            camera_uuid=getattr(record, "camera_uuid", None),
+        ) is None
+        for record, *_rest in rows
+    ):
         fallback_overlays = await _load_clip_overlay_payloads(
             db=db,
             user_id=int(user.id),
@@ -383,13 +405,19 @@ async def list_clips(
 
     clips: List[ClipOut] = []
     for record, camera_name, camera_code, record_site_uuid, site_name, site_code in rows:
-        overlay_payload = getattr(record, "overlay_payload", None)
+        overlay_payload = _overlay_payload_for_clip_camera(
+            getattr(record, "overlay_payload", None),
+            camera_uuid=getattr(record, "camera_uuid", None),
+        )
         if overlay_payload is None:
             clip_key = (
                 str(getattr(record, "camera_uuid", "") or ""),
                 str(getattr(record, "recording_url", "") or "").strip(),
             )
-            overlay_payload = fallback_overlays.get(clip_key)
+            overlay_payload = _overlay_payload_for_clip_camera(
+                fallback_overlays.get(clip_key),
+                camera_uuid=getattr(record, "camera_uuid", None),
+            )
 
         clips.append(
             ClipOut(

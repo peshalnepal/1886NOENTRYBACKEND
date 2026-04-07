@@ -841,6 +841,11 @@ class NotificationService:
         out: List[Dict[str, Any]] = []
         pending_camera_uuids: List[uuid.UUID] = []
         pending_tasks: List[asyncio.Future] = []
+        trigger_camera_uuid_str = str(msg.camera_uuid)
+        trigger_overlay_payload = self._build_clip_overlay_payload(
+            msg=msg,
+            extra_payload=None,
+        )
 
         for camera_uuid in plan.ordered_camera_uuids:
             camera_uuid_str = str(camera_uuid)
@@ -848,7 +853,7 @@ class NotificationService:
             if camera_ctx is None:
                 continue
 
-            if camera_uuid_str == str(msg.camera_uuid) and trigger_clip:
+            if camera_uuid_str == trigger_camera_uuid_str and trigger_clip:
                 out.append(
                     self._site_prerecord_clip_payload(
                         camera_uuid=camera_uuid_str,
@@ -866,9 +871,10 @@ class NotificationService:
                     ctx=camera_ctx,
                     event_ts_ms=msg.ts_ms,
                     trigger=f"site_prerecord:{msg.camera_uuid}:{plan.settings.trigger_mode}:{msg.alert_type}",
-                    overlay_payload=self._build_clip_overlay_payload(
-                        msg=msg,
-                        extra_payload=None,
+                    overlay_payload=(
+                        trigger_overlay_payload
+                        if camera_uuid_str == trigger_camera_uuid_str
+                        else None
                     ),
                 )
             )
