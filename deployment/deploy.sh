@@ -293,6 +293,7 @@ function health_check() {
   return 1
 }
 
+
 SHORT_SHA="$(echo "${GITHUB_SHA:-latest}" | cut -c1-12)"
 REV_SUFFIX="sha-${SHORT_SHA}"   # always starts with a letter
 
