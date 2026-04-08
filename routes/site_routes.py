@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Literal
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, delete
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, SiteSettings, Notification, VideoRecord
@@ -251,6 +252,56 @@ async def _delete_blobs_background(keys: List[str], *, service_cls: type, label:
             await svc.close()
         except Exception:
             pass
+
+
+async def _cleanup_cameras_background(
+    manager: "Manager",
+    cam_snapshot: List[dict],
+    active_pipeline: "Optional[Any]",
+) -> None:
+    """Fire-and-forget: stop edge inference streams, remove WebRTC publish keys,
+    and evict channels from the in-memory pipeline.
+
+    Each camera is handled independently — a timeout or error on one device
+    never prevents cleanup of the remaining cameras.
+
+    This intentionally runs AFTER the DB commit so the HTTP response is never
+    blocked by slow or unreachable edge devices (which can take ~30 s per camera
+    when the device is offline: 3 retries × 10 s connect-timeout each).
+    """
+    for cam in cam_snapshot:
+        cam_uuid = cam["camera_uuid"]
+        cam_code = cam.get("camera_code")
+        device_urls = cam.get("device_urls") or []
+
+        for dev_url in device_urls:
+            try:
+                await manager._edge.delete_camera(
+                    device_url=dev_url, camera_uuid=str(cam_uuid)
+                )
+            except Exception:
+                logger.warning(
+                    "site cleanup [bg]: edge delete failed cam=%s url=%s",
+                    cam_uuid, dev_url, exc_info=True,
+                )
+
+        if cam_code:
+            try:
+                await manager._webrtc.delete_stream(stream_key=str(cam_code))
+            except Exception:
+                logger.warning(
+                    "site cleanup [bg]: WebRTC delete failed cam=%s code=%s",
+                    cam_uuid, cam_code, exc_info=True,
+                )
+
+        if active_pipeline is not None:
+            try:
+                await active_pipeline.remove_channel(cam_uuid)
+            except Exception:
+                logger.warning(
+                    "site cleanup [bg]: pipeline remove_channel failed cam=%s",
+                    cam_uuid, exc_info=True,
+                )
 
 
 async def _invalidate_site_camera_mode_cache(
@@ -758,14 +809,37 @@ async def delete_site(
     site_repo = SiteRepository()
     site = await site_repo.get_site(db, user_id=user.id, site_uuid=site_uuid)
 
-    # ── 1. Snapshot all IDs and blob keys NOW, before any cascade wipes them ──
+    # ── 1. Snapshot everything we need BEFORE the cascade commit ──────────
+    #
+    # After db.commit() the Camera, VideoRecord, Notification rows are gone.
+    # Build plain-Python dicts so the data can be safely used in background
+    # tasks after this request's DB session is closed.
 
-    camera_uuids = (
-        await db.execute(select(Camera.camera_uuid).where(Camera.site_uuid == site.site_uuid))
+    # Load cameras with their linked devices in one query.
+    cameras_orm = (
+        await db.execute(
+            select(Camera)
+            .where(Camera.site_uuid == site.site_uuid)
+            .options(selectinload(Camera.devices))
+        )
     ).scalars().all()
 
-    # Alert image blobs live in Azure; Notification rows are CASCADE-deleted
-    # with the site so we must read their payloads before the commit.
+    # Serialise into plain dicts — ORM objects must NOT be used after commit.
+    cam_snapshot = [
+        {
+            "camera_uuid": cam.camera_uuid,
+            "camera_code": getattr(cam, "camera_code", None),
+            "device_urls": list({
+                str(getattr(dev, "device_url", "") or "").strip()
+                for dev in (getattr(cam, "devices", None) or [])
+                if str(getattr(dev, "device_url", "") or "").strip()
+            }),
+        }
+        for cam in cameras_orm
+    ]
+    camera_uuids = [c["camera_uuid"] for c in cam_snapshot]
+
+    # Alert image blobs — stored in Azure, rows CASCADE-deleted with site.
     alert_blob_keys: List[str] = []
     for payload in (
         await db.execute(select(Notification.payload).where(Notification.site_uuid == site.site_uuid))
@@ -774,8 +848,7 @@ async def delete_site(
         if key:
             alert_blob_keys.append(key)
 
-    # Video clip blobs live in Azure; VideoRecord rows are CASCADE-deleted
-    # through Camera, so collect storage_keys before the commit.
+    # Video clip blobs — stored in Azure, rows CASCADE-deleted via Camera.
     clip_blob_keys: List[str] = []
     if camera_uuids:
         clip_blob_keys = [
@@ -791,58 +864,54 @@ async def delete_site(
             if str(k or "").strip()
         ]
 
-    # ── 2. Best-effort pipeline / edge / WebRTC cleanup (requires manager) ─
-    # All of this is skipped gracefully when manager is None — the DB delete
-    # in step 3 is the source of truth and always runs.
+    # Resolve active pipeline now (in-memory lookup, fast) so the background
+    # task can evict channels without needing the DB.
+    active_pipeline = None
     if manager is not None:
-        active_pipeline = None
         try:
             active_pipeline = await manager.get_activepipeline(user_id=user.id)
         except Exception:
             logger.warning(
-                "Could not load active pipeline before deleting site=%s; "
-                "edge/pipeline cleanup will be partial.",
-                site_uuid,
-                exc_info=True,
+                "Could not load active pipeline for site=%s; pipeline eviction skipped.",
+                site_uuid, exc_info=True,
             )
 
-        # Stops edge inference, removes WebRTC publish keys, flushes per-camera
-        # DB rows (via channel_repo), and evicts channels from ModelPipeline.
-        # Must run BEFORE db.delete(site) because it re-queries cameras with
-        # their device associations.
-        await manager.cleanup_site_resources(
-            db,
-            user_id=int(user.id),
-            site_uuid=site.site_uuid,
-            active=active_pipeline,
+    # ── 2. Delete the site row — DB CASCADE removes everything ────────────
+    # Camera, ChannelConfiguration, CameraDevice, PipelineCamera,
+    # VideoRecord, SiteSettings, SiteDevice, Notification, NotificationEmail.
+    await db.delete(site)
+    await db.commit()
+    # The 204 is logically ready here. Everything below is cleanup.
+
+    # ── 3. Background: edge inference + WebRTC + pipeline channel cleanup ──
+    # _edge.delete_camera() retries 3× with a 10 s connect-timeout each
+    # (~30 s total per unreachable device).  Running this synchronously was
+    # the root cause of 503s: the Azure Container App proxy timed out while
+    # waiting for the edge device.  It is now fire-and-forget.
+    if manager is not None and cam_snapshot:
+        asyncio.create_task(
+            _cleanup_cameras_background(manager, cam_snapshot, active_pipeline)
         )
-    else:
+    elif manager is None:
         logger.warning(
             "Manager unavailable while deleting site=%s — "
-            "edge/WebRTC/pipeline cleanup skipped; DB will still be cleaned.",
+            "edge/WebRTC/pipeline cleanup skipped.",
             site_uuid,
         )
 
-    # ── 3. Delete the site row ─────────────────────────────────────────────
-    # DB CASCADE removes: Camera, ChannelConfiguration, CameraDevice,
-    # PipelineCamera, VideoRecord, SiteSettings, SiteDevice, Notification,
-    # NotificationEmail — everything tied to this site in the database.
-    await db.delete(site)
-    await db.commit()
-
-    # ── 4. Delete alert image blobs from Azure (background) ───────────────
+    # ── 4. Background: Azure blob cleanup ─────────────────────────────────
     if alert_blob_keys:
         asyncio.create_task(
             _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image")
         )
-
-    # ── 5. Delete video clip blobs from Azure (background) ─────────────────
     if clip_blob_keys:
         asyncio.create_task(
             _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip")
         )
 
-    # ── 6. Flush notification-service in-memory caches ─────────────────────
+    # ── 5. Sync: flush notification-service in-memory caches ──────────────
+    # These are pure in-memory dict operations — microseconds, safe to do
+    # synchronously before returning.
     if manager is not None:
         notif_svc = getattr(manager, "_notification_service", None)
         if notif_svc is not None:
@@ -850,14 +919,13 @@ async def delete_site(
                 notif_svc.invalidate_recipient_cache(user_id=int(user.id), site_uuid=site_uuid)
             except Exception:
                 logger.warning("Failed to invalidate recipient cache site=%s", site_uuid, exc_info=True)
-
             for camera_uuid in camera_uuids:
                 try:
                     notif_svc.invalidate_camera_roi_state(str(camera_uuid))
                 except Exception:
                     logger.warning("Failed to invalidate ROI state camera=%s", camera_uuid, exc_info=True)
 
-    # ── 7. Evict per-camera notification-mode route cache ──────────────────
+    # ── 6. Sync: evict per-camera notification-mode route cache ───────────
     for camera_uuid in camera_uuids:
         await invalidate_camera_mode_cache(camera_uuid)
 
