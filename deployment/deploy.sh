@@ -91,19 +91,11 @@ function rollback_deployment() {
       write_error "No previous stable revision found."
     fi
   else
-    local failed_revision
-    failed_revision=$(az containerapp revision list \
-      -n "${APP_NAME_MAIN}" \
-      -g "${AZURE_RESOURCE_GROUP}" \
-      --query "[?contains(name, '${REVISION_SUFFIX}')].name | [0]" -o tsv 2>/dev/null || true)
-
-    if [[ -n "${failed_revision}" ]]; then
-      write_info "Deactivating failed revision: ${failed_revision}"
-      az containerapp revision deactivate \
-        -n "${APP_NAME_MAIN}" \
-        -g "${AZURE_RESOURCE_GROUP}" \
-        --revision "${failed_revision}" >/dev/null || true
-    fi
+    # Single revision mode: there is no previous revision to restore.
+    # Deactivating the new revision would leave the app with zero active replicas.
+    # Leave it running and let the operator investigate logs.
+    write_info "Single revision mode — no previous revision to restore. Leaving current revision active."
+    write_info "Inspect logs: az containerapp logs show -n ${APP_NAME_MAIN} -g ${AZURE_RESOURCE_GROUP} --follow"
   fi
 }
 
@@ -143,13 +135,27 @@ function ensure_acr_exists() {
     write_info "ACR not found. Creating: ${AZURE_ACR_NAME}"
     az acr create -n "${AZURE_ACR_NAME}" -g "${AZURE_RESOURCE_GROUP}" --sku Basic >/dev/null
   fi
+
+  az acr update -n "${AZURE_ACR_NAME}" -g "${AZURE_RESOURCE_GROUP}" --admin-enabled true >/dev/null
+
   write_success "ACR ready: ${AZURE_ACR_NAME}"
 }
-
 function ensure_keyvault_exists() {
-  # Not used for secrets for now; just ensuring it exists since workflow includes it.
   write_info "Ensuring Key Vault exists: ${AZURE_KEY_VAULT_NAME}"
-  if ! az keyvault show -n "${AZURE_KEY_VAULT_NAME}" -g "${AZURE_RESOURCE_GROUP}" >/dev/null 2>&1; then
+  if az keyvault show -n "${AZURE_KEY_VAULT_NAME}" -g "${AZURE_RESOURCE_GROUP}" >/dev/null 2>&1; then
+    write_success "Key Vault ready: ${AZURE_KEY_VAULT_NAME}"
+    return 0
+  fi
+
+  # Check soft-deleted state (Key Vault retains names for 90 days after deletion).
+  local soft_deleted
+  soft_deleted=$(az keyvault list-deleted \
+    --query "[?name=='${AZURE_KEY_VAULT_NAME}'].name | [0]" -o tsv 2>/dev/null || true)
+
+  if [[ -n "${soft_deleted}" ]]; then
+    write_info "Key Vault is soft-deleted. Recovering: ${AZURE_KEY_VAULT_NAME}"
+    az keyvault recover -n "${AZURE_KEY_VAULT_NAME}" -l "${AZURE_LOCATION}" >/dev/null
+  else
     write_info "Key Vault not found. Creating: ${AZURE_KEY_VAULT_NAME}"
     az keyvault create -n "${AZURE_KEY_VAULT_NAME}" -g "${AZURE_RESOURCE_GROUP}" -l "${AZURE_LOCATION}" >/dev/null
   fi
@@ -190,7 +196,6 @@ function deploy_infrastructure() {
     --parameters \
       location="${AZURE_LOCATION}" \
       environmentName="${AZURE_ENVIRONMENT_NAME}" \
-      keyVaultName="${AZURE_KEY_VAULT_NAME}" \
       acrName="${AZURE_ACR_NAME}" \
       appImageTag="${IMAGE_TAG}" \
       revisionSuffix="${REV_SUFFIX}" \
@@ -205,7 +210,6 @@ function deploy_infrastructure() {
       mysqlDatabaseName="${MYSQL_DB_NAME}" \
       appDbUser="${APP_DB_USER}" \
       appDbPassword="${APP_DB_PASSWORD}" \
-      enableSmtp="${ENABLE_SMTP}" \
       smtpUsername="${SMTP_USERNAME}" \
       smtpPassword="${SMTP_PASSWORD}" \
       smtpFrom="${SMTP_FROM}" \
@@ -277,19 +281,21 @@ function health_check() {
   local app_fqdn=$1
   local health_endpoint="https://${app_fqdn}/"
   write_info "Performing health check on ${health_endpoint}..."
+  write_info "Waiting 30s for container to initialize before first probe..."
+  sleep 30
 
-  for i in {1..20}; do
+  for i in {1..36}; do
     local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "${health_endpoint}" || true)
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${health_endpoint}" || true)
     if [[ "${http_code}" -ge 200 && "${http_code}" -lt 400 ]]; then
-      write_success "Health check passed with status ${http_code}!"
+      write_success "Health check passed (attempt ${i}) with status ${http_code}!"
       return 0
     fi
-    write_info "Attempt ${i}/20 failed with status ${http_code}, retrying in 5s..."
-    sleep 5
+    write_info "Attempt ${i}/36 — status ${http_code}, retrying in 10s..."
+    sleep 10
   done
 
-  write_error "Health check failed for ${health_endpoint}"
+  write_error "Health check failed after ~6 minutes: ${health_endpoint}"
   return 1
 }
 

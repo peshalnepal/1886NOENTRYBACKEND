@@ -2,7 +2,6 @@
 
 param location string = resourceGroup().location
 param environmentName string
-param keyVaultName string
 param acrName string
 
 param appName string
@@ -21,7 +20,7 @@ param revisionMode string = 'Single' // 'Multiple' for blue/green
 param mysqlLocation string = location
 
 // Feature toggles
-param deployMediaMtx bool = true
+param deployMediaMtx bool = false
 param createMysqlDatabase bool = false
 param videoClipStorageAccountName string = '1886noentry'
 param videoClipContainerName string = 'event-clips'
@@ -47,7 +46,6 @@ param webrtcAdminUpsertPath string = ''
 param webrtcAdminUpdatePath string = ''
 param webrtcAdminDeletePath string = ''
 
-param enableSmtp bool = false
 param smtpUsername string = ''
 
 @secure()
@@ -82,10 +80,6 @@ param mediamtxApiPass string = '' // TEMP (only if deployMediaMtx=true)
 // ----------------------------
 resource acr 'Microsoft.ContainerRegistry/registries@2023-01-01-preview' existing = {
   name: acrName
-}
-
-resource keyVault 'Microsoft.KeyVault/vaults@2023-02-01' existing = {
-  name: keyVaultName
 }
 
 // ----------------------------
@@ -128,7 +122,7 @@ var mysqlSuffix = toLower(substring(uniqueString(resourceGroup().id, namePrefix,
 var mysqlServerName = toLower('${namePrefix}-mysql-${mysqlSuffix}')
 var mysqlFqdn = '${mysqlServerName}.mysql.database.azure.com'
 var clipStorageName = videoClipStorageAccountName != '' ? toLower(videoClipStorageAccountName) : toLower(substring(replace('${namePrefix}clips${suffix}', '-', ''), 0, 24))
-var clipStorageKey = listKeys(clipStorage.id, '2023-05-01').keys[0].value
+var clipStorageKey = clipStorage.listKeys().keys[0].value
 var clipStorageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${clipStorage.name};AccountKey=${clipStorageKey};EndpointSuffix=core.windows.net'
 
 // This is the exact format you are using in .env today
@@ -163,7 +157,8 @@ resource mysql 'Microsoft.DBforMySQL/flexibleServers@2024-12-30' = {
 }
 
 resource mysqlFwAzure 'Microsoft.DBforMySQL/flexibleServers/firewallRules@2024-12-30' = {
-  name: '${mysql.name}/AllowAzureServices'
+  parent: mysql
+  name: 'AllowAzureServices'
   properties: {
     startIpAddress: '0.0.0.0'
     endIpAddress: '0.0.0.0'
@@ -171,7 +166,8 @@ resource mysqlFwAzure 'Microsoft.DBforMySQL/flexibleServers/firewallRules@2024-1
 }
 
 resource mysqlRequireSecureTransport 'Microsoft.DBforMySQL/flexibleServers/configurations@2024-12-30' = {
-  name: '${mysql.name}/require_secure_transport'
+  parent: mysql
+  name: 'require_secure_transport'
   properties: {
     value: 'OFF'
     source: 'user-override'
@@ -203,11 +199,13 @@ resource clipStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 }
 
 resource clipStorageBlobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
-  name: '${clipStorage.name}/default'
+  parent: clipStorage
+  name: 'default'
 }
 
 resource clipStorageContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
-  name: '${clipStorage.name}/default/${videoClipContainerName}'
+  parent: clipStorageBlobService
+  name: videoClipContainerName
   properties: {
     publicAccess: 'None'
   }
@@ -477,7 +475,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       {
         name: 'caddy'
         secret: {
-          'Caddyfile': base64(caddyfile)
+          Caddyfile: base64(caddyfile)
         }
       }
       {
