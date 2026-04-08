@@ -30,9 +30,9 @@ from dependencies import (
     get_async_db,
     get_current_user,
     get_notification_hub,
+    get_notification_service,
     get_session_factory,
     get_user_snapshot_cache,
-    get_notification_service
 )
 from application.services.notification import NotificationService
 
@@ -567,7 +567,9 @@ async def delete_notifications_post(
 ):
     return await notification_service.handle_deletion_event(
         user_id=int(current_user.id),
-        notification_ids=payload.notification_ids or [],
+        notification_ids=payload.notification_ids,
+        site_uuid=payload.site_uuid,
+        camera_uuid=payload.camera_uuid,
     )
 
 @router.delete("")
@@ -578,7 +580,9 @@ async def delete_notifications(
 ):
     return await notification_service.handle_deletion_event(
         user_id=int(current_user.id),
-        notification_ids=payload.notification_ids or [],
+        notification_ids=payload.notification_ids,
+        site_uuid=payload.site_uuid,
+        camera_uuid=payload.camera_uuid,
     )
     
 @router.get("/detections-over-time", response_model=DetectionsOverTimeOut)

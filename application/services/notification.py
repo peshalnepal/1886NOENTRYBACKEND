@@ -23,7 +23,7 @@ import numpy as np
 
 from domain.events import DetectionsProducedEvent, DetectionItem
 from application.services.tracker import MultiCameraByteTrack, ROIAlertEngine, ROI
-from sqlalchemy import update, select
+from sqlalchemy import and_, update, select
 from application.services.alert_image_storage import (
     AlertImageStorageService,
     extract_image_storage_key,
@@ -1216,6 +1216,8 @@ class NotificationService:
         *,
         user_id: int,
         notification_ids: Optional[List[int]] = None,
+        site_uuid: Optional[str] = None,
+        camera_uuid: Optional[str] = None,
     ) -> Dict[str, Any]:
         ids = sorted(
             {
@@ -1225,8 +1227,48 @@ class NotificationService:
             }
         )
 
+        # Bulk delete by site/camera: resolve the matching DB IDs first.
+        # This happens when the frontend calls clear({ siteUuid }) or
+        # clear({ cameraUuid }) without passing specific notification_ids.
+        if not ids and (site_uuid or camera_uuid) and self._session_factory:
+            try:
+                su = uuid.UUID(site_uuid) if site_uuid else None
+            except ValueError:
+                su = None
+            try:
+                cu = uuid.UUID(camera_uuid) if camera_uuid else None
+            except ValueError:
+                cu = None
+
+            if su is not None or cu is not None:
+                try:
+                    conds = [
+                        Notification.user_id == int(user_id),
+                        Notification.visible.is_(True),
+                    ]
+                    if su is not None:
+                        conds.append(Notification.site_uuid == su)
+                    if cu is not None:
+                        conds.append(Notification.camera_uuid == cu)
+
+                    async with self._session_factory() as db:
+                        rows = (
+                            await db.execute(
+                                select(Notification.id).where(and_(*conds))
+                            )
+                        ).scalars().all()
+
+                    ids = sorted({int(r) for r in rows if r is not None and int(r) > 0})
+                except Exception:
+                    logger.exception(
+                        "Failed to resolve notification IDs for bulk delete user=%s site=%s camera=%s",
+                        user_id,
+                        site_uuid,
+                        camera_uuid,
+                    )
+
         if not ids:
-            return {"ok": True, "queued": 0}
+            return {"ok": True, "deleted": 0}
 
         async with self._buffer_lock:
             bucket = self._pending_delete_ids_by_user.setdefault(int(user_id), set())
@@ -1237,7 +1279,7 @@ class NotificationService:
 
         return {
             "ok": True,
-            "queued": len(ids),
+            "deleted": len(ids),
             "notification_ids": ids,
         }
 
