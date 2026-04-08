@@ -1,5 +1,6 @@
 # routes/sites.py
 import asyncio
+import logging
 import uuid
 from datetime import datetime, time as dt_time, timezone
 from typing import Any, Dict, List, Optional, Literal
@@ -9,15 +10,19 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, SiteSettings
+from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, SiteSettings, Notification, VideoRecord
 from dependencies import get_async_db, get_current_user, get_manager
 from application.channels.channel_config import VideoChannelConfig
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
 from domain.events import ChannelCreateEvent
 from application.services.manager import Manager
+from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
+from application.services.clip_storage import EventClipService
 from core.schemas import CameraWithConfigSchema
 from routes.device_routes import DeviceOut
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER = "roi_enter"
@@ -227,6 +232,25 @@ def _dedupe_uuid_list(values: Optional[List[uuid.UUID]]) -> List[uuid.UUID]:
         seen.add(key)
         out.append(parsed)
     return out
+
+
+async def _delete_blobs_background(keys: List[str], *, service_cls: type, label: str) -> None:
+    """Delete a deduplicated list of blob storage keys. Errors per-blob are logged, never raised."""
+    unique = list(dict.fromkeys(k for k in keys if k))
+    if not unique:
+        return
+    svc = service_cls()
+    try:
+        for key in unique:
+            try:
+                await svc.delete_blob(blob_name=key)
+            except Exception:
+                logger.warning("Failed to delete %s blob %r", label, key, exc_info=True)
+    finally:
+        try:
+            await svc.close()
+        except Exception:
+            pass
 
 
 async def _invalidate_site_camera_mode_cache(
@@ -724,18 +748,107 @@ async def delete_site(
     site_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
+    manager: Manager = Depends(get_manager),
 ):
     from routes.notifications_routes import invalidate_camera_mode_cache
 
-    site_repo=SiteRepository()
-    site = await site_repo.get_site(db,user_id=user.id, site_uuid=site_uuid)
+    site_repo = SiteRepository()
+    site = await site_repo.get_site(db, user_id=user.id, site_uuid=site_uuid)
+
+    # ── 1. Snapshot all IDs and blob keys NOW, before any cascade wipes them ──
+
     camera_uuids = (
         await db.execute(select(Camera.camera_uuid).where(Camera.site_uuid == site.site_uuid))
     ).scalars().all()
+
+    # Alert image blobs live in Azure; Notification rows are CASCADE-deleted
+    # with the site so we must read their payloads before the commit.
+    alert_blob_keys: List[str] = []
+    for payload in (
+        await db.execute(select(Notification.payload).where(Notification.site_uuid == site.site_uuid))
+    ).scalars().all():
+        key = extract_image_storage_key(payload)
+        if key:
+            alert_blob_keys.append(key)
+
+    # Video clip blobs live in Azure; VideoRecord rows are CASCADE-deleted
+    # through Camera, so collect storage_keys before the commit.
+    clip_blob_keys: List[str] = []
+    if camera_uuids:
+        clip_blob_keys = [
+            str(k).strip()
+            for k in (
+                await db.execute(
+                    select(VideoRecord.storage_key).where(
+                        VideoRecord.camera_uuid.in_(camera_uuids),
+                        VideoRecord.storage_key.isnot(None),
+                    )
+                )
+            ).scalars().all()
+            if str(k or "").strip()
+        ]
+
+    # ── 2. Resolve the active pipeline before touching any DB rows ─────────
+    active_pipeline = None
+    try:
+        active_pipeline = await manager.get_activepipeline(user_id=user.id)
+    except Exception:
+        logger.warning(
+            "Could not load active pipeline before deleting site=%s; "
+            "edge/pipeline cleanup will be partial.",
+            site_uuid,
+            exc_info=True,
+        )
+
+    # ── 3. Stop edge inference, remove WebRTC streams, evict pipeline channels
+    #        This must run BEFORE db.delete(site) because it re-queries the site
+    #        and cameras with their device associations. ──────────────────────
+    await manager.cleanup_site_resources(
+        db,
+        user_id=int(user.id),
+        site_uuid=site.site_uuid,
+        active=active_pipeline,
+    )
+
+    # ── 4. Delete the site row ─────────────────────────────────────────────
+    # DB CASCADE removes: Camera, ChannelConfiguration, CameraDevice,
+    # PipelineCamera, VideoRecord, SiteSettings, SiteDevice, Notification,
+    # NotificationEmail — everything tied to this site in the database.
     await db.delete(site)
     await db.commit()
+
+    # ── 5. Delete alert image blobs from Azure (background) ───────────────
+    if alert_blob_keys:
+        asyncio.create_task(
+            _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image")
+        )
+
+    # ── 6. Delete video clip blobs from Azure (background) ─────────────────
+    if clip_blob_keys:
+        asyncio.create_task(
+            _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip")
+        )
+
+    # ── 7. Flush notification-service in-memory caches ─────────────────────
+    notif_svc = getattr(manager, "_notification_service", None)
+    if notif_svc is not None:
+        # Recipient email cache keyed by (user_id, site_uuid)
+        try:
+            notif_svc.invalidate_recipient_cache(user_id=int(user.id), site_uuid=site_uuid)
+        except Exception:
+            logger.warning("Failed to invalidate recipient cache site=%s", site_uuid, exc_info=True)
+
+        # ROI engine state and ROI cache keyed by camera_uuid
+        for camera_uuid in camera_uuids:
+            try:
+                notif_svc.invalidate_camera_roi_state(str(camera_uuid))
+            except Exception:
+                logger.warning("Failed to invalidate ROI state camera=%s", camera_uuid, exc_info=True)
+
+    # ── 8. Evict per-camera notification-mode route cache ──────────────────
     for camera_uuid in camera_uuids:
         await invalidate_camera_mode_cache(camera_uuid)
+
     return None
 
 
