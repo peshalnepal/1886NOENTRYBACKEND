@@ -1,4 +1,21 @@
-# simple_model_pipeline.py  (Python 3.6)
+# pipeline.py  (Python 3.6)
+#
+# Fixes applied vs original:
+#  1. InferenceWorkerPool  — N parallel inference threads instead of 1.
+#     Each camera is pinned to a worker (round-robin at submit time) so
+#     camera N never waits for camera N-1's frame to finish.
+#  2. _pump_inference  — fire-and-forget dispatch; futures are resolved via
+#     done-callbacks so the dispatch coroutine never awaits a single future.
+#     All in-flight futures are tracked in a dict keyed by (camera_uuid, seq).
+#  3. CoalescingBuffer  — CPython dict assignment is atomic under the GIL;
+#     the asyncio.Lock now only guards _in_queue membership, not the hot path.
+#  4. _cache_snapshot  — JPEG encode offloaded to executor so the event loop
+#     is never stalled by cv2.imencode.
+#  5. Broadcaster  — lock replaced with a plain list copy (no await on hot path).
+#  6. YoloV8DetTRT.run  — letterbox + tensor prep moved OUT of TRTEngine.infer
+#     so the inference method only does memcpy + execute + memcpy.
+#     (See also trt_infer.py changes.)
+
 import asyncio
 import logging
 import re
@@ -9,11 +26,9 @@ import time
 from typing import Any, Dict, Optional, List
 
 try:
-    # Script mode (python main.py from Backend/tensort)
     from channels.channel_config import VideoChannelConfig
     from channels.channel import VideoChannel, RTSPEvent
 except Exception:
-    # Package mode (python -m Backend.tensort.main)
     from .channels.channel_config import VideoChannelConfig
     from .channels.channel import VideoChannel, RTSPEvent
 
@@ -21,17 +36,18 @@ logger = logging.getLogger(__name__)
 _DONE = object()
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _encode_jpeg_bytes(frame_bgr, *, max_edge: int = 960, jpeg_quality: int = 75) -> Optional[bytes]:
     if frame_bgr is None:
         return None
-
     try:
         import cv2
-
         height, width = frame_bgr.shape[:2]
         if height <= 0 or width <= 0:
             return None
-
         scale = min(float(max_edge) / float(max(height, width)), 1.0)
         output = frame_bgr
         if scale < 1.0:
@@ -40,11 +56,9 @@ def _encode_jpeg_bytes(frame_bgr, *, max_edge: int = 960, jpeg_quality: int = 75
                 (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
                 interpolation=cv2.INTER_AREA,
             )
-
         ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
         if not ok:
             return None
-
         return encoded.tobytes()
     except Exception:
         return None
@@ -73,41 +87,65 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     return max(float(minimum), float(value))
 
 
+# ---------------------------------------------------------------------------
+# FIX 5: Broadcaster — no asyncio.Lock on the hot broadcast path
+# ---------------------------------------------------------------------------
+
 class Broadcaster:
+    """
+    Lock-free broadcast for the hot path.
+
+    subscribe/unsubscribe still use a lock (they're rare).
+    broadcast() does a single atomic list snapshot under the GIL —
+    no await, no contention.
+    """
     def __init__(self):
-        self._subscribers = set()
-        self._lock = asyncio.Lock()
+        self._subscribers = []          # plain list; GIL makes snapshot atomic
+        self._sub_lock = asyncio.Lock() # only for subscribe/unsubscribe
 
     async def subscribe(self):
-        q = asyncio.Queue(maxsize=1000)
-        async with self._lock:
-            self._subscribers.add(q)
+        q = asyncio.Queue(maxsize=200)
+        async with self._sub_lock:
+            self._subscribers = self._subscribers + [q]  # new list = atomic replace
         return q
 
     async def unsubscribe(self, q):
-        async with self._lock:
-            if q in self._subscribers:
-                self._subscribers.remove(q)
+        async with self._sub_lock:
+            self._subscribers = [s for s in self._subscribers if s is not q]
 
     async def broadcast(self, msg):
-        async with self._lock:
-            for q in list(self._subscribers):
-                try:
-                    q.put_nowait(msg)
-                except asyncio.QueueFull:
-                    pass
+        # Snapshot is a single attribute read — atomic under GIL, no lock needed.
+        for q in self._subscribers:
+            try:
+                q.put_nowait(msg)
+            except asyncio.QueueFull:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# FIX 3: CoalescingBuffer — lock only guards set membership, not _latest
+# ---------------------------------------------------------------------------
 
 class CoalescingBuffer(object):
+    """
+    Keeps only the newest frame per camera.
+
+    _latest is a plain dict; CPython dict __setitem__ is atomic under the GIL
+    so we can read/write it without a lock on the hot put() path.
+    The asyncio.Lock only serialises _in_queue (a set) membership changes.
+    """
     def __init__(self, max_pending_keys=1000):
-        self._latest = {}  # camera_uuid -> RTSPEvent
+        self._latest = {}               # camera_uuid -> RTSPEvent  (GIL-safe)
         self._pending = asyncio.Queue(maxsize=max_pending_keys)
         self._in_queue = set()
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()     # guards _in_queue only
 
     async def put(self, ev):
         key = str(ev.camera_uuid)
+        # Atomically store latest — no lock needed (GIL protects dict assignment)
+        self._latest[key] = ev
+        # Lock only to check-and-update the de-dup set
         async with self._lock:
-            self._latest[key] = ev
             if key in self._in_queue:
                 return
             try:
@@ -120,42 +158,39 @@ class CoalescingBuffer(object):
         while True:
             key = await self._pending.get()
             async with self._lock:
-                if key in self._in_queue:
-                    self._in_queue.remove(key)
-                ev = self._latest.get(key)
+                self._in_queue.discard(key)
+            ev = self._latest.get(key)
             if ev is not None:
                 return ev
 
 
+# ---------------------------------------------------------------------------
+# FIX 1: InferenceWorker — unchanged; now used in a pool
+# ---------------------------------------------------------------------------
+
 class InferenceWorker(object):
     """
-    Dedicated inference thread that OWNS:
-      - PyCUDA context (via trt_infer import)
-      - TRT engines
-      - CUDA streams
-
-    You must not call TRT from other threads.
+    One dedicated inference thread owning its own CUDA context + TRT engines.
+    Never share across threads.
     """
-    def __init__(self, loop, max_q=2):
+    def __init__(self, loop, worker_id=0, max_q=2):
         self._loop = loop
+        self._worker_id = int(worker_id)
         self._q = queue.Queue(maxsize=max_q)
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="trt-infer-worker", daemon=True)
-
+        self._thread = threading.Thread(
+            target=self._run,
+            name="trt-infer-worker-{}".format(worker_id),
+            daemon=True,
+        )
         self._infer = None
         self._thread.start()
 
     def submit(self, bgr, meta, fut):
-        """
-        bgr: numpy ndarray (BGR)
-        meta: dict
-        fut: asyncio.Future (created in event loop thread)
-        """
         try:
             self._q.put_nowait((bgr, meta, fut))
             return True
         except queue.Full:
-            # drop if overloaded: set a failure result (non-blocking)
             def _set():
                 if not fut.done():
                     fut.set_result({
@@ -182,16 +217,12 @@ class InferenceWorker(object):
             pass
 
     def _run(self):
-        """
-        Runs inside the inference thread.
-        Import trt_infer here so PyCUDA context is created in this thread.
-        """
         from trt_infer import build_default
         try:
             self._infer = build_default()
-            # logger.info("TRTInfer initialized inside inference thread.")
+            logger.info("[worker-%d] TRTInfer ready", self._worker_id)
         except Exception as e:
-            logger.exception("Failed to init TRT infer in worker thread: %s", e)
+            logger.exception("[worker-%d] Failed to init TRT: %s", self._worker_id, e)
             self._infer = None
 
         while not self._stop.is_set():
@@ -213,19 +244,17 @@ class InferenceWorker(object):
                     "frame_seq": int(meta.get("frame_seq", 0)),
                     "reason": "TRT inference not initialized",
                 }
-                self._loop.call_soon_threadsafe(self._safe_set_result, fut, res)
-                continue
-
-            try:
-                res = self._infer.infer_multitask(bgr, meta)
-            except Exception as e:
-                res = {
-                    "type": "InferenceFailedEvent",
-                    "camera_uuid": str(meta.get("camera_uuid", "unknown")),
-                    "frame_ts_ms": int(meta.get("frame_ts_ms", 0)),
-                    "frame_seq": int(meta.get("frame_seq", 0)),
-                    "reason": "{}: {}".format(type(e).__name__, e),
-                }
+            else:
+                try:
+                    res = self._infer.infer_multitask(bgr, meta)
+                except Exception as e:
+                    res = {
+                        "type": "InferenceFailedEvent",
+                        "camera_uuid": str(meta.get("camera_uuid", "unknown")),
+                        "frame_ts_ms": int(meta.get("frame_ts_ms", 0)),
+                        "frame_seq": int(meta.get("frame_seq", 0)),
+                        "reason": "{}: {}".format(type(e).__name__, e),
+                    }
 
             self._loop.call_soon_threadsafe(self._safe_set_result, fut, res)
 
@@ -237,12 +266,57 @@ class InferenceWorker(object):
             pass
 
 
+# ---------------------------------------------------------------------------
+# FIX 1 (cont.): InferenceWorkerPool — N workers, cameras pinned by hash
+# ---------------------------------------------------------------------------
+
+class InferenceWorkerPool(object):
+    """
+    Wraps N InferenceWorker threads.
+
+    Camera uuid is hashed to a worker index so the same camera always goes
+    to the same worker (preserves ordering per-camera, avoids lock contention
+    between workers sharing a queue).
+    """
+    def __init__(self, loop, num_workers, max_q_per_worker=2):
+        self._workers = [
+            InferenceWorker(loop, worker_id=i, max_q=max_q_per_worker)
+            for i in range(max(1, num_workers))
+        ]
+        logger.info("InferenceWorkerPool: %d workers", len(self._workers))
+
+    def _pick(self, camera_uuid):
+        # Stable assignment: same camera always → same worker
+        return self._workers[hash(str(camera_uuid)) % len(self._workers)]
+
+    def submit(self, bgr, meta, fut):
+        worker = self._pick(meta.get("camera_uuid", ""))
+        return worker.submit(bgr, meta, fut)
+
+    def stop(self):
+        for w in self._workers:
+            w.stop()
+
+    def join(self, timeout=2.0):
+        for w in self._workers:
+            w.join(timeout)
+
+
+# ---------------------------------------------------------------------------
+# FIX 2: _handle_result + fire-and-forget dispatch
+# ---------------------------------------------------------------------------
+
 class SimpleInferencePipeline(object):
     def __init__(self, out_queue_max=None, infer_q_max=None):
         if out_queue_max is None:
             out_queue_max = _env_int("PIPELINE_OUT_QUEUE_MAX", 500, minimum=10)
         if infer_q_max is None:
-            infer_q_max = _env_int("INFER_QUEUE_MAX", 8, minimum=1)
+            infer_q_max = _env_int("INFER_QUEUE_MAX", 2, minimum=1)
+
+        # Number of parallel inference threads (one per camera is a good default)
+        self._num_workers = _env_int("INFER_NUM_WORKERS", 0, minimum=0)
+        # 0 → auto-size to number of cameras (capped at INFER_NUM_WORKERS_MAX)
+        self._num_workers_max = _env_int("INFER_NUM_WORKERS_MAX", 4, minimum=1)
 
         self._channels = {}
         self._channel_tasks = {}
@@ -262,14 +336,14 @@ class SimpleInferencePipeline(object):
         self._snapshot_jpeg_quality = _env_int("SNAPSHOT_JPEG_QUALITY", 75, minimum=1)
         self._snapshot_on_detection_only = _env_bool("SNAPSHOT_ON_DETECTION_ONLY", False)
         self._emit_empty_detections = _env_bool("EMIT_EMPTY_DETECTIONS", False)
-        self._infer_result_timeout_s = _env_float("INFER_RESULT_TIMEOUT_S", 10.0, minimum=0.0)
+        self._infer_result_timeout_s = _env_float("INFER_RESULT_TIMEOUT_S", 3.0, minimum=0.0)
         self._infer_error_log_interval_s = _env_float("INFER_ERROR_LOG_INTERVAL_S", 10.0, minimum=0.0)
         self._last_infer_error_sig = {}
         self._last_infer_error_ts = {}
 
         self._lock = asyncio.Lock()
         self._inference_task = None
-        self._infer_worker = None  # created on start()
+        self._infer_pool = None         # created on start()
         self._infer_q_max = int(infer_q_max)
         self._log_every_n = _env_int("PIPELINE_LOG_EVERY_N_FRAMES", 0, minimum=0)
         self._stats = {
@@ -281,6 +355,14 @@ class SimpleInferencePipeline(object):
             "alerts_attempted": 0,
         }
         self.broadcaster = Broadcaster()
+
+        # FIX 2: track in-flight futures so we can cancel on shutdown
+        self._inflight = {}             # (camera_uuid, seq) -> asyncio.Future
+        self._inflight_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _should_log_infer_failure(self, camera_uuid, reason):
         camera_key = str(camera_uuid)
@@ -302,6 +384,10 @@ class SimpleInferencePipeline(object):
             return True
         return False
 
+    # ------------------------------------------------------------------
+    # Channel management
+    # ------------------------------------------------------------------
+
     async def add_channel(self, cfg):
         camera_key = str(cfg.camera_uuid)
         new_channel = VideoChannel(cfg)
@@ -309,7 +395,6 @@ class SimpleInferencePipeline(object):
         async with self._lock:
             old_ch = self._channels.pop(camera_key, None)
             old_task = self._channel_tasks.pop(camera_key, None)
-
             self._channels[camera_key] = new_channel
             should_start = self._started and (not self._closing)
 
@@ -327,9 +412,6 @@ class SimpleInferencePipeline(object):
                 pass
 
         if should_start:
-            # Record the task inside the lock so that a concurrent remove_channel
-            # that runs between the lock release above and here sees the task and
-            # can cancel it instead of letting it run orphaned.
             async with self._lock:
                 if camera_key in self._channels and not self._closing:
                     self._start_channel_task(camera_key)
@@ -354,17 +436,18 @@ class SimpleInferencePipeline(object):
                 pass
 
         async with self._latest_lock:
-            if camera_key in self._latest:
-                del self._latest[camera_key]
-            if camera_key in self._latest_snapshots:
-                del self._latest_snapshots[camera_key]
-            if camera_key in self._latest_snapshot_ts_ms:
-                del self._latest_snapshot_ts_ms[camera_key]
+            self._latest.pop(camera_key, None)
+            self._latest_snapshots.pop(camera_key, None)
+            self._latest_snapshot_ts_ms.pop(camera_key, None)
         self._last_infer_error_sig.pop(camera_key, None)
         self._last_infer_error_ts.pop(camera_key, None)
 
     def list_channels(self):
         return list(self._channels.keys())
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self):
         async with self._lock:
@@ -374,7 +457,20 @@ class SimpleInferencePipeline(object):
             self._closing = False
 
             loop = asyncio.get_event_loop()
-            self._infer_worker = InferenceWorker(loop=loop, max_q=self._infer_q_max)
+
+            # Auto-size worker count if not set explicitly
+            num_workers = self._num_workers
+            if num_workers == 0:
+                num_workers = min(max(1, len(self._channels)), self._num_workers_max)
+                # Will be re-evaluated when first camera is added if channels are
+                # added after start(); minimum 1 worker to avoid deadlock.
+                num_workers = max(num_workers, 1)
+
+            self._infer_pool = InferenceWorkerPool(
+                loop=loop,
+                num_workers=num_workers,
+                max_q_per_worker=self._infer_q_max,
+            )
 
             self._inference_task = asyncio.ensure_future(self._pump_inference())
 
@@ -412,11 +508,11 @@ class SimpleInferencePipeline(object):
             except Exception:
                 pass
 
-        if self._infer_worker is not None:
-            self._infer_worker.stop()
+        if self._infer_pool is not None:
+            self._infer_pool.stop()
             loop = asyncio.get_event_loop()
             try:
-                await loop.run_in_executor(None, self._infer_worker.join, 2.0)
+                await loop.run_in_executor(None, self._infer_pool.join, 2.0)
             except Exception:
                 pass
 
@@ -429,10 +525,14 @@ class SimpleInferencePipeline(object):
 
         await self._put_out(_DONE)
 
+    # ------------------------------------------------------------------
+    # Internal tasks
+    # ------------------------------------------------------------------
+
     async def _put_out(self, ev):
         if self._out_q.full():
             try:
-                _ = self._out_q.get_nowait()
+                self._out_q.get_nowait()
             except Exception:
                 pass
         try:
@@ -444,21 +544,20 @@ class SimpleInferencePipeline(object):
         ch = self._channels.get(camera_key)
         if ch is None:
             return
-        self._channel_tasks[camera_key] = asyncio.ensure_future(self._pump_channel(camera_key, ch))
+        self._channel_tasks[camera_key] = asyncio.ensure_future(
+            self._pump_channel(camera_key, ch)
+        )
 
     async def _pump_channel(self, camera_key, ch):
         try:
-            # logger.info("[Jetson] Starting pump for camera %s", camera_key)
             async for ev in ch.stream(event_queue=None):
                 if self._closing:
                     break
-
                 if isinstance(ev, RTSPEvent):
                     if getattr(ev, "detection_enabled", True):
                         await self._buffer.put(ev)
                 else:
                     await self._put_out(ev)
-
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -468,13 +567,16 @@ class SimpleInferencePipeline(object):
                 await ch.stop()
             except Exception:
                 pass
-            
+
+    # ------------------------------------------------------------------
+    # FIX 2: fire-and-forget inference dispatch
+    # ------------------------------------------------------------------
+
     async def _pump_inference(self):
         """
-        Sends frames to the TRT inference thread.
-        Stores latest result per camera.
-        Emits only failures or positive detections by default.
-        No external alert webhook push from Jetson.
+        Dispatch frames to the worker pool without awaiting each one.
+        Results come back asynchronously via _handle_result() callbacks,
+        so we can immediately fetch the next frame from the buffer.
         """
         loop = asyncio.get_event_loop()
 
@@ -485,9 +587,8 @@ class SimpleInferencePipeline(object):
 
                 if self._log_every_n and (int(getattr(rtsp_ev, "seq", 0)) % self._log_every_n == 0):
                     logger.debug(
-                        "[Jetson] Received frame camera=%s seq=%s",
-                        rtsp_ev.camera_uuid,
-                        rtsp_ev.seq,
+                        "[pipeline] frame camera=%s seq=%s",
+                        rtsp_ev.camera_uuid, rtsp_ev.seq,
                     )
 
                 bgr = getattr(rtsp_ev, "frame", None)
@@ -501,12 +602,12 @@ class SimpleInferencePipeline(object):
                         "frame_seq": int(rtsp_ev.seq),
                         "reason": "No frame data (emit_format=raw required)",
                     }
-
-                    async with self._latest_lock:
-                        self._latest[str(rtsp_ev.camera_uuid)] = result
-
+                    self._latest[str(rtsp_ev.camera_uuid)] = result
                     await self.broadcaster.broadcast(result)
                     await self._put_out(result)
+                    continue
+
+                if self._infer_pool is None:
                     continue
 
                 meta = {
@@ -514,94 +615,127 @@ class SimpleInferencePipeline(object):
                     "channel_id": getattr(rtsp_ev, "channel_id", None),
                     "frame_ts_ms": int(rtsp_ev.ts_ms),
                     "frame_seq": int(rtsp_ev.seq),
+                    # Pass original frame dims for snapshot; bgr may have been
+                    # resized by channel already.
+                    "_bgr_ref": bgr,
+                    "_ts_ms": int(rtsp_ev.ts_ms),
                 }
 
                 fut = loop.create_future()
+                inflight_key = (str(rtsp_ev.camera_uuid), int(rtsp_ev.seq))
 
-                if self._infer_worker is None:
-                    result = {
-                        "type": "InferenceFailedEvent",
-                        "camera_uuid": meta["camera_uuid"],
-                        "frame_ts_ms": meta["frame_ts_ms"],
-                        "frame_seq": meta["frame_seq"],
-                        "reason": "Inference worker not running",
-                    }
+                # Register before submit so callback never races a missing key
+                async with self._inflight_lock:
+                    self._inflight[inflight_key] = fut
+
+                ok = self._infer_pool.submit(bgr, meta, fut)
+
+                if not ok:
+                    # Worker dropped it (queue full) — future already has result set
+                    async with self._inflight_lock:
+                        self._inflight.pop(inflight_key, None)
+                    # Still need to process the dropped-result
+                    if fut.done():
+                        asyncio.ensure_future(self._handle_result(fut.result(), meta))
                 else:
-                    ok = self._infer_worker.submit(bgr, meta, fut)
+                    # Fire-and-forget: wire result handler to future done callback
+                    def _on_done(f, _meta=meta, _key=inflight_key):
+                        # Called from the event loop thread when worker sets result
+                        asyncio.ensure_future(self._handle_result(f.result(), _meta))
+                        # Clean up inflight tracking (non-async; use call_soon)
+                        loop.call_soon(self._drop_inflight, _key)
 
-                    if not ok:
-                        result = await fut
-                    else:
-                        try:
-                            if self._infer_result_timeout_s > 0.0:
-                                result = await asyncio.wait_for(
-                                    fut,
-                                    timeout=self._infer_result_timeout_s,
-                                )
-                            else:
-                                result = await fut
-                        except asyncio.TimeoutError:
-                            result = {
-                                "type": "InferenceFailedEvent",
-                                "camera_uuid": meta["camera_uuid"],
-                                "frame_ts_ms": meta["frame_ts_ms"],
-                                "frame_seq": meta["frame_seq"],
-                                "reason": "Inference timed out",
-                            }
+                    fut.add_done_callback(_on_done)
 
-                has_detections = False
-
-                if isinstance(result, dict) and result.get("type") == "InferenceFailedEvent":
-                    self._stats["infer_fail"] += 1
-                    reason = str(result.get("reason", "") or "")
-
-                    if "queue full" in reason.lower():
-                        self._stats["infer_dropped"] += 1
-
-                    if self._should_log_infer_failure(rtsp_ev.camera_uuid, reason):
-                        logger.warning(
-                            "[Jetson] Inference failed camera=%s seq=%s reason=%s",
-                            rtsp_ev.camera_uuid,
-                            rtsp_ev.seq,
-                            reason or "unknown error",
+                    # Optional timeout watchdog — cancels stale futures so
+                    # _inflight doesn't grow forever if a worker hangs.
+                    if self._infer_result_timeout_s > 0.0:
+                        asyncio.ensure_future(
+                            self._watchdog_future(fut, inflight_key, meta)
                         )
-                else:
-                    self._stats["infer_ok"] += 1
-
-                    detections = []
-                    if isinstance(result, dict):
-                        detections = result.get("detections", []) or []
-
-                    self._stats["detections_total"] += len(detections)
-                    has_detections = bool(detections)
-
-                    # only cache snapshot when needed
-                    if self._snapshot_enabled and ((not self._snapshot_on_detection_only) or has_detections):
-                        await self._cache_snapshot(
-                            camera_uuid=rtsp_ev.camera_uuid,
-                            frame_bgr=bgr,
-                            ts_ms=int(rtsp_ev.ts_ms),
-                        )
-
-                async with self._latest_lock:
-                    self._latest[str(rtsp_ev.camera_uuid)] = result
-
-                should_emit = True
-                if isinstance(result, dict) and result.get("type") != "InferenceFailedEvent":
-                    should_emit = self._emit_empty_detections or has_detections
-
-                if should_emit:
-                    await self.broadcaster.broadcast(result)
-                    await self._put_out(result)
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
             await self._put_out({"type": "InferencePumpFailed", "reason": str(e)})
+
+    def _drop_inflight(self, key):
+        self._inflight.pop(key, None)
+
+    async def _watchdog_future(self, fut, key, meta):
+        """Cancel + resolve a future that hasn't completed within the timeout."""
+        await asyncio.sleep(self._infer_result_timeout_s)
+        if fut.done():
+            return
+        timeout_result = {
+            "type": "InferenceFailedEvent",
+            "camera_uuid": meta.get("camera_uuid", "unknown"),
+            "frame_ts_ms": meta.get("frame_ts_ms", 0),
+            "frame_seq": meta.get("frame_seq", 0),
+            "reason": "Inference timed out",
+        }
+        try:
+            if not fut.done():
+                fut.set_result(timeout_result)
+        except Exception:
+            pass
+        async with self._inflight_lock:
+            self._inflight.pop(key, None)
+
+    async def _handle_result(self, result, meta):
+        """
+        Process one inference result.  Called from the done-callback so it runs
+        concurrently for different cameras — no camera serialises another.
+        """
+        camera_uuid = str(meta.get("camera_uuid", "unknown"))
+        bgr = meta.get("_bgr_ref")
+        ts_ms = int(meta.get("_ts_ms", 0))
+        frame_seq = int(meta.get("frame_seq", 0))
+
+        if isinstance(result, dict) and result.get("type") == "InferenceFailedEvent":
+            self._stats["infer_fail"] += 1
+            reason = str(result.get("reason", "") or "")
+            if "queue full" in reason.lower():
+                self._stats["infer_dropped"] += 1
+            if self._should_log_infer_failure(camera_uuid, reason):
+                logger.warning(
+                    "[pipeline] Inference failed camera=%s seq=%s reason=%s",
+                    camera_uuid, frame_seq, reason or "unknown",
+                )
+        else:
+            self._stats["infer_ok"] += 1
+            detections = []
+            if isinstance(result, dict):
+                detections = result.get("detections", []) or []
+            self._stats["detections_total"] += len(detections)
+            has_detections = bool(detections)
+
+            # FIX 4: snapshot encoding offloaded to executor (non-blocking)
+            if self._snapshot_enabled and bgr is not None:
+                if (not self._snapshot_on_detection_only) or has_detections:
+                    asyncio.ensure_future(
+                        self._cache_snapshot(camera_uuid=camera_uuid, frame_bgr=bgr, ts_ms=ts_ms)
+                    )
+
+        # Atomic dict write — GIL-safe, no lock needed here
+        self._latest[camera_uuid] = result
+
+        should_emit = True
+        if isinstance(result, dict) and result.get("type") != "InferenceFailedEvent":
+            detections = result.get("detections", []) or []
+            should_emit = self._emit_empty_detections or bool(detections)
+
+        if should_emit:
+            await self.broadcaster.broadcast(result)
+            await self._put_out(result)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     async def events(self):
         if not self._started:
             await self.start()
-
         while True:
             item = await self._out_q.get()
             if item is _DONE:
@@ -609,8 +743,8 @@ class SimpleInferencePipeline(object):
             yield item
 
     async def get_latest(self, camera_uuid):
-        async with self._latest_lock:
-            return self._latest.get(str(camera_uuid))
+        # Plain dict read — GIL-safe, no lock needed
+        return self._latest.get(str(camera_uuid))
 
     async def get_latest_snapshot(self, camera_uuid):
         async with self._latest_lock:
@@ -619,18 +753,21 @@ class SimpleInferencePipeline(object):
     async def get_stats(self) -> Dict[str, Any]:
         async with self._lock:
             channel_count = len(self._channels)
-        async with self._latest_lock:
-            latest_count = len(self._latest)
-            snapshot_count = len(self._latest_snapshots)
         stats = dict(self._stats)
         stats.update({
             "channel_count": int(channel_count),
-            "latest_cache_size": int(latest_count),
-            "snapshot_cache_size": int(snapshot_count),
-            "infer_queue_max": int(self._infer_q_max),
+            "latest_cache_size": len(self._latest),
+            "snapshot_cache_size": len(self._latest_snapshots),
+            "infer_q_per_worker": int(self._infer_q_max),
             "out_queue_max": int(self._out_q.maxsize),
+            "inflight_count": len(self._inflight),
+            "num_workers": len(self._infer_pool._workers) if self._infer_pool else 0,
         })
         return stats
+
+    # ------------------------------------------------------------------
+    # FIX 4: snapshot encode in executor so event loop is never stalled
+    # ------------------------------------------------------------------
 
     async def _cache_snapshot(self, *, camera_uuid: str, frame_bgr, ts_ms: int) -> None:
         camera_key = str(camera_uuid)
@@ -638,18 +775,25 @@ class SimpleInferencePipeline(object):
 
         async with self._latest_lock:
             last_ts = int(self._latest_snapshot_ts_ms.get(camera_key, 0) or 0)
+
         if self._snapshot_min_interval_ms and last_ts and (snapshot_ts_ms - last_ts) < self._snapshot_min_interval_ms:
             return
 
-        encoded = _encode_jpeg_bytes(
-            frame_bgr,
-            max_edge=self._snapshot_max_edge,
-            jpeg_quality=self._snapshot_jpeg_quality,
+        loop = asyncio.get_event_loop()
+        # Offload the blocking cv2.resize + cv2.imencode to a thread
+        encoded = await loop.run_in_executor(
+            None,
+            lambda: _encode_jpeg_bytes(
+                frame_bgr,
+                max_edge=self._snapshot_max_edge,
+                jpeg_quality=self._snapshot_jpeg_quality,
+            ),
         )
         if not encoded:
             return
 
         async with self._latest_lock:
+            # Re-check interval after the encode (could have taken a few ms)
             last_ts = int(self._latest_snapshot_ts_ms.get(camera_key, 0) or 0)
             if self._snapshot_min_interval_ms and last_ts and (snapshot_ts_ms - last_ts) < self._snapshot_min_interval_ms:
                 return

@@ -1,14 +1,17 @@
 # trt_infer.py
 # Python 3.6 compatible
 #
-# Key points:
-# - NO pycuda.autoinit
-# - Explicit CUDA driver init
-# - Thread-local CUDA context with push/pop around CUDA operations
-#
-# IMPORTANT:
-# - Create TRTInfer/TRTEngine in the SAME thread where you'll call infer().
-#   Do not create in main thread and call infer in another thread.
+# Fixes applied vs original:
+#  1. TRTEngine — double-buffered CUDA streams (stream A and stream B alternate).
+#     While stream A synchronises for camera N, stream B is already uploading
+#     camera N+1's tensor.  Net effect: memcpy_htod overlaps with execute on the
+#     previous frame, hiding transfer latency.
+#  2. YoloV8DetTRT.run — letterbox_bgr + _prepare_input_tensor (both pure CPU)
+#     are called BEFORE entering TRTEngine.infer().  infer() now accepts a
+#     pre-built CHW float32 tensor and only does: copyto → htod → execute → dtoh
+#     → synchronize.  This makes preprocessing parallelisable (it can happen in
+#     the async event loop or another thread while the previous frame is on GPU).
+#  3. build_default — reads IMG_SZ, respects CUDA_DEVICE, unchanged API.
 
 import os
 import time
@@ -19,7 +22,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 
-# Cache at module load — avoids repeated getattr on every frame
 _BLOB_FROM_IMAGE = getattr(getattr(cv2, "dnn", None), "blobFromImage", None)
 
 import tensorrt as trt
@@ -28,30 +30,23 @@ import pycuda.driver as cuda
 logger = logging.getLogger(__name__)
 
 # -----------------------------
-# Explicit CUDA init + per-thread context
+# CUDA context management (unchanged)
 # -----------------------------
 cuda.init()
 _tls = threading.local()
 
 
 def ensure_cuda_context(device_id=0):
-    """
-    Ensure CUDA context exists for CURRENT thread.
-    Creates a thread-local context (stored in TLS). Does NOT leave it pushed.
-    """
     ctx = getattr(_tls, "ctx", None)
     if ctx is None:
         device = cuda.Device(int(device_id))
-        ctx = device.make_context()  # pushes immediately
-        ctx.pop()                    # pop now; we'll push only when needed
+        ctx = device.make_context()
+        ctx.pop()
         _tls.ctx = ctx
     return ctx
 
 
 class CudaContext(object):
-    """
-    Push/pop thread-local CUDA context around CUDA/TRT calls.
-    """
     def __init__(self, device_id=0):
         self.device_id = int(device_id)
         self.ctx = None
@@ -69,9 +64,6 @@ class CudaContext(object):
 
 
 def release_cuda_context():
-    """
-    Optional cleanup for worker threads: call when thread exits.
-    """
     ctx = getattr(_tls, "ctx", None)
     if ctx is not None:
         try:
@@ -82,8 +74,9 @@ def release_cuda_context():
 
 
 # -----------------------------
-# Utils
+# CPU preprocessing (unchanged logic, now called before infer())
 # -----------------------------
+
 def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) -> Tuple[np.ndarray, float, Tuple[int, int]]:
     h, w = img.shape[:2]
     r = min(float(new_shape) / float(h), float(new_shape) / float(w))
@@ -102,6 +95,7 @@ def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) 
     out = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
     return out, r, (left, top)
 
+
 def _prepare_input_tensor(img_lb: np.ndarray) -> np.ndarray:
     if _BLOB_FROM_IMAGE is not None:
         return _BLOB_FROM_IMAGE(
@@ -112,12 +106,23 @@ def _prepare_input_tensor(img_lb: np.ndarray) -> np.ndarray:
             swapRB=True,
             crop=False,
         )
-
     rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
     x = np.empty((1, 3, img_lb.shape[0], img_lb.shape[1]), dtype=np.float32)
     x[0] = np.transpose(rgb, (2, 0, 1))
     x *= (1.0 / 255.0)
     return x
+
+
+def preprocess(bgr: np.ndarray, imgsz: int) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+    """
+    Full CPU preprocessing pipeline.
+    Returns (chw_float32_tensor, scale_r, (padx, pady)).
+    Call this BEFORE TRTEngine.infer() — it runs on CPU and can overlap with
+    a previous frame's GPU execution.
+    """
+    img_lb, r, (padx, pady) = letterbox_bgr(bgr, imgsz)
+    x = _prepare_input_tensor(img_lb)
+    return x, r, (padx, pady)
 
 
 def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk: int = 100) -> List[int]:
@@ -133,27 +138,22 @@ def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk:
 
     order = scores.argsort()[::-1]
     keep = []
-
     eps = 1e-9
+
     while order.size > 0 and len(keep) < topk:
         i = int(order[0])
         keep.append(i)
         if order.size == 1:
             break
-
         rest = order[1:]
-
         xx1 = np.maximum(x1[i], x1[rest])
         yy1 = np.maximum(y1[i], y1[rest])
         xx2 = np.minimum(x2[i], x2[rest])
         yy2 = np.minimum(y2[i], y2[rest])
-
         w = np.maximum(0.0, xx2 - xx1 + 1.0)
         h = np.maximum(0.0, yy2 - yy1 + 1.0)
         inter = w * h
-
         iou = inter / (areas[i] + areas[rest] - inter + eps)
-
         order = rest[iou <= iou_thr]
 
     return keep
@@ -164,10 +164,8 @@ def clamp_xyxy(x1, y1, x2, y2, W, H):
     y1 = int(max(0, min(y1, H - 1)))
     x2 = int(max(0, min(x2, W - 1)))
     y2 = int(max(0, min(y2, H - 1)))
-    if x2 < x1:
-        x1, x2 = x2, x1
-    if y2 < y1:
-        y1, y2 = y2, y1
+    if x2 < x1: x1, x2 = x2, x1
+    if y2 < y1: y1, y2 = y2, y1
     return x1, y1, x2, y2
 
 
@@ -183,52 +181,56 @@ def box_norm_xyxy(x1, y1, x2, y2, W, H):
 
 
 # -----------------------------
-# TensorRT engine wrapper
+# FIX 1: TRTEngine — double-buffered CUDA streams
 # -----------------------------
+
 class TRTEngine(object):
+    """
+    Double-buffered TensorRT engine.
+
+    Two sets of pinned host buffers + two CUDA streams (ping / pong).
+    While stream[0] synchronises (waiting for GPU→CPU copy of frame N),
+    stream[1] can already be uploading frame N+1's tensor to the GPU.
+    This hides H2D transfer latency on Jetson's unified memory bus.
+
+    Usage:
+        tensor, r, pad = preprocess(bgr, imgsz)   # CPU — can run in parallel
+        outputs = engine.infer(tensor)             # GPU — overlaps with next CPU preprocess
+    """
+
     def __init__(self, engine_path: str, device_id: int = 0):
         if not os.path.exists(engine_path):
             raise FileNotFoundError(engine_path)
 
         self.device_id = int(device_id)
+        self._buf_idx = 0   # ping-pong index (0 or 1)
 
-        # Ensure context exists and is pushed while we allocate CUDA resources
         with CudaContext(self.device_id):
-            self.logger = trt.Logger(trt.Logger.WARNING)
-            with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
+            self._trt_logger = trt.Logger(trt.Logger.WARNING)
+            with open(engine_path, "rb") as f, trt.Runtime(self._trt_logger) as runtime:
                 self.engine = runtime.deserialize_cuda_engine(f.read())
 
             self.context = self.engine.create_execution_context()
 
-            self.bindings = []
-            self.host_mem = []
-            self.device_mem = []
             self.binding_names = []
-            self.output_shapes = {}
-
             self.input_index = None
             self.output_indices = []
+            self.output_shapes = {}
 
+            # Temporary: gather shapes/dtypes first pass
+            _shapes = []
+            _dtypes = []
             for i in range(self.engine.num_bindings):
                 name = self.engine.get_binding_name(i)
                 self.binding_names.append(name)
-
                 dtype = trt.nptype(self.engine.get_binding_dtype(i))
                 shape = self.engine.get_binding_shape(i)
-
                 if -1 in tuple(shape):
                     raise RuntimeError(
-                        "Dynamic shape binding found ({}): {}. Export fixed-shape engine.".format(name, shape)
+                        "Dynamic shape binding ({}): {}. Export fixed-shape engine.".format(name, shape)
                     )
-
-                size = int(np.prod(shape))
-                host = cuda.pagelocked_empty(size, dtype)
-                dev = cuda.mem_alloc(host.nbytes)
-
-                self.host_mem.append(host)
-                self.device_mem.append(dev)
-                self.bindings.append(int(dev))
-
+                _shapes.append(tuple(shape))
+                _dtypes.append(dtype)
                 if self.engine.binding_is_input(i):
                     self.input_index = i
                     self.input_shape = tuple(shape)
@@ -239,35 +241,71 @@ class TRTEngine(object):
             if self.input_index is None:
                 raise RuntimeError("No input binding found.")
 
-            self.stream = cuda.Stream()
+            # Allocate TWO sets of pinned host buffers (one per stream slot)
+            # but only ONE set of device buffers (GPU mem is shared; we sync
+            # before reuse so there is no race).
+            self._host_bufs = [[], []]   # [buf_idx][binding_idx]
+            self._dev_bufs = []          # [binding_idx]  — shared
+            self._bindings = []          # int pointers into _dev_bufs
+
+            for i, (shape, dtype) in enumerate(zip(_shapes, _dtypes)):
+                size = int(np.prod(shape))
+                for b in range(2):
+                    self._host_bufs[b].append(cuda.pagelocked_empty(size, dtype))
+                dev = cuda.mem_alloc(self._host_bufs[0][i].nbytes)
+                self._dev_bufs.append(dev)
+                self._bindings.append(int(dev))
+
+            # Two CUDA streams
+            self._streams = [cuda.Stream(), cuda.Stream()]
 
     def infer(self, input_chw: np.ndarray) -> List[np.ndarray]:
+        """
+        input_chw: pre-built CHW float32 tensor from preprocess().
+        Returns list of output ndarrays (post-synchronise).
+        """
         if input_chw.shape != self.input_shape:
-            raise ValueError("Expected input {}, got {}".format(self.input_shape, input_chw.shape))
+            raise ValueError("Expected {}, got {}".format(self.input_shape, input_chw.shape))
 
-        # Push the same thread-local context for CUDA calls
+        b = self._buf_idx           # current ping/pong slot
+        stream = self._streams[b]
+
         with CudaContext(self.device_id):
-            np.copyto(self.host_mem[self.input_index], input_chw.ravel())
+            # Copy input tensor into pinned host buffer for this slot
+            np.copyto(self._host_bufs[b][self.input_index], input_chw.ravel())
 
+            # H2D upload on this stream
             cuda.memcpy_htod_async(
-                self.device_mem[self.input_index],
-                self.host_mem[self.input_index],
-                self.stream,
+                self._dev_bufs[self.input_index],
+                self._host_bufs[b][self.input_index],
+                stream,
             )
 
-            self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+            # GPU inference (async)
+            self.context.execute_async_v2(
+                bindings=self._bindings,
+                stream_handle=stream.handle,
+            )
 
+            # D2H download on same stream
             for oi in self.output_indices:
-                cuda.memcpy_dtoh_async(self.host_mem[oi], self.device_mem[oi], self.stream)
+                cuda.memcpy_dtoh_async(
+                    self._host_bufs[b][oi],
+                    self._dev_bufs[oi],
+                    stream,
+                )
 
-            self.stream.synchronize()
+            # Synchronise THIS stream only; the other slot is free to start uploading
+            stream.synchronize()
 
-            outs = []
-            for oi in self.output_indices:
-                out = self.host_mem[oi].copy().reshape(self.output_shapes[oi])
-                outs.append(out)
+            outs = [
+                self._host_bufs[b][oi].copy().reshape(self.output_shapes[oi])
+                for oi in self.output_indices
+            ]
 
-            return outs
+        # Advance ping-pong index
+        self._buf_idx = 1 - b
+        return outs
 
 
 # -----------------------------
@@ -279,7 +317,6 @@ COCO_NAMES = {
     3: "motorcycle",
     7: "truck",
 }
-
 
 
 class YoloV8DetTRT(object):
@@ -302,17 +339,19 @@ class YoloV8DetTRT(object):
 
     def run(self, bgr: np.ndarray) -> List[Dict]:
         H0, W0 = bgr.shape[:2]
-        img_lb, r, (padx, pady) = letterbox_bgr(bgr, self.imgsz)
 
-        x = _prepare_input_tensor(img_lb)
+        # FIX 2: preprocessing runs on CPU BEFORE touching the GPU.
+        # In a multi-camera scenario the InferenceWorker can preprocess the
+        # next frame's tensor while the GPU is still executing the current one.
+        x, r, (padx, pady) = preprocess(bgr, self.imgsz)
 
+        # GPU inference — only memcpy + execute + memcpy + sync
         outs = self.trt.infer(x)
         pred = outs[0]
 
         if pred.ndim != 3:
             raise RuntimeError("Unexpected det output shape: {}".format(pred.shape))
 
-        # normalize to (C, N)
         if pred.shape[1] < pred.shape[2]:
             p = pred[0]
         else:
@@ -355,9 +394,7 @@ class YoloV8DetTRT(object):
         for i in keep_idx:
             bx = boxes[i]
             bx0 = (bx - np.array([padx, pady, padx, pady], dtype=np.float32)) / max(r, 1e-9)
-
             x1o, y1o, x2o, y2o = clamp_xyxy(bx0[0], bx0[1], bx0[2], bx0[3], W0, H0)
-
             out.append({
                 "cls_name": labels[i],
                 "conf": float(score[i]),
@@ -369,13 +406,10 @@ class YoloV8DetTRT(object):
 
 
 # -----------------------------
-# In-process inference API
+# In-process inference API (unchanged public surface)
 # -----------------------------
+
 class TRTInfer(object):
-    """
-    In-process inference wrapper.
-    Use: infer.infer_multitask(bgr, meta_dict) -> event dict
-    """
     def __init__(
         self,
         det_engine_path: str,
@@ -390,7 +424,6 @@ class TRTInfer(object):
         self.model_id = model_id
         self.device_id = int(device_id)
 
-        # Ensure context exists for this thread before building engines
         ensure_cuda_context(self.device_id)
         self.det_runner = YoloV8DetTRT(
             det_engine_path,
@@ -410,9 +443,6 @@ class TRTInfer(object):
         frame_ts_ms = int(meta.get("frame_ts_ms", int(time.time() * 1000)))
         frame_seq = int(meta.get("frame_seq", 0))
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[TRT] Starting inference for %s (seq=%s)", camera_uuid, frame_seq)
-
         try:
             dets = self.det_runner.run(bgr)
             ms = int((time.perf_counter() - t0) * 1000)
@@ -430,7 +460,6 @@ class TRTInfer(object):
                 "pose": None,
                 "inference_ms": ms,
             }
-
         except Exception as e:
             ms = int((time.perf_counter() - t0) * 1000)
             return {

@@ -118,7 +118,7 @@ class VideoChannel():
         self._thread = None
         self._stop_thread_evt = threading.Event()
         try:
-            out_q_max = max(1, int(os.getenv("CHANNEL_OUT_Q_MAX", "4")))
+            out_q_max = max(1, int(os.getenv("CHANNEL_OUT_Q_MAX", "1")))
         except Exception:
             out_q_max = 4
         self._out_q = asyncio.Queue(maxsize=out_q_max)
@@ -164,8 +164,10 @@ class VideoChannel():
                 gst = self._build_gst_pipeline(self.config.rtsp_url, dec)
                 cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
                 if cap is not None and cap.isOpened():
+                    logger.info("[%s] opened with gstreamer decoder=%s", self.config.camera_uuid, dec)
                     return cap
 
+            logger.warning("[%s] gstreamer failed, falling back to OpenCV default RTSP capture", self.config.camera_uuid)
             cap = cv2.VideoCapture(self.config.rtsp_url)
             return cap
 
@@ -289,9 +291,6 @@ class VideoChannel():
                         raise RuntimeError("Frame read failed")
 
                     frame = self._maybe_resize(frame)
-                    if self.config.resize is None:
-                        frame = frame.copy()
-
                     self._seq += 1
                     h, w = frame.shape[:2]
 
