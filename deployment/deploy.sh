@@ -225,6 +225,11 @@ function deploy_infrastructure() {
 }
 
 function route_traffic_to_latest() {
+  if [[ "${REVISION_MODE}" != "Multiple" ]]; then
+    write_info "Single revision mode — Azure routes traffic automatically. Skipping manual traffic shift."
+    return 0
+  fi
+
   write_info "Routing 100% traffic to latest revision of ${APP_NAME_MAIN}..."
 
   local latest_revision
