@@ -1,6 +1,6 @@
 import uuid
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -289,6 +289,8 @@ async def _load_clip_overlay_payloads(
     camera_uuids: List[uuid.UUID] = []
     seen_camera_uuids: set[uuid.UUID] = set()
     earliest_detected_at: Optional[datetime] = None
+    # Track clip time windows so we can add clip_start_time/clip_end_time to fallback overlays.
+    clip_time_windows: Dict[Tuple[str, str], Tuple[Optional[datetime], Optional[datetime]]] = {}
 
     for record, *_rest in rows:
         clip_url = str(getattr(record, "recording_url", "") or "").strip()
@@ -299,7 +301,12 @@ async def _load_clip_overlay_payloads(
         if camera_uuid is None:
             continue
 
-        clip_keys[(str(camera_uuid), clip_url)] = None
+        key = (str(camera_uuid), clip_url)
+        clip_keys[key] = None
+        clip_time_windows[key] = (
+            getattr(record, "start_time", None),
+            getattr(record, "end_time", None),
+        )
         if camera_uuid not in seen_camera_uuids:
             seen_camera_uuids.add(camera_uuid)
             camera_uuids.append(camera_uuid)
@@ -340,6 +347,15 @@ async def _load_clip_overlay_payloads(
         key, overlay_payload = match
         if key not in clip_keys or key in overlays:
             continue
+
+        # Attach clip time window so the frontend can position overlay frames on the timeline.
+        window = clip_time_windows.get(key)
+        if window:
+            clip_start, clip_end = window
+            if clip_start is not None:
+                overlay_payload["clip_start_time"] = clip_start.astimezone(timezone.utc).isoformat()
+            if clip_end is not None:
+                overlay_payload["clip_end_time"] = clip_end.astimezone(timezone.utc).isoformat()
 
         overlays[key] = overlay_payload
         if len(overlays) >= len(clip_keys):

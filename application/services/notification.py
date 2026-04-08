@@ -255,6 +255,7 @@ def _build_overlay_payload_from_frames(
         "frame_ts_ms": int(reference["frame_ts_ms"]),
         "frame_seq": int(reference["frame_seq"]),
         "detections": list(reference.get("detections") or []),
+        "frames": merged_frames,
     }
     if reference.get("frame_w") is not None:
         payload["frame_w"] = int(reference["frame_w"])
