@@ -224,6 +224,50 @@ function deploy_infrastructure() {
   echo "${app_fqdn}"
 }
 
+function route_traffic_to_latest() {
+  write_info "Routing 100% traffic to latest revision of ${APP_NAME_MAIN}..."
+
+  local latest_revision
+  latest_revision=$(az containerapp show \
+    -n "${APP_NAME_MAIN}" \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    --query "properties.latestRevisionName" \
+    -o tsv 2>/dev/null || true)
+
+  if [[ -z "${latest_revision}" ]]; then
+    write_error "Could not determine latest revision name — skipping traffic shift."
+    return 1
+  fi
+
+  write_info "Latest revision: ${latest_revision}"
+
+  az containerapp ingress traffic set \
+    -n "${APP_NAME_MAIN}" \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    --revision-weight "${latest_revision}=100" >/dev/null
+
+  write_success "All traffic now routed to: ${latest_revision}"
+
+  # Deactivate any other revisions that have 0% traffic to keep things clean.
+  local old_revisions
+  old_revisions=$(az containerapp revision list \
+    -n "${APP_NAME_MAIN}" \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    --query "[?name != '${latest_revision}' && properties.active == true].name" \
+    -o tsv 2>/dev/null || true)
+
+  if [[ -n "${old_revisions}" ]]; then
+    while IFS= read -r rev; do
+      write_info "Deactivating old revision: ${rev}"
+      az containerapp revision deactivate \
+        -n "${APP_NAME_MAIN}" \
+        -g "${AZURE_RESOURCE_GROUP}" \
+        --revision "${rev}" >/dev/null 2>&1 || true
+    done <<< "${old_revisions}"
+    write_success "Old revisions deactivated."
+  fi
+}
+
 function health_check() {
   local app_fqdn=$1
   local health_endpoint="https://${app_fqdn}/"
@@ -271,6 +315,12 @@ function main() {
 
   # NOTE: MySQL bootstrap via `az mysql flexible-server execute` has been REMOVED.
   # You said you will run migrations later (recommended).
+
+  # Explicitly route all traffic to the new revision.
+  # Bicep with Single mode should do this automatically, but if the Container App
+  # was ever in Multiple mode, Azure leaves old revisions with 100% traffic and
+  # the new revision at 0%. This step is always safe to run.
+  route_traffic_to_latest
 
   # Final health check
   health_check "${app_fqdn}"
