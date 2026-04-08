@@ -16,6 +16,7 @@ from email.mime.text import MIMEText
 import os
 import uuid
 from sqlalchemy import update
+from sqlalchemy.exc import OperationalError
 from core.database_orm import Notification
 
 from pydantic import BaseModel, Field
@@ -1853,12 +1854,28 @@ class NotificationService:
         )
 
         notification_ids_by_site: Dict[uuid.UUID, List[int]] = {}
-        try:
-            async with self._session_factory() as db:
-                rows = await self._repo.create_notifications(db, rows=create_rows)
-                await db.commit()
-        except Exception:
-            logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
+        rows = None
+        for _attempt in range(3):
+            try:
+                async with self._session_factory() as db:
+                    rows = await self._repo.create_notifications(db, rows=create_rows)
+                    await db.commit()
+                break
+            except OperationalError as exc:
+                if _attempt < 2 and "1205" in str(exc):
+                    wait_s = 0.5 * (2 ** _attempt)
+                    logger.warning(
+                        "Notification INSERT lock timeout (attempt %s/3) user=%s — retrying in %.1fs",
+                        _attempt + 1, user_id, wait_s,
+                    )
+                    await asyncio.sleep(wait_s)
+                    continue
+                logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
+                return False
+            except Exception:
+                logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
+                return False
+        if rows is None:
             return False
 
         for site_uuid, indices in site_groups.items():

@@ -1233,6 +1233,28 @@ class Manager:
                 exc_info=True,
             )
 
+    async def _bg_edge_patch(self, *, device_url: str, camera_uuid: str, patch: dict) -> None:
+        try:
+            await self._edge.patch_camera(device_url=device_url, camera_uuid=camera_uuid, patch=patch)
+            logger.debug("Background edge patch succeeded camera_uuid=%s", camera_uuid)
+        except Exception:
+            logger.warning(
+                "Background edge patch failed camera_uuid=%s — run Sync to fix",
+                camera_uuid,
+                exc_info=True,
+            )
+
+    async def _bg_webrtc_update_stream(self, *, stream_key: str, rtsp_url: str) -> None:
+        try:
+            await self._webrtc.update_stream(stream_key=stream_key, rtsp_url=rtsp_url)
+            logger.debug("Background WebRTC update_stream succeeded stream_key=%s", stream_key)
+        except Exception:
+            logger.warning(
+                "Background WebRTC update_stream failed stream_key=%s — run Sync to fix",
+                stream_key,
+                exc_info=True,
+            )
+
     async def _add_channel(
         self,
         db: AsyncSession,
@@ -1254,21 +1276,23 @@ class Manager:
         if not site_uuid:
             raise ValueError("Create_Channel requires site_uuid")
         site_uuid = self._as_uuid(site_uuid, "site_uuid")
-        await self._ensure_site_owned_by_user(db, site_uuid=site_uuid, user_id=user_id)
 
         device_uuid = patch.get("device_uuid")
         if not device_uuid:
             raise ValueError("Create_Channel requires device_uuid (each camera must have exactly 1 device).")
         device_uuid = self._as_uuid(device_uuid, "device_uuid")
-        dev = await self._get_device(db, device_uuid, user_id=user_id)
 
         cam_uuid = patch.get("camera_uuid") or uuid.uuid4()
         cam_uuid = self._as_uuid(cam_uuid, "camera_uuid")
         patch["camera_uuid"] = cam_uuid
         patch["channel_id"] = cam_uuid  # keep compatibility
-
         camera_code = f"{camera_code_prefix}-{cam_uuid.hex[:8]}"
         webrtc_url = await self._webrtc.ensure_stream(stream_key=str(camera_code), rtsp_url=str(rtsp_url))
+
+        # Now validate ownership (first DB query — connection checked out here).
+        await self._ensure_site_owned_by_user(db, site_uuid=site_uuid, user_id=user_id)
+        dev = await self._get_device(db, device_uuid, user_id=user_id)
+
         cam, cfg_json, tz = await self.channel_repo.upsert_camera_from_channel_config(
             db,
             pipeline_id=pid,
@@ -1469,19 +1493,19 @@ class Manager:
         stale_old_devices = [
             dev for dev in old_devices
             if getattr(dev, "device_uuid", None) != new_device_uuid and getattr(dev, "device_url", None)
-        ]
-        if stale_old_devices:
-            try:
-                for dev in stale_old_devices:
-                    await self._edge.delete_camera(device_url=dev.device_url, camera_uuid=str(cam_uuid))
-            except Exception:
-                logger.warning("Failed removing camera from old device during reassignment", exc_info=True)
+        for dev in stale_old_devices:
+            asyncio.create_task(
+                self._bg_edge_delete(device_url=dev.device_url, camera_uuid=str(cam_uuid))
+            )
 
         if len(old_devices) != 1 or old_dev.device_uuid != new_device_uuid:
             await self._set_single_camera_device(db, cam_uuid, new_device_uuid)
 
+        # Fire-and-forget: do NOT await WebRTC call while X lock is held.
         if cam2.rtsp_url != old_rtsp and cam2.camera_code:
-            await self._webrtc.update_stream(stream_key=str(cam2.camera_code), rtsp_url=cam2.rtsp_url)
+            asyncio.create_task(
+                self._bg_webrtc_update_stream(stream_key=str(cam2.camera_code), rtsp_url=cam2.rtsp_url)
+            )
 
         enabled = bool(cam2.is_enabled)
         det_enabled = bool(cam2.is_detection_enabled)
@@ -1492,31 +1516,35 @@ class Manager:
             cfg_timezone=tz,
         )
 
-        try:
-            if det_enabled:
-                if old_dev.device_uuid != new_device_uuid:
-                    edge_payload = self._edge_payload_from_config(
-                        camera_uuid=str(cam_uuid),
-                        rtsp_url=cam2.rtsp_url,
-                        config={
-                            **_only_jetson_config(merged_cfg),
-                            "enabled": _edge_runtime_enabled(detection_enabled=det_enabled),
-                            "detection_enabled": det_enabled,
-                            "notification_enabled": bool(cam2.is_notification_enabled),
-                        },
-                    )
-                    await self._edge.upsert_camera(device_url=new_dev.device_url, payload=edge_payload)
-                else:
-                    edge_patch = _only_jetson_config(patch)
-                    edge_patch.setdefault("rtsp_url", cam2.rtsp_url)
-                    edge_patch["enabled"] = _edge_runtime_enabled(detection_enabled=det_enabled)
-                    edge_patch["detection_enabled"] = det_enabled
-                    edge_patch["notification_enabled"] = bool(cam2.is_notification_enabled)
-                    await self._edge.patch_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid), patch=edge_patch)
+        # Fire-and-forget edge sync — do NOT await while X lock is held on camera row.
+        if det_enabled:
+            if old_dev.device_uuid != new_device_uuid:
+                edge_payload = self._edge_payload_from_config(
+                    camera_uuid=str(cam_uuid),
+                    rtsp_url=cam2.rtsp_url,
+                    config={
+                        **_only_jetson_config(merged_cfg),
+                        "enabled": _edge_runtime_enabled(detection_enabled=det_enabled),
+                        "detection_enabled": det_enabled,
+                        "notification_enabled": bool(cam2.is_notification_enabled),
+                    },
+                )
+                asyncio.create_task(
+                    self._bg_edge_upsert(device_url=new_dev.device_url, payload=edge_payload)
+                )
             else:
-                await self._edge.delete_camera(device_url=new_dev.device_url, camera_uuid=str(cam_uuid))
-        except Exception:
-            logger.warning("Edge sync failed during camera edit", exc_info=True)
+                edge_patch = _only_jetson_config(patch)
+                edge_patch.setdefault("rtsp_url", cam2.rtsp_url)
+                edge_patch["enabled"] = _edge_runtime_enabled(detection_enabled=det_enabled)
+                edge_patch["detection_enabled"] = det_enabled
+                edge_patch["notification_enabled"] = bool(cam2.is_notification_enabled)
+                asyncio.create_task(
+                    self._bg_edge_patch(device_url=new_dev.device_url, camera_uuid=str(cam_uuid), patch=edge_patch)
+                )
+        else:
+            asyncio.create_task(
+                self._bg_edge_delete(device_url=new_dev.device_url, camera_uuid=str(cam_uuid))
+            )
 
         if active:
             runtime_overrides = _runtime_config_overrides(

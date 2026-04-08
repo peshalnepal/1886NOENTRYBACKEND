@@ -131,8 +131,8 @@ resource mysql 'Microsoft.DBforMySQL/flexibleServers@2024-12-30' = {
   name: mysqlServerName
   location: mysqlLocation
   sku: {
-    name: 'Standard_B1ms'
-    tier: 'Burstable'
+    name: 'Standard_D2ads'
+    tier: 'General Purpose'
   }
   properties: {
     administratorLogin: mysqlAdminUser
