@@ -131,8 +131,8 @@ resource mysql 'Microsoft.DBforMySQL/flexibleServers@2024-12-30' = {
   name: mysqlServerName
   location: mysqlLocation
   sku: {
-    name: 'Standard_D2ads'
-    tier: 'General Purpose'
+    name: 'Standard_D2ads_v5'
+    tier: 'GeneralPurpose'
   }
   properties: {
     administratorLogin: mysqlAdminUser
@@ -141,6 +141,7 @@ resource mysql 'Microsoft.DBforMySQL/flexibleServers@2024-12-30' = {
     storage: {
       storageSizeGB: 32
       autoGrow: 'Enabled'
+      autoIoScaling: 'Enabled'
     }
     backup: {
       backupRetentionDays: 7
