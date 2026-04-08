@@ -262,6 +262,39 @@ class DatabaseManager:
                         else:
                             raise
 
+            if dialect_name.startswith("mysql"):
+                for col_name, col_def in [
+                    ("config", "JSON NOT NULL DEFAULT '{}'"),
+                    ("day_of_week", "INT NOT NULL DEFAULT 6"),
+                    ("start_time", "TIME NOT NULL DEFAULT '00:00:00'"),
+                    ("end_time", "TIME NOT NULL DEFAULT '23:59:59'"),
+                    ("is_enabled", "TINYINT(1) NOT NULL DEFAULT 1"),
+                ]:
+                    missing = (
+                        await conn.execute(
+                            text("""
+                                SELECT 1
+                                FROM information_schema.COLUMNS
+                                WHERE TABLE_SCHEMA = DATABASE()
+                                  AND TABLE_NAME   = 'site_settings'
+                                  AND COLUMN_NAME  = :col
+                                LIMIT 1
+                            """),
+                            {"col": col_name},
+                        )
+                    ).fetchone()
+                    if not missing:
+                        try:
+                            await conn.execute(
+                                text(f"ALTER TABLE site_settings ADD COLUMN `{col_name}` {col_def}")
+                            )
+                            logger.info("Added site_settings.%s column.", col_name)
+                        except Exception as exc:
+                            if _is_duplicate_column_error(exc):
+                                logger.info("site_settings.%s column already exists.", col_name)
+                            else:
+                                raise
+
             # Migrate: add notification.visible column if missing (added after initial schema).
             # Backfill existing NULL rows to visible=TRUE so they appear in the list endpoint.
             if dialect_name.startswith("mysql"):

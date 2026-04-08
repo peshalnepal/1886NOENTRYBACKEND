@@ -626,11 +626,18 @@ async def update_site_settings(
         await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     await db.refresh(row)
     if payload.schedule is not None:
-        await _refresh_site_schedule_runtime(
-            manager=manager,
-            user_id=int(user.id),
-            site_uuid=site.site_uuid,
-        )
+        try:
+            await _refresh_site_schedule_runtime(
+                manager=manager,
+                user_id=int(user.id),
+                site_uuid=site.site_uuid,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to refresh site schedule runtime for site=%s; settings were saved successfully.",
+                site.site_uuid,
+                exc_info=True,
+            )
     return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
 
 
