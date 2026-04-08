@@ -758,6 +758,99 @@ class Manager:
                 )
 
 
+    async def _create_pipeline_unlocked(self, uid: int) -> ModelPipeline:
+        async with self._session_factory() as db:
+            pipeline_row = await self._repo.upsert_pipeline(
+                db,
+                user_id=uid,
+                pipeline_id=None,
+                name="default",
+                is_active=True,
+            )
+            pid = pipeline_row.id
+
+            full_pl = await self._repo.get_full_pipeline(db, pid)
+
+            mp = ModelPipeline(pipeline_id=pid)
+            self._wire_pipeline(mp)
+
+            if full_pl and getattr(full_pl, "cameras", None):
+                site_schedule_cache: Dict[str, Dict[str, Any]] = {}
+                for cam in full_pl.cameras:
+                    enabled = bool(getattr(cam, "is_enabled", True))
+                    det_enabled = bool(getattr(cam, "is_detection_enabled", True))
+                    devices = list(getattr(cam, "devices", None) or [])
+                    if len(devices) == 0:
+                        logger.warning(
+                            "Skipping camera %s (enabled=%s detection=%s) because device count=%s",
+                            cam.camera_uuid, enabled, det_enabled, len(devices)
+                        )
+                        continue
+                    if len(devices) > 1:
+                        logger.warning(
+                            "Camera %s has %s linked devices; using first loaded device %s for runtime compatibility",
+                            cam.camera_uuid,
+                            len(devices),
+                            getattr(devices[0], "device_uuid", None),
+                        )
+
+                    device = devices[0]
+                    d_url = getattr(device, "device_url", None)
+                    d_uuid = getattr(device, "device_uuid", None)
+                    if not d_url or not d_uuid:
+                        raise ValueError(f"Camera {cam.camera_uuid} has invalid device assignment.")
+
+                    cfg_json = {}
+                    if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None):
+                        cfg_json = cam.channel_configuration.configuration or {}
+                    schedule_state = await self._resolve_runtime_schedule(
+                        db,
+                        cam=cam,
+                        cfg_json=cfg_json,
+                        cfg_timezone=getattr(getattr(cam, "channel_configuration", None), "timezone", None),
+                        site_cache=site_schedule_cache,
+                    )
+
+                    runtime_overrides = _runtime_config_overrides(
+                        cfg_json,
+                        extra_forbidden={
+                            "sample_fps",
+                            "decode_backend",
+                            "request_timeout_s",
+                            "schedule",
+                            "timezone",
+                            "use_site_schedule",
+                        },
+                    )
+
+                    vcc = VideoChannelConfig(
+                        camera_uuid=cam.camera_uuid,
+                        rtsp_url=cam.rtsp_url,
+                        webrtc_url=cam.webrtc_url or "",
+                        site_uuid=cam.site_uuid,
+                        device_uuid=d_uuid,
+                        device_url=d_url,
+                        enabled=enabled,
+                        detection_enabled=det_enabled,
+                        notification_enabled=bool(getattr(cam, "is_notification_enabled", True)),
+                        sample_fps=float(cfg_json.get("sample_fps", 5.0)),
+                        decode_backend=str(cfg_json.get("decode_backend", "gstreamer")),
+                        request_timeout_s=float(
+                            cfg_json.get("request_timeout_s", self._default_request_timeout_s)
+                        ),
+                        timezone=schedule_state["timezone"],
+                        schedule=schedule_state["schedule"],
+                        use_site_schedule=schedule_state["use_site_schedule"],
+                        **runtime_overrides,
+                    )
+                    await mp.add_channel(VideoChannel(config=vcc))
+
+            await db.commit()
+
+        self._pipelines_by_user[uid] = mp
+        self._pipeline_id_by_user[uid] = pid
+        return mp
+
     async def create_pipeline(self, user_id: int | None = None) -> ModelPipeline:
         """
         Creates (loads) the user's default pipeline and builds a config-only ModelPipeline.
@@ -765,97 +858,7 @@ class Manager:
         uid = int(user_id or self._default_user_id)
 
         async with self._lock:
-            async with self._session_factory() as db:
-                pipeline_row = await self._repo.upsert_pipeline(
-                    db,
-                    user_id=uid,
-                    pipeline_id=None,
-                    name="default",
-                    is_active=True,
-                )
-                pid = pipeline_row.id
-
-                full_pl = await self._repo.get_full_pipeline(db, pid)
-
-                mp = ModelPipeline(pipeline_id=pid)
-                self._wire_pipeline(mp)
-
-                if full_pl and getattr(full_pl, "cameras", None):
-                    site_schedule_cache: Dict[str, Dict[str, Any]] = {}
-                    for cam in full_pl.cameras:
-                        enabled = bool(getattr(cam, "is_enabled", True))
-                        det_enabled = bool(getattr(cam, "is_detection_enabled", True))
-                        devices = list(getattr(cam, "devices", None) or [])
-                        if len(devices) == 0:
-                            logger.warning(
-                                "Skipping camera %s (enabled=%s detection=%s) because device count=%s",
-                                cam.camera_uuid, enabled, det_enabled, len(devices)
-                            )
-                            continue
-                        if len(devices) > 1:
-                            logger.warning(
-                                "Camera %s has %s linked devices; using first loaded device %s for runtime compatibility",
-                                cam.camera_uuid,
-                                len(devices),
-                                getattr(devices[0], "device_uuid", None),
-                            )
-
-                        device = devices[0]
-                        d_url = getattr(device, "device_url", None)
-                        d_uuid = getattr(device, "device_uuid", None)
-                        if not d_url or not d_uuid:
-                            raise ValueError(f"Camera {cam.camera_uuid} has invalid device assignment.")
-
-                        cfg_json = {}
-                        if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None):
-                            cfg_json = cam.channel_configuration.configuration or {}
-                        schedule_state = await self._resolve_runtime_schedule(
-                            db,
-                            cam=cam,
-                            cfg_json=cfg_json,
-                            cfg_timezone=getattr(getattr(cam, "channel_configuration", None), "timezone", None),
-                            site_cache=site_schedule_cache,
-                        )
-
-                        runtime_overrides = _runtime_config_overrides(
-                            cfg_json,
-                            extra_forbidden={
-                                "sample_fps",
-                                "decode_backend",
-                                "request_timeout_s",
-                                "schedule",
-                                "timezone",
-                                "use_site_schedule",
-                            },
-                        )
-
-                        vcc = VideoChannelConfig(
-                            camera_uuid=cam.camera_uuid,
-                            rtsp_url=cam.rtsp_url,
-                            webrtc_url=cam.webrtc_url or "",
-                            site_uuid=cam.site_uuid,
-                            device_uuid=d_uuid,
-                            device_url=d_url,
-                            enabled=enabled,
-                            detection_enabled=det_enabled,
-                            notification_enabled=bool(getattr(cam, "is_notification_enabled", True)),
-                            sample_fps=float(cfg_json.get("sample_fps", 5.0)),
-                            decode_backend=str(cfg_json.get("decode_backend", "gstreamer")),
-                            request_timeout_s=float(
-                                cfg_json.get("request_timeout_s", self._default_request_timeout_s)
-                            ),
-                            timezone=schedule_state["timezone"],
-                            schedule=schedule_state["schedule"],
-                            use_site_schedule=schedule_state["use_site_schedule"],
-                            **runtime_overrides,
-                        )
-                        await mp.add_channel(VideoChannel(config=vcc))
-
-                await db.commit()
-
-                self._pipelines_by_user[uid] = mp
-                self._pipeline_id_by_user[uid] = pid
-                return mp
+            return await self._create_pipeline_unlocked(uid)
 
     async def get_activepipeline(self, user_id: int | None = None) -> ModelPipeline:
         uid = int(user_id or self._default_user_id)
@@ -864,7 +867,7 @@ class Manager:
             async with self._lock:
                 mp = self._pipelines_by_user.get(uid)
                 if mp is None:
-                    mp = await self.create_pipeline(uid)
+                    mp = await self._create_pipeline_unlocked(uid)
         await mp.start()
         return mp
     

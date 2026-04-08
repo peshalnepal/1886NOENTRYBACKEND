@@ -190,7 +190,7 @@ function deploy_infrastructure() {
   write_info "Starting Bicep deployment for ${ENVIRONMENT_NAME} environment..."
 
   local app_fqdn
-  app_fqdn=$(az deployment group create \
+  app_fqdn=$(DOTNET_SYSTEM_GLOBALIZATION_INVARIANT="${DOTNET_SYSTEM_GLOBALIZATION_INVARIANT:-1}" az deployment group create \
     --resource-group "${AZURE_RESOURCE_GROUP}" \
     --template-file "${BICEP_FILE}" \
     --parameters \
@@ -226,6 +226,97 @@ function deploy_infrastructure() {
     -o tsv)
 
   echo "${app_fqdn}"
+}
+
+function ensure_mysql_firewall_for_containerapp() {
+  local mysql_server
+  mysql_server=$(az mysql flexible-server list \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    --query "[?starts_with(name, '${NAME_PREFIX}-mysql-')].name | [0]" \
+    -o tsv 2>/dev/null || true)
+
+  if [[ -z "${mysql_server}" || "${mysql_server}" == "null" ]]; then
+    write_info "No MySQL flexible server found for prefix ${NAME_PREFIX}; skipping firewall sync."
+    return 0
+  fi
+
+  local outbound_ips
+  outbound_ips=$(az containerapp show \
+    -n "${APP_NAME_MAIN}" \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    --query "properties.outboundIpAddresses" \
+    -o tsv 2>/dev/null || true)
+
+  if [[ -z "${outbound_ips}" || "${outbound_ips}" == "null" ]]; then
+    write_info "Container App outbound IPs not available yet; skipping MySQL firewall sync."
+    return 0
+  fi
+
+  local added_any=false
+  local ip rule_name
+  for ip in ${outbound_ips}; do
+    [[ -z "${ip}" || "${ip}" == "null" ]] && continue
+    rule_name="allow-containerapp-egress-${ip//./-}"
+
+    if az mysql flexible-server firewall-rule show \
+      -g "${AZURE_RESOURCE_GROUP}" \
+      -n "${mysql_server}" \
+      --rule-name "${rule_name}" >/dev/null 2>&1; then
+      continue
+    fi
+
+    write_info "Allowing Container App outbound IP ${ip} on MySQL server ${mysql_server}"
+    az mysql flexible-server firewall-rule create \
+      -g "${AZURE_RESOURCE_GROUP}" \
+      -n "${mysql_server}" \
+      --rule-name "${rule_name}" \
+      --start-ip-address "${ip}" \
+      --end-ip-address "${ip}" >/dev/null
+    added_any=true
+  done
+
+  if [[ "${added_any}" == true ]]; then
+    write_success "MySQL firewall updated for Container App outbound IPs."
+  else
+    write_info "MySQL firewall already allows current Container App outbound IPs."
+  fi
+}
+
+function dump_startup_diagnostics() {
+  write_info "Container App diagnostics for ${APP_NAME_MAIN}..."
+  az containerapp revision list \
+    -n "${APP_NAME_MAIN}" \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    -o table >&2 || true
+
+  local latest_revision
+  latest_revision=$(az containerapp show \
+    -n "${APP_NAME_MAIN}" \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    --query "properties.latestRevisionName" \
+    -o tsv 2>/dev/null || true)
+
+  if [[ -z "${latest_revision}" ]]; then
+    write_info "Latest revision name is not available yet."
+    return 0
+  fi
+
+  write_info "System logs for revision ${latest_revision}:"
+  az containerapp logs show \
+    -n "${APP_NAME_MAIN}" \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    --revision "${latest_revision}" \
+    --type system \
+    --tail 100 \
+    --format text >&2 || true
+
+  write_info "Console logs for revision ${latest_revision}:"
+  az containerapp logs show \
+    -n "${APP_NAME_MAIN}" \
+    -g "${AZURE_RESOURCE_GROUP}" \
+    --revision "${latest_revision}" \
+    --tail 100 \
+    --format text >&2 || true
 }
 
 function route_traffic_to_latest() {
@@ -291,11 +382,19 @@ function health_check() {
       write_success "Health check passed (attempt ${i}) with status ${http_code}!"
       return 0
     fi
+    if (( i % 6 == 0 )); then
+      write_info "Health check still failing after ${i} attempt(s); collecting current revision state..."
+      az containerapp revision list \
+        -n "${APP_NAME_MAIN}" \
+        -g "${AZURE_RESOURCE_GROUP}" \
+        -o table >&2 || true
+    fi
     write_info "Attempt ${i}/36 — status ${http_code}, retrying in 10s..."
     sleep 10
   done
 
   write_error "Health check failed after ~6 minutes: ${health_endpoint}"
+  dump_startup_diagnostics
   return 1
 }
 
@@ -313,6 +412,7 @@ function main() {
   ensure_resource_group
   ensure_acr_exists
   ensure_keyvault_exists
+  ensure_mysql_firewall_for_containerapp
 
   # Build + push image
   build_and_push_image "../Dockerfile" ".."
@@ -324,6 +424,8 @@ function main() {
     write_error "Failed to get App FQDN from Bicep deployment output."
     exit 1
   fi
+
+  ensure_mysql_firewall_for_containerapp
 
   # NOTE: MySQL bootstrap via `az mysql flexible-server execute` has been REMOVED.
   # You said you will run migrations later (recommended).

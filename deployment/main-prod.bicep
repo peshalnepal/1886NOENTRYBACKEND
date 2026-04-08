@@ -125,7 +125,6 @@ var clipStorageName = videoClipStorageAccountName != '' ? toLower(videoClipStora
 var clipStorageKey = clipStorage.listKeys().keys[0].value
 var clipStorageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${clipStorage.name};AccountKey=${clipStorageKey};EndpointSuffix=core.windows.net'
 
-// This is the exact format you are using in .env today
 var databaseUrl = 'Driver={MySQL ODBC 8.0 Unicode Driver};Server=${mysqlFqdn};Port=3306;Database=${mysqlDatabaseName};User=${appDbUser};Password=${appDbPassword};Option=3;'
 
 resource mysql 'Microsoft.DBforMySQL/flexibleServers@2024-12-30' = {
@@ -288,6 +287,10 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'ENVIRONMENT', value: 'production' }
             { name: 'DEBUG', value: 'false' }
             { name: 'PORT', value: '8080' }
+            { name: 'DB_INIT_MAX_ATTEMPTS', value: '40' }
+            { name: 'DB_INIT_RETRY_DELAY_S', value: '5' }
+            { name: 'DB_CONNECT_TIMEOUT_S', value: '5' }
+            { name: 'DB_IO_TIMEOUT_S', value: '15' }
 
             { name: 'DATABASE_URL', value: databaseUrl }
 
@@ -323,6 +326,41 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'VIDEO_CLIP_BLOB_CONTAINER', value: videoClipContainerName }
             { name: 'MEDIAMTX_PLAYBACK_BASE_URL', value: deployMediaMtx ? 'https://${proxyHost}/playback' : '' }
             { name: 'VIDEO_CLIP_BLOB_CONNECTION_STRING', secretRef: 'video-clip-blob-connection-string' }
+          ]
+          probes: [
+            {
+              type: 'Startup'
+              httpGet: {
+                path: '/'
+                port: 8080
+              }
+              initialDelaySeconds: 15
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 30
+            }
+            {
+              type: 'Readiness'
+              httpGet: {
+                path: '/'
+                port: 8080
+              }
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 6
+            }
+            {
+              type: 'Liveness'
+              httpGet: {
+                path: '/'
+                port: 8080
+              }
+              initialDelaySeconds: 30
+              periodSeconds: 30
+              timeoutSeconds: 5
+              failureThreshold: 3
+            }
           ]
         }
       ]

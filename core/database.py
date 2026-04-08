@@ -1,4 +1,5 @@
 # database_core.py
+import asyncio
 import logging
 import traceback
 import urllib.parse
@@ -35,6 +36,15 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     return max(minimum, value)
 
 
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        value = float(default)
+    return max(minimum, value)
+
+
 def _engine_pool_kwargs() -> dict:
     return {
         "pool_pre_ping": True,
@@ -43,6 +53,22 @@ def _engine_pool_kwargs() -> dict:
         "pool_timeout": _env_int("DB_POOL_TIMEOUT_S", 30, minimum=1),
         "pool_recycle": _env_int("DB_POOL_RECYCLE_S", 1800, minimum=0),
         "pool_use_lifo": True,
+    }
+
+
+def _mysql_sync_connect_args() -> dict:
+    timeout_s = _env_int("DB_CONNECT_TIMEOUT_S", 5, minimum=1)
+    io_timeout_s = _env_int("DB_IO_TIMEOUT_S", 15, minimum=1)
+    return {
+        "connect_timeout": timeout_s,
+        "read_timeout": io_timeout_s,
+        "write_timeout": io_timeout_s,
+    }
+
+
+def _mysql_async_connect_args() -> dict:
+    return {
+        "connect_timeout": _env_int("DB_CONNECT_TIMEOUT_S", 5, minimum=1),
     }
 
 
@@ -154,14 +180,16 @@ class DatabaseManager:
         async_url = f"mysql+aiomysql://{urllib.parse.quote(uid)}:{urllib.parse.quote(pwd)}@{host}:{port}/{database}"
 
         pool_kwargs = _engine_pool_kwargs()
-        self.engine = create_engine(sync_url, **pool_kwargs)
+        sync_connect_args = _mysql_sync_connect_args()
+        async_connect_args = _mysql_async_connect_args()
+        self.engine = create_engine(sync_url, connect_args=sync_connect_args, **pool_kwargs)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
 
-        self.async_engine = create_async_engine(async_url, **pool_kwargs)
+        self.async_engine = create_async_engine(async_url, connect_args=async_connect_args, **pool_kwargs)
         self.AsyncSessionLocal = async_sessionmaker(bind=self.async_engine, class_=AsyncSession, expire_on_commit=False)
 
 
-    async def initialize_tables_and_data(self):
+    async def _initialize_tables_and_data_once(self) -> bool:
         ...
         async with self.async_engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -312,6 +340,36 @@ class DatabaseManager:
                 await db.commit()
 
         return True
+
+    async def initialize_tables_and_data(self) -> bool:
+        max_attempts = _env_int("DB_INIT_MAX_ATTEMPTS", 1, minimum=1)
+        retry_delay_s = _env_float("DB_INIT_RETRY_DELAY_S", 5.0, minimum=0.0)
+        logger.info(
+            "Initializing database schema and seed data (max_attempts=%s, retry_delay_s=%.1f).",
+            max_attempts,
+            retry_delay_s,
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                ok = await self._initialize_tables_and_data_once()
+                logger.info("Database initialization completed successfully.")
+                return ok
+            except Exception:
+                if attempt >= max_attempts:
+                    logger.exception(
+                        "Database initialization failed after %s attempt(s).",
+                        max_attempts,
+                    )
+                    return False
+                logger.warning(
+                    "Database initialization attempt %s/%s failed. Retrying in %.1fs.",
+                    attempt,
+                    max_attempts,
+                    retry_delay_s,
+                    exc_info=True,
+                )
+                await asyncio.sleep(retry_delay_s)
 
 
 # --- Global Instance and Session Makers ---

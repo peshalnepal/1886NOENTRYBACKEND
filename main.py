@@ -117,9 +117,11 @@ async def lifespan(app: FastAPI):
       - shutdown cleanly
     """
 
+    logger.info("Application startup: initializing database.")
     ok = await db_manager.initialize_tables_and_data()
     if not ok:
         raise RuntimeError("FATAL: Could not initialize database tables and defaults.")
+    logger.info("Application startup: database initialization finished.")
 
     app.state.manager = Manager(session_factory=SessionLocal)
     app.state.session_factory = SessionLocal
@@ -151,6 +153,7 @@ async def lifespan(app: FastAPI):
     app.state.retention_service = RetentionService(session_factory=SessionLocal)
     app.state.alert_blob_cleanup_tasks = set()
 
+    logger.info("Application startup: starting background pipelines.")
     pipeline_startup = await app.state.manager.start_background_pipelines()
     app.state.pipeline_startup = pipeline_startup
     if pipeline_startup["error_count"]:

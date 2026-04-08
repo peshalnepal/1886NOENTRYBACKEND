@@ -1226,10 +1226,6 @@ class NotificationService:
                 if raw_id is not None and int(raw_id) > 0
             }
         )
-
-        # Bulk delete by site/camera: resolve the matching DB IDs first.
-        # This happens when the frontend calls clear({ siteUuid }) or
-        # clear({ cameraUuid }) without passing specific notification_ids.
         if not ids and (site_uuid or camera_uuid) and self._session_factory:
             try:
                 su = uuid.UUID(site_uuid) if site_uuid else None

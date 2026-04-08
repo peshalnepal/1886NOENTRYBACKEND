@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.40.2.10011",
-      "templateHash": "3453773471436505303"
+      "templateHash": "15317881033256807925"
     }
   },
   "parameters": {
@@ -14,9 +14,6 @@
       "defaultValue": "[resourceGroup().location]"
     },
     "environmentName": {
-      "type": "string"
-    },
-    "keyVaultName": {
       "type": "string"
     },
     "acrName": {
@@ -51,7 +48,7 @@
     },
     "deployMediaMtx": {
       "type": "bool",
-      "defaultValue": true
+      "defaultValue": false
     },
     "createMysqlDatabase": {
       "type": "bool",
@@ -110,10 +107,6 @@
     "webrtcAdminDeletePath": {
       "type": "string",
       "defaultValue": ""
-    },
-    "enableSmtp": {
-      "type": "bool",
-      "defaultValue": false
     },
     "smtpUsername": {
       "type": "string",
@@ -247,7 +240,7 @@
     {
       "type": "Microsoft.DBforMySQL/flexibleServers/firewallRules",
       "apiVersion": "2024-12-30",
-      "name": "[format('{0}/AllowAzureServices', variables('mysqlServerName'))]",
+      "name": "[format('{0}/{1}', variables('mysqlServerName'), 'AllowAzureServices')]",
       "properties": {
         "startIpAddress": "0.0.0.0",
         "endIpAddress": "0.0.0.0"
@@ -259,7 +252,7 @@
     {
       "type": "Microsoft.DBforMySQL/flexibleServers/configurations",
       "apiVersion": "2024-12-30",
-      "name": "[format('{0}/require_secure_transport', variables('mysqlServerName'))]",
+      "name": "[format('{0}/{1}', variables('mysqlServerName'), 'require_secure_transport')]",
       "properties": {
         "value": "OFF",
         "source": "user-override"
@@ -300,7 +293,7 @@
     {
       "type": "Microsoft.Storage/storageAccounts/blobServices",
       "apiVersion": "2023-05-01",
-      "name": "[format('{0}/default', variables('clipStorageName'))]",
+      "name": "[format('{0}/{1}', variables('clipStorageName'), 'default')]",
       "dependsOn": [
         "[resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName'))]"
       ]
@@ -308,12 +301,12 @@
     {
       "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
       "apiVersion": "2023-05-01",
-      "name": "[format('{0}/default/{1}', variables('clipStorageName'), parameters('videoClipContainerName'))]",
+      "name": "[format('{0}/{1}/{2}', variables('clipStorageName'), 'default', parameters('videoClipContainerName'))]",
       "properties": {
         "publicAccess": "None"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName'))]"
+        "[resourceId('Microsoft.Storage/storageAccounts/blobServices', variables('clipStorageName'), 'default')]"
       ]
     },
     {
@@ -412,6 +405,22 @@
                 {
                   "name": "PORT",
                   "value": "8080"
+                },
+                {
+                  "name": "DB_INIT_MAX_ATTEMPTS",
+                  "value": "40"
+                },
+                {
+                  "name": "DB_INIT_RETRY_DELAY_S",
+                  "value": "5"
+                },
+                {
+                  "name": "DB_CONNECT_TIMEOUT_S",
+                  "value": "5"
+                },
+                {
+                  "name": "DB_IO_TIMEOUT_S",
+                  "value": "15"
                 },
                 {
                   "name": "DATABASE_URL",
@@ -525,6 +534,41 @@
                   "name": "VIDEO_CLIP_BLOB_CONNECTION_STRING",
                   "secretRef": "video-clip-blob-connection-string"
                 }
+              ],
+              "probes": [
+                {
+                  "type": "Startup",
+                  "httpGet": {
+                    "path": "/",
+                    "port": 8080
+                  },
+                  "initialDelaySeconds": 15,
+                  "periodSeconds": 10,
+                  "timeoutSeconds": 5,
+                  "failureThreshold": 30
+                },
+                {
+                  "type": "Readiness",
+                  "httpGet": {
+                    "path": "/",
+                    "port": 8080
+                  },
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 10,
+                  "timeoutSeconds": 5,
+                  "failureThreshold": 6
+                },
+                {
+                  "type": "Liveness",
+                  "httpGet": {
+                    "path": "/",
+                    "port": 8080
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 30,
+                  "timeoutSeconds": 5,
+                  "failureThreshold": 3
+                }
               ]
             }
           ],
@@ -536,11 +580,11 @@
       },
       "dependsOn": [
         "[resourceId('Microsoft.Storage/storageAccounts', variables('clipStorageName'))]",
-        "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', split(format('{0}/default/{1}', variables('clipStorageName'), parameters('videoClipContainerName')), '/')[0], split(format('{0}/default/{1}', variables('clipStorageName'), parameters('videoClipContainerName')), '/')[1], split(format('{0}/default/{1}', variables('clipStorageName'), parameters('videoClipContainerName')), '/')[2])]",
+        "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', variables('clipStorageName'), 'default', parameters('videoClipContainerName'))]",
         "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]",
         "[resourceId('Microsoft.DBforMySQL/flexibleServers/databases', variables('mysqlServerName'), parameters('mysqlDatabaseName'))]",
-        "[resourceId('Microsoft.DBforMySQL/flexibleServers/firewallRules', split(format('{0}/AllowAzureServices', variables('mysqlServerName')), '/')[0], split(format('{0}/AllowAzureServices', variables('mysqlServerName')), '/')[1])]",
-        "[resourceId('Microsoft.DBforMySQL/flexibleServers/configurations', split(format('{0}/require_secure_transport', variables('mysqlServerName')), '/')[0], split(format('{0}/require_secure_transport', variables('mysqlServerName')), '/')[1])]"
+        "[resourceId('Microsoft.DBforMySQL/flexibleServers/firewallRules', variables('mysqlServerName'), 'AllowAzureServices')]",
+        "[resourceId('Microsoft.DBforMySQL/flexibleServers/configurations', variables('mysqlServerName'), 'require_secure_transport')]"
       ]
     },
     {
