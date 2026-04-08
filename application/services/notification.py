@@ -15,13 +15,19 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import os
 import uuid
+from sqlalchemy import update
+from core.database_orm import Notification
 
 from pydantic import BaseModel, Field
 import numpy as np
 
 from domain.events import DetectionsProducedEvent, DetectionItem
 from application.services.tracker import MultiCameraByteTrack, ROIAlertEngine, ROI
-
+from sqlalchemy import update, select
+from application.services.alert_image_storage import (
+    AlertImageStorageService,
+    extract_image_storage_key,
+)
 # NEW: repository
 from application.repositories.notification_repository import (
     NotificationRepository,
@@ -325,6 +331,10 @@ def _event_overlay_payload(
         "frames": [],
     }
 
+@dataclass(frozen=True)
+class BufferedDeletion:
+    user_id: int
+    notification_ids: Tuple[int, ...]
 
 @dataclass(frozen=True)
 class CameraMode:
@@ -819,6 +829,9 @@ class NotificationService:
         self._flush_event = asyncio.Event()
         # Changed from flat list to hierarchical: user_id -> site_uuid -> camera_uuid -> alerts
         self._pending_by_user: Dict[int, Dict[str, Dict[str, List[BufferedNotification]]]] = {}
+        self._pending_delete_ids_by_user: Dict[int, Set[int]] = {}
+        self._delete_event = asyncio.Event()
+        self._delete_task: Optional[asyncio.Task] = None
         self._pending_since: Dict[int, float] = {}
         self._active_flush_users: Set[int] = set()
         self._flush_task: Optional[asyncio.Task] = None
@@ -848,6 +861,32 @@ class NotificationService:
             except Exception:
                 logger.exception("Failed to set session factory on EventClipService")
 
+
+    async def _delete_alert_blob_keys(self, storage_keys: List[str]) -> None:
+        unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
+        if not unique_keys:
+            return
+
+        image_service = self._image_service or AlertImageStorageService()
+        close_when_done = image_service is not self._image_service
+
+        try:
+            for storage_key in unique_keys:
+                try:
+                    await image_service.delete_blob(blob_name=storage_key)
+                except Exception:
+                    logger.warning(
+                        "Failed deleting alert image blob %s after alert hide",
+                        storage_key,
+                        exc_info=True,
+                    )
+        finally:
+            if close_when_done:
+                try:
+                    await image_service.close()
+                except Exception:
+                    logger.exception("Failed closing temporary alert image service")
+                    
     async def record_detection_overlay_frame(
         self,
         *,
@@ -1066,6 +1105,141 @@ class NotificationService:
             except Exception:
                 logger.exception("Notification background task failed")
         asyncio.create_task(_runner())
+
+    def _ensure_delete_task(self) -> None:
+        if self._closing:
+            return
+        task = self._delete_task
+        if task is None or task.done():
+            self._delete_task = asyncio.create_task(
+                self._delete_loop(),
+                name="notification_delete_queue",
+            )
+
+    async def _delete_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(self._delete_event.wait(), timeout=self._buffer_poll_s)
+            except asyncio.TimeoutError:
+                pass
+
+            self._delete_event.clear()
+            force_all = bool(self._closing)
+
+            await self._flush_delete_queue(force_all=force_all)
+
+            if force_all:
+                return
+
+    async def _flush_delete_queue(self, *, force_all: bool = False) -> None:
+        if not self._session_factory:
+            return
+
+        ready: Dict[int, List[int]] = {}
+
+        async with self._buffer_lock:
+            for user_id, ids in list(self._pending_delete_ids_by_user.items()):
+                clean_ids = sorted({int(x) for x in ids if int(x) > 0})
+                if clean_ids:
+                    ready[int(user_id)] = clean_ids
+            self._pending_delete_ids_by_user.clear()
+
+        if not ready:
+            return
+
+        for user_id, ids in ready.items():
+            storage_keys: List[str] = []
+
+            try:
+                async with self._session_factory() as db:
+                    rows = (
+                        await db.execute(
+                            select(Notification.id, Notification.payload)
+                            .where(
+                                Notification.user_id == int(user_id),
+                                Notification.id.in_(ids),
+                                Notification.visible.is_(True),
+                            )
+                        )
+                    ).all()
+
+                    matched_ids: List[int] = []
+                    for notification_id, notification_payload in rows:
+                        try:
+                            parsed_id = int(notification_id)
+                        except Exception:
+                            continue
+
+                        if parsed_id <= 0:
+                            continue
+
+                        matched_ids.append(parsed_id)
+
+                        storage_key = extract_image_storage_key(notification_payload)
+                        if storage_key:
+                            storage_keys.append(storage_key)
+
+                    matched_ids = sorted(set(matched_ids))
+                    if not matched_ids:
+                        await db.rollback()
+                        continue
+
+                    await db.execute(
+                        update(Notification)
+                        .where(
+                            Notification.user_id == int(user_id),
+                            Notification.id.in_(matched_ids),
+                            Notification.visible.is_(True),
+                        )
+                        .values(visible=False)
+                        .execution_options(synchronize_session=False)
+                    )
+                    await db.commit()
+
+                if storage_keys:
+                    self._fire_and_forget(self._delete_alert_blob_keys(storage_keys))
+
+            except Exception:
+                logger.exception(
+                    "Failed to apply queued notification hide user=%s ids=%s",
+                    user_id,
+                    ids,
+                )
+                if not force_all:
+                    async with self._buffer_lock:
+                        bucket = self._pending_delete_ids_by_user.setdefault(int(user_id), set())
+                        bucket.update(ids)
+                    self._delete_event.set()
+                    
+    async def handle_deletion_event(
+        self,
+        *,
+        user_id: int,
+        notification_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        ids = sorted(
+            {
+                int(raw_id)
+                for raw_id in (notification_ids or [])
+                if raw_id is not None and int(raw_id) > 0
+            }
+        )
+
+        if not ids:
+            return {"ok": True, "queued": 0}
+
+        async with self._buffer_lock:
+            bucket = self._pending_delete_ids_by_user.setdefault(int(user_id), set())
+            bucket.update(ids)
+
+        self._ensure_delete_task()
+        self._delete_event.set()
+
+        return {
+            "ok": True,
+            "queued": len(ids),
+            "notification_ids": ids,
+        }
 
     def _ensure_flush_task(self) -> None:
         if self._closing:
@@ -1623,11 +1797,6 @@ class NotificationService:
                 for idx in indices
                 if idx < len(rows) and getattr(rows[idx], "id", None) is not None
             ]
-
-        # Publish SSE events with DB IDs so the frontend can delete individual alerts.
-        # The original hub.publish() fires immediately (before DB write) so the alert
-        # appears in real-time; this follow-up carries the db_id so the frontend can
-        # update the in-memory record's identity key and enable ID-based deletion.
         for idx in range(len(items)):
             if idx >= len(rows):
                 break
@@ -1745,16 +1914,17 @@ class NotificationService:
 
         return ctx
     
-    async def enqueue_notification(
+    async def _prepare_notification_item(
         self,
         msg: NotificationMessage,
         ctx: CameraContext,
         extra_payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        if not self._session_factory:
-            return
-
-        extra_payload = await self._attach_clip_payload(msg=msg, ctx=ctx, extra_payload=extra_payload)
+    ) -> BufferedNotification:
+        extra_payload = await self._attach_clip_payload(
+            msg=msg,
+            ctx=ctx,
+            extra_payload=extra_payload,
+        )
 
         updated_fields: Dict[str, Any] = {}
 
@@ -1767,6 +1937,7 @@ class NotificationService:
         if isinstance(clip_payload, dict):
             next_clip_url = str(clip_payload.get("recording_url") or "").strip()
             next_clip_status = str(clip_payload.get("status") or "").strip()
+
             if next_clip_url and next_clip_url != str(msg.clip_url or "").strip():
                 updated_fields["clip_url"] = next_clip_url
             if next_clip_status and next_clip_status != str(msg.clip_status or "").strip():
@@ -1774,50 +1945,61 @@ class NotificationService:
 
         if updated_fields:
             msg = msg.model_copy(update=updated_fields)
-            await self.hub.publish(msg)
 
-        self._ensure_flush_task()
-        user_id = int(ctx.user_id)
-        site_uuid_str = str(ctx.site_uuid)
-        camera_uuid_str = str(msg.camera_uuid)
-
-        item = BufferedNotification(
+        return BufferedNotification(
             msg=msg,
             ctx=ctx,
             extra_payload=extra_payload,
         )
 
-        async with self._buffer_lock:
-            if user_id not in self._pending_by_user:
-                self._pending_by_user[user_id] = {}
-                self._pending_since[user_id] = time.monotonic()
+    async def _persist_notification_now(
+        self,
+        msg: NotificationMessage,
+        ctx: CameraContext,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self._session_factory:
+            return
 
-            if site_uuid_str not in self._pending_by_user[user_id]:
-                self._pending_by_user[user_id][site_uuid_str] = {}
+        item = await self._prepare_notification_item(
+            msg=msg,
+            ctx=ctx,
+            extra_payload=extra_payload,
+        )
 
-            if camera_uuid_str not in self._pending_by_user[user_id][site_uuid_str]:
-                self._pending_by_user[user_id][site_uuid_str][camera_uuid_str] = []
-
-            self._pending_by_user[user_id][site_uuid_str][camera_uuid_str].append(item)
-
-            total_items = sum(
-                len(alerts)
-                for sites in self._pending_by_user[user_id].values()
-                for alerts in sites.values()
+        ok = await self._flush_user_batch(int(ctx.user_id), [item])
+        if not ok:
+            logger.warning(
+                "Failed to persist notification immediately user=%s camera=%s msg_id=%s",
+                ctx.user_id,
+                msg.camera_uuid,
+                msg.id,
             )
-            should_flush = total_items >= self._buffer_max_items
-
-        if should_flush:
-            self._flush_event.set()
-    
+            
+    async def enqueue_notification(
+        self,
+        msg: NotificationMessage,
+        ctx: CameraContext,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        await self._persist_notification_now(
+            msg=msg,
+            ctx=ctx,
+            extra_payload=extra_payload,
+        )
+        
     async def _persist_and_send(
         self,
         msg: NotificationMessage,
         ctx: CameraContext,
         extra_payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        await self.enqueue_notification(msg, ctx, extra_payload=extra_payload)
-
+        await self._persist_notification_now(
+            msg=msg,
+            ctx=ctx,
+            extra_payload=extra_payload,
+        )
+        
     def _parse_roi_points(self, raw_points: Any) -> List[Tuple[float, float]]:
         if not isinstance(raw_points, (list, tuple)):
             return []
@@ -2040,7 +2222,6 @@ class NotificationService:
                         image_url=image_url,
                     )
 
-                    await self.hub.publish(msg)
                     _any_notification_fired = True
 
                     self._fire_and_forget(

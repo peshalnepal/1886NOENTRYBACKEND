@@ -1,261 +1,82 @@
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import StreamingResponse
+
+from application.services.alert_image_storage import (
+    AlertImageStorageService,
+    extract_image_storage_key,
+)
+from application.services.notification import WebNotificationHub
 from application.services.user_snapshot_cache import (
     CachedUserSnapshot,
     UserSnapshotCache,
     UserSnapshotLookupError,
 )
-from core.database import db_manager
-from application.channels.channel_config import VideoChannelConfig
-from application.services.alert_image_storage import (
-    AlertImageStorageService,
-    extract_image_storage_key,
-)
-from application.services.notification import CameraMode, WebNotificationHub
-from core.database_orm import Camera, ChannelConfiguration, Notification, Site, SiteSettings, User
+from core.database_orm import Notification, User
 from core.security.tokens import decode_access_token
-from dependencies import get_current_user
-from domain.events import DetectionBox, DetectionItem, DetectionsProducedEvent
+from dependencies import (
+    get_alert_blob_cleanup_tasks,
+    get_async_db,
+    get_current_user,
+    get_notification_hub,
+    get_session_factory,
+    get_user_snapshot_cache,
+    get_notification_service
+)
+from application.services.notification import NotificationService
 
 router = APIRouter(prefix="/notifications")
 logger = logging.getLogger(__name__)
 
 
-def _configured_worker_count() -> int:
-    for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS"):
-        raw = str(os.getenv(name) or "").strip()
-        if not raw:
-            continue
-        try:
-            return max(1, int(raw))
-        except ValueError:
-            continue
-
-    match = re.search(r"(?:^|\s)(?:-w|--workers)(?:\s+|=)(\d+)", str(os.getenv("GUNICORN_CMD_ARGS") or ""))
-    if match:
-        try:
-            return max(1, int(match.group(1)))
-        except ValueError:
-            return 1
-
-    return 1
-
-
-_CAMERA_MODE_CACHE_TTL_S = 0.0 if _configured_worker_count() > 1 else 15.0
-_CAMERA_MODE_MISS_TTL_S = 0.0 if _configured_worker_count() > 1 else 5.0
-
-
-def _get_notification_service(request: Request):
-    svc = getattr(request.app.state, "notification_service", None)
-    if svc is not None:
-        return svc
-
-    manager = getattr(request.app.state, "manager", None)
-    if manager is not None:
-        svc = getattr(manager, "_notification_service", None)
-        if svc is not None:
-            return svc
-
-    return None
-
-
-def _get_notification_hub(request: Request):
-    hub = getattr(request.app.state, "notification_hub", None)
-    if hub is not None:
-        return hub
-
-    svc = _get_notification_service(request)
-    if svc is not None:
-        hub = getattr(svc, "hub", None)
-        if hub is not None:
-            return hub
-
-    return None
-
-
-@dataclass(frozen=True)
-class _CachedCameraModeState:
-    enabled: Any
-    detection_enabled: Any
-    notification_enabled: Any
-    use_site_schedule: Any
-    camera_config: Any
-    camera_timezone: Optional[str]
-    site_config: Any
-    site_timezone: Optional[str]
-
-
-_camera_mode_cache: Dict[str, Tuple[float, Optional[_CachedCameraModeState]]] = {}
-_camera_mode_cache_lock = asyncio.Lock()
-_camera_mode_generation: Dict[str, int] = {}
-_camera_mode_inflight: Dict[str, Tuple[int, asyncio.Future]] = {}
-
-
-def _camera_mode_from_state(
-    state: Optional[_CachedCameraModeState],
-    *,
-    now_utc: Optional[datetime] = None,
-) -> CameraMode:
-    if state is None:
-        return CameraMode(detection_enabled=False, notification_enabled=False)
-
-    return _camera_mode_with_schedule(
-        enabled=state.enabled,
-        detection_enabled=state.detection_enabled,
-        notification_enabled=state.notification_enabled,
-        use_site_schedule=state.use_site_schedule,
-        camera_config=state.camera_config,
-        camera_timezone=state.camera_timezone,
-        site_config=state.site_config,
-        site_timezone=state.site_timezone,
-        now_utc=now_utc,
-    )
-
-
-async def _get_camera_mode_cached(
-    request: Request,
-    *,
-    cam_uuid_obj: uuid.UUID,
-) -> CameraMode:
-    cache_key = str(cam_uuid_obj)
-    now = time.monotonic()
-    now_utc = datetime.now(timezone.utc)
-    leader = False
-    pending: Optional[asyncio.Future] = None
-    generation = 0
-
-    async with _camera_mode_cache_lock:
-        generation = _camera_mode_generation.get(cache_key, 0)
-        hit = _camera_mode_cache.get(cache_key)
-        if hit and hit[0] > now:
-            return _camera_mode_from_state(hit[1], now_utc=now_utc)
-
-        inflight = _camera_mode_inflight.get(cache_key)
-        if inflight is not None and inflight[0] == generation:
-            pending = inflight[1]
-        else:
-            pending = asyncio.get_running_loop().create_future()
-            _camera_mode_inflight[cache_key] = (generation, pending)
-            leader = True
-
-    if not leader and pending is not None:
-        state = await pending
-        return _camera_mode_from_state(state, now_utc=now_utc)
-
-    state: Optional[_CachedCameraModeState] = None
-    cache_ttl_s: Optional[float] = None
-    cancelled = False
-    sf = _session_factory_from_app(request)
-    try:
-        if sf is not None:
-            async with sf() as session:
-                res = await session.execute(
-                    select(
-                        Camera.is_enabled,
-                        Camera.is_detection_enabled,
-                        Camera.is_notification_enabled,
-                        Camera.use_site_schedule,
-                        ChannelConfiguration.configuration,
-                        ChannelConfiguration.timezone,
-                        SiteSettings.config,
-                        Site.timezone,
-                    )
-                    .select_from(Camera)
-                    .outerjoin(ChannelConfiguration, ChannelConfiguration.camera_uuid == Camera.camera_uuid)
-                    .outerjoin(Site, Site.site_uuid == Camera.site_uuid)
-                    .outerjoin(SiteSettings, SiteSettings.site_uuid == Camera.site_uuid)
-                    .where(Camera.camera_uuid == cam_uuid_obj)
-                )
-                row = res.first()
-                if row:
-                    state = _CachedCameraModeState(*row)
-            cache_ttl_s = _CAMERA_MODE_CACHE_TTL_S if state is not None else _CAMERA_MODE_MISS_TTL_S
-    except asyncio.CancelledError:
-        cancelled = True
-        raise
-    except Exception:
-        cache_ttl_s = None
-    finally:
-        async with _camera_mode_cache_lock:
-            current_generation = _camera_mode_generation.get(cache_key, 0)
-            if not cancelled and current_generation == generation:
-                if cache_ttl_s is not None and cache_ttl_s > 0:
-                    _camera_mode_cache[cache_key] = (
-                        time.monotonic() + cache_ttl_s,
-                        state,
-                    )
-                else:
-                    _camera_mode_cache.pop(cache_key, None)
-
-            current_inflight = _camera_mode_inflight.get(cache_key)
-            if (
-                current_inflight is not None
-                and current_inflight[1] is pending
-            ):
-                _camera_mode_inflight.pop(cache_key, None)
-
-            future = pending
-            if future is not None and not future.done():
-                if cancelled:
-                    future.cancel()
-                else:
-                    future.set_result(state)
-
-    return _camera_mode_from_state(state, now_utc=now_utc)
-
-
-async def invalidate_camera_mode_cache(camera_uuid: Optional[uuid.UUID] = None) -> None:
-    async with _camera_mode_cache_lock:
-        if camera_uuid is not None:
-            key = str(camera_uuid)
-            _camera_mode_generation[key] = _camera_mode_generation.get(key, 0) + 1
-            _camera_mode_cache.pop(key, None)
-            return
-        keys = set(_camera_mode_generation.keys()) | set(_camera_mode_cache.keys()) | set(_camera_mode_inflight.keys())
-        for key in keys:
-            _camera_mode_generation[key] = _camera_mode_generation.get(key, 0) + 1
-        _camera_mode_cache.clear()
-        
-# ---------------------------
-# SSE helpers
-# ---------------------------
+# -------------------------------------------------------------------
+# stream helpers
+# -------------------------------------------------------------------
 def _sse(data: str, event: Optional[str] = None) -> str:
-    # SSE format: optional event + data
     if event:
         return f"event: {event}\ndata: {data}\n\n"
     return f"data: {data}\n\n"
 
-async def _resolve_stream_user(
-    *,
-    request: Request,
-    access_token: Optional[str],
-) -> CachedUserSnapshot:
-    auth_header = request.headers.get("authorization", "")
+
+def _extract_bearer_token(auth_header: str, access_token: Optional[str]) -> str:
     token = ""
+
     if auth_header.lower().startswith("bearer "):
         token = auth_header.split(" ", 1)[1].strip()
+
     if not token:
         token = str(access_token or "").strip()
+
     if not token:
         raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    return token
+
+
+async def _resolve_stream_user(
+    *,
+    auth_header: str,
+    access_token: Optional[str],
+    cache: UserSnapshotCache,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> CachedUserSnapshot:
+    token = _extract_bearer_token(auth_header, access_token)
 
     try:
         payload = decode_access_token(token)
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc))
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
 
     raw_user_id = payload.get("user_id") or payload.get("sub")
     try:
@@ -263,239 +84,20 @@ async def _resolve_stream_user(
     except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
-    sf = _session_factory_from_app(request)
-    if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    cache = _get_user_snapshot_cache(request)
     try:
-        user = await cache.get(session_factory=sf, user_id=user_id)
+        user = await cache.get(session_factory=session_factory, user_id=user_id)
     except UserSnapshotLookupError:
         raise HTTPException(status_code=503, detail="Database not available")
+
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
+
     return user
 
-@router.get("/stream")
-async def notifications_stream(
-    request: Request,
-    access_token: Optional[str] = None,
-):
-    """
-    User-scoped notifications SSE stream.
-    Authentication can be provided via Authorization header or access_token query param.
-    """
-    hub: WebNotificationHub = _get_notification_hub(request)
-    if hub is None:
-        raise HTTPException(status_code=503, detail="Notification hub not available")
-    sf = _session_factory_from_app(request)
-    if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
 
-    user = await _resolve_stream_user(request=request, access_token=access_token)
-    user_id = int(user.id)
-    q = await hub.subscribe(user_id=user_id)
-
-    async def gen():
-        last_ping = time.monotonic()
-        try:
-            while True:
-                if await request.is_disconnected():
-                    break
-                now = time.monotonic()
-                if (now - last_ping) > 20.0:
-                    last_ping = now
-                    yield _sse(json.dumps({"ts": int(time.time() * 1000)}), event="ping")
-
-                try:
-                    msg = await asyncio.wait_for(q.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-
-                yield _sse(msg.model_dump_json(), event="notification")
-        finally:
-            await hub.unsubscribe(user_id=user_id, q=q)
-
-    headers = {
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        # If you ever run behind nginx:
-        "X-Accel-Buffering": "no",
-    }
-    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
-
-
-# ---------------------------
-# Alert ingest (/alert)
-# ---------------------------
-class AlertRequest(BaseModel):
-    camera_uuid: str
-    frame_ts_ms: int
-    frame_seq: int
-    frame_w: Optional[int] = None
-    frame_h: Optional[int] = None
-    image_url: Optional[str] = None
-    detections: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-def _parse_box(raw_box: Any) -> Optional[DetectionBox]:
-    if isinstance(raw_box, dict):
-        keys = ("x1", "y1", "x2", "y2")
-        if not all(k in raw_box for k in keys):
-            return None
-        try:
-            return DetectionBox(
-                x1=int(raw_box["x1"]),
-                y1=int(raw_box["y1"]),
-                x2=int(raw_box["x2"]),
-                y2=int(raw_box["y2"]),
-            )
-        except Exception:
-            return None
-
-    if isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
-        try:
-            return DetectionBox(
-                x1=int(raw_box[0]),
-                y1=int(raw_box[1]),
-                x2=int(raw_box[2]),
-                y2=int(raw_box[3]),
-            )
-        except Exception:
-            return None
-
-    return None
-
-
-
-def _session_factory_from_app(request: Request):
-    sf = getattr(request.app.state, "session_factory", None)
-    if sf is not None:
-        return sf
-
-    svc = _get_notification_service(request)
-    if svc is not None:
-        sf = getattr(svc, "_session_factory", None)
-        if sf is not None:
-            return sf
-
-    return getattr(db_manager, "AsyncSessionLocal", None)
-
-def _get_user_snapshot_cache(request: Request) -> UserSnapshotCache:
-    cache = getattr(request.app.state, "user_snapshot_cache", None)
-    if cache is None:
-        cache = UserSnapshotCache()
-        request.app.state.user_snapshot_cache = cache
-    return cache
-
-def _config_dict(raw: Any) -> Dict[str, Any]:
-    return dict(raw) if isinstance(raw, dict) else {}
-
-
-def _camera_mode_with_schedule(
-    *,
-    enabled: Any,
-    detection_enabled: Any,
-    notification_enabled: Any,
-    use_site_schedule: Any,
-    camera_config: Any,
-    camera_timezone: Optional[str],
-    site_config: Any,
-    site_timezone: Optional[str],
-    now_utc: Optional[datetime] = None,
-) -> CameraMode:
-    camera_cfg = _config_dict(camera_config)
-    site_cfg = _config_dict(site_config)
-    inherited = bool(use_site_schedule)
-
-    if inherited:
-        schedule = VideoChannelConfig.normalize_schedule(site_cfg.get("schedule"))
-        timezone_name = str(
-            site_cfg.get("timezone")
-            or site_timezone
-            or camera_cfg.get("timezone")
-            or camera_timezone
-            or "UTC"
-        )
-    else:
-        schedule = VideoChannelConfig.normalize_schedule(camera_cfg.get("schedule"))
-        timezone_name = str(
-            camera_cfg.get("timezone")
-            or camera_timezone
-            or site_cfg.get("timezone")
-            or site_timezone
-            or "UTC"
-        )
-
-    if not schedule:
-        schedule = VideoChannelConfig.default_schedule()
-
-    schedule_active = VideoChannelConfig.schedule_is_active(
-        schedule,
-        timezone_name,
-        now_utc=now_utc or datetime.now(timezone.utc),
-    )
-
-    # `enabled` controls playback provisioning, not alert ingest.
-    return CameraMode(
-        playback_enabled=bool(enabled),
-        detection_enabled=bool(detection_enabled and schedule_active),
-        notification_enabled=bool(notification_enabled and schedule_active),
-    )
-
-
-@router.post("/alert")
-async def receive_alert(payload: AlertRequest, request: Request):
-    """
-    Ingest detections from edge devices (Jetson).
-    """
-    svc = _get_notification_service(request)
-    if svc is None:
-        raise HTTPException(status_code=503, detail="Notification service not available")
-    # validate camera_uuid as UUID string
-    try:
-        cam_uuid_obj = uuid.UUID(str(payload.camera_uuid))
-        camera_uuid = str(cam_uuid_obj)
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid camera_uuid")
-
-    # Convert payload detections -> domain DetectionItem list
-    det_items: List[DetectionItem] = []
-    for d in payload.detections or []:
-        box = _parse_box(d.get("box"))
-        if box is None:
-            continue
-        det_items.append(
-            DetectionItem(
-                cls_name=str(d.get("cls_name", "unknown")),
-                conf=float(d.get("conf", 0.0) or 0.0),
-                box=box,
-            )
-        )
-
-    ev = DetectionsProducedEvent(
-        camera_uuid=camera_uuid,
-        model_id="remote-jetson",
-        frame_ts_ms=int(payload.frame_ts_ms),
-        frame_seq=int(payload.frame_seq),
-        detections=det_items,
-    )
-
-    mode = await _get_camera_mode_cached(request, cam_uuid_obj=cam_uuid_obj)
-
-    await svc.handle_detection_event(
-        ev,
-        camera_mode=mode,
-        frame_w=payload.frame_w,
-        frame_h=payload.frame_h,
-        extra_payload={
-            "image_url": str(payload.image_url).strip(),
-        } if str(payload.image_url or "").strip() else None,
-    )
-
-    return {"ok": True}
-
-
+# -------------------------------------------------------------------
+# response / request models
+# -------------------------------------------------------------------
 class NotificationOut(BaseModel):
     id: int
     user_id: int
@@ -519,23 +121,88 @@ class NotificationOut(BaseModel):
     status: str
 
 
+class ChartPoint(BaseModel):
+    bucket_start: datetime
+    count: int
+
+
+class DetectionsOverTimeOut(BaseModel):
+    user_id: int
+    site_uuid: Optional[str] = None
+    hours: int
+    object_class: Optional[str] = None
+    roi_only: bool
+    bucket_minutes: int
+    from_time: datetime = Field(alias="from")
+    to: datetime
+    total: int
+    points: List[ChartPoint]
+
+    class Config:
+        populate_by_name = True
+
+
+class ClearNotificationsRequest(BaseModel):
+    site_uuid: Optional[str] = None
+    camera_uuid: Optional[str] = None
+
+
+class DeleteNotificationsRequest(BaseModel):
+    site_uuid: Optional[str] = None
+    camera_uuid: Optional[str] = None
+    notification_ids: Optional[List[int]] = None
+
+
+# -------------------------------------------------------------------
+# shared helpers
+# -------------------------------------------------------------------
+def _parse_optional_uuid(value: Optional[str], field_name: str) -> Optional[uuid.UUID]:
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Invalid {field_name}")
+
+
+def _validate_pagination(limit: int, offset: int) -> Tuple[int, int]:
+    if limit <= 0:
+        raise HTTPException(status_code=422, detail="limit must be positive")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be non-negative")
+    return min(int(limit), 500), int(offset)
+
+
+def _payload_msg(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    msg = payload.get("msg")
+    if isinstance(msg, dict):
+        return msg
+    return payload
+
+
 def _to_out(n: Notification) -> NotificationOut:
     msg = _payload_msg(n.payload)
     extra = n.payload.get("extra") if isinstance(n.payload, dict) else None
+
     image_url = ""
     image_storage_key = ""
     clip_url = ""
     clip_status = ""
-    
+
     if isinstance(extra, dict):
         image_url = str(extra.get("image_url") or "").strip()
         image_storage_key = str(extra.get("image_storage_key") or "").strip()
+
     if not image_url:
         image_url = str(msg.get("image_url") or "").strip()
     if not image_storage_key:
         image_storage_key = str(msg.get("image_storage_key") or "").strip()
+
     clip_url = str(msg.get("clip_url") or "").strip()
     clip_status = str(msg.get("clip_status") or "").strip()
+
     if isinstance(extra, dict) and not clip_url:
         clip_payload = extra.get("clip")
         if isinstance(clip_payload, dict):
@@ -564,293 +231,6 @@ def _to_out(n: Notification) -> NotificationOut:
         sent_at=n.sent_at,
         status=str(n.status),
     )
-
-
-# Response models for chart data
-class ChartPoint(BaseModel):
-    bucket_start: datetime
-    count: int
-
-
-class DetectionsOverTimeOut(BaseModel):
-    user_id: int
-    site_uuid: Optional[str] = None
-    hours: int
-    object_class: Optional[str] = None
-    roi_only: bool
-    bucket_minutes: int
-    from_time: datetime = Field(alias="from")
-    to: datetime
-    total: int
-    points: List[ChartPoint]
-    
-    class Config:
-        populate_by_name = True
-
-
-@router.get("", response_model=List[NotificationOut])
-async def list_notifications(
-    request: Request,
-    site_uuid: Optional[str] = None,
-    camera_uuid: Optional[str] = None,
-    unread_only: bool = False,
-    limit: int = 100,
-    offset: int = 0,
-    user: User = Depends(get_current_user),
-):
-    sf = _session_factory_from_app(request)
-    if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
-    if limit <= 0:
-        raise HTTPException(status_code=422, detail="limit must be positive")
-    if offset < 0:
-        raise HTTPException(status_code=422, detail="offset must be non-negative")
-
-    su = None
-    cu = None
-    try:
-        su = uuid.UUID(site_uuid) if site_uuid else None
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid site_uuid")
-
-    try:
-        cu = uuid.UUID(camera_uuid) if camera_uuid else None
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid camera_uuid")
-
-    async with sf() as db:
-        stmt = select(Notification).where(
-            Notification.user_id == int(user.id),
-            Notification.visible.is_(True),
-        )
-        if su:
-            stmt = stmt.where(Notification.site_uuid == su)
-        if cu:
-            stmt = stmt.where(Notification.camera_uuid == cu)
-        if unread_only:
-            stmt = stmt.where(Notification.read_at.is_(None))
-
-        stmt = (
-            stmt.order_by(desc(Notification.detected_at))
-            .offset(int(offset))
-            .limit(min(int(limit), 500))
-        )
-        rows = (await db.execute(stmt)).scalars().all()
-
-    return [_to_out(n) for n in rows]
-
-
-class ClearNotificationsRequest(BaseModel):
-    site_uuid: Optional[str] = None
-    camera_uuid: Optional[str] = None
-
-
-@router.post("/clear")
-async def clear_notifications(
-    payload: ClearNotificationsRequest,
-    request: Request,
-    user: User = Depends(get_current_user),
-):
-    """
-    Recommended behavior: do NOT delete history.
-    Mark as read (read_at + status='read').
-    """
-    sf = _session_factory_from_app(request)
-    if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    su = None
-    cu = None
-    try:
-        su = uuid.UUID(payload.site_uuid) if payload.site_uuid else None
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid site_uuid")
-    try:
-        cu = uuid.UUID(payload.camera_uuid) if payload.camera_uuid else None
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid camera_uuid")
-
-    now = datetime.now(timezone.utc)
-
-    async with sf() as db:
-        conds = [Notification.user_id == int(user.id)]
-        if su:
-            conds.append(Notification.site_uuid == su)
-        if cu:
-            conds.append(Notification.camera_uuid == cu)
-
-        stmt = (
-            update(Notification)
-            .where(and_(*conds))
-            .values(read_at=now, status="read")
-        )
-        res = await db.execute(stmt)
-        await db.commit()
-
-    return {"ok": True, "updated": int(getattr(res, "rowcount", 0) or 0)}
-
-
-class DeleteNotificationsRequest(BaseModel):
-    site_uuid: Optional[str] = None
-    camera_uuid: Optional[str] = None
-    notification_ids: Optional[List[int]] = None
-
-
-async def _delete_alert_blob_keys(storage_keys: List[str]) -> None:
-    unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
-    if not unique_keys:
-        return
-
-    image_service = AlertImageStorageService()
-    try:
-        for storage_key in unique_keys:
-            try:
-                await image_service.delete_blob(blob_name=storage_key)
-            except Exception:
-                logger.warning(
-                    "Failed deleting alert image blob %s after alert removal",
-                    storage_key,
-                    exc_info=True,
-                )
-    finally:
-        await image_service.close()
-
-
-def _schedule_alert_blob_cleanup(request: Request, storage_keys: List[str]) -> None:
-    unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
-    if not unique_keys:
-        return
-
-    tasks = getattr(request.app.state, "alert_blob_cleanup_tasks", None)
-    if tasks is None:
-        tasks = set()
-        request.app.state.alert_blob_cleanup_tasks = tasks
-
-    task = asyncio.create_task(
-        _delete_alert_blob_keys(unique_keys),
-        name="alert_blob_cleanup",
-    )
-    tasks.add(task)
-
-    def _on_done(done_task: asyncio.Task) -> None:
-        tasks.discard(done_task)
-        try:
-            done_task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Alert blob cleanup task failed")
-
-    task.add_done_callback(_on_done)
-
-
-async def _delete_notifications_impl(
-    payload: DeleteNotificationsRequest,
-    request: Request,
-    user: User = Depends(get_current_user),
-):
-    """
-    Hide matching alerts quickly in the database.
-    """
-    sf = _session_factory_from_app(request)
-    if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    su = None
-    cu = None
-    try:
-        su = uuid.UUID(payload.site_uuid) if payload.site_uuid else None
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid site_uuid")
-    try:
-        cu = uuid.UUID(payload.camera_uuid) if payload.camera_uuid else None
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid camera_uuid")
-
-    async with sf() as db:
-        conds = [
-            Notification.user_id == int(user.id),
-            Notification.visible.is_(True),
-        ]
-        if su:
-            conds.append(Notification.site_uuid == su)
-        if cu:
-            conds.append(Notification.camera_uuid == cu)
-        if payload.notification_ids:
-            ids: List[int] = []
-            for raw_id in payload.notification_ids:
-                try:
-                    parsed = int(raw_id)
-                except Exception:
-                    continue
-                if parsed > 0:
-                    ids.append(parsed)
-            ids = sorted(set(ids))
-            if not ids:
-                return {"ok": True, "deleted": 0}
-            conds.append(Notification.id.in_(ids))
-
-        rows = (
-            await db.execute(
-                select(Notification.id, Notification.payload)
-                .where(and_(*conds))
-            )
-        ).all()
-
-        matched_ids: List[int] = []
-        storage_keys: List[str] = []
-        for notification_id, notification_payload in rows:
-            try:
-                parsed_id = int(notification_id)
-            except Exception:
-                continue
-            if parsed_id <= 0:
-                continue
-            matched_ids.append(parsed_id)
-            storage_key = extract_image_storage_key(notification_payload)
-            if storage_key:
-                storage_keys.append(storage_key)
-
-        matched_ids = sorted(set(matched_ids))
-        if not matched_ids:
-            return {"ok": True, "deleted": 0}
-
-        await db.execute(
-            update(Notification)
-            .where(Notification.id.in_(matched_ids))
-            .values(visible=False)
-            .execution_options(synchronize_session=False)
-        )
-        await db.commit()
-
-    _schedule_alert_blob_cleanup(request, storage_keys)
-    deleted = len(matched_ids)
-
-    return {"ok": True, "deleted": deleted}
-
-
-@router.post("/delete")
-async def delete_notifications_post(
-    payload: DeleteNotificationsRequest,
-    request: Request,
-    user: User = Depends(get_current_user),
-):
-    """
-    Preferred alert delete route for environments that do not handle DELETE bodies well.
-    """
-    return await _delete_notifications_impl(payload=payload, request=request, user=user)
-
-
-@router.delete("")
-async def delete_notifications(
-    payload: DeleteNotificationsRequest,
-    request: Request,
-    user: User = Depends(get_current_user),
-):
-    """
-    Backward-compatible alias for alert deletion.
-    """
-    return await _delete_notifications_impl(payload=payload, request=request, user=user)
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -912,27 +292,24 @@ def _normalize_object_class(raw: Optional[str]) -> Optional[str]:
     )
 
 
-def _payload_msg(payload: Any) -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        return {}
-    msg = payload.get("msg")
-    if isinstance(msg, dict):
-        return msg
-    return payload
-
-
 def _extract_object_classes(event_type: Any, title: Any, message: Any, payload: Any) -> Set[str]:
     msg = _payload_msg(payload)
     classes: Set[str] = set()
 
-    for source in (msg.get("cls_names"), payload.get("cls_names") if isinstance(payload, dict) else None):
+    for source in (
+        msg.get("cls_names"),
+        payload.get("cls_names") if isinstance(payload, dict) else None,
+    ):
         if isinstance(source, (list, tuple)):
             for item in source:
                 normalized = _canonical_object_class(item)
                 if normalized:
                     classes.add(normalized)
 
-    for source in (msg.get("cls_name"), payload.get("cls_name") if isinstance(payload, dict) else None):
+    for source in (
+        msg.get("cls_name"),
+        payload.get("cls_name") if isinstance(payload, dict) else None,
+    ):
         normalized = _canonical_object_class(source)
         if normalized:
             classes.add(normalized)
@@ -972,34 +349,251 @@ def _is_roi_notification(event_type: Any, title: Any, message: Any, payload: Any
     return False
 
 
+# -------------------------------------------------------------------
+# blob cleanup helpers
+# -------------------------------------------------------------------
+async def _delete_alert_blob_keys(storage_keys: List[str]) -> None:
+    unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
+    if not unique_keys:
+        return
+
+    image_service = AlertImageStorageService()
+    try:
+        for storage_key in unique_keys:
+            try:
+                await image_service.delete_blob(blob_name=storage_key)
+            except Exception:
+                logger.warning(
+                    "Failed deleting alert image blob %s after alert removal",
+                    storage_key,
+                    exc_info=True,
+                )
+    finally:
+        await image_service.close()
+
+
+def _schedule_alert_blob_cleanup(tasks: set, storage_keys: List[str]) -> None:
+    unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
+    if not unique_keys:
+        return
+
+    task = asyncio.create_task(
+        _delete_alert_blob_keys(unique_keys),
+        name="alert_blob_cleanup",
+    )
+    tasks.add(task)
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        tasks.discard(done_task)
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Alert blob cleanup task failed")
+
+    task.add_done_callback(_on_done)
+
+
+# -------------------------------------------------------------------
+# delete implementation
+# -------------------------------------------------------------------
+async def _delete_notifications_impl(
+    *,
+    payload: DeleteNotificationsRequest,
+    db: AsyncSession,
+    current_user: User,
+    cleanup_tasks: set,
+):
+    su = _parse_optional_uuid(payload.site_uuid, "site_uuid")
+    cu = _parse_optional_uuid(payload.camera_uuid, "camera_uuid")
+
+    conds = [
+        Notification.user_id == int(current_user.id),
+        Notification.visible.is_(True),
+    ]
+
+    if su:
+        conds.append(Notification.site_uuid == su)
+    if cu:
+        conds.append(Notification.camera_uuid == cu)
+
+    if payload.notification_ids:
+        ids: List[int] = []
+        for raw_id in payload.notification_ids:
+            try:
+                parsed = int(raw_id)
+            except Exception:
+                continue
+            if parsed > 0:
+                ids.append(parsed)
+
+        ids = sorted(set(ids))
+        if not ids:
+            return {"ok": True, "deleted": 0}
+
+        conds.append(Notification.id.in_(ids))
+
+    rows = (
+        await db.execute(
+            select(Notification.id, Notification.payload).where(and_(*conds))
+        )
+    ).all()
+
+    matched_ids: List[int] = []
+    storage_keys: List[str] = []
+
+    for notification_id, notification_payload in rows:
+        try:
+            parsed_id = int(notification_id)
+        except Exception:
+            continue
+
+        if parsed_id <= 0:
+            continue
+
+        matched_ids.append(parsed_id)
+
+        storage_key = extract_image_storage_key(notification_payload)
+        if storage_key:
+            storage_keys.append(storage_key)
+
+    matched_ids = sorted(set(matched_ids))
+    if not matched_ids:
+        return {"ok": True, "deleted": 0}
+
+    await db.execute(
+        update(Notification)
+        .where(Notification.id.in_(matched_ids))
+        .values(visible=False)
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+
+    _schedule_alert_blob_cleanup(cleanup_tasks, storage_keys)
+    return {"ok": True, "deleted": len(matched_ids)}
+
+
+# -------------------------------------------------------------------
+# routes
+# -------------------------------------------------------------------
+@router.get("/stream")
+async def notifications_stream(
+    request: Request,
+    access_token: Optional[str] = None,
+    hub: WebNotificationHub = Depends(get_notification_hub),
+    user_snapshot_cache: UserSnapshotCache = Depends(get_user_snapshot_cache),
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+):
+    """
+    User-scoped notifications SSE stream.
+    Authentication can be provided via Authorization header or access_token query param.
+    """
+    user = await _resolve_stream_user(
+        auth_header=request.headers.get("authorization", ""),
+        access_token=access_token,
+        cache=user_snapshot_cache,
+        session_factory=session_factory,
+    )
+    user_id = int(user.id)
+    q = await hub.subscribe(user_id=user_id)
+
+    async def gen():
+        last_ping = time.monotonic()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                now = time.monotonic()
+                if (now - last_ping) > 20.0:
+                    last_ping = now
+                    yield _sse(json.dumps({"ts": int(time.time() * 1000)}), event="ping")
+
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                yield _sse(msg.model_dump_json(), event="notification")
+        finally:
+            await hub.unsubscribe(user_id=user_id, q=q)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+
+@router.get("", response_model=List[NotificationOut])
+async def list_notifications(
+    site_uuid: Optional[str] = None,
+    camera_uuid: Optional[str] = None,
+    unread_only: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+):
+    limit, offset = _validate_pagination(limit, offset)
+    su = _parse_optional_uuid(site_uuid, "site_uuid")
+    cu = _parse_optional_uuid(camera_uuid, "camera_uuid")
+
+    stmt = select(Notification).where(
+        Notification.user_id == int(current_user.id),
+        Notification.visible.is_(True),
+    )
+
+    if su:
+        stmt = stmt.where(Notification.site_uuid == su)
+    if cu:
+        stmt = stmt.where(Notification.camera_uuid == cu)
+    if unread_only:
+        stmt = stmt.where(Notification.read_at.is_(None))
+
+    stmt = stmt.order_by(desc(Notification.detected_at)).offset(offset).limit(limit)
+
+    rows = (await db.execute(stmt)).scalars().all()
+    return [_to_out(n) for n in rows]
+
+
+@router.post("/delete")
+async def delete_notifications_post(
+    payload: DeleteNotificationsRequest,
+    current_user: User = Depends(get_current_user),
+    notification_service: NotificationService = Depends(get_notification_service),
+):
+    return await notification_service.handle_deletion_event(
+        user_id=int(current_user.id),
+        notification_ids=payload.notification_ids or [],
+    )
+
+@router.delete("")
+async def delete_notifications(
+    payload: DeleteNotificationsRequest,
+    current_user: User = Depends(get_current_user),
+    notification_service: NotificationService = Depends(get_notification_service),
+):
+    return await notification_service.handle_deletion_event(
+        user_id=int(current_user.id),
+        notification_ids=payload.notification_ids or [],
+    )
+    
 @router.get("/detections-over-time", response_model=DetectionsOverTimeOut)
 async def detections_over_time(
-    request: Request,
     site_uuid: Optional[str] = None,
     hours: int = 24,
     object_class: Optional[str] = None,
     roi_only: bool = False,
-    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """
-    Returns simple time buckets for dashboard charts.
-    """
-    sf = _session_factory_from_app(request)
-    if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    su = None
-    try:
-        su = uuid.UUID(site_uuid) if site_uuid else None
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid site_uuid")
-
+    su = _parse_optional_uuid(site_uuid, "site_uuid")
     class_filter = _normalize_object_class(object_class)
 
     hours_i = max(1, min(int(hours), 24 * 7))
-    # Keep output compact and readable:
-    # - 1 day or less => hourly buckets
-    # - over 1 day     => daily buckets
     bucket_minutes = 60 if hours_i <= 24 else 24 * 60
 
     now = datetime.now(timezone.utc)
@@ -1009,22 +603,22 @@ async def detections_over_time(
     aligned_start_ms = start_ms - (start_ms % bucket_ms)
     now_ms = int(now.timestamp() * 1000)
 
-    async with sf() as db:
-        stmt = select(
-            Notification.detected_at,
-            Notification.event_type,
-            Notification.title,
-            Notification.message,
-            Notification.payload,
-        ).where(
-            Notification.user_id == int(user.id),
-            Notification.visible.is_(True),
-            Notification.detected_at >= start,
-        )
-        if su:
-            stmt = stmt.where(Notification.site_uuid == su)
+    stmt = select(
+        Notification.detected_at,
+        Notification.event_type,
+        Notification.title,
+        Notification.message,
+        Notification.payload,
+    ).where(
+        Notification.user_id == int(current_user.id),
+        Notification.visible.is_(True),
+        Notification.detected_at >= start,
+    )
 
-        rows = (await db.execute(stmt)).all()
+    if su:
+        stmt = stmt.where(Notification.site_uuid == su)
+
+    rows = (await db.execute(stmt)).all()
 
     counts: Dict[int, int] = {}
     for raw_dt, event_type, title, message, payload in rows:
@@ -1041,7 +635,7 @@ async def detections_over_time(
         bucket = ts_ms - (ts_ms % bucket_ms)
         counts[bucket] = counts.get(bucket, 0) + 1
 
-    points = []
+    points: List[ChartPoint] = []
     cursor = aligned_start_ms
     while cursor <= now_ms:
         points.append(
@@ -1053,8 +647,9 @@ async def detections_over_time(
         cursor += bucket_ms
 
     total = sum(p.count for p in points)
+
     return DetectionsOverTimeOut(
-        user_id=int(user.id),
+        user_id=int(current_user.id),
         site_uuid=str(su) if su else None,
         hours=hours_i,
         object_class=class_filter,
@@ -1069,29 +664,25 @@ async def detections_over_time(
 
 @router.get("/unread-count")
 async def unread_count(
-    request: Request,
     site_uuid: Optional[str] = None,
-    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
 ):
-    sf = _session_factory_from_app(request)
-    if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
+    su = _parse_optional_uuid(site_uuid, "site_uuid")
 
-    su = None
-    try:
-        su = uuid.UUID(site_uuid) if site_uuid else None
-    except Exception:
-        raise HTTPException(status_code=422, detail="Invalid site_uuid")
+    stmt = select(func.count(Notification.id)).where(
+        Notification.user_id == int(current_user.id),
+        Notification.read_at.is_(None),
+        Notification.visible.is_(True),
+    )
 
-    async with sf() as db:
-        stmt = select(func.count(Notification.id)).where(
-            Notification.user_id == int(user.id),
-            Notification.read_at.is_(None),
-            Notification.visible.is_(True),
-        )
-        if su:
-            stmt = stmt.where(Notification.site_uuid == su)
+    if su:
+        stmt = stmt.where(Notification.site_uuid == su)
 
-        n = (await db.execute(stmt)).scalar_one()
+    count = (await db.execute(stmt)).scalar_one()
 
-    return {"user_id": int(user.id), "site_uuid": str(su) if su else None, "unread": int(n)}
+    return {
+        "user_id": int(current_user.id),
+        "site_uuid": str(su) if su else None,
+        "unread": int(count),
+    }
