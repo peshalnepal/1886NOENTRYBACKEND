@@ -186,7 +186,7 @@ class Manager:
 
     def __init__(self, session_factory: Callable[[], AsyncSession]):
         self._session_factory = session_factory
-        self._lock = asyncio.Lock()
+        self._locks_by_user: Dict[int, asyncio.Lock] = {}  # Per-user locks instead of global
 
         self._repo = PipelineRepository()
         self.channel_repo = ChannelRepository()
@@ -199,7 +199,24 @@ class Manager:
         self._notification_service: Optional[Any] = None
 
         self._default_user_id = int(os.getenv("DEFAULT_USER_ID", "1"))
-        self._default_request_timeout_s = 3.0
+        self._default_request_timeout_s = float(os.getenv("REQUEST_TIMEOUT_S", "3.0"))
+        self._external_timeout_s = float(os.getenv("EXTERNAL_SERVICE_TIMEOUT_S", "10.0"))
+        self._edge_retry_max_attempts = max(1, int(os.getenv("EDGE_RETRY_MAX_ATTEMPTS", "3")))
+        self._edge_retry_base_ms = max(100, int(os.getenv("EDGE_RETRY_BASE_MS", "500")))
+
+    def _get_user_lock(self, uid: int) -> asyncio.Lock:
+        """Get or create a per-user lock to prevent concurrent pipeline operations for same user."""
+        if uid not in self._locks_by_user:
+            self._locks_by_user[uid] = asyncio.Lock()
+        return self._locks_by_user[uid]
+
+    async def _call_with_timeout(self, coro, timeout_s: Optional[float] = None):
+        """Wrap an async call with timeout handling."""
+        timeout = timeout_s or self._external_timeout_s
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(f"External service call timed out after {timeout}s") from e
 
     def _wire_pipeline(self, mp: ModelPipeline) -> None:
         mp.set_session_factory(self._session_factory)
@@ -251,10 +268,12 @@ class Manager:
                 logger.exception("Failed invalidating pipeline ROI state camera=%s", cam)
 
     async def shutdown(self) -> None:
-        async with self._lock:
-            pipelines = list(self._pipelines_by_user.values())
-            self._pipelines_by_user.clear()
-            self._pipeline_id_by_user.clear()
+        # Collect all user locks and pipelines
+        all_locks = list(self._locks_by_user.values())
+        self._locks_by_user.clear()
+        pipelines = list(self._pipelines_by_user.values())
+        self._pipelines_by_user.clear()
+        self._pipeline_id_by_user.clear()
 
         for mp in pipelines:
             if mp is None:
@@ -857,14 +876,16 @@ class Manager:
         """
         uid = int(user_id or self._default_user_id)
 
-        async with self._lock:
+        user_lock = self._get_user_lock(uid)
+        async with user_lock:
             return await self._create_pipeline_unlocked(uid)
 
     async def get_activepipeline(self, user_id: int | None = None) -> ModelPipeline:
         uid = int(user_id or self._default_user_id)
         mp = self._pipelines_by_user.get(uid)
         if mp is None:
-            async with self._lock:
+            user_lock = self._get_user_lock(uid)
+            async with user_lock:
                 mp = self._pipelines_by_user.get(uid)
                 if mp is None:
                     mp = await self._create_pipeline_unlocked(uid)
@@ -887,7 +908,8 @@ class Manager:
 
         active_pid = getattr(active, "pipeline_id", None) or self._pipeline_id_by_user.get(uid)
         if not active_pid:
-            async with self._lock:
+            user_lock = self._get_user_lock(uid)
+            async with user_lock:
                 self._pipelines_by_user.pop(uid, None)
                 self._pipeline_id_by_user.pop(uid, None)
             active = await self.get_activepipeline(uid)
@@ -914,7 +936,8 @@ class Manager:
                         "Active pipeline %s missing in DB for user %s (attempt %s).",
                         pid, uid, attempt
                     )
-                    async with self._lock:
+                    user_lock = self._get_user_lock(uid)
+                    async with user_lock:
                         self._pipelines_by_user.pop(uid, None)
                         self._pipeline_id_by_user.pop(uid, None)
 
@@ -970,6 +993,49 @@ class Manager:
 
         return None
     
+    async def _reconcile_device_edge_with_retry(
+        self,
+        *,
+        device_uuid: uuid.UUID,
+        user_id: Optional[int] = None,
+        dry_run: bool = False,
+        delete_unknown: bool = True,
+    ) -> Dict[str, List[str]]:
+        """
+        Wrapper around reconcile_device_edge_simple with exponential backoff retry.
+        """
+        last_exception = None
+        for attempt in range(1, self._edge_retry_max_attempts + 1):
+            try:
+                return await self.reconcile_device_edge_simple(
+                    device_uuid=device_uuid,
+                    user_id=user_id,
+                    dry_run=dry_run,
+                    delete_unknown=delete_unknown,
+                )
+            except Exception as e:
+                last_exception = e
+                if attempt < self._edge_retry_max_attempts:
+                    # Exponential backoff: base * (2 ^ (attempt-1))
+                    wait_ms = self._edge_retry_base_ms * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Device reconcile attempt %d/%d failed for %s, retrying in %dms: %s",
+                        attempt,
+                        self._edge_retry_max_attempts,
+                        device_uuid,
+                        wait_ms,
+                        str(e),
+                    )
+                    await asyncio.sleep(wait_ms / 1000.0)
+                else:
+                    logger.error(
+                        "Device reconcile failed after %d attempts for %s: %s",
+                        attempt,
+                        device_uuid,
+                        str(e),
+                    )
+        raise last_exception or RuntimeError("Device reconcile failed")
+
     async def reconcile_device_edge_simple(
         self,
         *,
@@ -1028,7 +1094,10 @@ class Manager:
         device_url = dev.device_url
         edge_warnings: List[str] = []
         try:
-            edge_set = await self._edge.list_cameras(device_url=device_url)
+            edge_set = await self._call_with_timeout(
+                self._edge.list_cameras(device_url=device_url),
+                timeout_s=self._external_timeout_s
+            )
         except EdgeCameraInventoryError as e:
             if _edge_health_ready(getattr(e, "health", None)):
                 logger.warning(
@@ -1108,7 +1177,10 @@ class Manager:
                 "notification_enabled": bool(cam.is_notification_enabled),
             }
             try:
-                await self._edge.upsert_camera(device_url=device_url, payload=payload)
+                await self._call_with_timeout(
+                    self._edge.upsert_camera(device_url=device_url, payload=payload),
+                    timeout_s=self._external_timeout_s
+                )
                 out["added"].append(cu)
             except Exception as e:
                 logger.warning("Edge upsert failed during reconcile for camera %s", cu, exc_info=True)
@@ -1117,7 +1189,10 @@ class Manager:
         if delete_unknown:
             for cu in to_remove:
                 try:
-                    await self._edge.delete_camera(device_url=device_url, camera_uuid=cu)
+                    await self._call_with_timeout(
+                        self._edge.delete_camera(device_url=device_url, camera_uuid=cu),
+                        timeout_s=self._external_timeout_s
+                    )
                     out["removed"].append(cu)
                 except Exception as e:
                     logger.warning("Edge delete failed during reconcile for camera %s", cu, exc_info=True)
@@ -1192,7 +1267,7 @@ class Manager:
         for du in device_uuids:
             key = str(du)
             try:
-                result = await self.reconcile_device_edge_simple(
+                result = await self._reconcile_device_edge_with_retry(
                     device_uuid=du,
                     user_id=uid,
                     dry_run=dry_run,
@@ -1492,7 +1567,7 @@ class Manager:
 
         stale_old_devices = [
             dev for dev in old_devices
-            if getattr(dev, "device_uuid", None) != new_device_uuid and getattr(dev, "device_url", None)
+            if getattr(dev, "device_uuid", None) != new_device_uuid and getattr(dev, "device_url", None)]
         for dev in stale_old_devices:
             asyncio.create_task(
                 self._bg_edge_delete(device_url=dev.device_url, camera_uuid=str(cam_uuid))
@@ -1717,7 +1792,8 @@ class Manager:
                     errors.append(f"webrtc:{stream_key}:{e}")
 
         pipeline_to_shutdown: Optional[ModelPipeline] = None
-        async with self._lock:
+        user_lock = self._get_user_lock(uid)
+        async with user_lock:
             pipeline_to_shutdown = self._pipelines_by_user.pop(uid, None)
             self._pipeline_id_by_user.pop(uid, None)
 

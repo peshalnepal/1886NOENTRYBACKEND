@@ -50,6 +50,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
 async def _edge_reconcile_loop(app: FastAPI) -> None:
     manager = app.state.manager
     delete_unknown = _env_bool("EDGE_RECONCILE_DELETE_UNKNOWN", False)
+    
+    # Exponential backoff for failures
+    base_wait_s = max(1.0, float(os.environ.get("EDGE_RECONCILE_FAILURE_BASE_S", "5.0")))
+    max_wait_s = max(base_wait_s, float(os.environ.get("EDGE_RECONCILE_FAILURE_MAX_S", "300.0")))
+    consecutive_failures = 0
+    
     while True:
         try:
             summary = await manager.reconcile_all_devices_edge(
@@ -62,25 +68,37 @@ async def _edge_reconcile_loop(app: FastAPI) -> None:
                     summary.get("device_count"),
                     len(summary.get("errors") or []),
                 )
+                consecutive_failures += 1
             elif summary.get("warnings"):
                 logger.warning(
                     "Edge reconcile completed with warnings device_count=%s warnings=%s",
                     summary.get("device_count"),
                     len(summary.get("warnings") or []),
                 )
+                consecutive_failures = 0
             else:
                 logger.info(
                     "Edge reconcile completed device_count=%s",
                     summary.get("device_count"),
                 )
+                consecutive_failures = 0
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Edge reconcile loop failed")
+            consecutive_failures += 1
 
         if RECONCILE_INTERVAL_S <= 0:
             return
-        await asyncio.sleep(float(RECONCILE_INTERVAL_S))
+        
+        # Exponential backoff on consecutive failures: base_wait * (1.5 ^ failures)
+        wait_s = RECONCILE_INTERVAL_S
+        if consecutive_failures > 0:
+            failure_wait_s = base_wait_s * (1.5 ** min(consecutive_failures - 1, 10))
+            wait_s = min(failure_wait_s, max_wait_s)
+            logger.info("Edge reconcile backoff after %d failures: waiting %.1fs", consecutive_failures, wait_s)
+        
+        await asyncio.sleep(wait_s)
 
 
 async def _retention_cleanup_loop(app: FastAPI) -> None:
