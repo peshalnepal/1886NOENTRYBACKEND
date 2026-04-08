@@ -20,7 +20,7 @@ param revisionMode string = 'Single' // 'Multiple' for blue/green
 param mysqlLocation string = location
 
 // Feature toggles
-param deployMediaMtx bool = false
+param deployMediaMtx bool = true
 param createMysqlDatabase bool = false
 param videoClipStorageAccountName string = '1886noentry'
 param videoClipContainerName string = 'event-clips'
