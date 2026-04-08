@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -54,6 +54,13 @@ def _require_app_state(request: Request, attr_name: str, detail: str) -> Any:
 # -------------------------------------------------------------------
 def get_manager(request: Request) -> Manager:
     return _require_app_state(request, "manager", "Manager not available")
+
+
+def get_manager_optional(request: Request) -> Optional[Manager]:
+    """Returns the Manager if available, None otherwise.  Never raises 503.
+    Use this on routes where the DB operation must succeed even when the
+    manager (pipeline / edge-device layer) has not fully started up."""
+    return getattr(request.app.state, "manager", None)
 
 
 def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:

@@ -11,7 +11,7 @@ from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, SiteSettings, Notification, VideoRecord
-from dependencies import get_async_db, get_current_user, get_manager
+from dependencies import get_async_db, get_current_user, get_manager, get_manager_optional
 from application.channels.channel_config import VideoChannelConfig
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
@@ -748,7 +748,10 @@ async def delete_site(
     site_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    manager: Manager = Depends(get_manager),
+    # get_manager_optional never raises 503 — DB deletion must succeed even
+    # when the manager (pipeline / edge layer) has not fully started up or is
+    # temporarily unavailable (Azure Container App cold-start, scale-out, etc.)
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
     from routes.notifications_routes import invalidate_camera_mode_cache
 
@@ -788,64 +791,73 @@ async def delete_site(
             if str(k or "").strip()
         ]
 
-    # ── 2. Resolve the active pipeline before touching any DB rows ─────────
-    active_pipeline = None
-    try:
-        active_pipeline = await manager.get_activepipeline(user_id=user.id)
-    except Exception:
+    # ── 2. Best-effort pipeline / edge / WebRTC cleanup (requires manager) ─
+    # All of this is skipped gracefully when manager is None — the DB delete
+    # in step 3 is the source of truth and always runs.
+    if manager is not None:
+        active_pipeline = None
+        try:
+            active_pipeline = await manager.get_activepipeline(user_id=user.id)
+        except Exception:
+            logger.warning(
+                "Could not load active pipeline before deleting site=%s; "
+                "edge/pipeline cleanup will be partial.",
+                site_uuid,
+                exc_info=True,
+            )
+
+        # Stops edge inference, removes WebRTC publish keys, flushes per-camera
+        # DB rows (via channel_repo), and evicts channels from ModelPipeline.
+        # Must run BEFORE db.delete(site) because it re-queries cameras with
+        # their device associations.
+        await manager.cleanup_site_resources(
+            db,
+            user_id=int(user.id),
+            site_uuid=site.site_uuid,
+            active=active_pipeline,
+        )
+    else:
         logger.warning(
-            "Could not load active pipeline before deleting site=%s; "
-            "edge/pipeline cleanup will be partial.",
+            "Manager unavailable while deleting site=%s — "
+            "edge/WebRTC/pipeline cleanup skipped; DB will still be cleaned.",
             site_uuid,
-            exc_info=True,
         )
 
-    # ── 3. Stop edge inference, remove WebRTC streams, evict pipeline channels
-    #        This must run BEFORE db.delete(site) because it re-queries the site
-    #        and cameras with their device associations. ──────────────────────
-    await manager.cleanup_site_resources(
-        db,
-        user_id=int(user.id),
-        site_uuid=site.site_uuid,
-        active=active_pipeline,
-    )
-
-    # ── 4. Delete the site row ─────────────────────────────────────────────
+    # ── 3. Delete the site row ─────────────────────────────────────────────
     # DB CASCADE removes: Camera, ChannelConfiguration, CameraDevice,
     # PipelineCamera, VideoRecord, SiteSettings, SiteDevice, Notification,
     # NotificationEmail — everything tied to this site in the database.
     await db.delete(site)
     await db.commit()
 
-    # ── 5. Delete alert image blobs from Azure (background) ───────────────
+    # ── 4. Delete alert image blobs from Azure (background) ───────────────
     if alert_blob_keys:
         asyncio.create_task(
             _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image")
         )
 
-    # ── 6. Delete video clip blobs from Azure (background) ─────────────────
+    # ── 5. Delete video clip blobs from Azure (background) ─────────────────
     if clip_blob_keys:
         asyncio.create_task(
             _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip")
         )
 
-    # ── 7. Flush notification-service in-memory caches ─────────────────────
-    notif_svc = getattr(manager, "_notification_service", None)
-    if notif_svc is not None:
-        # Recipient email cache keyed by (user_id, site_uuid)
-        try:
-            notif_svc.invalidate_recipient_cache(user_id=int(user.id), site_uuid=site_uuid)
-        except Exception:
-            logger.warning("Failed to invalidate recipient cache site=%s", site_uuid, exc_info=True)
-
-        # ROI engine state and ROI cache keyed by camera_uuid
-        for camera_uuid in camera_uuids:
+    # ── 6. Flush notification-service in-memory caches ─────────────────────
+    if manager is not None:
+        notif_svc = getattr(manager, "_notification_service", None)
+        if notif_svc is not None:
             try:
-                notif_svc.invalidate_camera_roi_state(str(camera_uuid))
+                notif_svc.invalidate_recipient_cache(user_id=int(user.id), site_uuid=site_uuid)
             except Exception:
-                logger.warning("Failed to invalidate ROI state camera=%s", camera_uuid, exc_info=True)
+                logger.warning("Failed to invalidate recipient cache site=%s", site_uuid, exc_info=True)
 
-    # ── 8. Evict per-camera notification-mode route cache ──────────────────
+            for camera_uuid in camera_uuids:
+                try:
+                    notif_svc.invalidate_camera_roi_state(str(camera_uuid))
+                except Exception:
+                    logger.warning("Failed to invalidate ROI state camera=%s", camera_uuid, exc_info=True)
+
+    # ── 7. Evict per-camera notification-mode route cache ──────────────────
     for camera_uuid in camera_uuids:
         await invalidate_camera_mode_cache(camera_uuid)
 
