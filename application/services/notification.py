@@ -960,12 +960,15 @@ class NotificationService:
         if frame is None:
             return None
 
-        return _build_overlay_payload_from_frames(
+        result = _build_overlay_payload_from_frames(
             camera_uuid=str(msg.camera_uuid),
             frames=[frame],
             preferred_ts_ms=int(msg.ts_ms),
             timeline_source="trigger_frame",
         )
+        if result is not None and msg.alert_type:
+            result["alert_type"] = str(msg.alert_type)
+        return result
 
     async def _clip_overlay_frames_for_window(
         self,
@@ -1546,6 +1549,34 @@ class NotificationService:
         clip_service = self._clip_service
         if clip_service is None:
             return extra_payload
+
+        # If the site has prerecord enabled, only record clips for events that
+        # match the configured trigger mode. Cameras in the prerecord list that
+        # fire a non-matching event (e.g. item_detected when mode=roi_enter) are
+        # skipped entirely so that playback reflects the saved site setting.
+        if self._session_factory is not None:
+            try:
+                trigger_cam_uuid = uuid.UUID(str(msg.camera_uuid))
+            except Exception:
+                trigger_cam_uuid = None
+
+            if trigger_cam_uuid is not None:
+                async with self._session_factory() as _precheck_db:
+                    _precheck_settings = await self._repo.get_site_prerecord_settings(
+                        _precheck_db,
+                        user_id=int(ctx.user_id),
+                        site_uuid=ctx.site_uuid,
+                    )
+                if (
+                    _precheck_settings.enabled
+                    and trigger_cam_uuid in set(_precheck_settings.camera_uuids)
+                    and not self._site_prerecord_trigger_matches(
+                        trigger_mode=_precheck_settings.trigger_mode,
+                        alert_type=msg.alert_type,
+                    )
+                ):
+                    return extra_payload
+
         overlay_payload = self._build_clip_overlay_payload(
             msg=msg,
             extra_payload=extra_payload,

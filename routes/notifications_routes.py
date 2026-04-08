@@ -23,7 +23,7 @@ from application.services.user_snapshot_cache import (
     UserSnapshotCache,
     UserSnapshotLookupError,
 )
-from core.database_orm import Notification, User
+from core.database_orm import Camera, Notification, Site, SiteSettings, User
 from core.security.tokens import decode_access_token
 from dependencies import (
     get_alert_blob_cleanup_tasks,
@@ -347,6 +347,99 @@ def _is_roi_notification(event_type: Any, title: Any, message: Any, payload: Any
         return True
 
     return False
+
+
+# -------------------------------------------------------------------
+# camera mode cache
+# -------------------------------------------------------------------
+from typing import NamedTuple
+
+
+class _CameraMode(NamedTuple):
+    is_enabled: bool
+    detection_enabled: bool
+    notification_enabled: bool
+    use_site_schedule: bool
+    roi: Any
+    site_config: Any
+    site_settings_id: Any
+    timezone: str
+
+
+_camera_mode_cache: Dict[uuid.UUID, _CameraMode] = {}
+_inflight: Dict[uuid.UUID, "asyncio.Future[_CameraMode]"] = {}
+
+
+async def invalidate_camera_mode_cache(camera_uuid: Optional[uuid.UUID] = None) -> None:
+    """Remove one or all camera mode cache entries.
+
+    Does NOT cancel in-flight DB lookups so waiting callers still receive
+    the (stale) result they were waiting for — the result simply won't be
+    written back to the cache because the inflight slot has been cleared.
+    """
+    if camera_uuid is None:
+        _camera_mode_cache.clear()
+        _inflight.clear()
+    else:
+        _camera_mode_cache.pop(camera_uuid, None)
+        _inflight.pop(camera_uuid, None)
+
+
+async def _get_camera_mode_cached(
+    request: Any, *, cam_uuid_obj: uuid.UUID
+) -> _CameraMode:
+    """Fetch camera+site mode from cache, coalescing concurrent requests."""
+    if cam_uuid_obj in _camera_mode_cache:
+        return _camera_mode_cache[cam_uuid_obj]
+
+    existing = _inflight.get(cam_uuid_obj)
+    if existing is not None:
+        return await existing
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[_CameraMode] = loop.create_future()
+    _inflight[cam_uuid_obj] = fut
+
+    try:
+        session_factory = request.app.state.session_factory
+        async with session_factory() as db:
+            row = (
+                await db.execute(
+                    select(
+                        Camera.is_enabled,
+                        Camera.is_detection_enabled,
+                        Camera.is_notification_enabled,
+                        Camera.use_site_schedule,
+                        Camera.roi,
+                        SiteSettings.config,
+                        SiteSettings.id,
+                        Site.timezone,
+                    )
+                    .join(Site, Site.site_uuid == Camera.site_uuid)
+                    .outerjoin(SiteSettings, SiteSettings.site_uuid == Camera.site_uuid)
+                    .where(Camera.camera_uuid == cam_uuid_obj)
+                )
+            ).first()
+
+        mode = (
+            _CameraMode(*row)
+            if row is not None
+            else _CameraMode(False, False, False, False, None, None, None, "UTC")
+        )
+
+        if _inflight.get(cam_uuid_obj) is fut:
+            _camera_mode_cache[cam_uuid_obj] = mode
+            _inflight.pop(cam_uuid_obj, None)
+
+        fut.set_result(mode)
+        return mode
+
+    except Exception as exc:
+        if _inflight.get(cam_uuid_obj) is fut:
+            _inflight.pop(cam_uuid_obj, None)
+        if not fut.done():
+            fut.set_exception(exc)
+        raise
 
 
 # -------------------------------------------------------------------

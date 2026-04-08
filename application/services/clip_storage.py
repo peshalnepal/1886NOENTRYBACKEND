@@ -220,7 +220,7 @@ def _normalize_overlay_payload(
         payload["frame_w"] = int(reference["frame_w"])
     if reference.get("frame_h") is not None:
         payload["frame_h"] = int(reference["frame_h"])
-    for key in ("clip_start_time", "clip_end_time", "timeline_source"):
+    for key in ("clip_start_time", "clip_end_time", "timeline_source", "alert_type"):
         if raw_payload.get(key) is not None:
             payload[key] = raw_payload.get(key)
     return payload
