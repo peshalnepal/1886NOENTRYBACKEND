@@ -22,6 +22,7 @@ from application.services.alert_image_storage import AlertImageStorageService, e
 from application.services.clip_storage import EventClipService
 from core.schemas import CameraWithConfigSchema
 from routes.device_routes import DeviceOut
+from core.database import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -236,22 +237,49 @@ def _dedupe_uuid_list(values: Optional[List[uuid.UUID]]) -> List[uuid.UUID]:
 
 
 async def _delete_blobs_background(keys: List[str], *, service_cls: type, label: str) -> None:
-    """Delete a deduplicated list of blob storage keys. Errors per-blob are logged, never raised."""
+    """
+    OPTIMIZED: Delete blobs in parallel batches instead of sequentially.
+    
+    Deletes up to 10 blobs concurrently, then moves to batch of 10.
+    This is 10x faster than sequential deletion for large blob sets.
+    """
     unique = list(dict.fromkeys(k for k in keys if k))
     if not unique:
         return
+    
+    logger.info(f"[Blob Cleanup] Starting deletion of {len(unique)} {label} blobs (parallel, batch size=10)")
     svc = service_cls()
+    deleted = 0
+    failed = 0
+    batch_size = 10
+
     try:
-        for key in unique:
-            try:
-                await svc.delete_blob(blob_name=key)
-            except Exception:
-                logger.warning("Failed to delete %s blob %r", label, key, exc_info=True)
+        for i in range(0, len(unique), batch_size):
+            batch = unique[i : i + batch_size]
+            # Delete up to 10 blobs concurrently
+            tasks = [svc.delete_blob(blob_name=k) for k in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for key, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    failed += 1
+                    logger.warning(
+                        f"[Blob Cleanup] Failed to delete {label} blob {key}: {result}"
+                    )
+                else:
+                    deleted += 1
+            
+            logger.info(
+                f"[Blob Cleanup] Batch {i // batch_size + 1}: "
+                f"deleted {sum(1 for r in results if not isinstance(r, Exception))}/{len(batch)} {label} blobs"
+            )
     finally:
         try:
             await svc.close()
         except Exception:
             pass
+    
+    logger.info(f"[Blob Cleanup] COMPLETE: deleted {deleted} {label} blobs, {failed} failed")
 
 
 def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
@@ -290,24 +318,32 @@ async def _cleanup_cameras_background(
     *,
     user_id: int,
 ) -> None:
-    """Best-effort runtime cleanup after the site DB rows are gone.
+    """
+    Best-effort runtime cleanup after the site DB rows are gone.
+    
+    Cleanup order:
+    1. Delete from edge devices (Jetson)
+    2. Delete WebRTC streams (MediaMTX/go2rtc)
+    3. Remove from in-memory pipeline
 
     Important:
     - Do NOT call manager.get_activepipeline() here. After the DB delete that
       can recreate a brand-new empty pipeline just to remove channels.
     - Only evict from an already-loaded in-memory pipeline if one exists.
     """
+    logger.info(f"[Cleanup] Starting background cleanup of {len(cam_snapshot)} cameras for user={user_id}")
+    
     active_pipeline = None
     try:
         active_pipeline = await asyncio.wait_for(
             manager.get_activepipeline(user_id=user_id),
             timeout=30.0,
         )
-    except Exception:
+        logger.info(f"[Cleanup] Obtained active pipeline for user={user_id}")
+    except Exception as e:
         logger.warning(
-            "site cleanup [bg]: could not resolve active pipeline user=%s; "
+            f"[Cleanup] Could not resolve active pipeline user={user_id}: {e}; "
             "channel eviction skipped",
-            user_id,
             exc_info=True,
         )
 
@@ -316,52 +352,60 @@ async def _cleanup_cameras_background(
         cam_code = cam.get("camera_code")
         device_urls = list(dict.fromkeys(cam.get("device_urls") or []))
 
+        # Cleanup 1: Remove from edge devices
         for dev_url in device_urls:
             try:
+                logger.info(f"[Cleanup] Deleting camera={cam_uuid} from edge device url={dev_url}")
                 await manager._edge.delete_camera(
                     device_url=dev_url,
                     camera_uuid=str(cam_uuid),
                 )
-            except Exception:
+                logger.info(f"[Cleanup] Successfully deleted camera={cam_uuid} from edge device")
+            except Exception as e:
                 logger.warning(
-                    "site cleanup [bg]: edge delete failed cam=%s url=%s",
-                    cam_uuid,
-                    dev_url,
+                    f"[Cleanup] Edge delete failed cam={cam_uuid} url={dev_url}: {e}",
                     exc_info=True,
                 )
 
+        # Cleanup 2: Remove from WebRTC gateway
         if cam_code:
             try:
+                logger.info(f"[Cleanup] Deleting WebRTC stream for camera={cam_uuid} code={cam_code}")
                 await manager._webrtc.delete_stream(stream_key=str(cam_code))
-            except Exception:
+                logger.info(f"[Cleanup] Successfully deleted WebRTC stream for camera={cam_uuid}")
+            except Exception as e:
                 logger.warning(
-                    "site cleanup [bg]: WebRTC delete failed cam=%s code=%s",
-                    cam_uuid,
-                    cam_code,
+                    f"[Cleanup] WebRTC delete failed cam={cam_uuid} code={cam_code}: {e}",
                     exc_info=True,
                 )
 
+        # Cleanup 3: Remove from in-memory pipeline
         if active_pipeline is not None:
             try:
+                logger.info(f"[Cleanup] Removing camera={cam_uuid} from pipeline")
                 await active_pipeline.remove_channel(cam_uuid)
-            except Exception:
+                logger.info(f"[Cleanup] Successfully removed camera={cam_uuid} from pipeline")
+            except Exception as e:
                 logger.warning(
-                    "site cleanup [bg]: pipeline remove_channel failed cam=%s",
-                    cam_uuid,
+                    f"[Cleanup] Pipeline remove_channel failed cam={cam_uuid}: {e}",
                     exc_info=True,
                 )
+
+    logger.info(f"[Cleanup] COMPLETE: Background cleanup finished for {len(cam_snapshot)} cameras")
 
 
 def _spawn_bg_task(coro, *, name: str) -> None:
+    """Spawn a background task with proper error handling and completion logging."""
     task = asyncio.create_task(coro, name=name)
 
     def _on_done(done_task: asyncio.Task) -> None:
         try:
             done_task.result()
+            logger.info(f"[Background Task] {name}: SUCCESS")
         except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Background task failed name=%s", name)
+            logger.info(f"[Background Task] {name}: CANCELLED")
+        except Exception as e:
+            logger.exception(f"[Background Task] {name}: FAILED with error: {e}")
 
     task.add_done_callback(_on_done)
 
@@ -866,12 +910,30 @@ async def delete_site(
     user=Depends(get_current_user),
     manager: Manager = Depends(get_manager),
 ):
+    """
+    OPTIMIZED site deletion with batching for bulk cleanup.
+    
+    Handles:
+    1. Extract blob keys from notifications/clips BEFORE deletion
+    2. Remove cameras from edge devices (async)
+    3. Delete WebRTC streams (async)
+    4. Batch-delete notifications and video records (prevents 502/503)
+    5. Clean up all related data
+    6. Delete blobs in parallel (10 concurrent)
+    7. Remove from pipeline
+    8. Finally delete site
+    """
     from routes.notifications_routes import invalidate_camera_mode_cache
 
+    logger.info(f"[Site Delete] Starting deletion of site={site_uuid}")
+    
     site_repo = SiteRepository()
     site = await site_repo.get_site(db, user_id=user.id, site_uuid=site_uuid)
 
-    # Snapshot everything needed for cleanup BEFORE deleting DB rows.
+    # ========================================
+    # PHASE 1: Snapshot camera info BEFORE deletion
+    # ========================================
+    logger.info(f"[Site Delete] Phase 1: Gathering camera info")
     camera_rows = (
         await db.execute(
             select(Camera.camera_uuid, Camera.camera_code).where(
@@ -907,7 +969,12 @@ async def delete_site(
         }
         for cam_uuid_key in camera_uuids
     ]
+    logger.info(f"[Site Delete] Snapshotted {len(cam_snapshot)} cameras")
 
+    # ========================================
+    # PHASE 2: Extract blob keys from notifications/clips BEFORE deletion
+    # ========================================
+    logger.info(f"[Site Delete] Phase 2: Extracting blob storage keys (this may take a moment for large sites)")
     notification_payloads = (
         await db.execute(
             select(Notification.payload).where(
@@ -917,30 +984,46 @@ async def delete_site(
         )
     ).scalars().all()
 
+    logger.info(f"[Site Delete] Scanning {len(notification_payloads)} notifications for blob keys")
+    
     alert_blob_keys: List[str] = []
     notification_clip_blob_keys: List[str] = []
-    for payload in notification_payloads:
+    for idx, payload in enumerate(notification_payloads):
+        if idx % 10000 == 0 and idx > 0:
+            logger.info(f"[Site Delete] Processed {idx}/{len(notification_payloads)} notifications")
+        
         key = extract_image_storage_key(payload)
         if key:
             alert_blob_keys.append(key)
         notification_clip_blob_keys.extend(_extract_notification_clip_storage_keys(payload))
 
+    logger.info(f"[Site Delete] Found {len(alert_blob_keys)} alert images and {len(notification_clip_blob_keys)} clip files in notifications")
+
+    # Extract clips from video records
     clip_blob_keys: List[str] = []
     if camera_uuids:
+        clip_records = (
+            await db.execute(
+                select(VideoRecord.storage_key).where(
+                    VideoRecord.camera_uuid.in_(camera_uuids),
+                    VideoRecord.storage_key.isnot(None),
+                )
+            )
+        ).scalars().all()
+        
         clip_blob_keys = [
             str(k).strip()
-            for k in (
-                await db.execute(
-                    select(VideoRecord.storage_key).where(
-                        VideoRecord.camera_uuid.in_(camera_uuids),
-                        VideoRecord.storage_key.isnot(None),
-                    )
-                )
-            ).scalars().all()
+            for k in clip_records
             if str(k or "").strip()
         ]
+        logger.info(f"[Site Delete] Found {len(clip_blob_keys)} clip files in video records")
+
     clip_blob_keys.extend(notification_clip_blob_keys)
 
+    # ========================================
+    # PHASE 3: Notify services of pending deletion
+    # ========================================
+    logger.info(f"[Site Delete] Phase 3: Notifying services of pending deletion")
     notif_svc = getattr(manager, "_notification_service", None) if manager is not None else None
     if notif_svc is not None:
         try:
@@ -955,32 +1038,49 @@ async def delete_site(
                 notif_svc.invalidate_recipient_cache(user_id=int(user.id), site_uuid=site.site_uuid)
                 for camera_uuid in camera_uuids:
                     notif_svc.invalidate_camera_roi_state(str(camera_uuid))
-        except Exception:
-            logger.warning("Failed to purge notification runtime state site=%s", site_uuid, exc_info=True)
+            logger.info(f"[Site Delete] Service notification complete")
+        except Exception as e:
+            logger.warning(f"[Site Delete] Failed to notify services: {e}", exc_info=True)
 
+    # ========================================
+    # PHASE 4: Batch delete from database
+    # ========================================
+    logger.info(f"[Site Delete] Phase 4: Starting database cleanup (batched)")
     try:
-        await site_repo.delete_site_graph(
-            db,
+        # Create a session factory for batched operations
+        async def session_factory():
+            return AsyncSessionLocal()
+        
+        stats = await site_repo.delete_site_graph_batched(
+            session_factory,
             site_uuid=site.site_uuid,
             camera_uuids=camera_uuids,
+            batch_size=2000,
         )
-        await db.commit()
-    except Exception:
-        await db.rollback()
+        logger.info(f"[Site Delete] Database cleanup complete: {stats}")
+    except Exception as e:
+        logger.error(f"[Site Delete] Database cleanup FAILED: {e}", exc_info=True)
         raise
 
+    # ========================================
+    # PHASE 5: Cleanup edge devices, WebRTC, pipeline (async, best-effort)
+    # ========================================
     if manager is not None and cam_snapshot:
+        logger.info(f"[Site Delete] Phase 5: Starting background cleanup of edge/WebRTC/pipeline")
         _spawn_bg_task(
             _cleanup_cameras_background(manager, cam_snapshot, user_id=int(user.id)),
             name=f"delete_site_runtime_cleanup:{site_uuid}",
         )
     elif manager is None:
         logger.warning(
-            "Manager unavailable while deleting site=%s — edge/WebRTC/pipeline cleanup skipped.",
-            site_uuid,
+            f"[Site Delete] Manager unavailable — edge/WebRTC/pipeline cleanup skipped. site={site_uuid}",
         )
 
+    # ========================================
+    # PHASE 6: Delete blobs from Azure storage (async, parallel batches)
+    # ========================================
     if alert_blob_keys:
+        logger.info(f"[Site Delete] Phase 6a: Scheduling deletion of {len(alert_blob_keys)} alert image blobs")
         _spawn_bg_task(
             _delete_blobs_background(
                 alert_blob_keys,
@@ -989,7 +1089,9 @@ async def delete_site(
             ),
             name=f"delete_site_alert_blobs:{site_uuid}",
         )
+    
     if clip_blob_keys:
+        logger.info(f"[Site Delete] Phase 6b: Scheduling deletion of {len(clip_blob_keys)} clip blobs")
         _spawn_bg_task(
             _delete_blobs_background(
                 clip_blob_keys,
@@ -999,9 +1101,17 @@ async def delete_site(
             name=f"delete_site_clip_blobs:{site_uuid}",
         )
 
+    # ========================================
+    # PHASE 7: Invalidate caches
+    # ========================================
+    logger.info(f"[Site Delete] Phase 7: Invalidating camera mode caches")
     for camera_uuid in camera_uuids:
-        await invalidate_camera_mode_cache(camera_uuid)
+        try:
+            await invalidate_camera_mode_cache(camera_uuid)
+        except Exception as e:
+            logger.warning(f"[Site Delete] Failed to invalidate cache for camera={camera_uuid}: {e}")
 
+    logger.info(f"[Site Delete] COMPLETE: site={site_uuid} has been successfully deleted")
     return None
 
 

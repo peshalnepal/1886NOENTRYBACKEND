@@ -5,7 +5,7 @@ from datetime import time as dt_time
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -258,6 +258,7 @@ class SiteRepository:
         site_uuid: uuid.UUID,
         camera_uuids: Optional[List[uuid.UUID]] = None,
     ) -> None:
+        """DEPRECATED: Use delete_site_graph_batched() for large sites."""
         normalized_camera_uuids: List[uuid.UUID] = []
         seen = set()
         for value in camera_uuids or []:
@@ -308,3 +309,174 @@ class SiteRepository:
 
         await db.execute(delete(Camera).where(Camera.site_uuid == site_uuid))
         await db.execute(delete(Site).where(Site.site_uuid == site_uuid))
+
+    async def delete_site_graph_batched(
+        self,
+        db,  # SessionFactory - returns AsyncSession
+        *,
+        site_uuid: uuid.UUID,
+        camera_uuids: Optional[List[uuid.UUID]] = None,
+        batch_size: int = 2000,
+    ) -> dict:
+        """
+        OPTIMIZED deletion with batching to avoid 502/503 errors on large sites.
+        
+        Deletes in this order:
+        1. Notifications (largest table, batched)
+        2. VideoRecords (batched)
+        3. Camera relationships
+        4. Cameras
+        5. Site settings & links
+        6. Site itself
+        
+        Returns: {"notifications": count, "videos": count, "cameras": count}
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        normalized_camera_uuids: List[uuid.UUID] = []
+        seen = set()
+        for value in camera_uuids or []:
+            parsed = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+            key = str(parsed)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized_camera_uuids.append(parsed)
+
+        stats = {"notifications": 0, "videos": 0, "cameras": len(normalized_camera_uuids)}
+
+        # Phase 1: Batch delete notifications (LARGEST table - often millions)
+        logger.info(f"[Site Delete] Phase 1: Deleting notifications for site={site_uuid}")
+        stats["notifications"] = await self._batch_delete(
+            db,
+            table=Notification,
+            where_clause=Notification.site_uuid == site_uuid,
+            batch_size=batch_size,
+            label="notifications",
+        )
+        logger.info(f"[Site Delete] Deleted {stats['notifications']} notifications")
+
+        # Phase 2: Batch delete video records (second largest)
+        if normalized_camera_uuids:
+            logger.info(f"[Site Delete] Phase 2: Deleting video records for {len(normalized_camera_uuids)} cameras")
+            stats["videos"] = await self._batch_delete(
+                db,
+                table=VideoRecord,
+                where_clause=VideoRecord.camera_uuid.in_(normalized_camera_uuids),
+                batch_size=batch_size,
+                label="video records",
+            )
+            logger.info(f"[Site Delete] Deleted {stats['videos']} video records")
+
+        # Phase 3: Delete notification emails (faster)
+        notification_email_count = await self._fast_delete(db, NotificationEmail, NotificationEmail.site_uuid == site_uuid)
+        logger.info(f"[Site Delete] Phase 3: Deleted {notification_email_count} notification emails")
+
+        # Phase 4: Delete camera relationships (faster, predictable size)
+        if normalized_camera_uuids:
+            logger.info(f"[Site Delete] Phase 4: Deleting camera relationships")
+            pipeline_cam_count = await self._fast_delete(
+                db,
+                PipelineCamera,
+                PipelineCamera.camera_uuid.in_(normalized_camera_uuids)
+            )
+            camera_device_count = await self._fast_delete(
+                db,
+                CameraDevice,
+                CameraDevice.camera_uuid.in_(normalized_camera_uuids)
+            )
+            channel_config_count = await self._fast_delete(
+                db,
+                ChannelConfiguration,
+                ChannelConfiguration.camera_uuid.in_(normalized_camera_uuids)
+            )
+            logger.info(
+                f"[Site Delete] Deleted {pipeline_cam_count} pipeline-camera links, "
+                f"{camera_device_count} camera-device links, {channel_config_count} channel configs"
+            )
+
+        # Phase 5: Delete cameras
+        camera_count = await self._fast_delete(db, Camera, Camera.site_uuid == site_uuid)
+        logger.info(f"[Site Delete] Phase 5: Deleted {camera_count} cameras")
+
+        # Phase 6: Delete site settings and device links
+        site_settings_count = await self._fast_delete(db, SiteSettings, SiteSettings.site_uuid == site_uuid)
+        site_device_count = await self._fast_delete(db, SiteDevice, SiteDevice.site_uuid == site_uuid)
+        logger.info(f"[Site Delete] Phase 6: Deleted {site_settings_count} site settings, {site_device_count} site-device links")
+
+        # Phase 7: Delete the site itself
+        site_count = await self._fast_delete(db, Site, Site.site_uuid == site_uuid)
+        logger.info(f"[Site Delete] Phase 7: Deleted {site_count} site rows")
+
+        logger.info(f"[Site Delete] COMPLETE: Deleted {stats['notifications']} notifications, {stats['videos']} videos, {stats['cameras']} cameras")
+        return stats
+
+    async def _batch_delete(
+        self,
+        db,  # SessionFactory
+        *,
+        table,
+        where_clause,
+        batch_size: int = 2000,
+        label: str = "records",
+    ) -> int:
+        """
+        Delete large tables in batches to avoid locking and memory issues.
+        Each batch uses a separate transaction.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        total_deleted = 0
+        batch_num = 0
+
+        while True:
+            # Get a fresh session for each batch
+            session = db() if callable(db) else db
+
+            try:
+                # Count how many records match in this batch
+                count_stmt = select(func.count()).select_from(table).where(where_clause)
+                count_result = await session.execute(count_stmt)
+                remaining = count_result.scalar() or 0
+
+                if remaining == 0:
+                    break
+
+                # Delete this batch
+                delete_stmt = delete(table).where(where_clause).limit(batch_size)
+                result = await session.execute(delete_stmt)
+                await session.commit()
+
+                deleted_in_batch = result.rowcount or 0
+                total_deleted += deleted_in_batch
+                batch_num += 1
+
+                logger.info(
+                    f"[Batch Delete] {label}: batch #{batch_num} deleted {deleted_in_batch}, "
+                    f"total={total_deleted}, remaining={remaining - deleted_in_batch}"
+                )
+
+                if deleted_in_batch == 0:
+                    break
+
+            except Exception as e:
+                await session.rollback()
+                logger.error(f"[Batch Delete] {label}: batch #{batch_num} failed: {e}")
+                raise
+            finally:
+                if callable(db):
+                    await session.close()
+
+        return total_deleted
+
+    async def _fast_delete(
+        self,
+        db,  # AsyncSession (single transaction)
+        table,
+        where_clause,
+    ) -> int:
+        """Single-transaction delete for smaller tables."""
+        delete_stmt = delete(table).where(where_clause)
+        result = await db.execute(delete_stmt)
+        return result.rowcount or 0
