@@ -556,6 +556,23 @@ async def list_clips(
                 camera_uuid=getattr(record, "camera_uuid", None),
             )
 
+        # Ensure clip_start_time/clip_end_time are present so the frontend can
+        # time-align detection overlays during video playback.  The fallback
+        # overlays (from notifications) already carry these fields, but overlays
+        # stored directly in VideoRecord.overlay_payload may not.
+        if overlay_payload is not None and "clip_start_time" not in overlay_payload:
+            overlay_payload = dict(overlay_payload)
+            start = record.start_time
+            end = record.end_time
+            if start is not None:
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                overlay_payload["clip_start_time"] = start.isoformat()
+            if end is not None:
+                if end.tzinfo is None:
+                    end = end.replace(tzinfo=timezone.utc)
+                overlay_payload["clip_end_time"] = end.isoformat()
+
         clips.append(
             ClipOut(
                 id=int(record.id),
