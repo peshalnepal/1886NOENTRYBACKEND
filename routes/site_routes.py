@@ -254,6 +254,36 @@ async def _delete_blobs_background(keys: List[str], *, service_cls: type, label:
             pass
 
 
+def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
+    if not isinstance(payload, dict):
+        return []
+
+    keys: List[str] = []
+
+    def _append_from_clip_dict(raw_clip: Any) -> None:
+        if not isinstance(raw_clip, dict):
+            return
+        key = str(raw_clip.get("storage_key") or "").strip()
+        if key:
+            keys.append(key)
+
+    msg = payload.get("msg")
+    if isinstance(msg, dict):
+        _append_from_clip_dict(msg)
+        _append_from_clip_dict(msg.get("clip"))
+
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        _append_from_clip_dict(extra)
+        _append_from_clip_dict(extra.get("clip"))
+        for raw_clip in list(extra.get("multi_camera_prerecordings") or []):
+            _append_from_clip_dict(raw_clip)
+
+    _append_from_clip_dict(payload.get("clip"))
+
+    return list(dict.fromkeys(keys))
+
+
 async def _cleanup_cameras_background(
     manager: "Manager",
     cam_snapshot: List[dict],
@@ -823,31 +853,12 @@ async def delete_site(
     site_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    # get_manager_optional never raises 503 — DB deletion must succeed even
-    # when the manager (pipeline / edge layer) has not fully started up or is
-    # temporarily unavailable (Azure Container App cold-start, scale-out, etc.)
     manager: Optional[Manager] = Depends(get_manager_optional),
 ):
     from routes.notifications_routes import invalidate_camera_mode_cache
 
     site_repo = SiteRepository()
     site = await site_repo.get_site(db, user_id=user.id, site_uuid=site_uuid)
-
-    # ── 1. Snapshot everything we need BEFORE the cascade commit ──────────
-    #
-    # After db.commit() the Camera, VideoRecord, Notification rows are gone.
-    # Build plain-Python dicts so the data can be safely used in background
-    # tasks after this request's DB session is closed.
-    #
-    # IMPORTANT: Use scalar/column queries only — do NOT load full Camera ORM
-    # objects into the session's identity map.  If ORM Camera objects are in
-    # the session when db.delete(site) is called, SQLAlchemy's
-    # "delete-orphan" cascade detects them and issues one DELETE per Camera
-    # (N+1) instead of relying on MySQL's single-statement ON DELETE CASCADE.
-    # For sites with many cameras + video records this snowballs into hundreds
-    # of round-trips → request timeout → Azure proxy 502.
-
-    # Step A: camera UUIDs + codes (scalar query — no ORM objects in session)
     cam_code_rows = (
         await db.execute(
             select(Camera.camera_uuid, Camera.camera_code)
@@ -882,16 +893,22 @@ async def delete_site(
     ]
     camera_uuids = list(cam_to_urls.keys())
 
-    # Alert image blobs — stored in Azure, rows CASCADE-deleted with site.
+    notification_payloads = (
+        await db.execute(
+            select(Notification.payload).where(Notification.site_uuid == site.site_uuid)
+        )
+    ).scalars().all()
+
+    # Alert image blobs — stored in Azure, rows may be DB-deleted before blob cleanup runs.
     alert_blob_keys: List[str] = []
-    for payload in (
-        await db.execute(select(Notification.payload).where(Notification.site_uuid == site.site_uuid))
-    ).scalars().all():
+    notification_clip_blob_keys: List[str] = []
+    for payload in notification_payloads:
         key = extract_image_storage_key(payload)
         if key:
             alert_blob_keys.append(key)
+        notification_clip_blob_keys.extend(_extract_notification_clip_storage_keys(payload))
 
-    # Video clip blobs — stored in Azure, rows CASCADE-deleted via Camera.
+    # Video clip blobs — stored in Azure, rows are site-owned via Camera.
     clip_blob_keys: List[str] = []
     if camera_uuids:
         clip_blob_keys = [
@@ -906,26 +923,14 @@ async def delete_site(
             ).scalars().all()
             if str(k or "").strip()
         ]
+    clip_blob_keys.extend(notification_clip_blob_keys)
 
-    # ── 2. Delete the site row — DB CASCADE removes everything ────────────
-    # Camera, ChannelConfiguration, CameraDevice, PipelineCamera,
-    # VideoRecord, SiteSettings, SiteDevice, Notification, NotificationEmail.
-    #
-    # Because NO Camera ORM objects are in the session (scalar queries above),
-    # SQLAlchemy issues exactly ONE DELETE FROM sites WHERE site_uuid = ? and
-    # lets MySQL's ON DELETE CASCADE handle all child rows in a single
-    # server-side transaction — O(1) round-trips regardless of camera count.
-    await db.delete(site)
+    await site_repo.delete_site_graph(
+        db,
+        site_uuid=site.site_uuid,
+        camera_uuids=camera_uuids,
+    )
     await db.commit()
-    # The 204 is logically ready here. Everything below is cleanup.
-
-    # ── 3. Background: edge inference + WebRTC + pipeline channel cleanup ──
-    # _edge.delete_camera() retries 3× with a 10 s connect-timeout each
-    # (~30 s total per unreachable device).  Running this synchronously was
-    # the root cause of 503s.  It is now fire-and-forget.
-    # get_activepipeline is also resolved inside the background task (off the
-    # HTTP critical path) so lock contention or a cold-start pipeline build
-    # never delays the 204 response.
     if manager is not None and cam_snapshot:
         asyncio.create_task(
             _cleanup_cameras_background(manager, cam_snapshot, user_id=int(user.id))
@@ -947,9 +952,6 @@ async def delete_site(
             _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip")
         )
 
-    # ── 5. Sync: flush notification-service in-memory caches ──────────────
-    # These are pure in-memory dict operations — microseconds, safe to do
-    # synchronously before returning.
     if manager is not None:
         notif_svc = getattr(manager, "_notification_service", None)
         if notif_svc is not None:

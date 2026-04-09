@@ -281,8 +281,8 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
           name: 'notentapi'
           image: '${acr.properties.loginServer}/${appName}:${appImageTag}'
           resources: {
-            cpu: json('0.5')
-            memory: '1.0Gi'
+            cpu: json('2.0')
+            memory: '4.0Gi'
           }
           env: [
             { name: 'ENVIRONMENT', value: 'production' }

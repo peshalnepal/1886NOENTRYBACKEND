@@ -1,18 +1,28 @@
 # application/repositories/site_repository.py
 
 import uuid
-from typing import List, Optional
-
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 from datetime import time as dt_time
 from typing import Any, Dict, List, Optional
 
-from core.database_orm import Camera, ChannelConfiguration, Device, CameraDevice,Site,SiteSettings
-from application.channels.channel_config import VideoChannelConfig
+from fastapi import HTTPException
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from application.channels.channel_config import VideoChannelConfig
+from core.database_orm import (
+    Camera,
+    CameraDevice,
+    ChannelConfiguration,
+    Device,
+    Notification,
+    NotificationEmail,
+    PipelineCamera,
+    Site,
+    SiteDevice,
+    SiteSettings,
+    VideoRecord,
+)
 
 class SiteRepository:
     """
@@ -240,3 +250,61 @@ class SiteRepository:
     
     async def create_site(self,db: AsyncSession):
         pass
+
+    async def delete_site_graph(
+        self,
+        db: AsyncSession,
+        *,
+        site_uuid: uuid.UUID,
+        camera_uuids: Optional[List[uuid.UUID]] = None,
+    ) -> None:
+        normalized_camera_uuids: List[uuid.UUID] = []
+        seen = set()
+        for value in camera_uuids or []:
+            parsed = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+            key = str(parsed)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized_camera_uuids.append(parsed)
+
+        # Delete site-owned rows explicitly instead of depending only on FK
+        # cascades. This protects deployed databases that may predate newer
+        # ON DELETE rules in the ORM metadata.
+        await db.execute(
+            delete(Notification).where(Notification.site_uuid == site_uuid)
+        )
+        await db.execute(
+            delete(NotificationEmail).where(NotificationEmail.site_uuid == site_uuid)
+        )
+        await db.execute(
+            delete(SiteSettings).where(SiteSettings.site_uuid == site_uuid)
+        )
+        await db.execute(
+            delete(SiteDevice).where(SiteDevice.site_uuid == site_uuid)
+        )
+
+        if normalized_camera_uuids:
+            await db.execute(
+                delete(PipelineCamera).where(
+                    PipelineCamera.camera_uuid.in_(normalized_camera_uuids)
+                )
+            )
+            await db.execute(
+                delete(CameraDevice).where(
+                    CameraDevice.camera_uuid.in_(normalized_camera_uuids)
+                )
+            )
+            await db.execute(
+                delete(ChannelConfiguration).where(
+                    ChannelConfiguration.camera_uuid.in_(normalized_camera_uuids)
+                )
+            )
+            await db.execute(
+                delete(VideoRecord).where(
+                    VideoRecord.camera_uuid.in_(normalized_camera_uuids)
+                )
+            )
+
+        await db.execute(delete(Camera).where(Camera.site_uuid == site_uuid))
+        await db.execute(delete(Site).where(Site.site_uuid == site_uuid))
