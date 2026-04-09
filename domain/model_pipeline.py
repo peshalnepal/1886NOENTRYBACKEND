@@ -324,7 +324,7 @@ class ModelPipeline:
         )
         self._startup_jitter_ms = max(
             0,
-            int(os.getenv("DETECTION_STARTUP_JITTER_MS", "500")),
+            int(os.getenv("DETECTION_STARTUP_JITTER_MS", "100")),
         )
         self._lock = asyncio.Lock()
         self._started = False
@@ -1025,8 +1025,8 @@ class ModelPipeline:
         )
 
     async def _poll_loop(self, key: str, ch: VideoChannel) -> None:
-        backoff_ms = 250
-        max_backoff_ms = 8000
+        backoff_ms = 200
+        max_backoff_ms = 4000
         empty_miss_count = 0
         if self._startup_jitter_ms > 0:
             await asyncio.sleep(random.uniform(0.0, self._startup_jitter_ms / 1000.0))
@@ -1051,9 +1051,9 @@ class ModelPipeline:
                     payload = await ch.stream()
                 resp = self._payload_to_resp(payload, ch)
                 if resp is None:
-                    empty_miss_count = min(empty_miss_count + 1, 6)
-                    base_sleep_s = max(0.25, float(cfg.poll_interval_ms) / 1000.0)
-                    miss_sleep_s = min(5.0, base_sleep_s * (2 ** (empty_miss_count - 1)))
+                    empty_miss_count = min(empty_miss_count + 1, 4)
+                    base_sleep_s = max(0.15, float(cfg.poll_interval_ms) / 1000.0)
+                    miss_sleep_s = min(2.0, base_sleep_s * (2 ** (empty_miss_count - 1)))
                     await asyncio.sleep(miss_sleep_s)
                     continue
 
@@ -1167,7 +1167,7 @@ class ModelPipeline:
                                 extra_payload=alert_extra_payload,
                             )
                         )
-                backoff_ms = 250
+                backoff_ms = 200
                 await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
 
             except asyncio.CancelledError:

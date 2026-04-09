@@ -188,8 +188,15 @@ class VideoChannel():
     def _maybe_resize(self, frame):
         if self.config.resize is None:
             return frame
-        w, h = self.config.resize
-        return cv2.resize(frame, (int(w), int(h)))
+        target_w, target_h = self.config.resize
+        fh, fw = frame.shape[:2]
+        # Maintain aspect ratio: scale to fit within target dimensions
+        scale = min(target_w / max(fw, 1), target_h / max(fh, 1))
+        if scale >= 1.0:
+            return frame  # don't upscale
+        new_w = int(round(fw * scale))
+        new_h = int(round(fh * scale))
+        return cv2.resize(frame, (new_w, new_h))
     
     def _put_latest(self, ev):
         # if we're stopping, do not enqueue any new RTSPEvents

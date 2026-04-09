@@ -634,7 +634,7 @@ async def update_site_settings(
     payload: SiteSettingsUpdate,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    manager: Manager = Depends(get_manager),
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
     site_repo=SiteRepository()
     site = await site_repo.get_site(db, user_id=user.id,site_uuid=site_uuid)
@@ -700,7 +700,7 @@ async def update_site_settings(
     if payload.schedule is not None:
         await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     await db.refresh(row)
-    if payload.schedule is not None:
+    if payload.schedule is not None and manager is not None:
         try:
             await _refresh_site_schedule_runtime(
                 manager=manager,
@@ -756,7 +756,7 @@ async def update_site(
     payload: SiteUpdate,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    manager: Manager = Depends(get_manager),
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
     site_repo=SiteRepository()
     site = await site_repo.get_site(db,user_id=user.id,site_uuid=site_uuid)
@@ -785,12 +785,15 @@ async def update_site(
     if data.get("timezone") is not None:
         await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     await db.refresh(site)
-    if data.get("timezone") is not None:
-        await _refresh_site_schedule_runtime(
-            manager=manager,
-            user_id=int(user.id),
-            site_uuid=site.site_uuid,
-        )
+    if data.get("timezone") is not None and manager is not None:
+        try:
+            await _refresh_site_schedule_runtime(
+                manager=manager,
+                user_id=int(user.id),
+                site_uuid=site.site_uuid,
+            )
+        except Exception:
+            logger.warning("Best-effort schedule runtime refresh failed site=%s", site_uuid, exc_info=True)
     return site
 
 

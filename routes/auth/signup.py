@@ -368,14 +368,13 @@ async def signup_verify(
         db.add(user)
         user.last_login_at = utc_now()
         await db.commit()
-        await db.refresh(user) 
+        await db.refresh(user)
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Account already exists")
     except Exception:
         await db.rollback()
         raise
-    await db.refresh(user)
     token = _build_access_token(user)
     return AuthTokenOut(access_token=token, user=_to_user_out(user))
 

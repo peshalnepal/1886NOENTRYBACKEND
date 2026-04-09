@@ -28,7 +28,7 @@ from application.channels.channel_config import VideoChannelConfig
 logger = logging.getLogger(__name__)
 
 _http = httpx.AsyncClient(
-    timeout=httpx.Timeout(connect=8.0, read=8.0, write=5.0, pool=8.0),
+    timeout=httpx.Timeout(connect=3.0, read=3.0, write=3.0, pool=3.0),
     limits=httpx.Limits(
         max_connections=50,
         max_keepalive_connections=20,
@@ -120,8 +120,8 @@ class VideoChannel:
         for url in urls:
             attempted += 1
             try:
-                timeout_s = float(self.config.request_timeout_s or 6.0)
-                t = httpx.Timeout(timeout_s, connect=min(8.0, timeout_s), read=timeout_s, write=timeout_s, pool=timeout_s)
+                timeout_s = float(self.config.request_timeout_s or 3.0)
+                t = httpx.Timeout(timeout_s, connect=min(3.0, timeout_s), read=timeout_s, write=timeout_s, pool=timeout_s)
                 r = await _http.get(url, timeout=t)
                 if r.status_code in (404, 405):
                     last_err_sig = f"http:{r.status_code}:{url}"
@@ -154,10 +154,10 @@ class VideoChannel:
         if not self.config.device_url:
             return None
 
-        timeout_s = float(self.config.request_timeout_s or 6.0)
+        timeout_s = float(self.config.request_timeout_s or 3.0)
         timeout = httpx.Timeout(
             timeout_s,
-            connect=min(8.0, timeout_s),
+            connect=min(3.0, timeout_s),
             read=timeout_s,
             write=timeout_s,
             pool=timeout_s,

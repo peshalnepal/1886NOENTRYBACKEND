@@ -1,14 +1,18 @@
 # routes/devices.py
+import asyncio
+import logging
 import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import Device  # adjust import path
-from dependencies import get_db, get_async_db, get_current_user, get_manager
+from dependencies import get_db, get_async_db, get_current_user, get_manager, get_manager_optional
 from application.services.manager import EdgeDeviceUnavailableError, Manager
 
 router = APIRouter(prefix="/devices", tags=["devices"])
@@ -150,12 +154,28 @@ async def delete_device(
     device_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    manager: Manager = Depends(get_manager),  # NEW dependency
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
     device = await _get_device_or_404(db, user.id, device_uuid)
-    active_pipeline=await manager.get_activepipeline(user_id=user.id)
-    await manager.cleanup_device_resources(db, device_uuid=device_uuid,active=active_pipeline)
-    
+
+    # Best-effort cleanup — DB delete must succeed even if manager/edge is down.
+    if manager is not None:
+        try:
+            active_pipeline = await asyncio.wait_for(
+                manager.get_activepipeline(user_id=user.id), timeout=5.0,
+            )
+            await asyncio.wait_for(
+                manager.cleanup_device_resources(
+                    db, device_uuid=device_uuid, active=active_pipeline,
+                ),
+                timeout=10.0,
+            )
+        except Exception:
+            logger.warning(
+                "Best-effort device cleanup failed for %s; proceeding with DB delete.",
+                device_uuid, exc_info=True,
+            )
+
     await db.delete(device)
     await db.commit()
     return None

@@ -17,8 +17,14 @@ from application.services.user_snapshot_cache import UserSnapshotCache
 
 from core.database_orm import User
 from core.security.hashing import get_password_hash, verify_password
-from dependencies import get_async_db, get_current_user, get_manager
+import asyncio
+import logging
+from typing import Optional
+
+from dependencies import get_async_db, get_current_user, get_manager_optional
 from application.services.manager import Manager
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -176,21 +182,22 @@ async def delete_my_account(
     request: Request,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
-    manager: Manager = Depends(get_manager),
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
     if not verify_password(payload.password.get_secret_value(), current_user.hashed_password):
         raise HTTPException(status_code=400, detail="Password is incorrect")
 
     try:
-        cleanup = await manager.cleanup_user_resources(db, user_id=int(current_user.id))
-        if cleanup.get("errors"):
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "Failed to fully clean external camera/MediaMTX resources. User was not deleted.",
-                    "errors": cleanup["errors"],
-                },
+        if manager is not None:
+            cleanup = await asyncio.wait_for(
+                manager.cleanup_user_resources(db, user_id=int(current_user.id)),
+                timeout=15.0,
             )
+            if cleanup.get("errors"):
+                logger.warning(
+                    "Partial cleanup errors for user %s: %s",
+                    current_user.id, cleanup["errors"],
+                )
 
         await db.delete(current_user)
         await db.commit()
