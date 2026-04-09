@@ -652,12 +652,16 @@ async def list_site_devices(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    site_repo=SiteRepository()
-    site = await site_repo.get_site(db,user_id=user.id,site_uuid= site_uuid)
+    # Single query: join Site for ownership check + fetch devices in one round-trip.
     q = (
         select(Device)
         .join(SiteDevice, SiteDevice.device_uuid == Device.device_uuid)
-        .where(SiteDevice.site_uuid == site.site_uuid, Device.user_id == user.id)
+        .join(Site, Site.site_uuid == SiteDevice.site_uuid)
+        .where(
+            SiteDevice.site_uuid == site_uuid,
+            Site.user_id == int(user.id),
+            Device.user_id == int(user.id),
+        )
         .order_by(Device.created_at.desc())
     )
     return (await db.execute(q)).scalars().all()
@@ -669,10 +673,17 @@ async def get_site_settings(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    site_repo=SiteRepository()
-    site = await site_repo.get_site(db, user_id=user.id,site_uuid= site_uuid)
-    row = await site_repo.get_site_settings(db, user_id=int(user.id), site_uuid=site.site_uuid)
-    return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
+    # Single query: fetch site + settings together, ownership check via Site.user_id.
+    result = await db.execute(
+        select(Site, SiteSettings)
+        .outerjoin(SiteSettings, SiteSettings.site_uuid == Site.site_uuid)
+        .where(Site.site_uuid == site_uuid, Site.user_id == int(user.id))
+    )
+    row = result.one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Site not found")
+    site, settings_row = row
+    return _serialize_site_settings(site.site_uuid, settings_row, fallback_timezone=site.timezone)
 
 
 @router.post("/{site_uuid}/cameras", response_model=CameraWithConfigSchema, status_code=status.HTTP_201_CREATED)
@@ -913,25 +924,27 @@ async def delete_site(
     """
     OPTIMIZED site deletion with batching for bulk cleanup.
     
-    Handles:
-    1. Extract blob keys from notifications/clips BEFORE deletion
-    2. Remove cameras from edge devices (async)
-    3. Delete WebRTC streams (async)
-    4. Batch-delete notifications and video records (prevents 502/503)
-    5. Clean up all related data
-    6. Delete blobs in parallel (10 concurrent)
-    7. Remove from pipeline
-    8. Finally delete site
+    Deletion order:
+    1. Snapshot camera/device info from DB
+    2. STOP CAMERAS FIRST (synchronous):
+       a. Purge notification service in-memory state (no new alerts buffered)
+       b. Remove cameras from edge devices (Jetson stops detecting)
+       c. Delete WebRTC streams (no new clips recorded)
+       d. Evict from in-memory pipeline
+    3. Extract blob keys from the now-stable DB
+    4. Batch-delete DB rows (no new data arriving)
+    5. Schedule async blob deletion
+    6. Invalidate caches
     """
     from routes.notifications_routes import invalidate_camera_mode_cache
 
     logger.info(f"[Site Delete] Starting deletion of site={site_uuid}")
-    
+
     site_repo = SiteRepository()
     site = await site_repo.get_site(db, user_id=user.id, site_uuid=site_uuid)
 
     # ========================================
-    # PHASE 1: Snapshot camera info BEFORE deletion
+    # PHASE 1: Snapshot camera info BEFORE any changes
     # ========================================
     logger.info(f"[Site Delete] Phase 1: Gathering camera info")
     camera_rows = (
@@ -972,9 +985,68 @@ async def delete_site(
     logger.info(f"[Site Delete] Snapshotted {len(cam_snapshot)} cameras")
 
     # ========================================
-    # PHASE 2: Extract blob keys from notifications/clips BEFORE deletion
+    # PHASE 2: STOP CAMERAS (synchronous, BEFORE any DB deletion)
+    #
+    # This is the critical gate. New images/detections/clips are uploaded
+    # to blob storage every second the cameras run. If we delete the DB rows
+    # first, the pipeline just re-creates them. We MUST stop the hardware
+    # and in-process pipeline before touching the DB.
     # ========================================
-    logger.info(f"[Site Delete] Phase 2: Extracting blob storage keys in batches")
+    logger.info(f"[Site Delete] Phase 2: Stopping cameras before deletion")
+
+    # 2a: Purge notification service in-memory state immediately.
+    #     This prevents buffered detections for these cameras from being
+    #     written to the DB after we start deleting.
+    notif_svc = getattr(manager, "_notification_service", None) if manager is not None else None
+    if notif_svc is not None:
+        try:
+            purge_fn = getattr(notif_svc, "purge_deleted_site_runtime_state", None)
+            if callable(purge_fn):
+                await purge_fn(
+                    user_id=int(user.id),
+                    site_uuid=site.site_uuid,
+                    camera_uuids=camera_uuids,
+                )
+            else:
+                notif_svc.invalidate_recipient_cache(user_id=int(user.id), site_uuid=site.site_uuid)
+                for cam_uuid in camera_uuids:
+                    notif_svc.invalidate_camera_roi_state(str(cam_uuid))
+            logger.info(f"[Site Delete] Notification service state purged")
+        except Exception as exc:
+            logger.warning(f"[Site Delete] Failed to purge notification service state: {exc}", exc_info=True)
+
+    # 2b: Remove cameras from edge devices, WebRTC, and pipeline (synchronous with timeout).
+    #     After this call completes (or times out), no new detections/clips arrive.
+    if manager is not None and cam_snapshot:
+        logger.info(
+            f"[Site Delete] Stopping {len(cam_snapshot)} cameras on edge/WebRTC/pipeline"
+        )
+        try:
+            await asyncio.wait_for(
+                _cleanup_cameras_background(manager, cam_snapshot, user_id=int(user.id)),
+                timeout=90.0,
+            )
+            logger.info(f"[Site Delete] Cameras stopped successfully")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[Site Delete] Camera stop timed out after 90s — proceeding with deletion. "
+                f"Some cameras on edge devices may still be running briefly."
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[Site Delete] Camera stop encountered errors — proceeding: {exc}",
+                exc_info=True,
+            )
+    elif manager is None:
+        logger.warning(
+            f"[Site Delete] Manager unavailable — edge/WebRTC/pipeline stop skipped. site={site_uuid}"
+        )
+
+    # ========================================
+    # PHASE 3: Extract blob keys from the now-stable DB
+    # Cameras are stopped so no new rows are being created.
+    # ========================================
+    logger.info(f"[Site Delete] Phase 3: Extracting blob storage keys in batches")
     alert_blob_keys: List[str] = []
     notification_clip_blob_keys: List[str] = []
 
@@ -1029,7 +1101,7 @@ async def delete_site(
                 )
             )
         ).scalars().all()
-        
+
         clip_blob_keys = [
             str(k).strip()
             for k in clip_records
@@ -1040,29 +1112,8 @@ async def delete_site(
     clip_blob_keys.extend(notification_clip_blob_keys)
 
     # ========================================
-    # PHASE 3: Notify services of pending deletion
-    # ========================================
-    logger.info(f"[Site Delete] Phase 3: Notifying services of pending deletion")
-    notif_svc = getattr(manager, "_notification_service", None) if manager is not None else None
-    if notif_svc is not None:
-        try:
-            purge_fn = getattr(notif_svc, "purge_deleted_site_runtime_state", None)
-            if callable(purge_fn):
-                await purge_fn(
-                    user_id=int(user.id),
-                    site_uuid=site.site_uuid,
-                    camera_uuids=camera_uuids,
-                )
-            else:
-                notif_svc.invalidate_recipient_cache(user_id=int(user.id), site_uuid=site.site_uuid)
-                for camera_uuid in camera_uuids:
-                    notif_svc.invalidate_camera_roi_state(str(camera_uuid))
-            logger.info(f"[Site Delete] Service notification complete")
-        except Exception as e:
-            logger.warning(f"[Site Delete] Failed to notify services: {e}", exc_info=True)
-
-    # ========================================
     # PHASE 4: Batch delete from database
+    # Cameras are already stopped — no new rows arrive during deletion.
     # ========================================
     logger.info(f"[Site Delete] Phase 4: Starting database cleanup (batched)")
     try:
@@ -1076,20 +1127,6 @@ async def delete_site(
     except Exception as e:
         logger.error(f"[Site Delete] Database cleanup FAILED: {e}", exc_info=True)
         raise
-
-    # ========================================
-    # PHASE 5: Cleanup edge devices, WebRTC, pipeline (async, best-effort)
-    # ========================================
-    if manager is not None and cam_snapshot:
-        logger.info(f"[Site Delete] Phase 5: Starting background cleanup of edge/WebRTC/pipeline")
-        _spawn_bg_task(
-            _cleanup_cameras_background(manager, cam_snapshot, user_id=int(user.id)),
-            name=f"delete_site_runtime_cleanup:{site_uuid}",
-        )
-    elif manager is None:
-        logger.warning(
-            f"[Site Delete] Manager unavailable — edge/WebRTC/pipeline cleanup skipped. site={site_uuid}",
-        )
 
     # ========================================
     # PHASE 6: Delete blobs from Azure storage (async, parallel batches)
