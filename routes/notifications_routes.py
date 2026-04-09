@@ -655,6 +655,7 @@ async def list_notifications(
 @router.post("/delete")
 async def delete_notifications_post(
     payload: DeleteNotificationsRequest,
+    db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     notification_service: NotificationService = Depends(get_notification_service),
 ):
@@ -668,6 +669,7 @@ async def delete_notifications_post(
 @router.delete("")
 async def delete_notifications(
     payload: DeleteNotificationsRequest,
+    db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
     notification_service: NotificationService = Depends(get_notification_service),
 ):

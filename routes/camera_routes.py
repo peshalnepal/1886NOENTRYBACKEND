@@ -18,11 +18,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dependencies import get_async_db, get_current_user, get_manager
+from dependencies import get_async_db, get_current_user, get_manager, get_manager_optional
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent
-from core.database_orm import User
+from core.database_orm import CameraDevice, Device, User
 from core.database import db_manager
 from core.security.tokens import decode_access_token
 from core.schemas import (
@@ -620,13 +620,56 @@ async def edit_camera(
     )
 
 
+async def _delete_camera_bg(
+    *,
+    manager: "Manager",
+    camera_uuid: uuid.UUID,
+    cam_code: Optional[str],
+    device_urls: List[str],
+    user_id: int,
+) -> None:
+    """Background: tell every edge device and the WebRTC server to stop this
+    camera, then evict it from the in-memory pipeline.
+
+    Runs AFTER the HTTP 200 is sent so slow / unreachable edge devices
+    (3 retries × 10 s connect-timeout = 30 s per device) never cause a 502.
+    """
+    for dev_url in device_urls:
+        try:
+            await manager._edge.delete_camera(device_url=dev_url, camera_uuid=str(camera_uuid))
+        except Exception:
+            logger.warning(
+                "cam delete [bg]: edge delete failed cam=%s url=%s", camera_uuid, dev_url, exc_info=True
+            )
+
+    if cam_code:
+        try:
+            await manager._webrtc.delete_stream(stream_key=str(cam_code))
+        except Exception:
+            logger.warning(
+                "cam delete [bg]: WebRTC delete failed cam=%s code=%s", camera_uuid, cam_code, exc_info=True
+            )
+
+    try:
+        active_pipeline = await asyncio.wait_for(
+            manager.get_activepipeline(user_id=user_id), timeout=10.0
+        )
+        await active_pipeline.remove_channel(camera_uuid)
+    except Exception:
+        logger.warning("cam delete [bg]: pipeline evict failed cam=%s", camera_uuid, exc_info=True)
+
+
 @router.delete("/{camera_uuid}")
 async def delete_camera(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
-    manager: Manager = Depends(get_manager),
+    # get_manager_optional never raises 503 — DB deletion must succeed even if
+    # the manager (pipeline / edge layer) has not fully started up.
+    manager: Optional[Manager] = Depends(get_manager_optional),
     user: User = Depends(get_current_user),
 ):
+    from routes.notifications_routes import invalidate_camera_mode_cache
+
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
@@ -634,16 +677,81 @@ async def delete_camera(
     cam, _cfg, _pid = full
     _ensure_user_owns_camera(cam, user.id)
 
-    pipeline = await manager.get_activepipeline(user_id=user.id)
+    # Snapshot data needed for background edge/WebRTC cleanup BEFORE any DB
+    # changes — these columns are gone after commit.
+    cam_code: Optional[str] = getattr(cam, "camera_code", None)
 
-    ev = ChannelRemoveEvent(
-        channel_id=camera_uuid,
-        configs={},
-        created_at=datetime.now(timezone.utc),
-    )
+    # Scalar join — no ORM Camera objects added to session identity map.
+    device_url_rows = (
+        await db.execute(
+            select(CameraDevice.camera_uuid, Device.device_url)
+            .join(Device, Device.device_uuid == CameraDevice.device_uuid)
+            .where(CameraDevice.camera_uuid == camera_uuid)
+        )
+    ).all()
+    device_urls = [
+        str(row[1]).strip() for row in device_url_rows if str(row[1] or "").strip()
+    ]
 
-    await manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=user.id)
-    from routes.notifications_routes import invalidate_camera_mode_cache
+    # ── Attempt pipeline-managed delete (DB + edge + WebRTC + in-memory) ──
+    # update_pipeline acquires the user-lock, does the DB commit, then calls
+    # _remove_channel which fires edge/WebRTC HTTP calls while STILL HOLDING
+    # the lock.  Those calls can take up to 30 s (3 retries × 10 s).
+    # We allow 20 s max so the Azure proxy never times us out at ~240 s,
+    # then fall back to a direct DB-only delete + background cleanup.
+    if manager is not None:
+        try:
+            pipeline = await asyncio.wait_for(
+                manager.get_activepipeline(user_id=user.id), timeout=5.0
+            )
+            ev = ChannelRemoveEvent(
+                channel_id=camera_uuid,
+                configs={},
+                created_at=datetime.now(timezone.utc),
+            )
+            await asyncio.wait_for(
+                manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=user.id),
+                timeout=20.0,
+            )
+            # Manager handled everything (DB + edge + WebRTC) within the timeout.
+            await invalidate_camera_mode_cache(camera_uuid)
+            return {"ok": True}
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Camera delete via manager timed out (edge/WebRTC slow) for cam=%s; "
+                "falling back to direct DB delete + background cleanup",
+                camera_uuid,
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.warning(
+                "Camera delete via manager failed for cam=%s; "
+                "falling back to direct DB delete + background cleanup",
+                camera_uuid, exc_info=True,
+            )
+
+    # ── Fallback: direct DB delete + background edge/WebRTC cleanup ───────
+    # The manager's update_pipeline may have rolled back (timeout during edge
+    # calls → the async-with-session exits via CancelledError → rollback).
+    # Re-fetch the camera to confirm it still needs deleting.
+    full2 = await repo.get_camera_full(db, camera_uuid=camera_uuid)
+    if full2:
+        cam2, _, _ = full2
+        await db.delete(cam2)
+        await db.commit()
+
+    if device_urls or cam_code:
+        asyncio.create_task(
+            _delete_camera_bg(
+                manager=manager,
+                camera_uuid=camera_uuid,
+                cam_code=cam_code,
+                device_urls=device_urls,
+                user_id=int(user.id),
+            ),
+            name="camera_cleanup",
+        )
 
     await invalidate_camera_mode_cache(camera_uuid)
     return {"ok": True}

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import logging
 from datetime import datetime, timedelta, timezone
@@ -86,6 +87,30 @@ async def _fetch_owned_clips(
     return [clips_by_id[clip_id] for clip_id in ordered_ids if clip_id in clips_by_id]
 
 
+async def _delete_clip_blobs_background(blob_keys: List[str]) -> None:
+    """Background task: delete Azure Blob Storage objects for removed clips.
+
+    Runs AFTER db.commit() so the HTTP response is never blocked by Azure
+    Storage round-trips (~1-5 s per blob × N clips = 502 territory for bulk
+    deletes with the old synchronous approach).
+    """
+    unique_keys = list(dict.fromkeys(k for k in blob_keys if k))
+    if not unique_keys:
+        return
+    svc = EventClipService()
+    try:
+        for key in unique_keys:
+            try:
+                await svc.delete_blob(blob_name=key)
+            except Exception:
+                logger.warning("clip cleanup [bg]: blob delete failed %s", key, exc_info=True)
+    finally:
+        try:
+            await svc.close()
+        except Exception:
+            pass
+
+
 async def _delete_clip_records(
     *,
     db: AsyncSession,
@@ -94,25 +119,28 @@ async def _delete_clip_records(
     if not clips:
         return 0
 
-    clip_service = EventClipService()
-    try:
-        for clip in clips:
-            storage_key = str(clip.storage_key or "").strip()
-            if storage_key:
-                try:
-                    await clip_service.delete_blob(blob_name=storage_key)
-                except Exception:
-                    logger.warning(
-                        "Failed deleting clip blob %s; removing DB record anyway",
-                        storage_key,
-                        exc_info=True,
-                    )
+    # Snapshot blob storage keys BEFORE any DB changes — the rows and their
+    # storage_key values are gone once we commit.
+    blob_keys = [
+        str(clip.storage_key or "").strip()
+        for clip in clips
+        if str(clip.storage_key or "").strip()
+    ]
 
-            await db.delete(clip)
+    # Delete DB rows first — pure SQL, no external calls.
+    # Doing this BEFORE blob deletion was the root cause of 502: Azure Storage
+    # delete_blob() calls (1-5 s each) were on the HTTP critical path, so a
+    # bulk clip delete could easily exceed the Azure proxy timeout.
+    for clip in clips:
+        await db.delete(clip)
+    await db.commit()
 
-        await db.commit()
-    finally:
-        await clip_service.close()
+    # Delete Azure blobs in the background after the 200/204 is already sent.
+    if blob_keys:
+        asyncio.create_task(
+            _delete_clip_blobs_background(blob_keys),
+            name="clip_blob_cleanup",
+        )
 
     return len(clips)
 
