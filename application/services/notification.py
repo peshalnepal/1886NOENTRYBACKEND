@@ -1190,6 +1190,111 @@ class NotificationService:
             if force_all:
                 return
 
+    async def _batch_hide_notifications(
+        self,
+        *,
+        user_id: int,
+        notification_ids: List[int],
+        batch_size: int = 1000,
+    ) -> List[str]:
+        """Hide notifications in batches to prevent table lock exhaustion.
+
+        Each batch is a separate transaction, releasing locks between commits.
+        Returns: list of blob storage keys to cleanup.
+        """
+        if not notification_ids:
+            return []
+
+        sorted_ids = sorted(set(int(nid) for nid in notification_ids if nid > 0))
+        all_storage_keys: List[str] = []
+        total_hidden = 0
+
+        logger.info(
+            "[Notification Batch Hide] starting hide of %d notifications for user=%s in batches of %d",
+            len(sorted_ids),
+            user_id,
+            batch_size,
+        )
+
+        for batch_num, i in enumerate(range(0, len(sorted_ids), batch_size), start=1):
+            batch_ids = sorted_ids[i : i + batch_size]
+
+            try:
+                async with self._session_factory() as db:
+                    # Fetch blob keys for this batch BEFORE hiding
+                    rows = (
+                        await db.execute(
+                            select(Notification.id, Notification.payload)
+                            .where(
+                                Notification.user_id == int(user_id),
+                                Notification.id.in_(batch_ids),
+                                Notification.visible.is_(True),
+                            )
+                        )
+                    ).all()
+
+                    matched_ids: List[int] = []
+                    for notification_id, notification_payload in rows:
+                        try:
+                            parsed_id = int(notification_id)
+                        except Exception:
+                            continue
+
+                        if parsed_id <= 0:
+                            continue
+
+                        matched_ids.append(parsed_id)
+                        storage_key = extract_image_storage_key(notification_payload)
+                        if storage_key:
+                            all_storage_keys.append(storage_key)
+
+                    if not matched_ids:
+                        logger.info(
+                            "[Notification Batch Hide] batch %d: no matching notifications to hide",
+                            batch_num,
+                        )
+                        continue
+
+                    # Hide this batch (set visible=False)
+                    result = await db.execute(
+                        update(Notification)
+                        .where(
+                            Notification.user_id == int(user_id),
+                            Notification.id.in_(matched_ids),
+                            Notification.visible.is_(True),
+                        )
+                        .values(visible=False)
+                        .execution_options(synchronize_session=False)
+                    )
+                    await db.commit()
+
+                    hidden_count = result.rowcount or len(matched_ids)
+                    total_hidden += hidden_count
+
+                    logger.info(
+                        "[Notification Batch Hide] batch %d: hid %d notifications, total=%d, remaining=%d",
+                        batch_num,
+                        hidden_count,
+                        total_hidden,
+                        len(sorted_ids) - total_hidden,
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "[Notification Batch Hide] batch %d failed for user=%s with %d ids: %s",
+                    batch_num,
+                    user_id,
+                    len(batch_ids),
+                    str(exc),
+                )
+                raise
+
+        logger.info(
+            "[Notification Batch Hide] complete: %d notifications hidden, %d storage keys to cleanup",
+            total_hidden,
+            len(all_storage_keys),
+        )
+        return all_storage_keys
+
     async def _flush_delete_queue(self, *, force_all: bool = False) -> None:
         if not self._session_factory:
             return
@@ -1207,60 +1312,20 @@ class NotificationService:
             return
 
         for user_id, ids in ready.items():
-            storage_keys: List[str] = []
-
             try:
-                async with self._session_factory() as db:
-                    rows = (
-                        await db.execute(
-                            select(Notification.id, Notification.payload)
-                            .where(
-                                Notification.user_id == int(user_id),
-                                Notification.id.in_(ids),
-                                Notification.visible.is_(True),
-                            )
-                        )
-                    ).all()
-
-                    matched_ids: List[int] = []
-                    for notification_id, notification_payload in rows:
-                        try:
-                            parsed_id = int(notification_id)
-                        except Exception:
-                            continue
-
-                        if parsed_id <= 0:
-                            continue
-
-                        matched_ids.append(parsed_id)
-
-                        storage_key = extract_image_storage_key(notification_payload)
-                        if storage_key:
-                            storage_keys.append(storage_key)
-
-                    matched_ids = sorted(set(matched_ids))
-                    if not matched_ids:
-                        await db.rollback()
-                        continue
-
-                    await db.execute(
-                        update(Notification)
-                        .where(
-                            Notification.user_id == int(user_id),
-                            Notification.id.in_(matched_ids),
-                            Notification.visible.is_(True),
-                        )
-                        .values(visible=False)
-                        .execution_options(synchronize_session=False)
-                    )
-                    await db.commit()
+                # Use batched hiding instead of single large transaction
+                storage_keys = await self._batch_hide_notifications(
+                    user_id=int(user_id),
+                    notification_ids=ids,
+                    batch_size=1000,
+                )
 
                 if storage_keys:
                     self._fire_and_forget(self._delete_alert_blob_keys(storage_keys))
 
             except Exception:
                 logger.exception(
-                    "Failed to apply queued notification hide user=%s ids=%s",
+                    "[Notification Batch Hide] failed to apply queued notification hide user=%s ids=%s",
                     user_id,
                     ids,
                 )
@@ -1269,7 +1334,8 @@ class NotificationService:
                         bucket = self._pending_delete_ids_by_user.setdefault(int(user_id), set())
                         bucket.update(ids)
                     self._delete_event.set()
-                    
+
+
     async def handle_deletion_event(
         self,
         *,
@@ -1306,14 +1372,32 @@ class NotificationService:
                     if cu is not None:
                         conds.append(Notification.camera_uuid == cu)
 
-                    async with self._session_factory() as db:
-                        rows = (
-                            await db.execute(
-                                select(Notification.id).where(and_(*conds))
-                            )
-                        ).scalars().all()
+                    # Fetch IDs in batches to avoid loading millions of rows at once
+                    id_batch_size = 10000
+                    id_offset = 0
+                    all_ids: set[int] = set()
+                    while True:
+                        async with self._session_factory() as db:
+                            rows = (
+                                await db.execute(
+                                    select(Notification.id)
+                                    .where(and_(*conds))
+                                    .order_by(Notification.id)
+                                    .offset(id_offset)
+                                    .limit(id_batch_size)
+                                )
+                            ).scalars().all()
 
-                    ids = sorted({int(r) for r in rows if r is not None and int(r) > 0})
+                        if not rows:
+                            break
+                        for r in rows:
+                            if r is not None and int(r) > 0:
+                                all_ids.add(int(r))
+                        id_offset += id_batch_size
+                        if len(rows) < id_batch_size:
+                            break
+
+                    ids = sorted(all_ids)
                 except Exception:
                     logger.exception(
                         "Failed to resolve notification IDs for bulk delete user=%s site=%s camera=%s",
@@ -1335,7 +1419,7 @@ class NotificationService:
         return {
             "ok": True,
             "deleted": len(ids),
-            "notification_ids": ids,
+            "notification_ids": ids[:1000],
         }
 
     def _ensure_flush_task(self) -> None:

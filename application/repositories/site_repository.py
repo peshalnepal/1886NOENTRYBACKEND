@@ -5,7 +5,7 @@ from datetime import time as dt_time
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import delete, select, func
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -414,7 +414,7 @@ class SiteRepository:
 
     async def _batch_delete(
         self,
-        db,  # SessionFactory
+        session_factory,  # callable returning AsyncSession
         *,
         table,
         where_clause,
@@ -424,59 +424,64 @@ class SiteRepository:
         """
         Delete large tables in batches to avoid locking and memory issues.
         Each batch uses a separate transaction.
+
+        Uses a subquery approach because SQLAlchemy's delete() does not
+        support .limit(). The pattern is:
+            DELETE FROM table WHERE id IN (SELECT id FROM table WHERE … LIMIT N)
         """
         import logging
         logger = logging.getLogger(__name__)
         total_deleted = 0
         batch_num = 0
 
+        pk = table.id  # assumes every table has an `id` primary key column
+
         while True:
-            # Get a fresh session for each batch
-            session = db() if callable(db) else db
+            async with session_factory() as session:
+                try:
+                    # Select a batch of IDs to delete
+                    id_stmt = (
+                        select(pk)
+                        .where(where_clause)
+                        .limit(batch_size)
+                    )
+                    batch_ids = (await session.execute(id_stmt)).scalars().all()
 
-            try:
-                # Count how many records match in this batch
-                count_stmt = select(func.count()).select_from(table).where(where_clause)
-                count_result = await session.execute(count_stmt)
-                remaining = count_result.scalar() or 0
+                    if not batch_ids:
+                        break
 
-                if remaining == 0:
-                    break
+                    delete_stmt = delete(table).where(pk.in_(batch_ids))
+                    result = await session.execute(delete_stmt)
+                    await session.commit()
 
-                # Delete this batch
-                delete_stmt = delete(table).where(where_clause).limit(batch_size)
-                result = await session.execute(delete_stmt)
-                await session.commit()
+                    deleted_in_batch = result.rowcount or 0
+                    total_deleted += deleted_in_batch
+                    batch_num += 1
 
-                deleted_in_batch = result.rowcount or 0
-                total_deleted += deleted_in_batch
-                batch_num += 1
+                    logger.info(
+                        f"[Batch Delete] {label}: batch #{batch_num} deleted {deleted_in_batch}, "
+                        f"total={total_deleted}"
+                    )
 
-                logger.info(
-                    f"[Batch Delete] {label}: batch #{batch_num} deleted {deleted_in_batch}, "
-                    f"total={total_deleted}, remaining={remaining - deleted_in_batch}"
-                )
+                    if deleted_in_batch == 0:
+                        break
 
-                if deleted_in_batch == 0:
-                    break
-
-            except Exception as e:
-                await session.rollback()
-                logger.error(f"[Batch Delete] {label}: batch #{batch_num} failed: {e}")
-                raise
-            finally:
-                if callable(db):
-                    await session.close()
+                except Exception as e:
+                    await session.rollback()
+                    logger.error(f"[Batch Delete] {label}: batch #{batch_num} failed: {e}")
+                    raise
 
         return total_deleted
 
     async def _fast_delete(
         self,
-        db,  # AsyncSession (single transaction)
+        session_factory,  # callable returning AsyncSession context manager
         table,
         where_clause,
     ) -> int:
         """Single-transaction delete for smaller tables."""
-        delete_stmt = delete(table).where(where_clause)
-        result = await db.execute(delete_stmt)
-        return result.rowcount or 0
+        async with session_factory() as session:
+            delete_stmt = delete(table).where(where_clause)
+            result = await session.execute(delete_stmt)
+            await session.commit()
+            return result.rowcount or 0

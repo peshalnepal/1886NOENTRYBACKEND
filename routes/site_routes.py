@@ -974,30 +974,49 @@ async def delete_site(
     # ========================================
     # PHASE 2: Extract blob keys from notifications/clips BEFORE deletion
     # ========================================
-    logger.info(f"[Site Delete] Phase 2: Extracting blob storage keys (this may take a moment for large sites)")
-    notification_payloads = (
-        await db.execute(
-            select(Notification.payload).where(
-                Notification.site_uuid == site.site_uuid,
-                Notification.user_id == int(user.id),
-            )
-        )
-    ).scalars().all()
-
-    logger.info(f"[Site Delete] Scanning {len(notification_payloads)} notifications for blob keys")
-    
+    logger.info(f"[Site Delete] Phase 2: Extracting blob storage keys in batches")
     alert_blob_keys: List[str] = []
     notification_clip_blob_keys: List[str] = []
-    for idx, payload in enumerate(notification_payloads):
-        if idx % 10000 == 0 and idx > 0:
-            logger.info(f"[Site Delete] Processed {idx}/{len(notification_payloads)} notifications")
-        
-        key = extract_image_storage_key(payload)
-        if key:
-            alert_blob_keys.append(key)
-        notification_clip_blob_keys.extend(_extract_notification_clip_storage_keys(payload))
 
-    logger.info(f"[Site Delete] Found {len(alert_blob_keys)} alert images and {len(notification_clip_blob_keys)} clip files in notifications")
+    blob_batch_size = 5000
+    blob_offset = 0
+    total_scanned = 0
+    while True:
+        async with AsyncSessionLocal() as blob_db:
+            batch = (
+                await blob_db.execute(
+                    select(Notification.id, Notification.payload)
+                    .where(
+                        Notification.site_uuid == site.site_uuid,
+                        Notification.user_id == int(user.id),
+                    )
+                    .order_by(Notification.id)
+                    .offset(blob_offset)
+                    .limit(blob_batch_size)
+                )
+            ).all()
+
+        if not batch:
+            break
+
+        for _nid, payload in batch:
+            key = extract_image_storage_key(payload)
+            if key:
+                alert_blob_keys.append(key)
+            notification_clip_blob_keys.extend(_extract_notification_clip_storage_keys(payload))
+
+        total_scanned += len(batch)
+        blob_offset += blob_batch_size
+        if total_scanned % 50000 == 0:
+            logger.info(f"[Site Delete] Scanned {total_scanned} notifications for blob keys so far")
+
+        if len(batch) < blob_batch_size:
+            break
+
+    logger.info(
+        f"[Site Delete] Scanned {total_scanned} notifications — "
+        f"found {len(alert_blob_keys)} alert images and {len(notification_clip_blob_keys)} clip files"
+    )
 
     # Extract clips from video records
     clip_blob_keys: List[str] = []
@@ -1047,12 +1066,8 @@ async def delete_site(
     # ========================================
     logger.info(f"[Site Delete] Phase 4: Starting database cleanup (batched)")
     try:
-        # Create a session factory for batched operations
-        async def session_factory():
-            return AsyncSessionLocal()
-        
         stats = await site_repo.delete_site_graph_batched(
-            session_factory,
+            AsyncSessionLocal,
             site_uuid=site.site_uuid,
             camera_uuids=camera_uuids,
             batch_size=2000,
