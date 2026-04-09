@@ -137,7 +137,8 @@ class VideoChannel():
         if decoder == "nvv4l2decoder":
             # Jetson HW decode (NVMM) -> nvvidconv to CPU BGRx -> videoconvert to BGR for OpenCV
             return (
-                "rtspsrc location={url} latency={lat} protocols={proto} ! "
+                "rtspsrc location={url} latency={lat} protocols={proto} "
+                "drop-on-latency=true do-retransmission=false ! "
                 + q +
                 "rtph264depay ! "
                 "h264parse config-interval=1 ! "
@@ -150,7 +151,8 @@ class VideoChannel():
 
         # CPU fallback decoder (avdec_h264)
         return (
-            "rtspsrc location={url} latency={lat} protocols={proto} ! "
+            "rtspsrc location={url} latency={lat} protocols={proto} "
+            "drop-on-latency=true do-retransmission=false ! "
             + q +
             "rtph264depay ! h264parse config-interval=1 ! "
             "{dec} ! "
@@ -270,6 +272,9 @@ class VideoChannel():
                     except Exception:
                         grabbed = False
 
+                    if not grabbed:
+                        raise RuntimeError("Frame grab failed")
+
                     ts_ms = int(time.time() * 1000)
 
                     if emit_interval_ms and (ts_ms - last_emit_ms) < emit_interval_ms:
@@ -277,18 +282,9 @@ class VideoChannel():
 
                     last_emit_ms = ts_ms
 
-                    frame = None
-                    if grabbed:
-                        ok, frame = cap.retrieve()
-                        if not ok:
-                            frame = None
-                    else:
-                        ok, frame = cap.read()
-                        if not ok:
-                            frame = None
-
-                    if frame is None:
-                        raise RuntimeError("Frame read failed")
+                    ok, frame = cap.retrieve()
+                    if not ok or frame is None:
+                        raise RuntimeError("Frame retrieve failed")
 
                     frame = self._maybe_resize(frame)
                     self._seq += 1

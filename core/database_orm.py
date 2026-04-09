@@ -212,6 +212,7 @@ class Site(Base):
         "Device",
         secondary="site_devices",
         back_populates="sites",
+        passive_deletes=True,
     )
 
     notification_emails = relationship(
@@ -275,6 +276,7 @@ class Device(Base):
         "Site",
         secondary="site_devices",
         back_populates="devices",
+        passive_deletes=True,
     )
 
     # Device <-> Cameras (M:N)
@@ -282,6 +284,7 @@ class Device(Base):
         "Camera",
         secondary="camera_devices",
         back_populates="devices",
+        passive_deletes=True,
     )
 
     __table_args__ = (
@@ -384,6 +387,7 @@ class Camera(Base):
         "Device",
         secondary="camera_devices",
         back_populates="cameras",
+        passive_deletes=True,
     )
 
     channel_configuration = relationship(
@@ -405,6 +409,7 @@ class Camera(Base):
         "Pipeline",
         secondary="pipeline_cameras",
         back_populates="cameras",
+        passive_deletes=True,
     )
 
     __table_args__ = (
@@ -455,6 +460,7 @@ class Pipeline(Base):
         "Camera",
         secondary="pipeline_cameras",
         back_populates="pipelines",
+        passive_deletes=True,
     )
 
 

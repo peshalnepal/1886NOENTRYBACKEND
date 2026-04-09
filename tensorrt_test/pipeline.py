@@ -13,6 +13,38 @@ logger = logging.getLogger(__name__)
 _DONE = object()
 
 
+def _encode_thumbnail_data_url(frame_bgr, max_edge=200, jpeg_quality=60):
+    if frame_bgr is None:
+        return None
+
+    try:
+        import base64
+        import cv2
+
+        h, w = frame_bgr.shape[:2]
+        if h > 0 and w > 0:
+            largest = max(h, w)
+            if largest > int(max_edge):
+                scale = float(max_edge) / float(largest)
+                frame_bgr = cv2.resize(
+                    frame_bgr,
+                    (max(1, int(w * scale)), max(1, int(h * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            frame_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
+        )
+        if not ok:
+            return None
+
+        return "data:image/jpeg;base64,{}".format(base64.b64encode(encoded.tobytes()).decode("ascii"))
+    except Exception:
+        return None
+
+
 class CoalescingBuffer(object):
     def __init__(self, max_pending_keys=1000):
         self._latest = {}  # camera_uuid -> RTSPEvent
@@ -404,12 +436,23 @@ class SimpleInferencePipeline(object):
                              })
                     
                     if dets:
+                        frame_h = result.get("frame_h")
+                        frame_w = result.get("frame_w")
+                        if (frame_w is None or frame_h is None) and bgr is not None:
+                            frame_h, frame_w = bgr.shape[:2]
                         alert_payload = {
                             "camera_uuid": str(meta["camera_uuid"]),
                             "frame_ts_ms": int(meta["frame_ts_ms"]),
                             "frame_seq": int(meta["frame_seq"]),
                             "detections": dets
                         }
+                        if frame_w is not None:
+                            alert_payload["frame_w"] = int(frame_w)
+                        if frame_h is not None:
+                            alert_payload["frame_h"] = int(frame_h)
+                        image_url = _encode_thumbnail_data_url(bgr)
+                        if image_url:
+                            alert_payload["image_url"] = image_url
                         loop.run_in_executor(None, _send_alert, notify_url, alert_payload)
 
                 async with self._latest_lock:

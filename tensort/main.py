@@ -22,11 +22,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jetson-app")
 
 app = Flask(__name__)
-DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "1.0"))
+DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "5.0"))
 DEFAULT_RESIZE_W = int(os.getenv("DEFAULT_RESIZE_W", "640"))
-DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "360"))
+DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "480"))
 DEFAULT_JPEG_QUALITY = int(os.getenv("DEFAULT_JPEG_QUALITY", "70"))
-MAX_SAMPLE_FPS = float(os.getenv("MAX_SAMPLE_FPS", "5.0"))
+MAX_SAMPLE_FPS = float(os.getenv("MAX_SAMPLE_FPS", "15.0"))
 # -----------------------------
 # Pipeline runtime (async loop in background thread)
 # -----------------------------

@@ -484,7 +484,7 @@ def build_default() -> TRTInfer:
             det_engine = candidate
 
     imgsz = int(os.getenv("IMG_SZ", "640"))
-    conf = float(os.getenv("CONF", "0.35"))
+    conf = float(os.getenv("CONF", "0.25"))
     iou = float(os.getenv("IOU", "0.45"))
     device_id = int(os.getenv("CUDA_DEVICE", "0"))
     nms_topk = int(os.getenv("NMS_TOPK", "100"))

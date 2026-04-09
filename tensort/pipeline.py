@@ -316,7 +316,7 @@ class SimpleInferencePipeline(object):
         # Number of parallel inference threads (one per camera is a good default)
         self._num_workers = _env_int("INFER_NUM_WORKERS", 0, minimum=0)
         # 0 → auto-size to number of cameras (capped at INFER_NUM_WORKERS_MAX)
-        self._num_workers_max = _env_int("INFER_NUM_WORKERS_MAX", 4, minimum=1)
+        self._num_workers_max = _env_int("INFER_NUM_WORKERS_MAX", 6, minimum=1)
 
         self._channels = {}
         self._channel_tasks = {}
