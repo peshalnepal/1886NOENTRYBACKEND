@@ -866,10 +866,16 @@ async def delete_site(
 
     # Resolve active pipeline now (in-memory lookup, fast) so the background
     # task can evict channels without needing the DB.
+    # Capped at 5 s — if a reconcile holds the user-lock longer (unreachable
+    # edge device can stall reconcile for 30+ s) we must not let the HTTP
+    # response hang until the Azure proxy returns 503.
     active_pipeline = None
     if manager is not None:
         try:
-            active_pipeline = await manager.get_activepipeline(user_id=user.id)
+            active_pipeline = await asyncio.wait_for(
+                manager.get_activepipeline(user_id=user.id),
+                timeout=5.0,
+            )
         except Exception:
             logger.warning(
                 "Could not load active pipeline for site=%s; pipeline eviction skipped.",
