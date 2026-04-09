@@ -257,7 +257,8 @@ async def _delete_blobs_background(keys: List[str], *, service_cls: type, label:
 async def _cleanup_cameras_background(
     manager: "Manager",
     cam_snapshot: List[dict],
-    active_pipeline: "Optional[Any]",
+    *,
+    user_id: int,
 ) -> None:
     """Fire-and-forget: stop edge inference streams, remove WebRTC publish keys,
     and evict channels from the in-memory pipeline.
@@ -268,7 +269,27 @@ async def _cleanup_cameras_background(
     This intentionally runs AFTER the DB commit so the HTTP response is never
     blocked by slow or unreachable edge devices (which can take ~30 s per camera
     when the device is offline: 3 retries × 10 s connect-timeout each).
+
+    The active pipeline is resolved here (in the background) rather than on the
+    HTTP request path so the route handler is never stalled by lock contention
+    or a cold-start pipeline creation.
     """
+    # Resolve the in-memory pipeline lazily — this is now off the HTTP path so
+    # we can afford a longer timeout and still get channel eviction right.
+    active_pipeline = None
+    try:
+        active_pipeline = await asyncio.wait_for(
+            manager.get_activepipeline(user_id=user_id),
+            timeout=15.0,
+        )
+    except Exception:
+        logger.warning(
+            "site cleanup [bg]: could not resolve active pipeline user=%s; "
+            "channel eviction skipped",
+            user_id,
+            exc_info=True,
+        )
+
     for cam in cam_snapshot:
         cam_uuid = cam["camera_uuid"]
         cam_code = cam.get("camera_code")
@@ -817,30 +838,49 @@ async def delete_site(
     # After db.commit() the Camera, VideoRecord, Notification rows are gone.
     # Build plain-Python dicts so the data can be safely used in background
     # tasks after this request's DB session is closed.
+    #
+    # IMPORTANT: Use scalar/column queries only — do NOT load full Camera ORM
+    # objects into the session's identity map.  If ORM Camera objects are in
+    # the session when db.delete(site) is called, SQLAlchemy's
+    # "delete-orphan" cascade detects them and issues one DELETE per Camera
+    # (N+1) instead of relying on MySQL's single-statement ON DELETE CASCADE.
+    # For sites with many cameras + video records this snowballs into hundreds
+    # of round-trips → request timeout → Azure proxy 502.
 
-    # Load cameras with their linked devices in one query.
-    cameras_orm = (
+    # Step A: camera UUIDs + codes (scalar query — no ORM objects in session)
+    cam_code_rows = (
         await db.execute(
-            select(Camera)
+            select(Camera.camera_uuid, Camera.camera_code)
             .where(Camera.site_uuid == site.site_uuid)
-            .options(selectinload(Camera.devices))
         )
-    ).scalars().all()
+    ).all()
 
-    # Serialise into plain dicts — ORM objects must NOT be used after commit.
+    # Step B: device URLs per camera (scalar join — also no ORM objects)
+    cam_to_urls: Dict[uuid.UUID, set] = {row[0]: set() for row in cam_code_rows}
+    cam_to_code: Dict[uuid.UUID, Optional[str]] = {row[0]: row[1] for row in cam_code_rows}
+
+    if cam_to_urls:
+        device_url_rows = (
+            await db.execute(
+                select(CameraDevice.camera_uuid, Device.device_url)
+                .join(Device, Device.device_uuid == CameraDevice.device_uuid)
+                .where(CameraDevice.camera_uuid.in_(list(cam_to_urls.keys())))
+            )
+        ).all()
+        for cam_uuid_key, dev_url in device_url_rows:
+            url = str(dev_url or "").strip()
+            if url and cam_uuid_key in cam_to_urls:
+                cam_to_urls[cam_uuid_key].add(url)
+
     cam_snapshot = [
         {
-            "camera_uuid": cam.camera_uuid,
-            "camera_code": getattr(cam, "camera_code", None),
-            "device_urls": list({
-                str(getattr(dev, "device_url", "") or "").strip()
-                for dev in (getattr(cam, "devices", None) or [])
-                if str(getattr(dev, "device_url", "") or "").strip()
-            }),
+            "camera_uuid": cam_uuid_key,
+            "camera_code": cam_to_code[cam_uuid_key],
+            "device_urls": list(cam_to_urls[cam_uuid_key]),
         }
-        for cam in cameras_orm
+        for cam_uuid_key in cam_to_urls
     ]
-    camera_uuids = [c["camera_uuid"] for c in cam_snapshot]
+    camera_uuids = list(cam_to_urls.keys())
 
     # Alert image blobs — stored in Azure, rows CASCADE-deleted with site.
     alert_blob_keys: List[str] = []
@@ -867,27 +907,14 @@ async def delete_site(
             if str(k or "").strip()
         ]
 
-    # Resolve active pipeline now (in-memory lookup, fast) so the background
-    # task can evict channels without needing the DB.
-    # Capped at 5 s — if a reconcile holds the user-lock longer (unreachable
-    # edge device can stall reconcile for 30+ s) we must not let the HTTP
-    # response hang until the Azure proxy returns 503.
-    active_pipeline = None
-    if manager is not None:
-        try:
-            active_pipeline = await asyncio.wait_for(
-                manager.get_activepipeline(user_id=user.id),
-                timeout=5.0,
-            )
-        except Exception:
-            logger.warning(
-                "Could not load active pipeline for site=%s; pipeline eviction skipped.",
-                site_uuid, exc_info=True,
-            )
-
     # ── 2. Delete the site row — DB CASCADE removes everything ────────────
     # Camera, ChannelConfiguration, CameraDevice, PipelineCamera,
     # VideoRecord, SiteSettings, SiteDevice, Notification, NotificationEmail.
+    #
+    # Because NO Camera ORM objects are in the session (scalar queries above),
+    # SQLAlchemy issues exactly ONE DELETE FROM sites WHERE site_uuid = ? and
+    # lets MySQL's ON DELETE CASCADE handle all child rows in a single
+    # server-side transaction — O(1) round-trips regardless of camera count.
     await db.delete(site)
     await db.commit()
     # The 204 is logically ready here. Everything below is cleanup.
@@ -895,11 +922,13 @@ async def delete_site(
     # ── 3. Background: edge inference + WebRTC + pipeline channel cleanup ──
     # _edge.delete_camera() retries 3× with a 10 s connect-timeout each
     # (~30 s total per unreachable device).  Running this synchronously was
-    # the root cause of 503s: the Azure Container App proxy timed out while
-    # waiting for the edge device.  It is now fire-and-forget.
+    # the root cause of 503s.  It is now fire-and-forget.
+    # get_activepipeline is also resolved inside the background task (off the
+    # HTTP critical path) so lock contention or a cold-start pipeline build
+    # never delays the 204 response.
     if manager is not None and cam_snapshot:
         asyncio.create_task(
-            _cleanup_cameras_background(manager, cam_snapshot, active_pipeline)
+            _cleanup_cameras_background(manager, cam_snapshot, user_id=int(user.id))
         )
     elif manager is None:
         logger.warning(
