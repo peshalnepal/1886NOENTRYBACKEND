@@ -21,7 +21,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from dependencies import get_async_db, get_current_user, get_manager_optional
+from dependencies import get_async_db, get_current_user,get_manager
 from application.services.manager import Manager
 
 logger = logging.getLogger(__name__)
@@ -182,7 +182,7 @@ async def delete_my_account(
     request: Request,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
-    manager: Optional[Manager] = Depends(get_manager_optional),
+    manager: Manager = Depends(get_manager),
 ):
     if not verify_password(payload.password.get_secret_value(), current_user.hashed_password):
         raise HTTPException(status_code=400, detail="Password is incorrect")

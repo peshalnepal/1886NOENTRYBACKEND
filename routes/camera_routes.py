@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dependencies import get_async_db, get_current_user, get_manager, get_manager_optional
+from dependencies import get_async_db, get_current_user, get_manager
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent
@@ -663,9 +663,7 @@ async def _delete_camera_bg(
 async def delete_camera(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
-    # get_manager_optional never raises 503 — DB deletion must succeed even if
-    # the manager (pipeline / edge layer) has not fully started up.
-    manager: Optional[Manager] = Depends(get_manager_optional),
+    manager:Manager= Depends(get_manager),
     user: User = Depends(get_current_user),
 ):
     from routes.notifications_routes import invalidate_camera_mode_cache

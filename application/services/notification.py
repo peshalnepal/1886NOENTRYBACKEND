@@ -1103,6 +1103,60 @@ class NotificationService:
             if key[0] == uid:
                 self._recipient_cache.pop(key, None)
 
+    async def purge_deleted_site_runtime_state(
+        self,
+        *,
+        user_id: int,
+        site_uuid: Optional[uuid.UUID] = None,
+        camera_uuids: Optional[List[uuid.UUID]] = None,
+    ) -> None:
+        """Drop cached/buffered runtime state for cameras that are being deleted.
+
+        This prevents:
+        - buffered alerts for the deleted site from being flushed after delete
+        - cached camera context from continuing to resolve deleted cameras
+        - stale overlay/ROI cooldown state from hanging around
+        """
+        uid = int(user_id)
+        site_key = str(site_uuid) if site_uuid is not None else None
+        camera_keys = {str(value) for value in (camera_uuids or []) if value is not None}
+
+        async with self._buffer_lock:
+            hierarchical = self._pending_by_user.get(uid)
+
+            if hierarchical is not None:
+                if site_key is not None:
+                    hierarchical.pop(site_key, None)
+
+                if camera_keys:
+                    for raw_site_key in list(hierarchical.keys()):
+                        per_camera = hierarchical.get(raw_site_key) or {}
+                        for cam_key in list(per_camera.keys()):
+                            if cam_key in camera_keys:
+                                per_camera.pop(cam_key, None)
+                        if not per_camera:
+                            hierarchical.pop(raw_site_key, None)
+
+                if hierarchical:
+                    self._pending_by_user[uid] = hierarchical
+                else:
+                    self._pending_by_user.pop(uid, None)
+                    self._pending_since.pop(uid, None)
+
+        self.invalidate_recipient_cache(user_id=uid, site_uuid=site_uuid)
+
+        for cam_key in camera_keys:
+            self._ctx_cache.pop(cam_key, None)
+            self._ctx_inflight.pop(cam_key, None)
+            self._roi_cache.pop(cam_key, None)
+            self._overlay_history_by_camera.pop(cam_key, None)
+            self.invalidate_camera_roi_state(cam_key)
+
+        if camera_keys:
+            for key in list(self._last_sent.keys()):
+                if key[0] in camera_keys:
+                    self._last_sent.pop(key, None)
+
     def _fire_and_forget(self, coro):
         async def _runner():
             try:

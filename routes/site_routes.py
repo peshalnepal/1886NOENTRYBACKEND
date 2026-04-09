@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, SiteSettings, Notification, VideoRecord
-from dependencies import get_async_db, get_current_user, get_manager, get_manager_optional
+from dependencies import get_async_db, get_current_user, get_manager
 from application.channels.channel_config import VideoChannelConfig
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
@@ -285,32 +285,23 @@ def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
 
 
 async def _cleanup_cameras_background(
-    manager: "Manager",
+    manager: Manager,
     cam_snapshot: List[dict],
     *,
     user_id: int,
 ) -> None:
-    """Fire-and-forget: stop edge inference streams, remove WebRTC publish keys,
-    and evict channels from the in-memory pipeline.
+    """Best-effort runtime cleanup after the site DB rows are gone.
 
-    Each camera is handled independently — a timeout or error on one device
-    never prevents cleanup of the remaining cameras.
-
-    This intentionally runs AFTER the DB commit so the HTTP response is never
-    blocked by slow or unreachable edge devices (which can take ~30 s per camera
-    when the device is offline: 3 retries × 10 s connect-timeout each).
-
-    The active pipeline is resolved here (in the background) rather than on the
-    HTTP request path so the route handler is never stalled by lock contention
-    or a cold-start pipeline creation.
+    Important:
+    - Do NOT call manager.get_activepipeline() here. After the DB delete that
+      can recreate a brand-new empty pipeline just to remove channels.
+    - Only evict from an already-loaded in-memory pipeline if one exists.
     """
-    # Resolve the in-memory pipeline lazily — this is now off the HTTP path so
-    # we can afford a longer timeout and still get channel eviction right.
     active_pipeline = None
     try:
         active_pipeline = await asyncio.wait_for(
             manager.get_activepipeline(user_id=user_id),
-            timeout=15.0,
+            timeout=30.0,
         )
     except Exception:
         logger.warning(
@@ -323,17 +314,20 @@ async def _cleanup_cameras_background(
     for cam in cam_snapshot:
         cam_uuid = cam["camera_uuid"]
         cam_code = cam.get("camera_code")
-        device_urls = cam.get("device_urls") or []
+        device_urls = list(dict.fromkeys(cam.get("device_urls") or []))
 
         for dev_url in device_urls:
             try:
                 await manager._edge.delete_camera(
-                    device_url=dev_url, camera_uuid=str(cam_uuid)
+                    device_url=dev_url,
+                    camera_uuid=str(cam_uuid),
                 )
             except Exception:
                 logger.warning(
                     "site cleanup [bg]: edge delete failed cam=%s url=%s",
-                    cam_uuid, dev_url, exc_info=True,
+                    cam_uuid,
+                    dev_url,
+                    exc_info=True,
                 )
 
         if cam_code:
@@ -342,7 +336,9 @@ async def _cleanup_cameras_background(
             except Exception:
                 logger.warning(
                     "site cleanup [bg]: WebRTC delete failed cam=%s code=%s",
-                    cam_uuid, cam_code, exc_info=True,
+                    cam_uuid,
+                    cam_code,
+                    exc_info=True,
                 )
 
         if active_pipeline is not None:
@@ -351,8 +347,23 @@ async def _cleanup_cameras_background(
             except Exception:
                 logger.warning(
                     "site cleanup [bg]: pipeline remove_channel failed cam=%s",
-                    cam_uuid, exc_info=True,
+                    cam_uuid,
+                    exc_info=True,
                 )
+
+
+def _spawn_bg_task(coro, *, name: str) -> None:
+    task = asyncio.create_task(coro, name=name)
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Background task failed name=%s", name)
+
+    task.add_done_callback(_on_done)
 
 
 async def _invalidate_site_camera_mode_cache(
@@ -685,7 +696,7 @@ async def update_site_settings(
     payload: SiteSettingsUpdate,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    manager: Optional[Manager] = Depends(get_manager_optional),
+    manager: Manager = Depends(get_manager),
 ):
     site_repo=SiteRepository()
     site = await site_repo.get_site(db, user_id=user.id,site_uuid=site_uuid)
@@ -807,7 +818,7 @@ async def update_site(
     payload: SiteUpdate,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    manager: Optional[Manager] = Depends(get_manager_optional),
+    manager:Manager = Depends(get_manager),
 ):
     site_repo=SiteRepository()
     site = await site_repo.get_site(db,user_id=user.id,site_uuid=site_uuid)
@@ -853,53 +864,59 @@ async def delete_site(
     site_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
-    manager: Optional[Manager] = Depends(get_manager_optional),
+    manager: Manager = Depends(get_manager),
 ):
     from routes.notifications_routes import invalidate_camera_mode_cache
 
     site_repo = SiteRepository()
     site = await site_repo.get_site(db, user_id=user.id, site_uuid=site_uuid)
-    cam_code_rows = (
+
+    # Snapshot everything needed for cleanup BEFORE deleting DB rows.
+    camera_rows = (
         await db.execute(
-            select(Camera.camera_uuid, Camera.camera_code)
-            .where(Camera.site_uuid == site.site_uuid)
+            select(Camera.camera_uuid, Camera.camera_code).where(
+                Camera.site_uuid == site.site_uuid,
+                Camera.user_id == int(user.id),
+            )
         )
     ).all()
 
-    # Step B: device URLs per camera (scalar join — also no ORM objects)
-    cam_to_urls: Dict[uuid.UUID, set] = {row[0]: set() for row in cam_code_rows}
-    cam_to_code: Dict[uuid.UUID, Optional[str]] = {row[0]: row[1] for row in cam_code_rows}
+    camera_uuids = [row[0] for row in camera_rows]
+    cam_to_urls: Dict[uuid.UUID, set[str]] = {row[0]: set() for row in camera_rows}
+    cam_to_code: Dict[uuid.UUID, Optional[str]] = {row[0]: row[1] for row in camera_rows}
 
-    if cam_to_urls:
+    if camera_uuids:
         device_url_rows = (
             await db.execute(
                 select(CameraDevice.camera_uuid, Device.device_url)
                 .join(Device, Device.device_uuid == CameraDevice.device_uuid)
-                .where(CameraDevice.camera_uuid.in_(list(cam_to_urls.keys())))
+                .where(CameraDevice.camera_uuid.in_(camera_uuids))
             )
         ).all()
+
         for cam_uuid_key, dev_url in device_url_rows:
             url = str(dev_url or "").strip()
-            if url and cam_uuid_key in cam_to_urls:
-                cam_to_urls[cam_uuid_key].add(url)
+            if url:
+                cam_to_urls.setdefault(cam_uuid_key, set()).add(url)
 
     cam_snapshot = [
         {
             "camera_uuid": cam_uuid_key,
-            "camera_code": cam_to_code[cam_uuid_key],
-            "device_urls": list(cam_to_urls[cam_uuid_key]),
+            "camera_code": cam_to_code.get(cam_uuid_key),
+            "device_urls": list(cam_to_urls.get(cam_uuid_key) or ()),
         }
-        for cam_uuid_key in cam_to_urls
+        for cam_uuid_key in camera_uuids
     ]
-    camera_uuids = list(cam_to_urls.keys())
 
     notification_payloads = (
         await db.execute(
-            select(Notification.payload).where(Notification.site_uuid == site.site_uuid)
+            select(Notification.payload).where(
+                Notification.site_uuid == site.site_uuid,
+                Notification.user_id == int(user.id),
+            )
         )
     ).scalars().all()
 
-    # Alert image blobs — stored in Azure, rows may be DB-deleted before blob cleanup runs.
     alert_blob_keys: List[str] = []
     notification_clip_blob_keys: List[str] = []
     for payload in notification_payloads:
@@ -908,7 +925,6 @@ async def delete_site(
             alert_blob_keys.append(key)
         notification_clip_blob_keys.extend(_extract_notification_clip_storage_keys(payload))
 
-    # Video clip blobs — stored in Azure, rows are site-owned via Camera.
     clip_blob_keys: List[str] = []
     if camera_uuids:
         clip_blob_keys = [
@@ -925,47 +941,64 @@ async def delete_site(
         ]
     clip_blob_keys.extend(notification_clip_blob_keys)
 
-    await site_repo.delete_site_graph(
-        db,
-        site_uuid=site.site_uuid,
-        camera_uuids=camera_uuids,
-    )
-    await db.commit()
+    notif_svc = getattr(manager, "_notification_service", None) if manager is not None else None
+    if notif_svc is not None:
+        try:
+            purge_fn = getattr(notif_svc, "purge_deleted_site_runtime_state", None)
+            if callable(purge_fn):
+                await purge_fn(
+                    user_id=int(user.id),
+                    site_uuid=site.site_uuid,
+                    camera_uuids=camera_uuids,
+                )
+            else:
+                notif_svc.invalidate_recipient_cache(user_id=int(user.id), site_uuid=site.site_uuid)
+                for camera_uuid in camera_uuids:
+                    notif_svc.invalidate_camera_roi_state(str(camera_uuid))
+        except Exception:
+            logger.warning("Failed to purge notification runtime state site=%s", site_uuid, exc_info=True)
+
+    try:
+        await site_repo.delete_site_graph(
+            db,
+            site_uuid=site.site_uuid,
+            camera_uuids=camera_uuids,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
     if manager is not None and cam_snapshot:
-        asyncio.create_task(
-            _cleanup_cameras_background(manager, cam_snapshot, user_id=int(user.id))
+        _spawn_bg_task(
+            _cleanup_cameras_background(manager, cam_snapshot, user_id=int(user.id)),
+            name=f"delete_site_runtime_cleanup:{site_uuid}",
         )
     elif manager is None:
         logger.warning(
-            "Manager unavailable while deleting site=%s — "
-            "edge/WebRTC/pipeline cleanup skipped.",
+            "Manager unavailable while deleting site=%s — edge/WebRTC/pipeline cleanup skipped.",
             site_uuid,
         )
 
-    # ── 4. Background: Azure blob cleanup ─────────────────────────────────
     if alert_blob_keys:
-        asyncio.create_task(
-            _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image")
+        _spawn_bg_task(
+            _delete_blobs_background(
+                alert_blob_keys,
+                service_cls=AlertImageStorageService,
+                label="alert image",
+            ),
+            name=f"delete_site_alert_blobs:{site_uuid}",
         )
     if clip_blob_keys:
-        asyncio.create_task(
-            _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip")
+        _spawn_bg_task(
+            _delete_blobs_background(
+                clip_blob_keys,
+                service_cls=EventClipService,
+                label="clip",
+            ),
+            name=f"delete_site_clip_blobs:{site_uuid}",
         )
 
-    if manager is not None:
-        notif_svc = getattr(manager, "_notification_service", None)
-        if notif_svc is not None:
-            try:
-                notif_svc.invalidate_recipient_cache(user_id=int(user.id), site_uuid=site_uuid)
-            except Exception:
-                logger.warning("Failed to invalidate recipient cache site=%s", site_uuid, exc_info=True)
-            for camera_uuid in camera_uuids:
-                try:
-                    notif_svc.invalidate_camera_roi_state(str(camera_uuid))
-                except Exception:
-                    logger.warning("Failed to invalidate ROI state camera=%s", camera_uuid, exc_info=True)
-
-    # ── 6. Sync: evict per-camera notification-mode route cache ───────────
     for camera_uuid in camera_uuids:
         await invalidate_camera_mode_cache(camera_uuid)
 
