@@ -15,13 +15,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from application.services.user_snapshot_cache import UserSnapshotCache
 
-from core.database_orm import User
+from core.database_orm import Camera, CameraDevice, Device, Notification, Site, User, VideoRecord
+from core.database import AsyncSessionLocal
 from core.security.hashing import get_password_hash, verify_password
+from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
+from application.services.clip_storage import EventClipService
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
-from dependencies import get_async_db, get_current_user,get_manager
+from dependencies import get_async_db, get_current_user, get_manager
 from application.services.manager import Manager
 
 logger = logging.getLogger(__name__)
@@ -176,6 +179,67 @@ async def change_my_password(
     return {"message": "Password updated successfully"}
 
 
+def _spawn_bg_task(coro, *, name: str) -> None:
+    task = asyncio.create_task(coro, name=name)
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.exception(f"[Background Task] {name}: FAILED with error: {e}")
+
+    task.add_done_callback(_on_done)
+
+
+async def _delete_blobs_background(keys: List[str], *, service_cls: type, label: str) -> None:
+    unique = list(dict.fromkeys(k for k in keys if k))
+    if not unique:
+        return
+    svc = service_cls()
+    try:
+        for i in range(0, len(unique), 10):
+            batch = unique[i: i + 10]
+            results = await asyncio.gather(*[svc.delete_blob(blob_name=k) for k in batch], return_exceptions=True)
+            for key, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    logger.warning(f"[Blob Cleanup] Failed to delete {label} blob {key}: {result}")
+    finally:
+        try:
+            await svc.close()
+        except Exception:
+            pass
+
+
+def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
+    if not isinstance(payload, dict):
+        return []
+    keys: List[str] = []
+
+    def _collect(raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        key = str(raw.get("storage_key") or "").strip()
+        if key:
+            keys.append(key)
+
+    msg = payload.get("msg")
+    if isinstance(msg, dict):
+        _collect(msg)
+        _collect(msg.get("clip"))
+
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        _collect(extra)
+        _collect(extra.get("clip"))
+        for item in list(extra.get("multi_camera_prerecordings") or []):
+            _collect(item)
+
+    _collect(payload.get("clip"))
+    return list(dict.fromkeys(keys))
+
+
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_my_account(
     payload: DeleteAccountRequest,
@@ -184,24 +248,136 @@ async def delete_my_account(
     current_user: User = Depends(get_current_user),
     manager: Manager = Depends(get_manager),
 ):
+    """
+    Full account deletion:
+    1. Snapshot all camera info for this user
+    2. Stop cameras (edge/WebRTC/pipeline) + purge notification service state
+    3. Extract all blob keys (notification images + clips, video record clips)
+    4. Delete user from DB (DB cascade removes sites, cameras, notifications, video records, etc.)
+    5. Async blob deletion
+    6. Invalidate caches
+    """
+    from routes.notifications_routes import invalidate_camera_mode_cache
+
     if not verify_password(payload.password.get_secret_value(), current_user.hashed_password):
         raise HTTPException(status_code=400, detail="Password is incorrect")
 
-    try:
-        if manager is not None:
+    user_id = int(current_user.id)
+    logger.info(f"[User Delete] Starting deletion of user={user_id}")
+
+    # ========================================
+    # PHASE 1: Snapshot camera + site info BEFORE any changes
+    # ========================================
+    camera_rows = (
+        await db.execute(
+            select(Camera.camera_uuid, Camera.camera_code).where(Camera.user_id == user_id)
+        )
+    ).all()
+    camera_uuids = [row[0] for row in camera_rows]
+
+    site_uuids = (
+        await db.execute(select(Site.site_uuid).where(Site.user_id == user_id))
+    ).scalars().all()
+
+    logger.info(f"[User Delete] Snapshotted {len(camera_uuids)} cameras, {len(site_uuids)} sites")
+
+    # ========================================
+    # PHASE 2: Stop cameras BEFORE any DB changes
+    # ========================================
+    logger.info(f"[User Delete] Phase 2: Stopping cameras on edge/WebRTC/pipeline")
+
+    # 2a: Purge notification service in-memory state
+    notif_svc = getattr(manager, "_notification_service", None) if manager is not None else None
+    if notif_svc is not None:
+        try:
+            purge_fn = getattr(notif_svc, "purge_deleted_site_runtime_state", None)
+            for site_uuid_val in site_uuids:
+                if callable(purge_fn):
+                    await purge_fn(user_id=user_id, site_uuid=site_uuid_val, camera_uuids=camera_uuids)
+                else:
+                    notif_svc.invalidate_recipient_cache(user_id=user_id, site_uuid=site_uuid_val)
+            for cam_uuid in camera_uuids:
+                inv_fn = getattr(notif_svc, "invalidate_camera_roi_state", None)
+                if callable(inv_fn):
+                    inv_fn(str(cam_uuid))
+        except Exception as exc:
+            logger.warning(f"[User Delete] Notification service purge failed: {exc}", exc_info=True)
+
+    # 2b: Edge devices, WebRTC streams, in-memory pipeline
+    if manager is not None:
+        try:
             cleanup = await asyncio.wait_for(
-                manager.cleanup_user_resources(db, user_id=int(current_user.id)),
-                timeout=15.0,
+                manager.cleanup_user_resources(db, user_id=user_id),
+                timeout=60.0,
             )
             if cleanup.get("errors"):
-                logger.warning(
-                    "Partial cleanup errors for user %s: %s",
-                    current_user.id, cleanup["errors"],
-                )
+                logger.warning("[User Delete] Partial cleanup errors: %s", cleanup["errors"])
+        except asyncio.TimeoutError:
+            logger.warning(f"[User Delete] Manager cleanup timed out after 60s — proceeding")
+        except Exception as exc:
+            logger.warning(f"[User Delete] Manager cleanup failed — proceeding: {exc}", exc_info=True)
 
+    # ========================================
+    # PHASE 3: Extract blob storage keys from stable DB
+    # Cameras are stopped — no new rows being created.
+    # ========================================
+    logger.info(f"[User Delete] Phase 3: Extracting blob storage keys")
+    alert_blob_keys: List[str] = []
+    clip_blob_keys: List[str] = []
+
+    offset = 0
+    batch_size = 5000
+    while True:
+        async with AsyncSessionLocal() as blob_db:
+            batch = (
+                await blob_db.execute(
+                    select(Notification.id, Notification.payload)
+                    .where(Notification.user_id == user_id)
+                    .order_by(Notification.id)
+                    .offset(offset)
+                    .limit(batch_size)
+                )
+            ).all()
+
+        if not batch:
+            break
+
+        for _nid, notif_payload in batch:
+            key = extract_image_storage_key(notif_payload)
+            if key:
+                alert_blob_keys.append(key)
+            clip_blob_keys.extend(_extract_notification_clip_storage_keys(notif_payload))
+
+        offset += batch_size
+        if len(batch) < batch_size:
+            break
+
+    if camera_uuids:
+        video_clip_keys = (
+            await db.execute(
+                select(VideoRecord.storage_key).where(
+                    VideoRecord.camera_uuid.in_(camera_uuids),
+                    VideoRecord.storage_key.isnot(None),
+                )
+            )
+        ).scalars().all()
+        clip_blob_keys.extend([str(k).strip() for k in video_clip_keys if str(k or "").strip()])
+
+    logger.info(
+        f"[User Delete] Found {len(alert_blob_keys)} alert image blobs, "
+        f"{len(clip_blob_keys)} clip blobs"
+    )
+
+    # ========================================
+    # PHASE 4: Delete user from DB
+    # DB cascade (passive_deletes=True) removes sites → cameras → video_records,
+    # channel_configurations, camera_devices, pipeline_cameras, notifications.
+    # ========================================
+    logger.info(f"[User Delete] Phase 4: Deleting user from database")
+    try:
         await db.delete(current_user)
         await db.commit()
-        _invalidate_user_snapshot_cache(request, int(current_user.id))
+        _invalidate_user_snapshot_cache(request, user_id)
     except HTTPException:
         await db.rollback()
         raise
@@ -209,4 +385,31 @@ async def delete_my_account(
         await db.rollback()
         raise
 
+    # ========================================
+    # PHASE 5: Async blob deletion
+    # ========================================
+    if alert_blob_keys:
+        logger.info(f"[User Delete] Phase 5a: Scheduling deletion of {len(alert_blob_keys)} alert image blobs")
+        _spawn_bg_task(
+            _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image"),
+            name=f"delete_user_alert_blobs:{user_id}",
+        )
+
+    if clip_blob_keys:
+        logger.info(f"[User Delete] Phase 5b: Scheduling deletion of {len(clip_blob_keys)} clip blobs")
+        _spawn_bg_task(
+            _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip"),
+            name=f"delete_user_clip_blobs:{user_id}",
+        )
+
+    # ========================================
+    # PHASE 6: Invalidate caches
+    # ========================================
+    for cam_uuid in camera_uuids:
+        try:
+            await invalidate_camera_mode_cache(cam_uuid)
+        except Exception:
+            pass
+
+    logger.info(f"[User Delete] COMPLETE: user={user_id} has been successfully deleted")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

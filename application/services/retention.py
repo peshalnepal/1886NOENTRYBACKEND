@@ -8,6 +8,36 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
 from application.services.clip_storage import EventClipService
 from core.database_orm import Notification, VideoRecord
+from typing import Any, List
+
+
+def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
+    """Extract clip storage_key values embedded in a notification payload."""
+    if not isinstance(payload, dict):
+        return []
+    keys: List[str] = []
+
+    def _collect(raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        key = str(raw.get("storage_key") or "").strip()
+        if key:
+            keys.append(key)
+
+    msg = payload.get("msg")
+    if isinstance(msg, dict):
+        _collect(msg)
+        _collect(msg.get("clip"))
+
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        _collect(extra)
+        _collect(extra.get("clip"))
+        for item in list(extra.get("multi_camera_prerecordings") or []):
+            _collect(item)
+
+    _collect(payload.get("clip"))
+    return list(dict.fromkeys(keys))
 
 
 logger = logging.getLogger(__name__)
@@ -78,23 +108,33 @@ class RetentionService:
                     (
                         int(row.id),
                         extract_image_storage_key(getattr(row, "payload", None)),
+                        _extract_notification_clip_storage_keys(getattr(row, "payload", None)),
                     )
                     for row in rows
                     if getattr(row, "id", None) is not None
                 ]
 
-            for _row_id, storage_key in batch:
-                if storage_key:
+            for _row_id, image_key, clip_keys in batch:
+                if image_key:
                     try:
-                        await self._image_service.delete_blob(blob_name=storage_key)
+                        await self._image_service.delete_blob(blob_name=image_key)
                     except Exception:
                         logger.warning(
                             "Failed deleting expired alert image blob %s; removing DB row anyway",
-                            storage_key,
+                            image_key,
+                            exc_info=True,
+                        )
+                for clip_key in clip_keys:
+                    try:
+                        await self._clip_service.delete_blob(blob_name=clip_key)
+                    except Exception:
+                        logger.warning(
+                            "Failed deleting expired notification clip blob %s; removing DB row anyway",
+                            clip_key,
                             exc_info=True,
                         )
 
-            ids = [row_id for row_id, _storage_key in batch]
+            ids = [row_id for row_id, _image_key, _clip_keys in batch]
             if not ids:
                 break
 

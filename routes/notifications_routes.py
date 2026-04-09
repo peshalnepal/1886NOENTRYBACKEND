@@ -9,14 +9,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, desc, func, select, update
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import StreamingResponse
 
-from application.services.alert_image_storage import (
-    AlertImageStorageService,
-    extract_image_storage_key,
-)
 from application.services.notification import WebNotificationHub
 from application.services.user_snapshot_cache import (
     CachedUserSnapshot,
@@ -26,7 +22,6 @@ from application.services.user_snapshot_cache import (
 from core.database_orm import Camera, Notification, Site, SiteSettings, User
 from core.security.tokens import decode_access_token
 from dependencies import (
-    get_alert_blob_cleanup_tasks,
     get_async_db,
     get_current_user,
     get_notification_hub,
@@ -440,131 +435,6 @@ async def _get_camera_mode_cached(
         if not fut.done():
             fut.set_exception(exc)
         raise
-
-
-# -------------------------------------------------------------------
-# blob cleanup helpers
-# -------------------------------------------------------------------
-async def _delete_alert_blob_keys(storage_keys: List[str]) -> None:
-    unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
-    if not unique_keys:
-        return
-
-    image_service = AlertImageStorageService()
-    try:
-        for storage_key in unique_keys:
-            try:
-                await image_service.delete_blob(blob_name=storage_key)
-            except Exception:
-                logger.warning(
-                    "Failed deleting alert image blob %s after alert removal",
-                    storage_key,
-                    exc_info=True,
-                )
-    finally:
-        await image_service.close()
-
-
-def _schedule_alert_blob_cleanup(tasks: set, storage_keys: List[str]) -> None:
-    unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
-    if not unique_keys:
-        return
-
-    task = asyncio.create_task(
-        _delete_alert_blob_keys(unique_keys),
-        name="alert_blob_cleanup",
-    )
-    tasks.add(task)
-
-    def _on_done(done_task: asyncio.Task) -> None:
-        tasks.discard(done_task)
-        try:
-            done_task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Alert blob cleanup task failed")
-
-    task.add_done_callback(_on_done)
-
-
-# -------------------------------------------------------------------
-# delete implementation
-# -------------------------------------------------------------------
-async def _delete_notifications_impl(
-    *,
-    payload: DeleteNotificationsRequest,
-    db: AsyncSession,
-    current_user: User,
-    cleanup_tasks: set,
-):
-    su = _parse_optional_uuid(payload.site_uuid, "site_uuid")
-    cu = _parse_optional_uuid(payload.camera_uuid, "camera_uuid")
-
-    conds = [
-        Notification.user_id == int(current_user.id),
-        Notification.visible.is_(True),
-    ]
-
-    if su:
-        conds.append(Notification.site_uuid == su)
-    if cu:
-        conds.append(Notification.camera_uuid == cu)
-
-    if payload.notification_ids:
-        ids: List[int] = []
-        for raw_id in payload.notification_ids:
-            try:
-                parsed = int(raw_id)
-            except Exception:
-                continue
-            if parsed > 0:
-                ids.append(parsed)
-
-        ids = sorted(set(ids))
-        if not ids:
-            return {"ok": True, "deleted": 0}
-
-        conds.append(Notification.id.in_(ids))
-
-    rows = (
-        await db.execute(
-            select(Notification.id, Notification.payload).where(and_(*conds))
-        )
-    ).all()
-
-    matched_ids: List[int] = []
-    storage_keys: List[str] = []
-
-    for notification_id, notification_payload in rows:
-        try:
-            parsed_id = int(notification_id)
-        except Exception:
-            continue
-
-        if parsed_id <= 0:
-            continue
-
-        matched_ids.append(parsed_id)
-
-        storage_key = extract_image_storage_key(notification_payload)
-        if storage_key:
-            storage_keys.append(storage_key)
-
-    matched_ids = sorted(set(matched_ids))
-    if not matched_ids:
-        return {"ok": True, "deleted": 0}
-
-    await db.execute(
-        update(Notification)
-        .where(Notification.id.in_(matched_ids))
-        .values(visible=False)
-        .execution_options(synchronize_session=False)
-    )
-    await db.commit()
-
-    _schedule_alert_blob_cleanup(cleanup_tasks, storage_keys)
-    return {"ok": True, "deleted": len(matched_ids)}
 
 
 # -------------------------------------------------------------------

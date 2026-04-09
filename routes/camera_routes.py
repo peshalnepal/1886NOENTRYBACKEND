@@ -15,15 +15,26 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete as sql_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dependencies import get_async_db, get_current_user, get_manager
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
-from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent
-from core.database_orm import CameraDevice, Device, User
-from core.database import db_manager
+from domain.events import ChannelCreateEvent, ChannelEditEvent
+from core.database_orm import (
+    Camera,
+    CameraDevice,
+    ChannelConfiguration,
+    Device,
+    Notification,
+    PipelineCamera,
+    User,
+    VideoRecord,
+)
+from core.database import AsyncSessionLocal, db_manager
+from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
+from application.services.clip_storage import EventClipService
 from core.security.tokens import decode_access_token
 from core.schemas import (
     CameraSchema,
@@ -620,54 +631,106 @@ async def edit_camera(
     )
 
 
-async def _delete_camera_bg(
-    *,
-    manager: "Manager",
-    camera_uuid: uuid.UUID,
-    cam_code: Optional[str],
-    device_urls: List[str],
-    user_id: int,
-) -> None:
-    """Background: tell every edge device and the WebRTC server to stop this
-    camera, then evict it from the in-memory pipeline.
+def _spawn_bg_task(coro, *, name: str) -> None:
+    """Spawn a background task with proper error handling and completion logging."""
+    task = asyncio.create_task(coro, name=name)
 
-    Runs AFTER the HTTP 200 is sent so slow / unreachable edge devices
-    (3 retries × 10 s connect-timeout = 30 s per device) never cause a 502.
-    """
-    for dev_url in device_urls:
+    def _on_done(done_task: asyncio.Task) -> None:
         try:
-            await manager._edge.delete_camera(device_url=dev_url, camera_uuid=str(camera_uuid))
-        except Exception:
-            logger.warning(
-                "cam delete [bg]: edge delete failed cam=%s url=%s", camera_uuid, dev_url, exc_info=True
-            )
+            done_task.result()
+            logger.info(f"[Background Task] {name}: SUCCESS")
+        except asyncio.CancelledError:
+            logger.info(f"[Background Task] {name}: CANCELLED")
+        except Exception as e:
+            logger.exception(f"[Background Task] {name}: FAILED with error: {e}")
 
-    if cam_code:
-        try:
-            await manager._webrtc.delete_stream(stream_key=str(cam_code))
-        except Exception:
-            logger.warning(
-                "cam delete [bg]: WebRTC delete failed cam=%s code=%s", camera_uuid, cam_code, exc_info=True
-            )
+    task.add_done_callback(_on_done)
 
+
+async def _delete_blobs_background(keys: List[str], *, service_cls: type, label: str) -> None:
+    """Delete blobs in parallel batches of 10."""
+    unique = list(dict.fromkeys(k for k in keys if k))
+    if not unique:
+        return
+
+    logger.info(f"[Blob Cleanup] Starting deletion of {len(unique)} {label} blobs")
+    svc = service_cls()
+    deleted = 0
+    failed = 0
+    batch_size = 10
     try:
-        active_pipeline = await asyncio.wait_for(
-            manager.get_activepipeline(user_id=user_id), timeout=10.0
-        )
-        await active_pipeline.remove_channel(camera_uuid)
-    except Exception:
-        logger.warning("cam delete [bg]: pipeline evict failed cam=%s", camera_uuid, exc_info=True)
+        for i in range(0, len(unique), batch_size):
+            batch = unique[i: i + batch_size]
+            results = await asyncio.gather(
+                *[svc.delete_blob(blob_name=k) for k in batch],
+                return_exceptions=True,
+            )
+            for key, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    failed += 1
+                    logger.warning(f"[Blob Cleanup] Failed to delete {label} blob {key}: {result}")
+                else:
+                    deleted += 1
+    finally:
+        try:
+            await svc.close()
+        except Exception:
+            pass
+    logger.info(f"[Blob Cleanup] COMPLETE: deleted {deleted} {label} blobs, {failed} failed")
+
+
+def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
+    if not isinstance(payload, dict):
+        return []
+    keys: List[str] = []
+
+    def _append_from_clip_dict(raw_clip: Any) -> None:
+        if not isinstance(raw_clip, dict):
+            return
+        key = str(raw_clip.get("storage_key") or "").strip()
+        if key:
+            keys.append(key)
+
+    msg = payload.get("msg")
+    if isinstance(msg, dict):
+        _append_from_clip_dict(msg)
+        _append_from_clip_dict(msg.get("clip"))
+
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        _append_from_clip_dict(extra)
+        _append_from_clip_dict(extra.get("clip"))
+        for raw_clip in list(extra.get("multi_camera_prerecordings") or []):
+            _append_from_clip_dict(raw_clip)
+
+    _append_from_clip_dict(payload.get("clip"))
+    return list(dict.fromkeys(keys))
+
 
 
 @router.delete("/{camera_uuid}")
 async def delete_camera(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
-    manager:Manager= Depends(get_manager),
+    manager: Manager = Depends(get_manager),
     user: User = Depends(get_current_user),
 ):
+    """
+    Full camera deletion:
+    1. Snapshot camera info
+    2. Stop camera on edge/WebRTC/pipeline (before any DB changes)
+    3. Extract blob keys from notifications + video records
+    4. Delete all linked DB rows (notifications, video records, relationships, camera)
+    5. Async blob deletion (alert images + clips)
+    6. Invalidate caches
+    """
     from routes.notifications_routes import invalidate_camera_mode_cache
 
+    logger.info(f"[Camera Delete] Starting deletion of camera={camera_uuid}")
+
+    # ========================================
+    # PHASE 1: Validate + snapshot info BEFORE any changes
+    # ========================================
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
@@ -675,11 +738,9 @@ async def delete_camera(
     cam, _cfg, _pid = full
     _ensure_user_owns_camera(cam, user.id)
 
-    # Snapshot data needed for background edge/WebRTC cleanup BEFORE any DB
-    # changes — these columns are gone after commit.
     cam_code: Optional[str] = getattr(cam, "camera_code", None)
+    site_uuid = cam.site_uuid
 
-    # Scalar join — no ORM Camera objects added to session identity map.
     device_url_rows = (
         await db.execute(
             select(CameraDevice.camera_uuid, Device.device_url)
@@ -687,71 +748,150 @@ async def delete_camera(
             .where(CameraDevice.camera_uuid == camera_uuid)
         )
     ).all()
-    device_urls = [
-        str(row[1]).strip() for row in device_url_rows if str(row[1] or "").strip()
-    ]
+    device_urls = [str(row[1]).strip() for row in device_url_rows if str(row[1] or "").strip()]
 
-    # ── Attempt pipeline-managed delete (DB + edge + WebRTC + in-memory) ──
-    # update_pipeline acquires the user-lock, does the DB commit, then calls
-    # _remove_channel which fires edge/WebRTC HTTP calls while STILL HOLDING
-    # the lock.  Those calls can take up to 30 s (3 retries × 10 s).
-    # We allow 20 s max so the Azure proxy never times us out at ~240 s,
-    # then fall back to a direct DB-only delete + background cleanup.
+    # ========================================
+    # PHASE 2: Stop camera BEFORE any DB changes
+    # Prevents new detections/clips being written while we delete.
+    # ========================================
+    logger.info(f"[Camera Delete] Phase 2: Stopping camera on edge/WebRTC/pipeline")
+
+    # 2a: Purge notification service in-memory state
+    notif_svc = getattr(manager, "_notification_service", None) if manager is not None else None
+    if notif_svc is not None:
+        try:
+            purge_fn = getattr(notif_svc, "purge_deleted_site_runtime_state", None)
+            if callable(purge_fn):
+                await purge_fn(
+                    user_id=int(user.id),
+                    site_uuid=site_uuid,
+                    camera_uuids=[camera_uuid],
+                )
+            else:
+                notif_svc.invalidate_camera_roi_state(str(camera_uuid))
+        except Exception as exc:
+            logger.warning(f"[Camera Delete] Notification service purge failed: {exc}", exc_info=True)
+
+    # 2b: Stop on edge device, WebRTC, and evict from pipeline
     if manager is not None:
         try:
-            pipeline = await asyncio.wait_for(
-                manager.get_activepipeline(user_id=user.id), timeout=5.0
+            active_pipeline = await asyncio.wait_for(
+                manager.get_activepipeline(user_id=int(user.id)), timeout=10.0
             )
-            ev = ChannelRemoveEvent(
-                channel_id=camera_uuid,
-                configs={},
-                created_at=datetime.now(timezone.utc),
-            )
-            await asyncio.wait_for(
-                manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=user.id),
-                timeout=20.0,
-            )
-            # Manager handled everything (DB + edge + WebRTC) within the timeout.
-            await invalidate_camera_mode_cache(camera_uuid)
-            return {"ok": True}
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Camera delete via manager timed out (edge/WebRTC slow) for cam=%s; "
-                "falling back to direct DB delete + background cleanup",
-                camera_uuid,
-            )
-        except HTTPException:
-            raise
         except Exception:
-            logger.warning(
-                "Camera delete via manager failed for cam=%s; "
-                "falling back to direct DB delete + background cleanup",
-                camera_uuid, exc_info=True,
+            active_pipeline = None
+            logger.warning(f"[Camera Delete] Could not get active pipeline for cam={camera_uuid}")
+
+        for dev_url in device_urls:
+            try:
+                await manager._edge.delete_camera(device_url=dev_url, camera_uuid=str(camera_uuid))
+            except Exception as exc:
+                logger.warning(f"[Camera Delete] Edge delete failed cam={camera_uuid} url={dev_url}: {exc}")
+
+        if cam_code:
+            try:
+                await manager._webrtc.delete_stream(stream_key=str(cam_code))
+            except Exception as exc:
+                logger.warning(f"[Camera Delete] WebRTC delete failed cam={camera_uuid} code={cam_code}: {exc}")
+
+        if active_pipeline is not None:
+            try:
+                await active_pipeline.remove_channel(camera_uuid)
+            except Exception as exc:
+                logger.warning(f"[Camera Delete] Pipeline evict failed cam={camera_uuid}: {exc}")
+
+    # ========================================
+    # PHASE 3: Extract blob storage keys from stable DB
+    # Camera is stopped — no new rows being created.
+    # ========================================
+    logger.info(f"[Camera Delete] Phase 3: Extracting blob storage keys")
+    alert_blob_keys: List[str] = []
+    clip_blob_keys: List[str] = []
+
+    offset = 0
+    batch_size = 5000
+    while True:
+        async with AsyncSessionLocal() as blob_db:
+            batch = (
+                await blob_db.execute(
+                    select(Notification.id, Notification.payload)
+                    .where(Notification.camera_uuid == camera_uuid)
+                    .order_by(Notification.id)
+                    .offset(offset)
+                    .limit(batch_size)
+                )
+            ).all()
+
+        if not batch:
+            break
+
+        for _nid, payload in batch:
+            key = extract_image_storage_key(payload)
+            if key:
+                alert_blob_keys.append(key)
+            clip_blob_keys.extend(_extract_notification_clip_storage_keys(payload))
+
+        offset += batch_size
+        if len(batch) < batch_size:
+            break
+
+    video_clip_keys = (
+        await db.execute(
+            select(VideoRecord.storage_key).where(
+                VideoRecord.camera_uuid == camera_uuid,
+                VideoRecord.storage_key.isnot(None),
             )
+        )
+    ).scalars().all()
+    clip_blob_keys.extend([str(k).strip() for k in video_clip_keys if str(k or "").strip()])
 
-    # ── Fallback: direct DB delete + background edge/WebRTC cleanup ───────
-    # The manager's update_pipeline may have rolled back (timeout during edge
-    # calls → the async-with-session exits via CancelledError → rollback).
-    # Re-fetch the camera to confirm it still needs deleting.
-    full2 = await repo.get_camera_full(db, camera_uuid=camera_uuid)
-    if full2:
-        cam2, _, _ = full2
-        await db.delete(cam2)
-        await db.commit()
+    logger.info(
+        f"[Camera Delete] Found {len(alert_blob_keys)} alert image blobs, "
+        f"{len(clip_blob_keys)} clip blobs"
+    )
 
-    if device_urls or cam_code:
-        asyncio.create_task(
-            _delete_camera_bg(
-                manager=manager,
-                camera_uuid=camera_uuid,
-                cam_code=cam_code,
-                device_urls=device_urls,
-                user_id=int(user.id),
-            ),
-            name="camera_cleanup",
+    # ========================================
+    # PHASE 4: Delete all linked DB rows
+    # Order: notifications first (SET NULL FK — must be explicit),
+    # then remaining children, then camera itself.
+    # ========================================
+    logger.info(f"[Camera Delete] Phase 4: Deleting database rows")
+    async with AsyncSessionLocal() as del_db:
+        # Notifications have ondelete="SET NULL" — must delete explicitly
+        await del_db.execute(sql_delete(Notification).where(Notification.camera_uuid == camera_uuid))
+        # Children with CASCADE FKs (explicit for safety)
+        await del_db.execute(sql_delete(VideoRecord).where(VideoRecord.camera_uuid == camera_uuid))
+        await del_db.execute(sql_delete(PipelineCamera).where(PipelineCamera.camera_uuid == camera_uuid))
+        await del_db.execute(sql_delete(CameraDevice).where(CameraDevice.camera_uuid == camera_uuid))
+        await del_db.execute(sql_delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
+        # Finally delete the camera row itself
+        await del_db.execute(sql_delete(Camera).where(Camera.camera_uuid == camera_uuid))
+        await del_db.commit()
+    logger.info(f"[Camera Delete] Database deletion complete")
+
+    # ========================================
+    # PHASE 5: Async blob deletion
+    # ========================================
+    if alert_blob_keys:
+        logger.info(f"[Camera Delete] Phase 5a: Scheduling deletion of {len(alert_blob_keys)} alert image blobs")
+        _spawn_bg_task(
+            _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image"),
+            name=f"delete_camera_alert_blobs:{camera_uuid}",
         )
 
+    if clip_blob_keys:
+        logger.info(f"[Camera Delete] Phase 5b: Scheduling deletion of {len(clip_blob_keys)} clip blobs")
+        _spawn_bg_task(
+            _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip"),
+            name=f"delete_camera_clip_blobs:{camera_uuid}",
+        )
+
+    # ========================================
+    # PHASE 6: Invalidate caches
+    # ========================================
     await invalidate_camera_mode_cache(camera_uuid)
+
+    logger.info(f"[Camera Delete] COMPLETE: camera={camera_uuid} has been successfully deleted")
     return {"ok": True}
 
 @router.get("/{camera_uuid}/snapshot.jpg")
