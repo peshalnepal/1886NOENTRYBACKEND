@@ -19,10 +19,10 @@ def get_public_webrtc_base() -> str:
 def derive_public_webrtc_url(stream_key: str) -> str:
     """
     Derive the WHEP endpoint URL for a stream.
-    Format: {base}/whep/{stream_key}
+    MediaMTX ≥ 1.4 uses: {base}/{stream_key}/whep
     """
     base = get_public_webrtc_base()
-    return f"{base}/whep/{stream_key}"
+    return f"{base}/{stream_key}/whep"
 
 
 def resolve_camera_webrtc_url(*, camera_code: Optional[str], stored_url: Optional[str]) -> Optional[str]:
@@ -39,7 +39,7 @@ class WebRTCGatewayClient:
 
     WHEP (WebRTC HTTP Egress Protocol) Requirements:
       - MediaMTX must have WHEP protocol enabled
-      - Streams are accessed via: {WEBRTC_PUBLIC_BASE_URL}/whep/{stream_key}
+      - Streams are accessed via: {WEBRTC_PUBLIC_BASE_URL}/{stream_key}/whep
       - The frontend will POST an SDP offer to establish P2P WebRTC connection
     
     Two operational modes:
@@ -140,7 +140,7 @@ class WebRTCGatewayClient:
         1. If admin API disabled, derive and return WHEP URL immediately
         2. If admin API enabled, provision stream via /v3/config/paths/add
         3. If add fails, try /v3/config/paths/patch
-        4. Return WHEP URL: {public_base}/whep/{stream_key}
+        4. Return WHEP URL: {public_base}/{stream_key}/whep
         
         Returns the public WHEP URL that frontend can use to connect.
         """

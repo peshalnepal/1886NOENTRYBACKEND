@@ -27,8 +27,8 @@ def build_playback(camera_uuid: str) -> dict:
     base = STREAM_GATEWAY_PUBLIC_BASE.rstrip("/")
 
     if STREAM_GATEWAY_PLAYBACK_MODE == "whep":
-        url = f"{base}/whep/{quote(path)}"
+        url = f"{base}/{quote(path)}/whep"
         return {"type": "webrtc", "mode": "whep", "path": path, "url": url}
 
-    url = f"{base}/{quote(path)}"
+    url = f"{base}/{quote(path)}/whep"
     return {"type": "webrtc", "mode": "path", "path": path, "url": url}
