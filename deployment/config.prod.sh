@@ -48,4 +48,4 @@ WEBRTC_ADMIN_DELETE_PATH=""
 # Optional: ACI MediaMTX (kept for later; off by default)
 DEPLOY_MEDIA_MTX="true"
 MEDIAMTX_API_USER="api"
-MEDIAMTX_API_PASS=""        # TEMP if DEPLOY_MEDIA_MTX=true
+MEDIAMTX_API_PASS="api_pass_123"        # TEMP if DEPLOY_MEDIA_MTX=true

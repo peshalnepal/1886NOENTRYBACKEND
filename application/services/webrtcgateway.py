@@ -49,8 +49,8 @@ class WebRTCGatewayClient:
     Required Environment Variables:
       - WEBRTC_PUBLIC_BASE_URL: Base URL for public WHEP access (e.g., https://mtx.example.com)
         If not set, defaults to http://localhost:8889
-      - WEBRTC_ADMIN_API_URL: MediaMTX admin API URL (e.g., https://mtx.example.com:9997)
-        Defaults to https://noentrymtxfdxidm.centralus.azurecontainer.io:9997
+      - WEBRTC_ADMIN_API_URL: MediaMTX admin API URL (via Caddy reverse proxy)
+        Defaults to https://noentrymtxfdxidm.centralus.azurecontainer.io
       - WEBRTC_ADMIN_API_ENABLED: Set to 'false' to skip stream provisioning (default: true)
       - MTX_API_USER or MEDIAMTX_API_USER: Admin API username (default: api)
       - MTX_API_PASS or MEDIAMTX_API_PASS: Admin API password (default: api_pass_123)
@@ -70,7 +70,7 @@ class WebRTCGatewayClient:
 
         self.admin_api_url = (
             os.getenv("WEBRTC_ADMIN_API_URL")
-            or "https://noentrymtxfdxidm.centralus.azurecontainer.io:9997"
+            or "https://noentrymtxfdxidm.centralus.azurecontainer.io"
         ).rstrip("/")
         if not self.admin_api_enabled:
             self.admin_api_url = ""
@@ -78,7 +78,13 @@ class WebRTCGatewayClient:
         self.public_base = get_public_webrtc_base()
 
         self.api_user = os.getenv("MTX_API_USER") or os.getenv("MEDIAMTX_API_USER", "api")
-        self.api_pass = os.getenv("MTX_API_PASS") or os.getenv("MEDIAMTX_API_PASS", "api_pass_123")
+        # Use 'is not None' to allow empty-string passwords (empty string IS a valid password)
+        mtx_pass = os.getenv("MTX_API_PASS","api_pass_123")
+        if mtx_pass is None:
+            mtx_pass = os.getenv("MEDIAMTX_API_PASS","api_pass_123")
+        if mtx_pass is None:
+            mtx_pass = "api_pass_123"
+        self.api_pass = mtx_pass
 
         request_timeout_s = float(os.getenv("WEBRTC_ADMIN_TIMEOUT_S", "15"))
         connect_timeout_s = float(os.getenv("WEBRTC_ADMIN_CONNECT_TIMEOUT_S", "5"))
