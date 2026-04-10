@@ -68,6 +68,10 @@ def _coerce_int(value: Any) -> Optional[int]:
     return parsed
 
 
+def _normalize_track_id(value: Any) -> Optional[int]:
+    return _coerce_int(value)
+
+
 def _normalize_overlay_box(raw_box: Any) -> Optional[Dict[str, int]]:
     if isinstance(raw_box, dict):
         keys = ("x1", "y1", "x2", "y2")
@@ -119,6 +123,7 @@ def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]
         cls_name = str(raw_detection.get("cls_name") or raw_detection.get("class") or "obj")
         conf = float(raw_detection.get("conf", 0.0) or 0.0)
         raw_box_norm = raw_detection.get("box_norm")
+        track_id = _normalize_track_id(raw_detection.get("track_id"))
     else:
         box = _normalize_overlay_box(getattr(raw_detection, "box", None) or getattr(raw_detection, "bbox", None))
         cls_name = str(
@@ -129,6 +134,7 @@ def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]
         )
         conf = float(getattr(raw_detection, "conf", 0.0) or 0.0)
         raw_box_norm = getattr(raw_detection, "box_norm", None)
+        track_id = _normalize_track_id(getattr(raw_detection, "track_id", None))
 
     if box is None:
         return None
@@ -141,7 +147,56 @@ def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]
     box_norm = _normalize_box_norm(raw_box_norm)
     if box_norm is not None:
         result["box_norm"] = box_norm
+    if track_id is not None:
+        result["track_id"] = track_id
     return result
+
+
+def _overlay_detection_base_key(normalized: Dict[str, Any]) -> Tuple[Any, ...]:
+    box = normalized["box"]
+    return (
+        normalized["cls_name"],
+        normalized["conf"],
+        box["x1"],
+        box["y1"],
+        box["x2"],
+        box["y2"],
+    )
+
+
+def _append_overlay_detection(
+    detections: List[Dict[str, Any]],
+    raw_detection: Any,
+    *,
+    seen_exact: set[Tuple[Any, ...]],
+    tracked_bases: set[Tuple[Any, ...]],
+    untracked_indexes: Dict[Tuple[Any, ...], int],
+) -> None:
+    normalized = _normalize_overlay_detection(raw_detection)
+    if normalized is None:
+        return
+
+    base_key = _overlay_detection_base_key(normalized)
+    track_id = normalized.get("track_id")
+    exact_key = base_key + (track_id,)
+    if exact_key in seen_exact:
+        return
+
+    if track_id is None:
+        if base_key in tracked_bases:
+            return
+        untracked_indexes.setdefault(base_key, len(detections))
+        detections.append(normalized)
+        seen_exact.add(exact_key)
+        return
+
+    untracked_index = untracked_indexes.pop(base_key, None)
+    if untracked_index is not None:
+        detections[untracked_index] = normalized
+    else:
+        detections.append(normalized)
+    tracked_bases.add(base_key)
+    seen_exact.add(exact_key)
 
 
 def _overlay_payload_from_resp(
@@ -150,26 +205,18 @@ def _overlay_payload_from_resp(
     fallback_detections: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     detections: List[Dict[str, Any]] = []
-    seen = set()
+    seen_exact: set[Tuple[Any, ...]] = set()
+    tracked_bases: set[Tuple[Any, ...]] = set()
+    untracked_indexes: Dict[Tuple[Any, ...], int] = {}
 
     for raw_detection in list(resp.detections or ()) + list(fallback_detections or ()):
-        normalized = _normalize_overlay_detection(raw_detection)
-        if normalized is None:
-            continue
-
-        box = normalized["box"]
-        key = (
-            normalized["cls_name"],
-            normalized["conf"],
-            box["x1"],
-            box["y1"],
-            box["x2"],
-            box["y2"],
+        _append_overlay_detection(
+            detections,
+            raw_detection,
+            seen_exact=seen_exact,
+            tracked_bases=tracked_bases,
+            untracked_indexes=untracked_indexes,
         )
-        if key in seen:
-            continue
-        seen.add(key)
-        detections.append(normalized)
 
     return {
         "frame_ts_ms": int(resp.frame_ts_ms),
