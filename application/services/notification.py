@@ -1716,6 +1716,7 @@ class NotificationService:
         msg: NotificationMessage,
         ctx: CameraContext,
         extra_payload: Optional[Dict[str, Any]],
+        db: Optional[Any] = None,  # AsyncSession, optional to reuse from caller
     ) -> Optional[Dict[str, Any]]:
         clip_service = self._clip_service
         if clip_service is None:
@@ -1731,12 +1732,20 @@ class NotificationService:
                 trigger_cam_uuid = None
 
             if trigger_cam_uuid is not None:
-                async with self._session_factory() as _precheck_db:
+                # Reuse provided session if available, otherwise create a new one
+                if db is not None:
                     _precheck_settings = await self._repo.get_site_prerecord_settings(
-                        _precheck_db,
+                        db,
                         user_id=int(ctx.user_id),
                         site_uuid=ctx.site_uuid,
                     )
+                else:
+                    async with self._session_factory() as _precheck_db:
+                        _precheck_settings = await self._repo.get_site_prerecord_settings(
+                            _precheck_db,
+                            user_id=int(ctx.user_id),
+                            site_uuid=ctx.site_uuid,
+                        )
                 # Recording disabled → no clips at all
                 if not _precheck_settings.enabled:
                     return extra_payload
@@ -1963,7 +1972,7 @@ class NotificationService:
 
         return out
 
-    async def _flush_user_batch(self, user_id: int, items: List[BufferedNotification]) -> bool:
+    async def _flush_user_batch(self, user_id: int, items: List[BufferedNotification], db: Optional[Any] = None) -> bool:
         if not items:
             return True
         if not self._session_factory:
@@ -2027,26 +2036,37 @@ class NotificationService:
 
         notification_ids_by_site: Dict[uuid.UUID, List[int]] = {}
         rows = None
-        for _attempt in range(3):
+        
+        # If db is provided, try to use it without retry logic; otherwise manage own sessions with retries
+        if db is not None:
             try:
-                async with self._session_factory() as db:
-                    rows = await self._repo.create_notifications(db, rows=create_rows)
-                    await db.commit()
-                break
-            except OperationalError as exc:
-                if _attempt < 2 and "1205" in str(exc):
-                    wait_s = 0.5 * (2 ** _attempt)
-                    logger.warning(
-                        "Notification INSERT lock timeout (attempt %s/3) user=%s — retrying in %.1fs",
-                        _attempt + 1, user_id, wait_s,
-                    )
-                    await asyncio.sleep(wait_s)
-                    continue
-                logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
-                return False
+                rows = await self._repo.create_notifications(db, rows=create_rows)
             except Exception:
                 logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
                 return False
+        else:
+            # Keep original retry logic for backward compatibility
+            for _attempt in range(3):
+                try:
+                    async with self._session_factory() as _db:
+                        rows = await self._repo.create_notifications(_db, rows=create_rows)
+                        await _db.commit()
+                    break
+                except OperationalError as exc:
+                    if _attempt < 2 and "1205" in str(exc):
+                        wait_s = 0.5 * (2 ** _attempt)
+                        logger.warning(
+                            "Notification INSERT lock timeout (attempt %s/3) user=%s — retrying in %.1fs",
+                            _attempt + 1, user_id, wait_s,
+                        )
+                        await asyncio.sleep(wait_s)
+                        continue
+                    logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
+                    return False
+                except Exception:
+                    logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
+                    return False
+        
         if rows is None:
             return False
 
@@ -2093,8 +2113,9 @@ class NotificationService:
         if not sent_ids and not failed_ids:
             return True
 
-        try:
-            async with self._session_factory() as db:
+        # Use provided session if available, otherwise create new session for final updates
+        if db is not None:
+            try:
                 if sent_ids:
                     await self._repo.mark_notifications_sent(
                         db,
@@ -2105,11 +2126,31 @@ class NotificationService:
                     await self._repo.mark_notifications_failed(
                         db,
                         notification_ids=failed_ids,
+                        sent_at=sent_at,
                     )
-                await db.commit()
-        except Exception:
-            logger.exception("Failed to update buffered notification statuses user=%s", user_id)
-            return True
+            except Exception:
+                logger.exception("Failed to update buffered notification statuses user=%s", user_id)
+                return True
+        else:
+            # Create a new session for final updates if none was provided
+            try:
+                async with self._session_factory() as _db:
+                    if sent_ids:
+                        await self._repo.mark_notifications_sent(
+                            _db,
+                            notification_ids=sent_ids,
+                            sent_at=sent_at,
+                        )
+                    if failed_ids:
+                        await self._repo.mark_notifications_failed(
+                            _db,
+                            notification_ids=failed_ids,
+                            sent_at=sent_at,
+                        )
+                    await _db.commit()
+            except Exception:
+                logger.exception("Failed to update buffered notification statuses user=%s", user_id)
+                return True
 
         return True
 
@@ -2178,11 +2219,13 @@ class NotificationService:
         msg: NotificationMessage,
         ctx: CameraContext,
         extra_payload: Optional[Dict[str, Any]] = None,
+        db: Optional[Any] = None,  # AsyncSession, optional to reuse from caller
     ) -> BufferedNotification:
         extra_payload = await self._attach_clip_payload(
             msg=msg,
             ctx=ctx,
             extra_payload=extra_payload,
+            db=db,  # Pass session through
         )
 
         updated_fields: Dict[str, Any] = {}
@@ -2220,20 +2263,23 @@ class NotificationService:
         if not self._session_factory:
             return
 
-        item = await self._prepare_notification_item(
-            msg=msg,
-            ctx=ctx,
-            extra_payload=extra_payload,
-        )
-
-        ok = await self._flush_user_batch(int(ctx.user_id), [item])
-        if not ok:
-            logger.warning(
-                "Failed to persist notification immediately user=%s camera=%s msg_id=%s",
-                ctx.user_id,
-                msg.camera_uuid,
-                msg.id,
+        # Create a session once and reuse it throughout the notification processing
+        async with self._session_factory() as db:
+            item = await self._prepare_notification_item(
+                msg=msg,
+                ctx=ctx,
+                extra_payload=extra_payload,
+                db=db,  # Pass the session to avoid opening a new one
             )
+
+            ok = await self._flush_user_batch(int(ctx.user_id), [item], db=db)
+            if not ok:
+                logger.warning(
+                    "Failed to persist notification immediately user=%s camera=%s msg_id=%s",
+                    ctx.user_id,
+                    msg.camera_uuid,
+                    msg.id,
+                )
             
     async def enqueue_notification(
         self,

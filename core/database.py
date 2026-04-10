@@ -48,7 +48,7 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
 def _engine_pool_kwargs() -> dict:
     return {
         "pool_pre_ping": True,
-        "pool_size": _env_int("DB_POOL_SIZE", 10, minimum=1),
+        "pool_size": _env_int("DB_POOL_SIZE", 30, minimum=1),
         "max_overflow": _env_int("DB_MAX_OVERFLOW", 20, minimum=0),
         "pool_timeout": _env_int("DB_POOL_TIMEOUT_S", 30, minimum=1),
         "pool_recycle": _env_int("DB_POOL_RECYCLE_S", 1800, minimum=0),
@@ -412,3 +412,18 @@ db_manager = DatabaseManager(os.getenv("DATABASE_URL", "Driver={MySQL ODBC 8.0 U
 async_engine = db_manager.async_engine
 SessionLocal = db_manager.SessionLocal
 AsyncSessionLocal = db_manager.AsyncSessionLocal
+
+
+def get_connection_pool_status() -> dict:
+    """Returns the current status of the async database connection pool."""
+    try:
+        pool = db_manager.async_engine.pool
+        return {
+            "size": pool.size() if hasattr(pool, 'size') else None,
+            "checked_out": pool.checkedout() if hasattr(pool, 'checkedout') else None,
+            "overflow": pool.overflow() if hasattr(pool, 'overflow') else None,
+            "total_created": pool._all_conns if hasattr(pool, '_all_conns') else None,
+        }
+    except Exception as exc:
+        logger.warning("Failed to get connection pool status: %s", exc)
+        return {"error": str(exc)}
