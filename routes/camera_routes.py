@@ -35,7 +35,7 @@ from core.database_orm import (
 from core.database import AsyncSessionLocal, db_manager
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
 from application.services.clip_storage import EventClipService
-from application.services.webrtcgateway import resolve_camera_webrtc_url
+from application.services.webrtcgateway import resolve_camera_webrtc_url, WebRTCGatewayClient
 from core.security.tokens import decode_access_token
 from core.schemas import (
     CameraSchema,
@@ -352,7 +352,10 @@ async def get_camera_playback(
     db: AsyncSession = Depends(get_async_db),
     user: User = Depends(get_current_user),
 ):
-    """Returns the WebRTC playback URL for this camera."""
+    """
+    Returns the WebRTC playback URL for this camera.
+    Ensures the stream is provisioned in MediaMTX before returning.
+    """
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
@@ -360,11 +363,52 @@ async def get_camera_playback(
 
     cam, _cfg, _pid = full
     _ensure_user_owns_camera(cam, user.id)
-    webrtc_url = _camera_webrtc_url(cam)
-    if not webrtc_url:
-        raise HTTPException(status_code=409, detail="WebRTC URL not provisioned yet")
-
-    return {"camera_uuid": str(cam.camera_uuid), "webrtc_url": webrtc_url}
+    
+    # Validate camera has required fields
+    rtsp_url = getattr(cam, "rtsp_url", None)
+    camera_code = getattr(cam, "camera_code", None)
+    if not camera_code:
+        raise HTTPException(status_code=409, detail="Camera code not set")
+    if not rtsp_url:
+        raise HTTPException(status_code=409, detail="RTSP URL not configured")
+    
+    # Provision stream in MediaMTX if not already done
+    try:
+        webrtc_client = WebRTCGatewayClient()
+        webrtc_url = await webrtc_client.ensure_stream(
+            stream_key=camera_code,
+            rtsp_url=rtsp_url
+        )
+        await webrtc_client.close()
+        
+        if not webrtc_url:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to provision WebRTC stream: no URL returned from gateway"
+            )
+        
+        logger.info(
+            "Stream provisioned for playback: camera_uuid=%s, camera_code=%s, webrtc_url=%s",
+            camera_uuid,
+            camera_code,
+            webrtc_url
+        )
+        return {"camera_uuid": str(cam.camera_uuid), "webrtc_url": webrtc_url}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Failed to provision WebRTC stream for playback: camera_uuid=%s, camera_code=%s, error=%s",
+            camera_uuid,
+            camera_code,
+            str(e),
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to provision WebRTC stream: {str(e)}"
+        )
 
 
 # -------------------------
@@ -557,6 +601,43 @@ async def create_camera(
             raise HTTPException(status_code=500, detail="Operation failed to create camera record")
 
         cam_out = result.cameras[0]
+        
+        # Provision WebRTC stream in MediaMTX after camera creation
+        camera_code = getattr(cam_out, "camera_code", None)
+        rtsp_url = getattr(cam_out, "rtsp_url", None)
+        webrtc_url = None
+        
+        if camera_code and rtsp_url:
+            try:
+                webrtc_client = WebRTCGatewayClient()
+                webrtc_url = await webrtc_client.ensure_stream(
+                    stream_key=camera_code,
+                    rtsp_url=rtsp_url
+                )
+                await webrtc_client.close()
+                logger.info(
+                    "Stream provisioned on camera creation: camera_uuid=%s, camera_code=%s, webrtc_url=%s",
+                    cam_out.camera_uuid,
+                    camera_code,
+                    webrtc_url
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to provision stream on camera creation (will retry on playback): "
+                    "camera_uuid=%s, camera_code=%s, error=%s",
+                    cam_out.camera_uuid,
+                    camera_code,
+                    str(e),
+                    exc_info=True
+                )
+                # Don't fail camera creation if provisioning fails - will retry on playback
+        
+        if not webrtc_url:
+            webrtc_url = resolve_camera_webrtc_url(
+                camera_code=camera_code,
+                stored_url=getattr(cam_out, "webrtc_url", None),
+            )
+        
         from routes.notifications_routes import invalidate_camera_mode_cache
 
         await invalidate_camera_mode_cache(cam_out.camera_uuid)
@@ -568,10 +649,7 @@ async def create_camera(
             site_uuid=cam_out.site_uuid,
             device_uuid=cam_out.device_uuid,
             rtsp_url=cam_out.rtsp_url,
-            webrtc_url=resolve_camera_webrtc_url(
-                camera_code=getattr(cam_out, "camera_code", None),
-                stored_url=getattr(cam_out, "webrtc_url", None),
-            ),
+            webrtc_url=webrtc_url,
             is_enabled=cam_out.enabled,
             is_detection_enabled=cam_out.detection_enabled,
             is_notification_enabled=cam_out.notification_enabled,
