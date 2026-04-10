@@ -132,10 +132,18 @@ class DetectionBox(BaseModel):
     y2: int
 
 
+class BoxNorm(BaseModel):
+    x: float
+    y: float
+    w: float
+    h: float
+
+
 class DetectionItem(BaseModel):
     cls_name: str
     conf: float
     box: DetectionBox
+    box_norm: Optional[BoxNorm] = None
 
 class PoseKeypoint(BaseModel):
     x: float

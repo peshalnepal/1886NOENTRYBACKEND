@@ -95,6 +95,19 @@ def _normalize_overlay_box(raw_box: Any) -> Optional[Dict[str, int]]:
     return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
 
 
+def _normalize_box_norm(raw: Any) -> Optional[Dict[str, float]]:
+    if not isinstance(raw, dict):
+        return None
+    try:
+        x = float(raw["x"])
+        y = float(raw["y"])
+        w = float(raw["w"])
+        h = float(raw["h"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
 def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(raw_detection, dict):
         return None
@@ -108,11 +121,15 @@ def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]
     except (TypeError, ValueError):
         conf = 0.0
 
-    return {
+    result: Dict[str, Any] = {
         "cls_name": str(raw_detection.get("cls_name") or raw_detection.get("class") or "obj"),
         "conf": conf,
         "box": box,
     }
+    box_norm = _normalize_box_norm(raw_detection.get("box_norm"))
+    if box_norm is not None:
+        result["box_norm"] = box_norm
+    return result
 
 
 def _normalize_overlay_frame(raw_frame: Any, *, default_camera_uuid: Optional[str] = None) -> Optional[Dict[str, Any]]:

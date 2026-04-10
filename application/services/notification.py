@@ -113,11 +113,29 @@ def _normalize_overlay_box(raw_box: Any) -> Optional[Dict[str, int]]:
     return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
 
 
+def _normalize_box_norm(raw: Any) -> Optional[Dict[str, float]]:
+    if isinstance(raw, dict):
+        raw_dict = raw
+    elif hasattr(raw, "x") and hasattr(raw, "y") and hasattr(raw, "w") and hasattr(raw, "h"):
+        raw_dict = {"x": raw.x, "y": raw.y, "w": raw.w, "h": raw.h}
+    else:
+        return None
+    try:
+        x = float(raw_dict["x"])
+        y = float(raw_dict["y"])
+        w = float(raw_dict["w"])
+        h = float(raw_dict["h"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
 def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]:
     if isinstance(raw_detection, dict):
         box = _normalize_overlay_box(raw_detection.get("box") or raw_detection.get("bbox"))
         cls_name = str(raw_detection.get("cls_name") or raw_detection.get("class") or "obj")
         conf = float(raw_detection.get("conf", 0.0) or 0.0)
+        raw_box_norm = raw_detection.get("box_norm")
     else:
         box = _normalize_overlay_box(getattr(raw_detection, "box", None) or getattr(raw_detection, "bbox", None))
         cls_name = str(
@@ -127,15 +145,20 @@ def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]
             or "obj"
         )
         conf = float(getattr(raw_detection, "conf", 0.0) or 0.0)
+        raw_box_norm = getattr(raw_detection, "box_norm", None)
 
     if box is None:
         return None
 
-    return {
+    result: Dict[str, Any] = {
         "cls_name": cls_name,
         "conf": conf,
         "box": box,
     }
+    box_norm = _normalize_box_norm(raw_box_norm)
+    if box_norm is not None:
+        result["box_norm"] = box_norm
+    return result
 
 
 def _normalize_overlay_frame(
