@@ -20,6 +20,7 @@ from domain.events import ChannelCreateEvent
 from application.services.manager import Manager
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
 from application.services.clip_storage import EventClipService
+from application.services.webrtcgateway import resolve_camera_webrtc_url
 from core.schemas import CameraWithConfigSchema
 from routes.device_routes import DeviceOut
 from core.database import AsyncSessionLocal
@@ -621,7 +622,10 @@ def _camera_out_to_response(cam_out) -> CameraWithConfigSchema:
         site_uuid=cam_out.site_uuid,
         device_uuid=cam_out.device_uuid,
         rtsp_url=cam_out.rtsp_url,
-        webrtc_url=cam_out.webrtc_url,
+        webrtc_url=resolve_camera_webrtc_url(
+            camera_code=getattr(cam_out, "camera_code", None),
+            stored_url=getattr(cam_out, "webrtc_url", None),
+        ),
         is_enabled=cam_out.enabled,
         is_detection_enabled=cam_out.detection_enabled,
         is_notification_enabled=cam_out.notification_enabled,

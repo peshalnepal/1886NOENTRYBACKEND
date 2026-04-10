@@ -1498,11 +1498,20 @@ class NotificationService:
         if not image_url.startswith("data:"):
             return payload, image_url, str(payload.get("image_storage_key") or "").strip() or None
 
-        stored = await image_service.store_image_data_url(
-            image_data_url=image_url,
-            camera_uuid=str(msg.camera_uuid),
-            ts_ms=int(msg.ts_ms),
-        )
+        try:
+            stored = await image_service.store_image_data_url(
+                image_data_url=image_url,
+                camera_uuid=str(msg.camera_uuid),
+                ts_ms=int(msg.ts_ms),
+            )
+        except Exception:
+            logger.warning(
+                "Alert image upload failed for camera=%s msg_id=%s; keeping inline image payload",
+                msg.camera_uuid,
+                msg.id,
+                exc_info=True,
+            )
+            return payload, image_url, None
         if not stored:
             return payload, image_url, None
 

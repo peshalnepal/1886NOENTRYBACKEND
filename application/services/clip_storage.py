@@ -824,10 +824,25 @@ class EventClipService:
                     start_time=clip_start,
                     external_id=external_id,
                 )
-                recording_url = await self._upload_blob(
-                    blob_name=storage_key,
-                    payload=payload,
-                )
+                try:
+                    recording_url = await self._upload_blob(
+                        blob_name=storage_key,
+                        payload=payload,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Blob upload failed for clip camera=%s path=%s external_id=%s; falling back to direct playback URL",
+                        camera_key,
+                        path,
+                        external_id,
+                        exc_info=True,
+                    )
+                    storage_key = ""
+                    recording_url = self._build_playback_clip_url(
+                        path=path,
+                        start_time=clip_start,
+                        duration_s=duration_s,
+                    )
 
                 try:
                     await self._save_video_record(

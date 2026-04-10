@@ -35,6 +35,7 @@ from core.database_orm import (
 from core.database import AsyncSessionLocal, db_manager
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
 from application.services.clip_storage import EventClipService
+from application.services.webrtcgateway import resolve_camera_webrtc_url
 from core.security.tokens import decode_access_token
 from core.schemas import (
     CameraSchema,
@@ -62,6 +63,13 @@ def _get_user_snapshot_cache(request: Request) -> UserSnapshotCache:
         cache = UserSnapshotCache()
         request.app.state.user_snapshot_cache = cache
     return cache
+
+
+def _camera_webrtc_url(cam: Any) -> Optional[str]:
+    return resolve_camera_webrtc_url(
+        camera_code=getattr(cam, "camera_code", None),
+        stored_url=getattr(cam, "webrtc_url", None),
+    )
 
 async def _resolve_stream_user(
     *,
@@ -289,7 +297,7 @@ async def list_cameras(
                 site_uuid=cam.site_uuid,
                 device_uuid=(dev.device_uuid if dev else None),
                 rtsp_url=cam.rtsp_url,
-                webrtc_url=getattr(cam, "webrtc_url", None),
+                webrtc_url=_camera_webrtc_url(cam),
                 is_enabled=cam.is_enabled,
                 is_detection_enabled=cam.is_detection_enabled,
                 is_notification_enabled=cam.is_notification_enabled,
@@ -325,7 +333,7 @@ async def get_camera(
         site_uuid=cam.site_uuid,
         device_uuid=(dev.device_uuid if dev else None),
         rtsp_url=cam.rtsp_url,
-        webrtc_url=getattr(cam, "webrtc_url", None),
+        webrtc_url=_camera_webrtc_url(cam),
         is_enabled=cam.is_enabled,
         is_detection_enabled=cam.is_detection_enabled,
         is_notification_enabled=cam.is_notification_enabled,
@@ -352,10 +360,11 @@ async def get_camera_playback(
 
     cam, _cfg, _pid = full
     _ensure_user_owns_camera(cam, user.id)
-    if not getattr(cam, "webrtc_url", None):
+    webrtc_url = _camera_webrtc_url(cam)
+    if not webrtc_url:
         raise HTTPException(status_code=409, detail="WebRTC URL not provisioned yet")
 
-    return {"camera_uuid": str(cam.camera_uuid), "webrtc_url": cam.webrtc_url}
+    return {"camera_uuid": str(cam.camera_uuid), "webrtc_url": webrtc_url}
 
 
 # -------------------------
@@ -559,7 +568,10 @@ async def create_camera(
             site_uuid=cam_out.site_uuid,
             device_uuid=cam_out.device_uuid,
             rtsp_url=cam_out.rtsp_url,
-            webrtc_url=cam_out.webrtc_url,
+            webrtc_url=resolve_camera_webrtc_url(
+                camera_code=getattr(cam_out, "camera_code", None),
+                stored_url=getattr(cam_out, "webrtc_url", None),
+            ),
             is_enabled=cam_out.enabled,
             is_detection_enabled=cam_out.detection_enabled,
             is_notification_enabled=cam_out.notification_enabled,
@@ -618,7 +630,10 @@ async def edit_camera(
         site_uuid=cam_out.site_uuid,
         device_uuid=cam_out.device_uuid,
         rtsp_url=cam_out.rtsp_url,
-        webrtc_url=cam_out.webrtc_url,
+        webrtc_url=resolve_camera_webrtc_url(
+            camera_code=getattr(cam_out, "camera_code", None),
+            stored_url=getattr(cam_out, "webrtc_url", None),
+        ),
         is_enabled=cam_out.enabled,
         is_detection_enabled=cam_out.detection_enabled,
         is_notification_enabled=cam_out.notification_enabled,

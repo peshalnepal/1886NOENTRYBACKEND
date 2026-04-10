@@ -8,6 +8,26 @@ import logging
 import time
 logger = logging.getLogger(__name__)
 
+
+def get_public_webrtc_base() -> str:
+    pub_host = os.getenv("PUBLIC_HOST", "localhost")
+    pub_scheme = os.getenv("PUBLIC_SCHEME", "http")
+    pub_port = os.getenv("WEBRTC_HTTP_PORT", "8889")
+    return (os.getenv("WEBRTC_PUBLIC_BASE_URL") or f"{pub_scheme}://{pub_host}:{pub_port}").rstrip("/")
+
+
+def derive_public_webrtc_url(stream_key: str) -> str:
+    return f"{get_public_webrtc_base()}/{stream_key}"
+
+
+def resolve_camera_webrtc_url(*, camera_code: Optional[str], stored_url: Optional[str]) -> Optional[str]:
+    code = str(camera_code or "").strip()
+    if code:
+        return derive_public_webrtc_url(code)
+
+    url = str(stored_url or "").strip()
+    return url or None
+
 class WebRTCGatewayClient:
     """
     Provisions (or updates) RTSP->WebRTC streams on an Azure-hosted gateway (MediaMTX/go2rtc/etc).
@@ -36,10 +56,7 @@ class WebRTCGatewayClient:
         if not self.admin_api_enabled:
             self.admin_api_url = ""
 
-        pub_host = os.getenv("PUBLIC_HOST", "localhost")
-        pub_scheme = os.getenv("PUBLIC_SCHEME", "http")
-        pub_port = os.getenv("WEBRTC_HTTP_PORT", "8889")
-        self.public_base = (os.getenv("WEBRTC_PUBLIC_BASE_URL") or f"{pub_scheme}://{pub_host}:{pub_port}").rstrip("/")
+        self.public_base = get_public_webrtc_base()
 
         self.api_user = os.getenv("MTX_API_USER") or os.getenv("MEDIAMTX_API_USER", "api")
         self.api_pass = os.getenv("MTX_API_PASS") or os.getenv("MEDIAMTX_API_PASS", "api_pass_123")
@@ -71,7 +88,7 @@ class WebRTCGatewayClient:
         return (self.api_user, self.api_pass)
 
     def _derive_public_webrtc_url(self, stream_key: str) -> str:
-        return f"{self.public_base}/{stream_key}"
+        return derive_public_webrtc_url(stream_key)
 
     def _response_error_message(self, *, action: str, response: httpx.Response) -> str:
         body = (response.text or "").strip().replace("\n", " ")
