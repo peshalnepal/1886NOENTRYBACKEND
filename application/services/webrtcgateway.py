@@ -107,7 +107,7 @@ class WebRTCGatewayClient:
 
         safe_name = quote(stream_key, safe="")
         add_url = f"{self.admin_api_url}/v3/config/paths/add/{safe_name}"
-        payload = {"source": rtsp_url, "rtspTransport": "tcp"}
+        payload = {"source": rtsp_url, "rtspTransport": "tcp", "sourceOnDemand": True}
         add_error: Optional[str] = None
 
         # 1. Try Add
@@ -165,7 +165,7 @@ class WebRTCGatewayClient:
             
         safe_name = quote(stream_key, safe="")
         url = f"{self.admin_api_url}/v3/config/paths/patch/{safe_name}"
-        payload = {"source": rtsp_url}
+        payload = {"source": rtsp_url, "rtspTransport": "tcp", "sourceOnDemand": True}
         
         try:
             await self._client.patch(url, json=payload, auth=self._auth())
