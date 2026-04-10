@@ -17,7 +17,12 @@ def get_public_webrtc_base() -> str:
 
 
 def derive_public_webrtc_url(stream_key: str) -> str:
-    return f"{get_public_webrtc_base()}/{stream_key}"
+    """
+    Derive the WHEP endpoint URL for a stream.
+    Format: {base}/whep/{stream_key}
+    """
+    base = get_public_webrtc_base()
+    return f"{base}/whep/{stream_key}"
 
 
 def resolve_camera_webrtc_url(*, camera_code: Optional[str], stored_url: Optional[str]) -> Optional[str]:
@@ -30,19 +35,33 @@ def resolve_camera_webrtc_url(*, camera_code: Optional[str], stored_url: Optiona
 
 class WebRTCGatewayClient:
     """
-    Provisions (or updates) RTSP->WebRTC streams on an Azure-hosted gateway (MediaMTX/go2rtc/etc).
+    Provisions (or updates) RTSP->WebRTC streams on a MediaMTX gateway using WHEP protocol.
 
-    We support two modes:
-      1) Admin API available -> call it to upsert streams.
-      2) No admin API -> derive a stable public webrtc_url from WEBRTC_PUBLIC_BASE_URL + stream_key.
-
-    Environment:
-      - WEBRTC_ADMIN_API_URL (optional)
-      - WEBRTC_ADMIN_UPSERT_PATH (default: /streams)
-      - WEBRTC_ADMIN_UPDATE_PATH (default: /streams/{stream_key})
-      - WEBRTC_ADMIN_DELETE_PATH (default: /streams/{stream_key})
-      - WEBRTC_PUBLIC_BASE_URL (required for derivation if admin doesn't return a url)
-      - WEBRTC_ADMIN_API_KEY (optional header: x-api-key)
+    WHEP (WebRTC HTTP Egress Protocol) Requirements:
+      - MediaMTX must have WHEP protocol enabled
+      - Streams are accessed via: {WEBRTC_PUBLIC_BASE_URL}/whep/{stream_key}
+      - The frontend will POST an SDP offer to establish P2P WebRTC connection
+    
+    Two operational modes:
+      1) Admin API available -> provisions streams via /v3/config/paths/add
+      2) No admin API -> derives stable public WHEP URLs
+    
+    Required Environment Variables:
+      - WEBRTC_PUBLIC_BASE_URL: Base URL for public WHEP access (e.g., https://mtx.example.com)
+        If not set, defaults to http://localhost:8889
+      - WEBRTC_ADMIN_API_URL: MediaMTX admin API URL (e.g., https://mtx.example.com:9997)
+        Defaults to https://noentrymtxfdxidm.centralus.azurecontainer.io:9997
+      - WEBRTC_ADMIN_API_ENABLED: Set to 'false' to skip stream provisioning (default: true)
+      - MTX_API_USER or MEDIAMTX_API_USER: Admin API username (default: api)
+      - MTX_API_PASS or MEDIAMTX_API_PASS: Admin API password (default: api_pass_123)
+      - WEBRTC_ADMIN_TIMEOUT_S: Request timeout in seconds (default: 15)
+      - WEBRTC_ADMIN_CONNECT_TIMEOUT_S: Connection timeout in seconds (default: 5)
+      - WEBRTC_WARN_INTERVAL_S: Throttle warnings to once per N seconds (default: 60)
+    
+    MediaMTX Configuration Required:
+      - WHEP protocol must be enabled in MediaMTX config
+      - Ensure environment has proper STUN servers configured
+      - Example rtspTransport: "tcp" for reliability
     """
 
     def __init__(self):
@@ -67,7 +86,16 @@ class WebRTCGatewayClient:
         self._last_warn: Dict[str, float] = {}
 
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(request_timeout_s, connect=connect_timeout_s)
+            timeout=httpx.Timeout(request_timeout_s, connect=connect_timeout_s),
+            verify=False  # Disable SSL verification for self-signed certs
+        )
+        
+        # Log configuration on initialization
+        logger.info(
+            "WebRTCGatewayClient initialized: admin_api_enabled=%s, admin_api_url=%s, public_base=%s",
+            self.admin_api_enabled,
+            self.admin_api_url if self.admin_api_enabled else "(disabled)",
+            self.public_base
         )
 
     def _warn_throttled(self, key: str, message: str, *args: object) -> None:
@@ -100,10 +128,21 @@ class WebRTCGatewayClient:
 
     async def ensure_stream(self, *, stream_key: str, rtsp_url: str) -> Optional[str]:
         """
-        Ensure stream exists in MediaMTX. Returns webrtc_url (stable).
+        Ensure stream exists in MediaMTX. Returns stable WHEP URL.
+        
+        Flow:
+        1. If admin API disabled, derive and return WHEP URL immediately
+        2. If admin API enabled, provision stream via /v3/config/paths/add
+        3. If add fails, try /v3/config/paths/patch
+        4. Return WHEP URL: {public_base}/whep/{stream_key}
+        
+        Returns the public WHEP URL that frontend can use to connect.
         """
+        whep_url = self._derive_public_webrtc_url(stream_key)
+        
         if not self.admin_api_url:
-            return self._derive_public_webrtc_url(stream_key)
+            logger.debug("Admin API disabled, returning derived WHEP URL: %s", whep_url)
+            return whep_url
 
         safe_name = quote(stream_key, safe="")
         add_url = f"{self.admin_api_url}/v3/config/paths/add/{safe_name}"
@@ -112,9 +151,13 @@ class WebRTCGatewayClient:
 
         # 1. Try Add
         try:
+            logger.debug("Attempting to provision stream: add_url=%s, stream_key=%s, rtsp_url=%s", 
+                        add_url, stream_key, rtsp_url)
             r = await self._client.post(add_url, json=payload, auth=self._auth())
             if r.status_code == 200:
-                return self._derive_public_webrtc_url(stream_key)
+                logger.info("Stream provisioned successfully via add: stream_key=%s, whep_url=%s", 
+                           stream_key, whep_url)
+                return whep_url
             add_error = self._response_error_message(action="MediaMTX add", response=r)
             logger.warning("%s. stream_key=%s admin_api=%s", add_error, stream_key, self.admin_api_url)
         except Exception as exc:
@@ -122,20 +165,26 @@ class WebRTCGatewayClient:
                 add_error = f"MediaMTX add timed out/unreachable: {type(exc).__name__}: {exc}"
                 self._warn_throttled(
                     "ensure_stream_add_timeout",
-                    "MediaMTX add timed out/unreachable. stream_key=%s admin_api=%s",
+                    "MediaMTX add timed out/unreachable. stream_key=%s admin_api=%s error=%s",
                     stream_key,
                     self.admin_api_url,
+                    str(exc),
                 )
             else:
                 add_error = f"MediaMTX add request failed: {type(exc).__name__}: {exc}"
-                logger.warning("MediaMTX add request failed, trying patch. stream_key=%s", stream_key, exc_info=True)
+                logger.warning("MediaMTX add request failed, trying patch. stream_key=%s error=%s", 
+                             stream_key, str(exc), exc_info=True)
 
         patch_url = f"{self.admin_api_url}/v3/config/paths/patch/{safe_name}"
         patch_error: Optional[str] = None
         try:
+            logger.debug("Attempting to provision stream: patch_url=%s, stream_key=%s", 
+                        patch_url, stream_key)
             r = await self._client.patch(patch_url, json=payload, auth=self._auth())
             if r.status_code == 200:
-                return self._derive_public_webrtc_url(stream_key)
+                logger.info("Stream provisioned successfully via patch: stream_key=%s, whep_url=%s", 
+                           stream_key, whep_url)
+                return whep_url
             patch_error = self._response_error_message(action="MediaMTX patch", response=r)
             logger.error("%s. stream_key=%s admin_api=%s", patch_error, stream_key, self.admin_api_url)
         except Exception as exc:
@@ -143,16 +192,20 @@ class WebRTCGatewayClient:
                 patch_error = f"MediaMTX patch timed out/unreachable: {type(exc).__name__}: {exc}"
                 self._warn_throttled(
                     "ensure_stream_patch_timeout",
-                    "MediaMTX patch timed out/unreachable. stream_key=%s admin_api=%s",
+                    "MediaMTX patch timed out/unreachable. stream_key=%s admin_api=%s error=%s",
                     stream_key,
                     self.admin_api_url,
+                    str(exc),
                 )
             else:
                 patch_error = f"MediaMTX patch request failed: {type(exc).__name__}: {exc}"
-                logger.error("MediaMTX patch request failed. stream_key=%s", stream_key, exc_info=True)
+                logger.error("MediaMTX patch request failed. stream_key=%s error=%s", 
+                           stream_key, str(exc), exc_info=True)
 
         raise RuntimeError(
-            "Failed to provision MediaMTX stream '{}'. add_error={}; patch_error={}".format(
+            "Failed to provision MediaMTX stream '{}'. add_error={}; patch_error={}. "
+            "This likely means: (1) MediaMTX is unreachable, (2) credentials are wrong, "
+            "(3) WHEP protocol not enabled, or (4) stream format invalid.".format(
                 stream_key,
                 add_error or "unknown",
                 patch_error or "unknown",
