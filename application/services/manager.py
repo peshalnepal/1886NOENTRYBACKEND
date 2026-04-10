@@ -1091,6 +1091,51 @@ class Manager:
                 if bool(cam.is_enabled) and getattr(cam, "camera_code", None):
                     active_streams.add(str(cam.camera_code))
 
+        # --- WebRTC stream provisioning (independent of edge device) ---
+        # Always provision WHEP streams in MediaMTX so live view works even
+        # when the Jetson edge device is unreachable.
+        try:
+            webrtc_list = await self._webrtc.list_webrtc_cameras()
+        except Exception as e:
+            logger.warning("Cannot reach WebRTC gateway during reconcile: %s", e)
+            webrtc_list = []
+        webrtc_set = {
+            str(c.get("stream_key"))
+            for c in webrtc_list
+            if isinstance(c, dict) and c.get("stream_key")
+        }
+        known_streams = {str(c.camera_code) for c in cams if c.camera_code}
+        to_add_stream = sorted(active_streams - webrtc_set)
+        to_remove_stream = sorted((webrtc_set & known_streams) - active_streams)
+        cams_by_code = {str(c.camera_code): c for c in cams if c.camera_code}
+
+        webrtc_added: List[str] = []
+        webrtc_errors: List[str] = []
+        for cu in to_add_stream:
+            cam = cams_by_code.get(cu)
+            if cam is None:
+                webrtc_errors.append(f"Camera not found in DB during WebRTC reconcile: {cu}")
+                continue
+            try:
+                await self._webrtc.ensure_stream(stream_key=cu, rtsp_url=cam.rtsp_url)
+                webrtc_added.append(str(cam.camera_uuid))
+            except Exception as e:
+                logger.warning("WebRTC ensure_stream failed during reconcile for %s: %s", cu, e)
+                webrtc_errors.append(f"Failed to provision stream {cu}: {e}")
+
+        webrtc_removed: List[str] = []
+        if delete_unknown:
+            for cu in to_remove_stream:
+                try:
+                    await self._webrtc.delete_stream(stream_key=cu)
+                    removed_cam = cams_by_code.get(cu)
+                    removed_uuid = str(removed_cam.camera_uuid) if removed_cam else cu
+                    webrtc_removed.append(removed_uuid)
+                except Exception as e:
+                    logger.warning("WebRTC delete_stream failed during reconcile for %s: %s", cu, e)
+                    webrtc_errors.append(f"Failed to remove stream {cu}: {e}")
+
+        # --- Edge device reconcile ---
         device_url = dev.device_url
         edge_warnings: List[str] = []
         try:
@@ -1118,6 +1163,7 @@ class Manager:
                     e,
                     exc_info=True,
                 )
+                # Even though edge is unreachable, return WebRTC results so they aren't lost
                 raise EdgeDeviceUnavailableError(device_url, e) from e
         except Exception as e:
             logger.warning(
@@ -1128,31 +1174,17 @@ class Manager:
                 exc_info=True,
             )
             raise EdgeDeviceUnavailableError(device_url, e) from e
-        try:
-            webrtc_list = await self._webrtc.list_webrtc_cameras()
-        except Exception as e:
-            logger.warning("Cannot reach WebRTC gateway during reconcile: %s", e)
-            webrtc_list = []
-        webrtc_set = {
-            str(c.get("stream_key"))
-            for c in webrtc_list
-            if isinstance(c, dict) and c.get("stream_key")
-        }
-
-        known_streams = {str(c.camera_code) for c in cams if c.camera_code}
         to_add = sorted(desired_set - edge_set)
         to_remove = sorted(edge_set - desired_set)
-        to_add_stream = sorted(active_streams - webrtc_set)
-        to_remove_stream = sorted((webrtc_set & known_streams) - active_streams)
 
         out: Dict[str, List[str]] = {
             "to_add": to_add,
             "to_remove": to_remove,
             "to_add_stream": to_add_stream,
             "to_remove_stream": to_remove_stream,
-            "added": [],
-            "removed": [],
-            "errors": [],
+            "added": list(webrtc_added),
+            "removed": list(webrtc_removed),
+            "errors": list(webrtc_errors),
             "warnings": edge_warnings,
         }
 
@@ -1194,34 +1226,6 @@ class Manager:
                         timeout_s=self._external_timeout_s
                     )
                     out["removed"].append(cu)
-                except Exception as e:
-                    logger.warning("Edge delete failed during reconcile for camera %s", cu, exc_info=True)
-                    out["errors"].append(f"Failed to remove {cu}: {e}")
-        cams_by_code = {str(c.camera_code): c for c in cams if c.camera_code}
-
-        for cu in to_add_stream:
-            cam = cams_by_code.get(cu)
-            if cam is None:
-                out["errors"].append(f"Camera not found in DB during reconcile: {cu}")
-                continue
-            try:
-                await self._webrtc.ensure_stream(stream_key=cu, rtsp_url=cam.rtsp_url)
-                cam_uuid = str(cam.camera_uuid)
-                if cam_uuid not in out["added"]:
-                    out["added"].append(cam_uuid)
-            except Exception as e:
-                logger.warning("Edge upsert failed during reconcile for camera %s", cu, exc_info=True)
-                out["errors"].append(f"Failed to add {cu}: {e}")
-
-        if delete_unknown:
-            for cu in to_remove_stream:
-                try:
-                    await self._webrtc.delete_stream(stream_key=cu)
-                    # Append camera_uuid (not stream_key/camera_code) to stay consistent with
-                    # the Jetson removal path and the `added` list which also uses camera UUIDs
-                    removed_cam = cams_by_code.get(cu)
-                    removed_uuid = str(removed_cam.camera_uuid) if removed_cam else cu
-                    out["removed"].append(removed_uuid)
                 except Exception as e:
                     logger.warning("Edge delete failed during reconcile for camera %s", cu, exc_info=True)
                     out["errors"].append(f"Failed to remove {cu}: {e}")
