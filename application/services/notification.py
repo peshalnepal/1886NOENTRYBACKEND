@@ -1721,10 +1721,9 @@ class NotificationService:
         if clip_service is None:
             return extra_payload
 
-        # If the site has prerecord enabled, only record clips for events that
-        # match the configured trigger mode. Cameras in the prerecord list that
-        # fire a non-matching event (e.g. item_detected when mode=roi_enter) are
-        # skipped entirely so that playback reflects the saved site setting.
+        # Check the site prerecord setting. If recording is disabled, skip ALL
+        # clip capture (both the trigger camera and multi-camera prerecord).
+        # If recording is enabled but the trigger mode doesn't match, also skip.
         if self._session_factory is not None:
             try:
                 trigger_cam_uuid = uuid.UUID(str(msg.camera_uuid))
@@ -1738,9 +1737,12 @@ class NotificationService:
                         user_id=int(ctx.user_id),
                         site_uuid=ctx.site_uuid,
                     )
+                # Recording disabled → no clips at all
+                if not _precheck_settings.enabled:
+                    return extra_payload
+                # Recording enabled but trigger mode doesn't match for this camera
                 if (
-                    _precheck_settings.enabled
-                    and trigger_cam_uuid in set(_precheck_settings.camera_uuids)
+                    trigger_cam_uuid in set(_precheck_settings.camera_uuids)
                     and not self._site_prerecord_trigger_matches(
                         trigger_mode=_precheck_settings.trigger_mode,
                         alert_type=msg.alert_type,
