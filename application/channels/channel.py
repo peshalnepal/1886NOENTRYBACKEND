@@ -50,6 +50,11 @@ class VideoChannel:
         self.config = config
         self._last_good_detection_url: Optional[str] = None
         self._last_error_sig: Optional[str] = None
+        # Tracks whether the edge device was reachable on the last attempt.
+        # False only when a connection-level failure (ConnectError, ConnectTimeout,
+        # PoolTimeout) occurs. Used by the poll loop to apply a longer backoff when
+        # the device is known to be down rather than just returning no data yet.
+        self._device_reachable: bool = True
 
     def key(self) -> str:
         return str(self.config.camera_uuid)
@@ -134,13 +139,20 @@ class VideoChannel:
 
                 self._last_good_detection_url = url
                 self._last_error_sig = None
+                self._device_reachable = True
                 return data
 
-            except (httpx.ConnectTimeout, httpx.ConnectError):
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout):
+                # Device-level failure: ConnectTimeout, ConnectError, or PoolTimeout
+                # (pool exhausted because many connections are stuck waiting on a
+                # down device). Trying more URLs on the same host is pointless — break
+                # immediately instead of falling through to the generic continue path.
                 last_err_sig = f"connect_error:{url}"
+                self._device_reachable = False
                 break
             except httpx.ReadTimeout:
                 last_err_sig = f"read_timeout:{url}"
+                self._device_reachable = False
                 break
             except Exception as e:
                 last_err_sig = f"exc:{type(e).__name__}:{url}"

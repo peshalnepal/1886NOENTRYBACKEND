@@ -1099,6 +1099,10 @@ class ModelPipeline:
         backoff_ms = 200
         max_backoff_ms = 4000
         empty_miss_count = 0
+        # Separate counter for consecutive device-unreachable failures so we can
+        # apply a much longer backoff than for "device online but no data yet."
+        device_down_count = 0
+        _MAX_DEVICE_DOWN_BACKOFF_S = 15.0
         if self._startup_jitter_ms > 0:
             await asyncio.sleep(random.uniform(0.0, self._startup_jitter_ms / 1000.0))
 
@@ -1122,10 +1126,25 @@ class ModelPipeline:
                     payload = await ch.stream()
                 resp = self._payload_to_resp(payload, ch)
                 if resp is None:
-                    empty_miss_count = min(empty_miss_count + 1, 4)
-                    base_sleep_s = max(0.15, float(cfg.poll_interval_ms) / 1000.0)
-                    miss_sleep_s = min(2.0, base_sleep_s * (2 ** (empty_miss_count - 1)))
-                    await asyncio.sleep(miss_sleep_s)
+                    # Distinguish between a truly unreachable device and a device
+                    # that is online but simply has no detection data yet.
+                    # When the device is down, apply exponential backoff up to
+                    # _MAX_DEVICE_DOWN_BACKOFF_S to avoid hammering an unreachable
+                    # host with a new connection every ~1-2 seconds.
+                    device_reachable = getattr(ch, "_device_reachable", True)
+                    if not device_reachable:
+                        device_down_count = min(device_down_count + 1, 6)
+                        down_sleep_s = min(
+                            _MAX_DEVICE_DOWN_BACKOFF_S,
+                            1.0 * (2 ** (device_down_count - 1)),
+                        )
+                        await asyncio.sleep(down_sleep_s)
+                    else:
+                        device_down_count = 0
+                        empty_miss_count = min(empty_miss_count + 1, 4)
+                        base_sleep_s = max(0.15, float(cfg.poll_interval_ms) / 1000.0)
+                        miss_sleep_s = min(2.0, base_sleep_s * (2 ** (empty_miss_count - 1)))
+                        await asyncio.sleep(miss_sleep_s)
                     continue
 
                 empty_miss_count = 0
