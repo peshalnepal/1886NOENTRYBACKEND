@@ -128,16 +128,17 @@ class CameraCreateSchema(BaseModel):
 
     Important:
     - webrtc_url is NOT accepted here (server provisions it)
-    - device_uuid is required because we must push config to Jetson
+    - device_uuid may be omitted when the site has exactly one linked device;
+      the backend will auto-link the camera to that device
     """
     model_config = ConfigDict(extra="forbid")
 
     user_id: Optional[int] = Field(default=None, ge=1, description="Optional. Server resolves user from JWT.")
 
     site_uuid: uuid.UUID
-    device_uuid: uuid.UUID
+    device_uuid: Optional[uuid.UUID] = None
     rtsp_url: str = Field(..., min_length=1)
-    device_url: str = Field(..., min_length=1)
+    device_url: Optional[str] = Field(default=None, min_length=1)
     name: Optional[str] = None
     location: Optional[str] = None
 
@@ -165,7 +166,7 @@ class CameraCreateSchema(BaseModel):
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("rtsp_url", "name", "location", "detection_path_template", "timezone"):
+        for attr in ("rtsp_url", "device_url", "name", "location", "detection_path_template", "timezone"):
             v = getattr(self, attr, None)
             if isinstance(v, str) and not v.strip():
                 setattr(self, attr, None)

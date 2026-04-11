@@ -16,7 +16,7 @@ from fastapi import HTTPException
 
 from application.repositories.pipeline_repository import PipelineRepository
 from application.repositories.channel_repository import ChannelRepository
-from core.database_orm import Site, SiteSettings, Device, Camera, CameraDevice
+from core.database_orm import Site, SiteDevice, SiteSettings, Device, Camera, CameraDevice
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent, VideoChannelEvent
 from domain.model_pipeline import ModelPipeline
 from application.channels.channel_config import VideoChannelConfig
@@ -389,6 +389,77 @@ class Manager:
         if not getattr(dev, "device_url", None):
             raise ValueError(f"Device missing device_url: {device_uuid}")
         return dev
+
+    async def _get_site_devices(
+        self,
+        db: AsyncSession,
+        *,
+        site_uuid: uuid.UUID,
+        user_id: int,
+    ) -> List[Device]:
+        q = (
+            select(Device)
+            .join(SiteDevice, SiteDevice.device_uuid == Device.device_uuid)
+            .where(
+                SiteDevice.site_uuid == site_uuid,
+                Device.user_id == int(user_id),
+            )
+            .order_by(
+                Device.is_enabled.desc(),
+                SiteDevice.created_at.desc(),
+                Device.created_at.desc(),
+            )
+        )
+        return (await db.execute(q)).scalars().all()
+
+    async def _resolve_site_device(
+        self,
+        db: AsyncSession,
+        *,
+        site_uuid: uuid.UUID,
+        user_id: int,
+        requested_device_uuid: Optional[uuid.UUID] = None,
+        required: bool = True,
+    ) -> Optional[Device]:
+        """
+        Resolve the device a camera should use for a site.
+
+        Rules:
+        - if the client explicitly asks for a device, validate that it exists
+          and, when the site already has linked devices, ensure it belongs to the site
+        - if no device is requested, auto-pick only when the site resolves to exactly
+          one usable device; ambiguity stays explicit instead of silently choosing
+          the wrong Jetson
+        """
+        site_devices = await self._get_site_devices(db, site_uuid=site_uuid, user_id=user_id)
+
+        if requested_device_uuid is not None:
+            dev = await self._get_device(db, requested_device_uuid, user_id=user_id)
+            if site_devices:
+                site_device_ids = {getattr(item, "device_uuid", None) for item in site_devices}
+                if dev.device_uuid not in site_device_ids:
+                    raise ValueError(
+                        f"Device {requested_device_uuid} is not linked to site {site_uuid}."
+                    )
+            return dev
+
+        if not site_devices:
+            if required:
+                raise ValueError(
+                    f"Site {site_uuid} has no linked device. Link a device to the site first."
+                )
+            return None
+
+        enabled_devices = [dev for dev in site_devices if bool(getattr(dev, "is_enabled", True))]
+        candidates = enabled_devices or site_devices
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if required:
+            raise ValueError(
+                f"Site {site_uuid} has multiple linked devices. Specify device_uuid explicitly."
+            )
+        return None
 
     async def _ensure_site_owned_by_user(self, db: AsyncSession, *, site_uuid: uuid.UUID, user_id: int) -> None:
         site = (
@@ -800,11 +871,31 @@ class Manager:
                     det_enabled = bool(getattr(cam, "is_detection_enabled", True))
                     devices = list(getattr(cam, "devices", None) or [])
                     if len(devices) == 0:
-                        logger.warning(
-                            "Skipping camera %s (enabled=%s detection=%s) because device count=%s",
-                            cam.camera_uuid, enabled, det_enabled, len(devices)
+                        repair_device = await self._resolve_site_device(
+                            db,
+                            site_uuid=cam.site_uuid,
+                            user_id=uid,
+                            requested_device_uuid=None,
+                            required=False,
                         )
-                        continue
+                        if repair_device is None:
+                            logger.warning(
+                                "Skipping camera %s (enabled=%s detection=%s) because device count=%s and no unique site device could be inferred",
+                                cam.camera_uuid, enabled, det_enabled, len(devices)
+                            )
+                            continue
+                        await self._set_single_camera_device(
+                            db,
+                            cam.camera_uuid,
+                            repair_device.device_uuid,
+                        )
+                        devices = [repair_device]
+                        logger.info(
+                            "Auto-linked missing camera_devices row camera=%s site=%s device=%s during pipeline load",
+                            cam.camera_uuid,
+                            cam.site_uuid,
+                            repair_device.device_uuid,
+                        )
                     if len(devices) > 1:
                         logger.warning(
                             "Camera %s has %s linked devices; using first loaded device %s for runtime compatibility",
@@ -1356,11 +1447,6 @@ class Manager:
             raise ValueError("Create_Channel requires site_uuid")
         site_uuid = self._as_uuid(site_uuid, "site_uuid")
 
-        device_uuid = patch.get("device_uuid")
-        if not device_uuid:
-            raise ValueError("Create_Channel requires device_uuid (each camera must have exactly 1 device).")
-        device_uuid = self._as_uuid(device_uuid, "device_uuid")
-
         cam_uuid = patch.get("camera_uuid") or uuid.uuid4()
         cam_uuid = self._as_uuid(cam_uuid, "camera_uuid")
         patch["camera_uuid"] = cam_uuid
@@ -1370,7 +1456,20 @@ class Manager:
 
         # Now validate ownership (first DB query — connection checked out here).
         await self._ensure_site_owned_by_user(db, site_uuid=site_uuid, user_id=user_id)
-        dev = await self._get_device(db, device_uuid, user_id=user_id)
+        raw_device_uuid = patch.get("device_uuid")
+        device_uuid = (
+            self._as_uuid(raw_device_uuid, "device_uuid")
+            if raw_device_uuid is not None else None
+        )
+        dev = await self._resolve_site_device(
+            db,
+            site_uuid=site_uuid,
+            user_id=user_id,
+            requested_device_uuid=device_uuid,
+            required=True,
+        )
+        device_uuid = dev.device_uuid
+        patch["device_uuid"] = device_uuid
 
         cam, cfg_json, tz = await self.channel_repo.upsert_camera_from_channel_config(
             db,
@@ -1522,10 +1621,10 @@ class Manager:
 
         old_rtsp = cam_db.rtsp_url
         old_webrtc = cam_db.webrtc_url
+        patch = self._patch_to_dict(getattr(ev, "configs", None))
+        patch.pop("webrtc_url", None)
 
         old_devices = await self._get_camera_devices(db, cam_uuid)
-        if not old_devices:
-            raise ValueError(f"Camera {cam_uuid} must have at least 1 device assigned")
         if len(old_devices) > 1:
             logger.warning(
                 "Camera %s has %s linked devices during edit; using most recent device %s",
@@ -1533,18 +1632,37 @@ class Manager:
                 len(old_devices),
                 getattr(old_devices[0], "device_uuid", None),
             )
-        old_dev = old_devices[0]
-        if not getattr(old_dev, "device_url", None):
+        old_dev = old_devices[0] if old_devices else None
+        if old_dev is not None and not getattr(old_dev, "device_url", None):
             raise ValueError(f"Assigned device has no device_url for camera {cam_uuid}")
 
-        patch = self._patch_to_dict(getattr(ev, "configs", None))
-        patch.pop("webrtc_url", None)
-        new_device_uuid = patch.get("device_uuid")
-        if new_device_uuid is None:
-            new_device_uuid = old_dev.device_uuid
-        new_device_uuid = self._as_uuid(new_device_uuid, "device_uuid")
-
-        new_dev = await self._get_device(db, new_device_uuid, user_id=user_id)
+        requested_device_uuid = patch.get("device_uuid")
+        if requested_device_uuid is not None:
+            requested_device_uuid = self._as_uuid(requested_device_uuid, "device_uuid")
+            new_dev = await self._resolve_site_device(
+                db,
+                site_uuid=cam_db.site_uuid,
+                user_id=user_id,
+                requested_device_uuid=requested_device_uuid,
+                required=True,
+            )
+        elif old_dev is not None:
+            new_dev = old_dev
+        else:
+            new_dev = await self._resolve_site_device(
+                db,
+                site_uuid=cam_db.site_uuid,
+                user_id=user_id,
+                requested_device_uuid=None,
+                required=True,
+            )
+            logger.info(
+                "Auto-linked camera %s to site device %s during edit repair",
+                cam_uuid,
+                new_dev.device_uuid,
+            )
+        new_device_uuid = new_dev.device_uuid
+        patch["device_uuid"] = new_device_uuid
 
         # merge config json
         merged_cfg: Dict[str, Any] = {}
@@ -1577,7 +1695,8 @@ class Manager:
                 self._bg_edge_delete(device_url=dev.device_url, camera_uuid=str(cam_uuid))
             )
 
-        if len(old_devices) != 1 or old_dev.device_uuid != new_device_uuid:
+        device_changed = old_dev is None or old_dev.device_uuid != new_device_uuid
+        if len(old_devices) != 1 or device_changed:
             await self._set_single_camera_device(db, cam_uuid, new_device_uuid)
 
         # Fire-and-forget: do NOT await WebRTC call while X lock is held.
@@ -1597,7 +1716,7 @@ class Manager:
 
         # Fire-and-forget edge sync — do NOT await while X lock is held on camera row.
         if det_enabled:
-            if old_dev.device_uuid != new_device_uuid:
+            if device_changed:
                 edge_payload = self._edge_payload_from_config(
                     camera_uuid=str(cam_uuid),
                     rtsp_url=cam2.rtsp_url,

@@ -576,10 +576,6 @@ async def create_camera(
     try:
         data = payload.model_dump(exclude_none=True)
 
-        # New rule: device_uuid is required
-        if not data.get("device_uuid"):
-            raise HTTPException(status_code=422, detail="device_uuid is required (each camera must have a device).")
-
         # Trust JWT context, not client-provided user_id.
         data["user_id"] = int(user.id)
         pipeline = await manager.get_activepipeline(user_id=user.id)
@@ -662,6 +658,8 @@ async def create_camera(
         )
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
         logger.exception("Error creating camera")
         raise HTTPException(status_code=500, detail=f"Failed to create camera: {str(e)}")
@@ -692,7 +690,10 @@ async def edit_camera(
         created_at=datetime.now(timezone.utc),
     )
 
-    result = await manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=user.id)
+    try:
+        result = await manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not result or not result.cameras:
         raise HTTPException(status_code=500, detail="Failed to edit camera")
 
