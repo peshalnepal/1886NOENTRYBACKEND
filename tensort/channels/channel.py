@@ -385,5 +385,14 @@ class VideoChannel():
 
         t = self._thread
         if t and t.is_alive():
-            # On Py3.6: keep this bounded so delete doesn't hang forever
-            t.join(timeout=6.0)
+            # Never block the asyncio loop with a thread join. A stalled RTSP read
+            # can take several seconds to unwind; if we join inline, every Flask
+            # request that calls into the pipeline (latest, detection, patch) can
+            # time out waiting for the loop.
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, t.join, 6.0)
+            if t.is_alive():
+                logger.warning("[%s] Channel thread did not stop within 6s", cam)
+
+        if t and not t.is_alive():
+            self._thread = None

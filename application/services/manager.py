@@ -412,6 +412,19 @@ class Manager:
         )
         return (await db.execute(q)).scalars().all()
 
+    async def _pick_site_device_uuid(
+        self,
+        db: AsyncSession,
+        *,
+        site_uuid: uuid.UUID,
+        user_id: int,
+    ) -> Optional[uuid.UUID]:
+        """Auto-select device if exactly one is available. Returns None if 0 or 2+ devices."""
+        devices = await self._get_site_devices(db, site_uuid=site_uuid, user_id=user_id)
+        if len(devices) == 1:
+            return devices[0].device_uuid
+        return None
+
     async def _resolve_site_device(
         self,
         db: AsyncSession,
@@ -475,20 +488,20 @@ class Manager:
 
     async def _get_single_camera_device(self, db: AsyncSession, camera_uuid: uuid.UUID, *, required: bool = True) -> Optional[Device]:
         """
-        Returns the single Device assigned to this camera (enforces exactly one).
+        Returns the primary Device assigned to this camera (most recent).
+        Now supports flexible device management.
         """
         devices = await self._get_camera_devices(db, camera_uuid)
 
-        if len(devices) == 1:
+        if len(devices) > 0:
             dev = devices[0]
             if not getattr(dev, "device_url", None):
                 raise ValueError(f"Assigned device has no device_url for camera {camera_uuid}")
             return dev
 
-        if not required and len(devices) == 0:
-            return None
-
-        raise ValueError(f"Camera {camera_uuid} must have exactly 1 device assigned, found {len(devices)}")
+        if required:
+            raise ValueError(f"Camera {camera_uuid} has no device assigned. Assign a device first.")
+        return None
 
     async def _get_camera_devices(self, db: AsyncSession, camera_uuid: uuid.UUID) -> List[Device]:
         q = (
@@ -1636,6 +1649,7 @@ class Manager:
         if old_dev is not None and not getattr(old_dev, "device_url", None):
             raise ValueError(f"Assigned device has no device_url for camera {cam_uuid}")
 
+        # Determine new device: requested > preserve old > auto-pick
         requested_device_uuid = patch.get("device_uuid")
         if requested_device_uuid is not None:
             requested_device_uuid = self._as_uuid(requested_device_uuid, "device_uuid")
@@ -1647,17 +1661,22 @@ class Manager:
                 required=True,
             )
         elif old_dev is not None:
+            # PRESERVE: Keep existing device if not changing
             new_dev = old_dev
         else:
-            new_dev = await self._resolve_site_device(
+            # AUTO-PICK: Try if exactly 1 device in site
+            picked_uuid = await self._pick_site_device_uuid(
                 db,
                 site_uuid=cam_db.site_uuid,
                 user_id=user_id,
-                requested_device_uuid=None,
-                required=True,
             )
+            if picked_uuid is None:
+                raise ValueError(
+                    f"Camera has no device assigned. Link a Device to this site or assign explicitly."
+                )
+            new_dev = await self._get_device(db, picked_uuid, user_id=user_id)
             logger.info(
-                "Auto-linked camera %s to site device %s during edit repair",
+                "Auto-linked camera %s to device %s",
                 cam_uuid,
                 new_dev.device_uuid,
             )
