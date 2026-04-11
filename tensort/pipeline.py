@@ -87,6 +87,47 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     return max(float(minimum), float(value))
 
 
+def _detect_total_memory_mb() -> Optional[int]:
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return max(0, int(parts[1]) // 1024)
+    except Exception:
+        return None
+    return None
+
+
+def _default_auto_worker_cap(total_mem_mb: Optional[int] = None) -> int:
+    if total_mem_mb is None:
+        total_mem_mb = _detect_total_memory_mb()
+
+    if total_mem_mb is None:
+        return 2
+    if int(total_mem_mb) <= 4608:
+        return 1
+    if int(total_mem_mb) <= 8192:
+        return 2
+    if int(total_mem_mb) <= 16384:
+        return 3
+    return 4
+
+
+def _default_infer_result_timeout_s(total_mem_mb: Optional[int] = None) -> float:
+    if total_mem_mb is None:
+        total_mem_mb = _detect_total_memory_mb()
+
+    if total_mem_mb is None:
+        return 1.5
+    if int(total_mem_mb) <= 4608:
+        return 2.0
+    if int(total_mem_mb) <= 8192:
+        return 1.5
+    return 1.0
+
+
 # ---------------------------------------------------------------------------
 # FIX 5: Broadcaster — no asyncio.Lock on the hot broadcast path
 # ---------------------------------------------------------------------------
@@ -279,15 +320,26 @@ class InferenceWorkerPool(object):
     between workers sharing a queue).
     """
     def __init__(self, loop, num_workers, max_q_per_worker=2):
-        self._workers = [
-            InferenceWorker(loop, worker_id=i, max_q=max_q_per_worker)
-            for i in range(max(1, num_workers))
-        ]
-        logger.info("InferenceWorkerPool: %d workers", len(self._workers))
+        self._loop = loop
+        self._max_q_per_worker = max_q_per_worker
+        self._workers = []
+        self.ensure_size(num_workers)
 
     def _pick(self, camera_uuid):
         # Stable assignment: same camera always → same worker
         return self._workers[hash(str(camera_uuid)) % len(self._workers)]
+
+    def ensure_size(self, num_workers):
+        target = max(1, int(num_workers))
+        current = len(self._workers)
+        if target <= current:
+            return current
+        for i in range(current, target):
+            self._workers.append(
+                InferenceWorker(self._loop, worker_id=i, max_q=self._max_q_per_worker)
+            )
+        logger.info("InferenceWorkerPool: %d workers", len(self._workers))
+        return len(self._workers)
 
     def submit(self, bgr, meta, fut):
         worker = self._pick(meta.get("camera_uuid", ""))
@@ -314,10 +366,14 @@ class SimpleInferencePipeline(object):
             # 1 = drop immediately when worker is busy; avoids queuing stale frames
             infer_q_max = _env_int("INFER_QUEUE_MAX", 1, minimum=1)
 
+        self._detected_mem_mb = _detect_total_memory_mb()
+        auto_worker_cap = _default_auto_worker_cap(self._detected_mem_mb)
+        infer_timeout_default = _default_infer_result_timeout_s(self._detected_mem_mb)
+
         # Number of parallel inference threads (one per camera is a good default)
         self._num_workers = _env_int("INFER_NUM_WORKERS", 0, minimum=0)
         # 0 → auto-size to number of cameras (capped at INFER_NUM_WORKERS_MAX)
-        self._num_workers_max = _env_int("INFER_NUM_WORKERS_MAX", 6, minimum=1)
+        self._num_workers_max = _env_int("INFER_NUM_WORKERS_MAX", auto_worker_cap, minimum=1)
 
         self._channels = {}
         self._channel_tasks = {}
@@ -337,7 +393,7 @@ class SimpleInferencePipeline(object):
         self._snapshot_jpeg_quality = _env_int("SNAPSHOT_JPEG_QUALITY", 75, minimum=1)
         self._snapshot_on_detection_only = _env_bool("SNAPSHOT_ON_DETECTION_ONLY", True)    # matches .env.example SNAPSHOT_ON_DETECTION_ONLY=true
         self._emit_empty_detections = _env_bool("EMIT_EMPTY_DETECTIONS", False)
-        self._infer_result_timeout_s = _env_float("INFER_RESULT_TIMEOUT_S", 0.5, minimum=0.0)
+        self._infer_result_timeout_s = _env_float("INFER_RESULT_TIMEOUT_S", infer_timeout_default, minimum=0.0)
         self._infer_error_log_interval_s = _env_float("INFER_ERROR_LOG_INTERVAL_S", 10.0, minimum=0.0)
         self._last_infer_error_sig = {}
         self._last_infer_error_ts = {}
@@ -360,6 +416,14 @@ class SimpleInferencePipeline(object):
         # FIX 2: track in-flight futures so we can cancel on shutdown
         self._inflight = {}             # (camera_uuid, seq) -> asyncio.Future
         self._inflight_lock = asyncio.Lock()
+
+        logger.info(
+            "[pipeline] config mem_total_mb=%s workers=%s worker_cap=%d infer_timeout_s=%.2f",
+            self._detected_mem_mb if self._detected_mem_mb is not None else "unknown",
+            "auto" if self._num_workers == 0 else int(self._num_workers),
+            int(self._num_workers_max),
+            float(self._infer_result_timeout_s),
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -403,6 +467,8 @@ class SimpleInferencePipeline(object):
             old_task.cancel()
             try:
                 await old_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
 
@@ -415,6 +481,9 @@ class SimpleInferencePipeline(object):
         if should_start:
             async with self._lock:
                 if camera_key in self._channels and not self._closing:
+                    if self._infer_pool is not None and self._num_workers == 0:
+                        desired_workers = min(max(1, len(self._channels)), self._num_workers_max)
+                        self._infer_pool.ensure_size(desired_workers)
                     self._start_channel_task(camera_key)
 
     async def remove_channel(self, camera_uuid):
@@ -427,6 +496,8 @@ class SimpleInferencePipeline(object):
             t.cancel()
             try:
                 await t
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
 
@@ -459,18 +530,20 @@ class SimpleInferencePipeline(object):
 
             loop = asyncio.get_event_loop()
 
-            # Auto-size worker count if not set explicitly.
-            # IMPORTANT: start() is called before cameras are added (len==0 at this point),
-            # so we pre-allocate _num_workers_max workers. Idle workers are cheap threads;
-            # without this, all 5 cameras pin to 1 worker and starve each other.
             num_workers = self._num_workers
             if num_workers == 0:
-                num_workers = self._num_workers_max
+                num_workers = min(max(1, len(self._channels)), self._num_workers_max)
 
             self._infer_pool = InferenceWorkerPool(
                 loop=loop,
                 num_workers=num_workers,
                 max_q_per_worker=self._infer_q_max,
+            )
+            logger.info(
+                "[pipeline] starting camera_count=%d worker_count=%d auto_workers=%s",
+                len(self._channels),
+                len(self._infer_pool._workers),
+                self._num_workers == 0,
             )
 
             self._inference_task = asyncio.ensure_future(self._pump_inference())
@@ -494,6 +567,8 @@ class SimpleInferencePipeline(object):
         for t in list(self._channel_tasks.values()):
             try:
                 await t
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
 
@@ -506,6 +581,8 @@ class SimpleInferencePipeline(object):
         if self._inference_task is not None:
             try:
                 await self._inference_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
 
@@ -768,6 +845,10 @@ class SimpleInferencePipeline(object):
             "out_queue_max": int(self._out_q.maxsize),
             "inflight_count": len(self._inflight),
             "num_workers": len(self._infer_pool._workers) if self._infer_pool else 0,
+            "workers_auto": self._num_workers == 0,
+            "worker_cap": int(self._num_workers_max),
+            "infer_timeout_s": float(self._infer_result_timeout_s),
+            "mem_total_mb": self._detected_mem_mb,
         })
         return stats
 

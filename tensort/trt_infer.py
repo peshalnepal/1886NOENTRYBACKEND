@@ -477,11 +477,14 @@ def build_default() -> TRTInfer:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     det_engine = os.getenv("DET_ENGINE")
     if not det_engine:
-        det_engine = os.path.join(base_dir, "models", "yolo26n.engine")
+        det_engine = os.path.join(base_dir, "models", "yolov8n.engine")
     elif not os.path.isabs(det_engine) and not os.path.exists(det_engine):
         candidate = os.path.join(base_dir, det_engine)
         if os.path.exists(candidate):
             det_engine = candidate
+
+    if not os.path.exists(det_engine):
+        raise FileNotFoundError("DET_ENGINE not found: {}".format(det_engine))
 
     imgsz = int(os.getenv("IMG_SZ", "640"))
     conf = float(os.getenv("CONF", "0.350"))   # matches .env.example CONF=0.350
