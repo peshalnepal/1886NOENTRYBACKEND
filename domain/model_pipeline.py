@@ -1054,6 +1054,7 @@ class ModelPipeline:
 
         uniq_classes = sorted(set(classes))
         classes_text = ", ".join(uniq_classes)
+        _verb = "is" if len(uniq_classes) == 1 else "are"
         image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
         overlay_payload = _overlay_payload_from_resp(resp)
         msg = NotificationMessage(
@@ -1064,7 +1065,7 @@ class ModelPipeline:
             site_uuid=str(ctx.site_uuid),
             site_name=ctx.site_name,
             title=f"Detection: {classes_text}",
-            body=f"Detected {classes_text} (max_conf={max_conf:.2f})",
+            body=f"{int(max_conf * 100)}% chance that {classes_text} {_verb} being detected",
             alert_type="detection_summary",
             cls_names=uniq_classes,
             max_conf=float(max_conf),

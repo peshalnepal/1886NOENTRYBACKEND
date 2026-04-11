@@ -2666,6 +2666,8 @@ class NotificationService:
 
                 if send_classes:
                     max_conf = max([c for (_n, c) in matches] or [0.0])
+                    _send_classes_str = ', '.join(sorted(set(send_classes)))
+                    _verb = "is" if len(set(send_classes)) == 1 else "are"
                     msg = NotificationMessage(
                         user_id=int(ctx.user_id),
                         id=f"{cam}-{ts_ms}-summary",
@@ -2673,8 +2675,8 @@ class NotificationService:
                         camera_uuid=cam,
                         site_uuid=site_uuid_str,
                         site_name=site_name,
-                        title=f"Detection: {', '.join(sorted(set(send_classes)))}",
-                        body=f"Detected {', '.join(sorted(set(send_classes)))} (max_conf={max_conf:.2f})",
+                        title=f"Detection: {_send_classes_str}",
+                        body=f"{int(max_conf * 100)}% chance that {_send_classes_str} {_verb} being detected",
                         alert_type="detection_summary",
                         cls_names=sorted(set(send_classes)),
                         max_conf=float(max_conf),
@@ -2717,6 +2719,8 @@ class NotificationService:
             return
 
         max_conf = max([c for (_n, c) in matches] or [0.0])
+        _send_classes_str = ', '.join(sorted(set(send_classes)))
+        _verb = "is" if len(set(send_classes)) == 1 else "are"
 
         msg = NotificationMessage(
             user_id=int(ctx.user_id),
@@ -2725,8 +2729,8 @@ class NotificationService:
             camera_uuid=cam,
             site_uuid=site_uuid_str,
             site_name=site_name,
-            title=f"Detection: {', '.join(sorted(set(send_classes)))}",
-            body=f"Detected {', '.join(sorted(set(send_classes)))} (max_conf={max_conf:.2f})",
+            title=f"Detection: {_send_classes_str}",
+            body=f"{int(max_conf * 100)}% chance that {_send_classes_str} {_verb} being detected",
             alert_type="detection_summary",
             cls_names=sorted(set(send_classes)),
             max_conf=float(max_conf),
