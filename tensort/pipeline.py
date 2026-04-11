@@ -332,10 +332,10 @@ class SimpleInferencePipeline(object):
         self._latest_snapshot_ts_ms = {}
         self._latest_lock = asyncio.Lock()
         self._snapshot_enabled = _env_bool("ENABLE_SNAPSHOT_CACHE", True)
-        self._snapshot_min_interval_ms = _env_int("SNAPSHOT_MIN_INTERVAL_MS", 1000, minimum=0)
+        self._snapshot_min_interval_ms = _env_int("SNAPSHOT_MIN_INTERVAL_MS", 500, minimum=0)   # matches .env.example SNAPSHOT_MIN_INTERVAL_MS=500
         self._snapshot_max_edge = _env_int("SNAPSHOT_MAX_EDGE", 960, minimum=64)
         self._snapshot_jpeg_quality = _env_int("SNAPSHOT_JPEG_QUALITY", 75, minimum=1)
-        self._snapshot_on_detection_only = _env_bool("SNAPSHOT_ON_DETECTION_ONLY", False)
+        self._snapshot_on_detection_only = _env_bool("SNAPSHOT_ON_DETECTION_ONLY", True)    # matches .env.example SNAPSHOT_ON_DETECTION_ONLY=true
         self._emit_empty_detections = _env_bool("EMIT_EMPTY_DETECTIONS", False)
         self._infer_result_timeout_s = _env_float("INFER_RESULT_TIMEOUT_S", 0.5, minimum=0.0)
         self._infer_error_log_interval_s = _env_float("INFER_ERROR_LOG_INTERVAL_S", 10.0, minimum=0.0)
@@ -743,20 +743,25 @@ class SimpleInferencePipeline(object):
                 break
             yield item
 
-    async def get_latest(self, camera_uuid):
-        # Plain dict read — GIL-safe, no lock needed
+    def peek_latest(self, camera_uuid):
+        # Plain dict read — GIL-safe, no event-loop hop needed.
         return self._latest.get(str(camera_uuid))
 
-    async def get_latest_snapshot(self, camera_uuid):
-        async with self._latest_lock:
-            return self._latest_snapshots.get(str(camera_uuid))
+    async def get_latest(self, camera_uuid):
+        return self.peek_latest(camera_uuid)
 
-    async def get_stats(self) -> Dict[str, Any]:
-        async with self._lock:
-            channel_count = len(self._channels)
+    def peek_latest_snapshot(self, camera_uuid):
+        # Reads a single dict entry; fine for health/debug paths that should not
+        # block on the pipeline loop.
+        return self._latest_snapshots.get(str(camera_uuid))
+
+    async def get_latest_snapshot(self, camera_uuid):
+        return self.peek_latest_snapshot(camera_uuid)
+
+    def peek_stats(self) -> Dict[str, Any]:
         stats = dict(self._stats)
         stats.update({
-            "channel_count": int(channel_count),
+            "channel_count": len(self._channels),
             "latest_cache_size": len(self._latest),
             "snapshot_cache_size": len(self._latest_snapshots),
             "infer_q_per_worker": int(self._infer_q_max),
@@ -765,6 +770,9 @@ class SimpleInferencePipeline(object):
             "num_workers": len(self._infer_pool._workers) if self._infer_pool else 0,
         })
         return stats
+
+    async def get_stats(self) -> Dict[str, Any]:
+        return self.peek_stats()
 
     # ------------------------------------------------------------------
     # FIX 4: snapshot encode in executor so event loop is never stalled

@@ -335,20 +335,26 @@ class PipelineRuntime(object):
         return {"camera_uuid": camera_uuid, "config": cfg_data}
 
     def get_latest(self, camera_uuid: str) -> Dict[str, Any]:
-        # get_latest is async
         pipeline = self._require_pipeline()
-        result = self._call(pipeline.get_latest(camera_uuid), timeout_s=5.0)
-        return result
+        peek_latest = getattr(pipeline, "peek_latest", None)
+        if callable(peek_latest):
+            return peek_latest(camera_uuid)
+        return self._call(pipeline.get_latest(camera_uuid), timeout_s=5.0)
 
     def get_snapshot(self, camera_uuid: str):
-        # get_latest_snapshot is async
         pipeline = self._require_pipeline()
+        peek_latest_snapshot = getattr(pipeline, "peek_latest_snapshot", None)
+        if callable(peek_latest_snapshot):
+            return peek_latest_snapshot(camera_uuid)
         return self._call(pipeline.get_latest_snapshot(camera_uuid), timeout_s=5.0)
 
     def get_stats(self) -> Dict[str, Any]:
         if self.loop is None or self.pipeline is None:
             return {}
         try:
+            peek_stats = getattr(self.pipeline, "peek_stats", None)
+            if callable(peek_stats):
+                return peek_stats()
             return self._call(self.pipeline.get_stats(), timeout_s=2.0)
         except Exception:
             logger.exception("Failed to fetch pipeline stats")
@@ -373,17 +379,32 @@ def _require_rtsp(url: str):
     return url.startswith("rtsp://") or url.startswith("rtsps://")
 
 
+def _runtime_status(*, include_stats: bool) -> Dict[str, Any]:
+    payload = {
+        "ok": True,
+        "service": "jetson-tensort",
+        "pipeline_ready": bool(runtime.pipeline is not None and runtime.loop is not None),
+    }
+    if include_stats:
+        payload["stats"] = runtime.get_stats()
+    return payload
+
+
 # -----------------------------
 # Routes
 # -----------------------------
+@app.route("/", methods=["GET"])
+@app.route("/api", methods=["GET"])
+def root():
+    # Keep the root probe lightweight so reverse proxies and health checks can
+    # confirm the process is alive without waiting on pipeline stats collection.
+    return jsonify(_runtime_status(include_stats=False))
+
+
 @app.route("/health", methods=["GET"])
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({
-        "ok": True,
-        "pipeline_ready": bool(runtime.pipeline is not None and runtime.loop is not None),
-        "stats": runtime.get_stats(),
-    })
+    return jsonify(_runtime_status(include_stats=True))
 
 
 @app.route("/cameras", methods=["GET"])
@@ -591,4 +612,4 @@ def _sse_generator(target_camera_uuid=None):
 
 if __name__ == "__main__":
     # threaded=True lets Flask handle multiple requests
-    app.run(host="0.0.0.0", port=8080, threaded=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), threaded=True)

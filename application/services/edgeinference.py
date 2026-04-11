@@ -70,6 +70,15 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_float(name: str, default: float, minimum: float = 0.1) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except Exception:
+        value = float(default)
+    return max(float(minimum), float(value))
+
 class EdgeInferenceClient:
     """
     Talks to the Jetson TensorRT (inference) service.
@@ -92,10 +101,32 @@ class EdgeInferenceClient:
         self.delete_path = os.getenv("EDGE_DELETE_PATH", "/cameras/{camera_uuid}")
         self.api_key = os.getenv("EDGE_API_KEY")
         self.list_path = os.getenv("EDGE_LIST_PATH", self.add_path)
-        self.request_timeout_s = float(os.getenv("EDGE_TIMEOUT_S", "15"))
-        self.connect_timeout_s = float(os.getenv("EDGE_CONNECT_TIMEOUT_S", "10"))
+        self.request_timeout_s = _env_float("EDGE_TIMEOUT_S", 15.0)
+        self.connect_timeout_s = _env_float(
+            "EDGE_CONNECT_TIMEOUT_S",
+            min(self.request_timeout_s, 10.0),
+        )
+        self.list_timeout_s = _env_float(
+            "EDGE_LIST_TIMEOUT_S",
+            min(self.request_timeout_s, 5.0),
+        )
+        self.list_connect_timeout_s = _env_float(
+            "EDGE_LIST_CONNECT_TIMEOUT_S",
+            min(self.connect_timeout_s, self.list_timeout_s, 3.0),
+        )
+        self.health_timeout_s = _env_float(
+            "EDGE_HEALTH_TIMEOUT_S",
+            min(self.list_timeout_s, 2.0),
+        )
+        self.health_connect_timeout_s = _env_float(
+            "EDGE_HEALTH_CONNECT_TIMEOUT_S",
+            min(self.connect_timeout_s, self.health_timeout_s, 1.5),
+        )
         self.retry_count = max(1, int(os.getenv("EDGE_HTTP_RETRIES", "3")))
-        self.trust_env = _env_bool("EDGE_HTTP_TRUST_ENV", True)
+        # Edge-device calls should bypass ambient proxy settings unless explicitly
+        # opted in. Proxy env vars are a common source of opaque ConnectError
+        # failures for device-local or port-forwarded URLs.
+        self.trust_env = _env_bool("EDGE_HTTP_TRUST_ENV", False)
 
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self.request_timeout_s, connect=self.connect_timeout_s),
@@ -158,14 +189,47 @@ class EdgeInferenceClient:
             urls.append(url)
         return urls
 
-    async def _request_json(self, method: str, url_or_urls: Union[str, Iterable[str]]) -> Any:
+    def _timeout(
+        self,
+        *,
+        request_timeout_s: Optional[float] = None,
+        connect_timeout_s: Optional[float] = None,
+    ) -> httpx.Timeout:
+        read_timeout = max(
+            0.1,
+            float(self.request_timeout_s if request_timeout_s is None else request_timeout_s),
+        )
+        connect_timeout = max(
+            0.1,
+            float(self.connect_timeout_s if connect_timeout_s is None else connect_timeout_s),
+        )
+        connect_timeout = min(connect_timeout, read_timeout)
+        return httpx.Timeout(read_timeout, connect=connect_timeout)
+
+    async def _request_json(
+        self,
+        method: str,
+        url_or_urls: Union[str, Iterable[str]],
+        *,
+        request_timeout_s: Optional[float] = None,
+        connect_timeout_s: Optional[float] = None,
+    ) -> Any:
         urls = self._normalize_urls(url_or_urls)
         last_exc: Optional[Exception] = None
         last_url = urls[-1] if urls else ""
+        timeout = self._timeout(
+            request_timeout_s=request_timeout_s,
+            connect_timeout_s=connect_timeout_s,
+        )
         for attempt in range(self.retry_count):
             for url in urls:
                 try:
-                    r = await self._client.request(method, url, headers=self._headers())
+                    r = await self._client.request(
+                        method,
+                        url,
+                        headers=self._headers(),
+                        timeout=timeout,
+                    )
                     if r.status_code in _ROUTE_FALLBACK_STATUS_CODES and len(urls) > 1:
                         last_url = url
                         last_exc = RuntimeError(
@@ -187,20 +251,30 @@ class EdgeInferenceClient:
             raise RuntimeError(self._format_request_error(method, last_url, last_exc)) from last_exc
         raise RuntimeError(f"Edge service request failed for {method} {last_url}")
 
-    async def get_health(self, *, device_url: str) -> Optional[Dict[str, Any]]:
+    async def get_health(
+        self,
+        *,
+        device_url: str,
+        request_timeout_s: Optional[float] = None,
+        connect_timeout_s: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Best-effort health probe.
         Tries /health then /api/health and returns parsed JSON payload.
         Accepts 503 responses too if they include structured readiness details.
         """
         base = device_url.rstrip("/")
+        timeout = self._timeout(
+            request_timeout_s=self.health_timeout_s if request_timeout_s is None else request_timeout_s,
+            connect_timeout_s=self.health_connect_timeout_s if connect_timeout_s is None else connect_timeout_s,
+        )
         urls = [
             "{}/health".format(base),
             "{}/api/health".format(base),
         ]
         for url in urls:
             try:
-                r = await self._client.get(url, headers=self._headers())
+                r = await self._client.get(url, headers=self._headers(), timeout=timeout)
                 data = r.json()
                 if isinstance(data, dict):
                     if any(k in data for k in ("ok", "pipeline_ready", "startup_error")):
@@ -222,7 +296,12 @@ class EdgeInferenceClient:
         """
         urls = self._candidate_urls(device_url=device_url, path=self.list_path)
         try:
-            data = await self._request_json("GET", urls)
+            data = await self._request_json(
+                "GET",
+                urls,
+                request_timeout_s=self.list_timeout_s,
+                connect_timeout_s=self.list_connect_timeout_s,
+            )
         except Exception as exc:
             health = await self.get_health(device_url=device_url)
             raise EdgeCameraInventoryError(str(exc), health=health, cause=exc) from exc

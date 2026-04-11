@@ -19,6 +19,7 @@ import asyncio
 import json
 import httpx
 import logging
+import os
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
@@ -27,6 +28,19 @@ from urllib.parse import urljoin
 from application.channels.channel_config import VideoChannelConfig
 logger = logging.getLogger(__name__)
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+_EDGE_HTTP_TRUST_ENV = _env_bool(
+    "EDGE_CHANNEL_HTTP_TRUST_ENV",
+    _env_bool("EDGE_HTTP_TRUST_ENV", False),
+)
+
 _http = httpx.AsyncClient(
     timeout=httpx.Timeout(connect=3.0, read=3.0, write=3.0, pool=3.0),
     limits=httpx.Limits(
@@ -34,6 +48,7 @@ _http = httpx.AsyncClient(
         max_keepalive_connections=20,
         keepalive_expiry=30.0,
     ),
+    trust_env=_EDGE_HTTP_TRUST_ENV,
 )
 
 async def _run_blocking(fn, *args, **kwargs):
