@@ -2325,21 +2325,32 @@ class NotificationService:
 
         # Create a session once and reuse it throughout the notification processing
         async with self._session_factory() as db:
-            item = await self._prepare_notification_item(
-                msg=msg,
-                ctx=ctx,
-                extra_payload=extra_payload,
-                db=db,  # Pass the session to avoid opening a new one
-            )
-
-            ok = await self._flush_user_batch(int(ctx.user_id), [item], db=db)
-            if not ok:
-                logger.warning(
-                    "Failed to persist notification immediately user=%s camera=%s msg_id=%s",
-                    ctx.user_id,
-                    msg.camera_uuid,
-                    msg.id,
+            try:
+                item = await self._prepare_notification_item(
+                    msg=msg,
+                    ctx=ctx,
+                    extra_payload=extra_payload,
+                    db=db,  # Pass the session to avoid opening a new one
                 )
+
+                ok = await self._flush_user_batch(int(ctx.user_id), [item], db=db)
+                if not ok:
+                    await db.rollback()
+                    logger.warning(
+                        "Failed to persist notification immediately user=%s camera=%s msg_id=%s",
+                        ctx.user_id,
+                        msg.camera_uuid,
+                        msg.id,
+                    )
+                    return
+
+                # The live SSE publish happens before this method runs. Commit the
+                # DB transaction here so dashboard reloads and chart queries can
+                # immediately rehydrate the same alerts from persisted storage.
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
             
     async def enqueue_notification(
         self,
