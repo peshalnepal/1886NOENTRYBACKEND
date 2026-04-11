@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jetson-app")
 
 app = Flask(__name__)
-DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "15.0"))
+DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "5.0"))
 # 0 disables pre-resize — TRT letterbox handles any input size so this is just wasted work
 DEFAULT_RESIZE_W = int(os.getenv("DEFAULT_RESIZE_W", "0"))
 DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "0"))

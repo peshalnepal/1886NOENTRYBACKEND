@@ -49,14 +49,13 @@ def _encode_jpeg_bytes(frame_bgr, *, max_edge: int = 960, jpeg_quality: int = 75
         if height <= 0 or width <= 0:
             return None
         scale = min(float(max_edge) / float(max(height, width)), 1.0)
-        output = frame_bgr
         if scale < 1.0:
-            output = cv2.resize(
+            frame_bgr = cv2.resize(
                 frame_bgr,
                 (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
                 interpolation=cv2.INTER_AREA,
             )
-        ok, encoded = cv2.imencode(".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+        ok, encoded = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
         if not ok:
             return None
         return encoded.tobytes()
@@ -200,7 +199,7 @@ class CoalescingBuffer(object):
             key = await self._pending.get()
             async with self._lock:
                 self._in_queue.discard(key)
-            ev = self._latest.get(key)
+            ev = self._latest.pop(key, None)
             if ev is not None:
                 return ev
 
@@ -402,6 +401,12 @@ class SimpleInferencePipeline(object):
         self._inference_task = None
         self._infer_pool = None         # created on start()
         self._infer_q_max = int(infer_q_max)
+        # Cap how many frames can be in-flight at once. Must be >= number of
+        # cameras so every camera gets a fair shot at inference each cycle.
+        # Worker queue rejection (INFER_QUEUE_MAX) is the real memory guard —
+        # it only holds 2 frames (1 processing + 1 queued). This cap is a
+        # safety net against runaway inflight growth, not the primary throttle.
+        self._max_inflight = _env_int("MAX_INFLIGHT_FRAMES", 8, minimum=1)
         self._log_every_n = _env_int("PIPELINE_LOG_EVERY_N_FRAMES", 0, minimum=0)
         self._stats = {
             "frames_in": 0,
@@ -418,11 +423,12 @@ class SimpleInferencePipeline(object):
         self._inflight_lock = asyncio.Lock()
 
         logger.info(
-            "[pipeline] config mem_total_mb=%s workers=%s worker_cap=%d infer_timeout_s=%.2f",
+            "[pipeline] config mem_total_mb=%s workers=%s worker_cap=%d infer_timeout_s=%.2f max_inflight=%d",
             self._detected_mem_mb if self._detected_mem_mb is not None else "unknown",
             "auto" if self._num_workers == 0 else int(self._num_workers),
             int(self._num_workers_max),
             float(self._infer_result_timeout_s),
+            int(self._max_inflight),
         )
 
     # ------------------------------------------------------------------
@@ -670,6 +676,8 @@ class SimpleInferencePipeline(object):
                     )
 
                 bgr = getattr(rtsp_ev, "frame", None)
+                # Release frame from the event so GC can free it once we're done
+                rtsp_ev.frame = None
 
                 if bgr is None:
                     self._stats["infer_fail"] += 1
@@ -686,6 +694,13 @@ class SimpleInferencePipeline(object):
                     continue
 
                 if self._infer_pool is None:
+                    continue
+
+                # Back-pressure: if too many frames are already in flight,
+                # drop this one to prevent unbounded memory growth on low-RAM
+                # devices like Jetson Nano.
+                if len(self._inflight) >= self._max_inflight:
+                    self._stats["infer_dropped"] += 1
                     continue
 
                 meta = {
@@ -709,12 +724,14 @@ class SimpleInferencePipeline(object):
                 ok = self._infer_pool.submit(bgr, meta, fut)
 
                 if not ok:
-                    # Worker dropped it (queue full) — future already has result set
+                    # Worker dropped it (queue full). The future result is set
+                    # via call_soon_threadsafe (deferred), so fut.done() is
+                    # False here. Clean up immediately — don't wait for the
+                    # deferred callback since it would hold frame memory.
                     async with self._inflight_lock:
                         self._inflight.pop(inflight_key, None)
-                    # Still need to process the dropped-result
-                    if fut.done():
-                        asyncio.ensure_future(self._handle_result(fut.result(), meta))
+                    meta.pop("_bgr_ref", None)
+                    self._stats["infer_dropped"] += 1
                 else:
                     # Fire-and-forget: wire result handler to future done callback
                     def _on_done(f, _meta=meta, _key=inflight_key):
@@ -725,11 +742,16 @@ class SimpleInferencePipeline(object):
 
                     fut.add_done_callback(_on_done)
 
-                    # Optional timeout watchdog — cancels stale futures so
-                    # _inflight doesn't grow forever if a worker hangs.
+                    # Lightweight watchdog — only holds metadata for timeout
+                    # reporting, NOT the frame reference (_bgr_ref excluded).
                     if self._infer_result_timeout_s > 0.0:
+                        watchdog_meta = {
+                            "camera_uuid": meta["camera_uuid"],
+                            "frame_ts_ms": meta["frame_ts_ms"],
+                            "frame_seq": meta["frame_seq"],
+                        }
                         asyncio.ensure_future(
-                            self._watchdog_future(fut, inflight_key, meta)
+                            self._watchdog_future(fut, inflight_key, watchdog_meta)
                         )
 
         except asyncio.CancelledError:
@@ -766,7 +788,7 @@ class SimpleInferencePipeline(object):
         concurrently for different cameras — no camera serialises another.
         """
         camera_uuid = str(meta.get("camera_uuid", "unknown"))
-        bgr = meta.get("_bgr_ref")
+        bgr = meta.pop("_bgr_ref", None)
         ts_ms = int(meta.get("_ts_ms", 0))
         frame_seq = int(meta.get("frame_seq", 0))
 
@@ -794,6 +816,10 @@ class SimpleInferencePipeline(object):
                     asyncio.ensure_future(
                         self._cache_snapshot(camera_uuid=camera_uuid, frame_bgr=bgr, ts_ms=ts_ms)
                     )
+
+        # Release frame reference now that snapshot is scheduled.
+        # The executor lambda already captured its own ref; we don't need ours.
+        bgr = None
 
         # Atomic dict write — GIL-safe, no lock needed here
         self._latest[camera_uuid] = result
@@ -844,6 +870,7 @@ class SimpleInferencePipeline(object):
             "infer_q_per_worker": int(self._infer_q_max),
             "out_queue_max": int(self._out_q.maxsize),
             "inflight_count": len(self._inflight),
+            "max_inflight": int(self._max_inflight),
             "num_workers": len(self._infer_pool._workers) if self._infer_pool else 0,
             "workers_auto": self._num_workers == 0,
             "worker_cap": int(self._num_workers_max),
@@ -863,29 +890,29 @@ class SimpleInferencePipeline(object):
         camera_key = str(camera_uuid)
         snapshot_ts_ms = int(ts_ms)
 
-        async with self._latest_lock:
-            last_ts = int(self._latest_snapshot_ts_ms.get(camera_key, 0) or 0)
-
+        # Quick check without lock (GIL-safe dict read)
+        last_ts = int(self._latest_snapshot_ts_ms.get(camera_key, 0) or 0)
         if self._snapshot_min_interval_ms and last_ts and (snapshot_ts_ms - last_ts) < self._snapshot_min_interval_ms:
             return
 
         loop = asyncio.get_event_loop()
-        # Offload the blocking cv2.resize + cv2.imencode to a thread
+        max_edge = self._snapshot_max_edge
+        jpeg_quality = self._snapshot_jpeg_quality
+        # Encode in executor; capture frame_bgr in the lambda then release
+        # our local reference so the caller's frame can be GC'd sooner.
         encoded = await loop.run_in_executor(
             None,
-            lambda: _encode_jpeg_bytes(
-                frame_bgr,
-                max_edge=self._snapshot_max_edge,
-                jpeg_quality=self._snapshot_jpeg_quality,
+            lambda bgr=frame_bgr: _encode_jpeg_bytes(
+                bgr,
+                max_edge=max_edge,
+                jpeg_quality=jpeg_quality,
             ),
         )
+        # Release frame reference — executor is done with it
+        frame_bgr = None
         if not encoded:
             return
 
-        async with self._latest_lock:
-            # Re-check interval after the encode (could have taken a few ms)
-            last_ts = int(self._latest_snapshot_ts_ms.get(camera_key, 0) or 0)
-            if self._snapshot_min_interval_ms and last_ts and (snapshot_ts_ms - last_ts) < self._snapshot_min_interval_ms:
-                return
-            self._latest_snapshots[camera_key] = encoded
-            self._latest_snapshot_ts_ms[camera_key] = snapshot_ts_ms
+        # Atomic store — GIL-safe dict writes, no lock needed
+        self._latest_snapshots[camera_key] = encoded
+        self._latest_snapshot_ts_ms[camera_key] = snapshot_ts_ms

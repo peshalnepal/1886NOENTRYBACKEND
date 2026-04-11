@@ -820,6 +820,15 @@ async def update_site_settings(
     await db.commit()
     if payload.schedule is not None:
         await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
+    if payload.multi_camera_prerecord is not None:
+        # Invalidate prerecord eligibility cache so cameras pick up the
+        # change without waiting for the TTL to expire.
+        try:
+            svc = getattr(manager, "_notification_service", None) if manager else None
+            if svc is not None and hasattr(svc, "invalidate_prerecord_eligible_cache"):
+                svc.invalidate_prerecord_eligible_cache()
+        except Exception:
+            pass
     await db.refresh(row)
     if payload.schedule is not None and manager is not None:
         try:

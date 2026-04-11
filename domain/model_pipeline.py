@@ -1183,7 +1183,20 @@ class ModelPipeline:
                 )
                 if callable(record_overlay):
                     try:
-                        if bool(getattr(cfg, "enabled", True)):
+                        # Only record overlay frames if the camera is in the
+                        # site's multi_camera_prerecord list with enabled=True.
+                        # This prevents prerecording from starting automatically
+                        # when a camera is added — it only starts after the
+                        # camera is added to the site triggered condition list.
+                        prerecord_check = getattr(
+                            self._notification_service,
+                            "is_camera_prerecord_eligible",
+                            None,
+                        )
+                        should_record = False
+                        if callable(prerecord_check) and bool(getattr(cfg, "enabled", True)):
+                            should_record = await prerecord_check(str(resp2.camera_uuid))
+                        if should_record:
                             await record_overlay(
                                 camera_uuid=str(resp2.camera_uuid),
                                 frame_ts_ms=int(resp2.frame_ts_ms),

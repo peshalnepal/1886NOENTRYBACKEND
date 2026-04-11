@@ -927,6 +927,14 @@ class NotificationService:
         self._clip_service = clip_service or EventClipService()
         self._image_service = image_service or AlertImageStorageService()
 
+        # Cache: camera_uuid_str -> (expires_at_monotonic, is_eligible)
+        # A camera is prerecord-eligible only if it appears in the site's
+        # multi_camera_prerecord.camera_uuids list and the rule is enabled.
+        self._prerecord_eligible_cache: Dict[str, Tuple[float, bool]] = {}
+        self._prerecord_eligible_ttl_s = _env_float(
+            "PRERECORD_ELIGIBLE_CACHE_TTL_S", 30.0, minimum=5.0
+        )
+
     def set_session_factory(self, session_factory):
         self._session_factory = session_factory
         if self._clip_service is not None:
@@ -960,7 +968,56 @@ class NotificationService:
                     await image_service.close()
                 except Exception:
                     logger.exception("Failed closing temporary alert image service")
-                    
+
+    async def is_camera_prerecord_eligible(self, camera_uuid_str: str) -> bool:
+        """Check if a camera is in its site's multi_camera_prerecord list.
+
+        Returns True only when the site has prerecording enabled AND the
+        camera appears in camera_uuids.  Result is cached for
+        ``_prerecord_eligible_ttl_s`` seconds to avoid DB queries on every
+        detection frame.
+        """
+        now = time.monotonic()
+        hit = self._prerecord_eligible_cache.get(camera_uuid_str)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+
+        eligible = False
+        try:
+            ctx = await self._get_camera_ctx_cached(camera_uuid_str)
+            if ctx is not None and self._session_factory is not None:
+                cam_uuid = uuid.UUID(str(camera_uuid_str))
+                async with self._session_factory() as db:
+                    settings = await self._repo.get_site_prerecord_settings(
+                        db,
+                        user_id=int(ctx.user_id),
+                        site_uuid=ctx.site_uuid,
+                    )
+                eligible = bool(
+                    settings.enabled
+                    and cam_uuid in set(settings.camera_uuids)
+                )
+        except Exception:
+            logger.exception(
+                "Failed to check prerecord eligibility camera=%s",
+                camera_uuid_str,
+            )
+
+        self._prerecord_eligible_cache[camera_uuid_str] = (
+            now + self._prerecord_eligible_ttl_s,
+            eligible,
+        )
+        return eligible
+
+    def invalidate_prerecord_eligible_cache(
+        self, camera_uuid_str: Optional[str] = None
+    ) -> None:
+        """Call when site prerecord settings or camera assignments change."""
+        if camera_uuid_str is None:
+            self._prerecord_eligible_cache.clear()
+        else:
+            self._prerecord_eligible_cache.pop(str(camera_uuid_str), None)
+
     async def record_detection_overlay_frame(
         self,
         *,
@@ -1809,13 +1866,13 @@ class NotificationService:
                 # Recording disabled → no clips at all
                 if not _precheck_settings.enabled:
                     return extra_payload
-                # Recording enabled but trigger mode doesn't match for this camera
-                if (
-                    trigger_cam_uuid in set(_precheck_settings.camera_uuids)
-                    and not self._site_prerecord_trigger_matches(
-                        trigger_mode=_precheck_settings.trigger_mode,
-                        alert_type=msg.alert_type,
-                    )
+                # Camera must be in the site's prerecord camera list
+                if trigger_cam_uuid not in set(_precheck_settings.camera_uuids):
+                    return extra_payload
+                # Trigger mode must match the alert type
+                if not self._site_prerecord_trigger_matches(
+                    trigger_mode=_precheck_settings.trigger_mode,
+                    alert_type=msg.alert_type,
                 ):
                     return extra_payload
 
@@ -2500,14 +2557,15 @@ class NotificationService:
         ts_ms = int(det_ev.frame_ts_ms)
 
         if bool(getattr(camera_mode, "playback_enabled", True)):
-            await self.record_detection_overlay_frame(
-                camera_uuid=cam,
-                frame_ts_ms=ts_ms,
-                frame_seq=int(det_ev.frame_seq),
-                frame_w=frame_w,
-                frame_h=frame_h,
-                detections=list(det_ev.detections or []),
-            )
+            if await self.is_camera_prerecord_eligible(cam):
+                await self.record_detection_overlay_frame(
+                    camera_uuid=cam,
+                    frame_ts_ms=ts_ms,
+                    frame_seq=int(det_ev.frame_seq),
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                    detections=list(det_ev.detections or []),
+                )
 
         if not camera_mode.notification_enabled or not camera_mode.detection_enabled:
             return
