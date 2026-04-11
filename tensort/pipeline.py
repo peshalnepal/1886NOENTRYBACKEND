@@ -136,26 +136,35 @@ class Broadcaster:
     Lock-free broadcast for the hot path.
 
     subscribe/unsubscribe still use a lock (they're rare).
+    Subscribers may optionally scope themselves to a single camera_uuid so a
+    per-camera SSE consumer does not queue unrelated detections.
     broadcast() does a single atomic list snapshot under the GIL —
     no await, no contention.
     """
     def __init__(self):
-        self._subscribers = []          # plain list; GIL makes snapshot atomic
+        self._subscribers = []          # [(asyncio.Queue, Optional[str])]
         self._sub_lock = asyncio.Lock() # only for subscribe/unsubscribe
 
-    async def subscribe(self):
+    async def subscribe(self, camera_uuid=None):
         q = asyncio.Queue(maxsize=200)
+        camera_key = None if camera_uuid is None else str(camera_uuid)
         async with self._sub_lock:
-            self._subscribers = self._subscribers + [q]  # new list = atomic replace
+            self._subscribers = self._subscribers + [(q, camera_key)]  # new list = atomic replace
         return q
 
     async def unsubscribe(self, q):
         async with self._sub_lock:
-            self._subscribers = [s for s in self._subscribers if s is not q]
+            self._subscribers = [(sub_q, camera_key) for (sub_q, camera_key) in self._subscribers if sub_q is not q]
 
     async def broadcast(self, msg):
         # Snapshot is a single attribute read — atomic under GIL, no lock needed.
-        for q in self._subscribers:
+        msg_camera_uuid = None
+        if isinstance(msg, dict) and msg.get("camera_uuid") is not None:
+            msg_camera_uuid = str(msg.get("camera_uuid"))
+
+        for q, camera_key in self._subscribers:
+            if camera_key is not None and camera_key != msg_camera_uuid:
+                continue
             try:
                 q.put_nowait(msg)
             except asyncio.QueueFull:
@@ -170,35 +179,30 @@ class CoalescingBuffer(object):
     """
     Keeps only the newest frame per camera.
 
-    _latest is a plain dict; CPython dict __setitem__ is atomic under the GIL
-    so we can read/write it without a lock on the hot put() path.
-    The asyncio.Lock only serialises _in_queue (a set) membership changes.
+    All access is from a single asyncio event-loop thread, so no locks are
+    needed — CPython dict/set operations are GIL-atomic and the asyncio
+    event loop is single-threaded.
     """
     def __init__(self, max_pending_keys=1000):
-        self._latest = {}               # camera_uuid -> RTSPEvent  (GIL-safe)
+        self._latest = {}               # camera_uuid -> RTSPEvent
         self._pending = asyncio.Queue(maxsize=max_pending_keys)
         self._in_queue = set()
-        self._lock = asyncio.Lock()     # guards _in_queue only
 
     async def put(self, ev):
         key = str(ev.camera_uuid)
-        # Atomically store latest — no lock needed (GIL protects dict assignment)
         self._latest[key] = ev
-        # Lock only to check-and-update the de-dup set
-        async with self._lock:
-            if key in self._in_queue:
-                return
-            try:
-                self._pending.put_nowait(key)
-                self._in_queue.add(key)
-            except asyncio.QueueFull:
-                pass
+        if key in self._in_queue:
+            return
+        try:
+            self._pending.put_nowait(key)
+            self._in_queue.add(key)
+        except asyncio.QueueFull:
+            pass
 
     async def get(self):
         while True:
             key = await self._pending.get()
-            async with self._lock:
-                self._in_queue.discard(key)
+            self._in_queue.discard(key)
             ev = self._latest.pop(key, None)
             if ev is not None:
                 return ev
@@ -267,7 +271,7 @@ class InferenceWorker(object):
 
         while not self._stop.is_set():
             try:
-                item = self._q.get(timeout=0.5)
+                item = self._q.get(timeout=0.05)
             except Exception:
                 continue
 
@@ -418,9 +422,9 @@ class SimpleInferencePipeline(object):
         }
         self.broadcaster = Broadcaster()
 
-        # FIX 2: track in-flight futures so we can cancel on shutdown
+        # FIX 2: track in-flight futures so we can cancel on shutdown.
+        # Only accessed from the single event-loop thread — no lock needed.
         self._inflight = {}             # (camera_uuid, seq) -> asyncio.Future
-        self._inflight_lock = asyncio.Lock()
 
         logger.info(
             "[pipeline] config mem_total_mb=%s workers=%s worker_cap=%d infer_timeout_s=%.2f max_inflight=%d",
@@ -661,6 +665,10 @@ class SimpleInferencePipeline(object):
         Dispatch frames to the worker pool without awaiting each one.
         Results come back asynchronously via _handle_result() callbacks,
         so we can immediately fetch the next frame from the buffer.
+
+        NOTE: _inflight is only touched from this event-loop thread
+        (put here, popped by call_soon callbacks / watchdog coroutines),
+        so no lock is needed — plain dict ops are GIL-atomic.
         """
         loop = asyncio.get_event_loop()
 
@@ -694,59 +702,55 @@ class SimpleInferencePipeline(object):
                     continue
 
                 if self._infer_pool is None:
+                    bgr = None
                     continue
 
                 # Back-pressure: if too many frames are already in flight,
-                # drop this one to prevent unbounded memory growth on low-RAM
-                # devices like Jetson Nano.
+                # drop this one to prevent unbounded memory growth.
                 if len(self._inflight) >= self._max_inflight:
+                    bgr = None
                     self._stats["infer_dropped"] += 1
                     continue
 
+                camera_uuid_str = str(rtsp_ev.camera_uuid)
                 meta = {
-                    "camera_uuid": str(rtsp_ev.camera_uuid),
+                    "camera_uuid": camera_uuid_str,
                     "channel_id": getattr(rtsp_ev, "channel_id", None),
                     "frame_ts_ms": int(rtsp_ev.ts_ms),
                     "frame_seq": int(rtsp_ev.seq),
-                    # Pass original frame dims for snapshot; bgr may have been
-                    # resized by channel already.
                     "_bgr_ref": bgr,
                     "_ts_ms": int(rtsp_ev.ts_ms),
                 }
 
                 fut = loop.create_future()
-                inflight_key = (str(rtsp_ev.camera_uuid), int(rtsp_ev.seq))
+                inflight_key = (camera_uuid_str, int(rtsp_ev.seq))
 
-                # Register before submit so callback never races a missing key
-                async with self._inflight_lock:
-                    self._inflight[inflight_key] = fut
+                # No lock — single event-loop thread
+                self._inflight[inflight_key] = fut
 
                 ok = self._infer_pool.submit(bgr, meta, fut)
 
                 if not ok:
-                    # Worker dropped it (queue full). The future result is set
-                    # via call_soon_threadsafe (deferred), so fut.done() is
-                    # False here. Clean up immediately — don't wait for the
-                    # deferred callback since it would hold frame memory.
-                    async with self._inflight_lock:
-                        self._inflight.pop(inflight_key, None)
+                    # Worker queue full — clean up immediately
+                    self._inflight.pop(inflight_key, None)
                     meta.pop("_bgr_ref", None)
+                    bgr = None
                     self._stats["infer_dropped"] += 1
                 else:
+                    # Release local ref — worker + meta["_bgr_ref"] still hold it
+                    bgr = None
+
                     # Fire-and-forget: wire result handler to future done callback
                     def _on_done(f, _meta=meta, _key=inflight_key):
-                        # Called from the event loop thread when worker sets result
                         asyncio.ensure_future(self._handle_result(f.result(), _meta))
-                        # Clean up inflight tracking (non-async; use call_soon)
                         loop.call_soon(self._drop_inflight, _key)
 
                     fut.add_done_callback(_on_done)
 
-                    # Lightweight watchdog — only holds metadata for timeout
-                    # reporting, NOT the frame reference (_bgr_ref excluded).
+                    # Lightweight watchdog — no frame reference
                     if self._infer_result_timeout_s > 0.0:
                         watchdog_meta = {
-                            "camera_uuid": meta["camera_uuid"],
+                            "camera_uuid": camera_uuid_str,
                             "frame_ts_ms": meta["frame_ts_ms"],
                             "frame_seq": meta["frame_seq"],
                         }
@@ -779,8 +783,7 @@ class SimpleInferencePipeline(object):
                 fut.set_result(timeout_result)
         except Exception:
             pass
-        async with self._inflight_lock:
-            self._inflight.pop(key, None)
+        self._inflight.pop(key, None)
 
     async def _handle_result(self, result, meta):
         """

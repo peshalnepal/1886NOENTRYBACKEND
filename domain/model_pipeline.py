@@ -683,7 +683,9 @@ class ModelPipeline:
         if ch is None:
             return None
 
-        payload = await ch.fetch_detection_json()
+        sem = self._device_fetch_semaphore(getattr(ch.config, "device_url", None))
+        async with sem:
+            payload = await ch.fetch_detection_json()
         resp = self._payload_to_resp(payload, ch)
         if resp is None:
             return None
@@ -776,13 +778,159 @@ class ModelPipeline:
             return
         await svc.enqueue_notification(msg, ctx, extra_payload=extra_payload)
 
-    def _ensure_poller(self, key: str, ch: VideoChannel) -> None:
-        t = self._poll_tasks.get(key)
-        if t is None or t.done():
-            self._poll_tasks[key] = asyncio.create_task(
-                self._poll_loop(key, ch),
-                name="poll_jetson_detection:%s" % key,
+    def _playback_enabled_for_channel(self, ch: VideoChannel) -> bool:
+        cfg = getattr(ch, "config", None)
+        return getattr(cfg, "enabled", True) is not False
+
+    def _notifications_allowed_now(self, ch: VideoChannel) -> bool:
+        cfg = getattr(ch, "config", None)
+        if cfg is None:
+            return True
+
+        if getattr(cfg, "notification_enabled", True) is False:
+            return False
+
+        is_scheduled_now = getattr(cfg, "is_scheduled_now", None)
+        if callable(is_scheduled_now):
+            try:
+                return bool(is_scheduled_now())
+            except Exception:
+                logger.exception("Failed to evaluate notification schedule camera=%s", ch.key())
+
+        return True
+
+    def _interesting_detection_classes(
+        self,
+        resp: ObjDetectResponse,
+        svc: NotificationService,
+    ) -> List[str]:
+        interesting = getattr(svc, "interesting", None)
+        cls_names: List[str] = []
+
+        for det in list(resp.detections or ()):
+            if not isinstance(det, dict):
+                continue
+            cls_name = str(det.get("cls_name") or "").strip()
+            if not cls_name:
+                continue
+            if interesting and cls_name not in interesting:
+                continue
+            cls_names.append(cls_name)
+
+        return sorted(set(cls_names))
+
+    async def _process_detection_payload(self, key: str, ch: VideoChannel, payload: Dict[str, Any]) -> bool:
+        resp = self._payload_to_resp(payload, ch)
+        if resp is None:
+            return False
+
+        if not self._is_new_detection(key, resp):
+            return False
+
+        tracker_out = self._tracker.update_from_event(payload or {})
+        tracks = tuple(tracker_out.get("tracks", []) or [])
+        track_events = tuple(tracker_out.get("events", []) or [])
+
+        alerts: List[Dict[str, Any]] = []
+        if resp.frame_w and resp.frame_h and tracks:
+            rois = await self._roi_provider(str(resp.camera_uuid))
+            alerts = self._roi_engine.process(
+                camera_uuid=str(resp.camera_uuid),
+                frame_w=int(resp.frame_w),
+                frame_h=int(resp.frame_h),
+                tracks=list(tracks),
+                rois=rois,
+                ts_ms=int(resp.frame_ts_ms),
             )
+
+        resp2 = replace(
+            resp,
+            tracks=tracks,
+            track_events=track_events,
+            alerts=tuple(alerts),
+        )
+
+        now = time.monotonic()
+        self._last_seen[key] = (int(resp2.frame_ts_ms), int(resp2.frame_seq))
+        self._last_ok_s[key] = now
+        self._last_seq[key] = int(resp2.frame_seq)
+
+        await self.detect_store.put(resp2)
+        await self.detection_hub.publish(resp2)
+
+        svc = self._notification_service
+        if svc is None:
+            return True
+
+        cam_uuid = str(resp2.camera_uuid)
+
+        if self._playback_enabled_for_channel(ch):
+            try:
+                if await svc.is_camera_prerecord_eligible(cam_uuid):
+                    overlay_payload = _overlay_payload_from_resp(resp2)
+                    await svc.record_detection_overlay_frame(
+                        camera_uuid=cam_uuid,
+                        frame_ts_ms=overlay_payload.get("frame_ts_ms"),
+                        frame_seq=overlay_payload.get("frame_seq"),
+                        frame_w=overlay_payload.get("frame_w"),
+                        frame_h=overlay_payload.get("frame_h"),
+                        detections=list(overlay_payload.get("detections") or []),
+                    )
+            except Exception:
+                logger.exception("Failed to record detection overlay frame camera=%s", cam_uuid)
+
+        if not self._notifications_allowed_now(ch):
+            return True
+
+        extra_payload: Optional[Dict[str, Any]] = None
+        extra_payload_loaded = False
+
+        async def _ensure_alert_extra_payload() -> Optional[Dict[str, Any]]:
+            nonlocal extra_payload, extra_payload_loaded
+            if not extra_payload_loaded:
+                extra_payload = await self._build_alert_extra_payload(resp=resp2, ch=ch)
+                extra_payload_loaded = True
+            return extra_payload
+
+        emitted_detail = False
+
+        if getattr(svc, "notify_on_confirmed", False) and track_events:
+            try:
+                emitted_detail = (
+                    await self._emit_item_detected_notifications(
+                        resp2,
+                        tracks,
+                        track_events,
+                        extra_payload=await _ensure_alert_extra_payload(),
+                    )
+                ) or emitted_detail
+            except Exception:
+                logger.exception("Failed to emit item-detected notifications camera=%s", cam_uuid)
+
+        if getattr(svc, "notify_on_roi_enter", True) and alerts:
+            try:
+                emitted_detail = (
+                    await self._emit_roi_alert_notifications(
+                        resp2,
+                        alerts,
+                        extra_payload=await _ensure_alert_extra_payload(),
+                    )
+                ) or emitted_detail
+            except Exception:
+                logger.exception("Failed to emit ROI notifications camera=%s", cam_uuid)
+
+        if not emitted_detail:
+            summary_classes = self._interesting_detection_classes(resp2, svc)
+            if summary_classes and self._reserve_detection_summary_alert(cam_uuid, summary_classes):
+                try:
+                    await self._emit_detection_summary_notification(
+                        resp2,
+                        extra_payload=await _ensure_alert_extra_payload(),
+                    )
+                except Exception:
+                    logger.exception("Failed to emit detection-summary notification camera=%s", cam_uuid)
+
+        return True
 
     def _device_fetch_semaphore(self, device_url: Optional[str]) -> asyncio.Semaphore:
         key = str(device_url or "").strip().lower()
@@ -850,7 +998,9 @@ class ModelPipeline:
             return {"image_url": image_url}
 
         try:
-            snapshot = await ch.fetch_snapshot_bytes()
+            sem = self._device_fetch_semaphore(getattr(ch.config, "device_url", None))
+            async with sem:
+                snapshot = await ch.fetch_snapshot_bytes()
         except Exception:
             logger.exception("Failed to fetch alert snapshot camera=%s", resp.camera_uuid)
             return None
@@ -871,21 +1021,22 @@ class ModelPipeline:
         alerts: List[Dict[str, Any]],
         *,
         extra_payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         svc = self._notification_service
         if svc is None:
-            return
+            return False
 
         cam_uuid = str(resp.camera_uuid)
 
         ctx = await self._get_camera_ctx(cam_uuid)
         if ctx is None:
             logger.warning("Skipping ROI alert publish because camera context was not found camera=%s", cam_uuid)
-            return
+            return False
 
         site_name = ctx.site_name
         site_uuid_str = str(ctx.site_uuid)
         image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
+        emitted = False
 
         for a in alerts:
             overlay_payload = _overlay_payload_from_resp(resp, fallback_detections=[a])
@@ -922,6 +1073,7 @@ class ModelPipeline:
             )
 
             await svc.hub.publish(msg)
+            emitted = True
 
             persist_payload = {
                 **overlay_payload,
@@ -932,7 +1084,9 @@ class ModelPipeline:
                 self._persist_and_maybe_email(ctx=ctx, msg=msg, extra_payload=persist_payload),
                 name=f"persist_roi_alert:{cam_uuid}",
             )
-                
+        
+        return emitted
+
     async def _emit_item_detected_notifications(
         self,
         resp: ObjDetectResponse,
@@ -940,14 +1094,14 @@ class ModelPipeline:
         track_events: Tuple[Tuple[str, int], ...],
         *,
         extra_payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         svc = self._notification_service
         if svc is None:
-            return
+            return False
 
         confirmed_track_ids = [int(track_id) for (ev_type, track_id) in track_events if ev_type == "track_confirmed"]
         if not confirmed_track_ids:
-            return
+            return False
 
         tracks_by_id: Dict[int, Dict[str, Any]] = {}
         for tr in tracks:
@@ -960,11 +1114,12 @@ class ModelPipeline:
         ctx = await self._get_camera_ctx(cam_uuid)
         if ctx is None:
             logger.warning("Skipping item-detected alert publish because camera context was not found camera=%s", cam_uuid)
-            return
+            return False
 
         site_name = ctx.site_name
         site_uuid_str = str(ctx.site_uuid)
         image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
+        emitted = False
 
         for track_id in confirmed_track_ids:
             tr = tracks_by_id.get(track_id)
@@ -998,6 +1153,7 @@ class ModelPipeline:
             )
 
             await svc.hub.publish(msg)
+            emitted = True
 
             persist_payload = {
                 **overlay_payload,
@@ -1014,20 +1170,22 @@ class ModelPipeline:
                 name=f"persist_track_confirmed:{cam_uuid}:{track_id}",
             )
 
+        return emitted
+
     async def _emit_detection_summary_notification(
         self,
         resp: ObjDetectResponse,
         *,
         extra_payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         svc = self._notification_service
         if svc is None:
-            return
+            return False
 
         cam_uuid = str(resp.camera_uuid)
         raw_detections = list(resp.detections or [])
         if not raw_detections:
-            return
+            return False
 
         interesting = getattr(svc, "interesting", None)
         filtered: List[Dict[str, Any]] = []
@@ -1047,12 +1205,12 @@ class ModelPipeline:
             filtered.append(d)
 
         if not filtered:
-            return
+            return False
 
         ctx = await self._get_camera_ctx(cam_uuid)
         if ctx is None:
             logger.warning("Skipping detection-summary alert because camera context was not found camera=%s", cam_uuid)
-            return
+            return False
 
         uniq_classes = sorted(set(classes))
         classes_text = ", ".join(uniq_classes)
@@ -1096,15 +1254,12 @@ class ModelPipeline:
             ),
             name=f"persist_detection_summary:{cam_uuid}",
         )
+        return True
+        
+    async def _stream_loop(self, key: str, ch: VideoChannel) -> None:
+        backoff_s = 0.5
+        max_backoff_s = 5.0
 
-    async def _poll_loop(self, key: str, ch: VideoChannel) -> None:
-        backoff_ms = 200
-        max_backoff_ms = 4000
-        empty_miss_count = 0
-        # Separate counter for consecutive device-unreachable failures so we can
-        # apply a much longer backoff than for "device online but no data yet."
-        device_down_count = 0
-        _MAX_DEVICE_DOWN_BACKOFF_S = 15.0
         if self._startup_jitter_ms > 0:
             await asyncio.sleep(random.uniform(0.0, self._startup_jitter_ms / 1000.0))
 
@@ -1123,165 +1278,33 @@ class ModelPipeline:
                 continue
 
             try:
-                sem = self._device_fetch_semaphore(getattr(cfg, "device_url", None))
-                async with sem:
-                    payload = await ch.stream()
-                resp = self._payload_to_resp(payload, ch)
-                if resp is None:
-                    # Distinguish between a truly unreachable device and a device
-                    # that is online but simply has no detection data yet.
-                    # When the device is down, apply exponential backoff up to
-                    # _MAX_DEVICE_DOWN_BACKOFF_S to avoid hammering an unreachable
-                    # host with a new connection every ~1-2 seconds.
-                    device_reachable = getattr(ch, "_device_reachable", True)
-                    if not device_reachable:
-                        device_down_count = min(device_down_count + 1, 6)
-                        down_sleep_s = min(
-                            _MAX_DEVICE_DOWN_BACKOFF_S,
-                            1.0 * (2 ** (device_down_count - 1)),
-                        )
-                        await asyncio.sleep(down_sleep_s)
-                    else:
-                        device_down_count = 0
-                        empty_miss_count = min(empty_miss_count + 1, 4)
-                        base_sleep_s = max(0.15, float(cfg.poll_interval_ms) / 1000.0)
-                        miss_sleep_s = min(2.0, base_sleep_s * (2 ** (empty_miss_count - 1)))
-                        await asyncio.sleep(miss_sleep_s)
-                    continue
+                got_any = False
+                async for payload in ch.stream_detections():
+                    got_any = True
+                    await self._process_detection_payload(key, ch, payload)
 
-                empty_miss_count = 0
-                if not self._is_new_detection(key, resp):
-                    await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
-                    continue
+                    async with self._lock:
+                        if self._closing or (not self._started) or (self._channels.get(key) is None):
+                            return
 
-                tracker_out = self._tracker.update_from_event(payload or {})
-                tracks = tuple(tracker_out.get("tracks", []) or [])
-                track_events = tuple(tracker_out.get("events", []) or [])
-
-                alerts: List[Dict[str, Any]] = []
-                if resp.frame_w and resp.frame_h and tracks:
-                    rois = await self._roi_provider(str(resp.camera_uuid))
-                    alerts = self._roi_engine.process(
-                        camera_uuid=str(resp.camera_uuid),
-                        frame_w=int(resp.frame_w),
-                        frame_h=int(resp.frame_h),
-                        tracks=list(tracks),
-                        rois=rois,
-                        ts_ms=int(resp.frame_ts_ms),
-                    )
-
-                resp2 = replace(
-                    resp,
-                    tracks=tracks,
-                    track_events=track_events,
-                    alerts=tuple(alerts),
-                )
-                record_overlay = (
-                    getattr(self._notification_service, "record_detection_overlay_frame", None)
-                    if self._notification_service is not None
-                    else None
-                )
-                if callable(record_overlay):
-                    try:
-                        # Only record overlay frames if the camera is in the
-                        # site's multi_camera_prerecord list with enabled=True.
-                        # This prevents prerecording from starting automatically
-                        # when a camera is added — it only starts after the
-                        # camera is added to the site triggered condition list.
-                        prerecord_check = getattr(
-                            self._notification_service,
-                            "is_camera_prerecord_eligible",
-                            None,
-                        )
-                        should_record = False
-                        if callable(prerecord_check) and bool(getattr(cfg, "enabled", True)):
-                            should_record = await prerecord_check(str(resp2.camera_uuid))
-                        if should_record:
-                            await record_overlay(
-                                camera_uuid=str(resp2.camera_uuid),
-                                frame_ts_ms=int(resp2.frame_ts_ms),
-                                frame_seq=int(resp2.frame_seq),
-                                frame_w=resp2.frame_w,
-                                frame_h=resp2.frame_h,
-                                detections=list(resp2.detections or []),
-                            )
-                    except Exception:
-                        logger.exception(
-                            "Failed to record clip overlay history camera=%s frame_ts_ms=%s frame_seq=%s",
-                            resp2.camera_uuid,
-                            resp2.frame_ts_ms,
-                            resp2.frame_seq,
-                        )
-                now = time.monotonic()
-                self._last_seen[key] = (int(resp2.frame_ts_ms), int(resp2.frame_seq))
-                self._last_ok_s[key] = now
-                self._last_seq[key] = int(resp2.frame_seq)
-                await self.detect_store.put(resp2)
-                await self.detection_hub.publish(resp2)
-                alerts_allowed = True
-                if hasattr(cfg, "is_scheduled_now"):
-                    try:
-                        alerts_allowed = bool(cfg.is_scheduled_now())
-                    except Exception:
-                        logger.exception("Failed to evaluate alert schedule camera=%s", key)
-                        alerts_allowed = True
-                if alerts_allowed and getattr(cfg, "notification_enabled", True) and self._notification_service:
-                    emit_track_notifications = any(
-                        str(ev_type) == "track_confirmed"
-                        for (ev_type, _track_id) in track_events
-                    )
-                    emit_roi_notifications = bool(alerts)
-                    emit_summary_notification = False
-                    if (not emit_track_notifications) and (not emit_roi_notifications) and resp2.detections:
-                        # Extract class names for per-class cooldown
-                        cls_names = []
-                        for d in resp2.detections:
-                            if isinstance(d, dict):
-                                cls_name = d.get("cls_name")
-                                if cls_name:
-                                    cls_names.append(str(cls_name))
-                        emit_summary_notification = self._reserve_detection_summary_alert(
-                            str(resp2.camera_uuid),
-                            cls_names if cls_names else None
-                        )
-
-                    alert_extra_payload: Optional[Dict[str, Any]] = None
-                    if emit_track_notifications or emit_roi_notifications or emit_summary_notification:
-                        alert_extra_payload = await self._build_alert_extra_payload(resp=resp2, ch=ch)
-                    if emit_track_notifications:
-                        asyncio.create_task(
-                            self._emit_item_detected_notifications(
-                                resp2,
-                                tracks,
-                                track_events,
-                                extra_payload=alert_extra_payload,
-                            )
-                        )
-                    if emit_roi_notifications:
-                        asyncio.create_task(
-                            self._emit_roi_alert_notifications(
-                                resp2,
-                                alerts,
-                                extra_payload=alert_extra_payload,
-                            )
-                        )
-                    if emit_summary_notification:
-                        asyncio.create_task(
-                            self._emit_detection_summary_notification(
-                                resp2,
-                                extra_payload=alert_extra_payload,
-                            )
-                        )
-                backoff_ms = 200
-                await asyncio.sleep(max(0.05, float(cfg.poll_interval_ms) / 1000.0))
+                # normal stream end -> reconnect
+                if got_any:
+                    backoff_s = 0.5
 
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Detection poll failed camera=%s", key)
-                await asyncio.sleep(backoff_ms / 1000.0)
-                backoff_ms = min(backoff_ms * 2, max_backoff_ms)
+                logger.exception("Detection stream loop failed camera=%s", key)
 
+            await asyncio.sleep(backoff_s)
+            backoff_s = min(max_backoff_s, backoff_s * 2.0)
+    def _ensure_poller(self, key: str, ch: VideoChannel) -> None:
+        t = self._poll_tasks.get(key)
+        if t is None or t.done():
+            self._poll_tasks[key] = asyncio.create_task(
+                self._stream_loop(key, ch),
+                name="stream_jetson_detection:%s" % key,
+            )
     def _payload_to_resp(self, payload: Optional[Dict[str, Any]], ch: VideoChannel) -> Optional[ObjDetectResponse]:
         if not payload or not isinstance(payload, dict):
             return None

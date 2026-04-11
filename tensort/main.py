@@ -1,5 +1,6 @@
 # main.py  (Python 3.6)
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import uuid
@@ -23,9 +24,11 @@ logger = logging.getLogger("jetson-app")
 
 app = Flask(__name__)
 DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "5.0"))
-# 0 disables pre-resize — TRT letterbox handles any input size so this is just wasted work
-DEFAULT_RESIZE_W = int(os.getenv("DEFAULT_RESIZE_W", "0"))
-DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "0"))
+# Pre-resize to 640x480 before inference — cuts per-frame memory from ~6MB (1080p)
+# to ~700KB, critical for Jetson Nano (2-3GB RAM) with multiple cameras.
+# Set to 0 to disable (only if you have plenty of RAM).
+DEFAULT_RESIZE_W = int(os.getenv("DEFAULT_RESIZE_W", "640"))
+DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "480"))
 DEFAULT_JPEG_QUALITY = int(os.getenv("DEFAULT_JPEG_QUALITY", "70"))
 MAX_SAMPLE_FPS = float(os.getenv("MAX_SAMPLE_FPS", "25.0"))
 # -----------------------------
@@ -67,10 +70,13 @@ class PipelineRuntime(object):
 
         cfg_data["sample_fps"] = max(0.1, min(sample_fps, MAX_SAMPLE_FPS))
 
-        # Pre-resize is disabled (DEFAULT_RESIZE_W/H == 0). TRT letterbox handles any
-        # input resolution, so pre-resizing is pure overhead. Force None so old DB
-        # configs with resize=[640,480] don't re-enable it on restore.
-        cfg_data["resize"] = None
+        # Pre-resize reduces per-frame memory (~6MB → ~700KB for 1080p) which is
+        # critical on Jetson Nano with multiple cameras. TRT letterbox still handles
+        # the final 640x640 pad, but the bulk resize is already done.
+        if DEFAULT_RESIZE_W > 0 and DEFAULT_RESIZE_H > 0:
+            cfg_data["resize"] = (DEFAULT_RESIZE_W, DEFAULT_RESIZE_H)
+        else:
+            cfg_data["resize"] = None
 
         try:
             jpeg_quality = int(cfg_data.get("jpeg_quality", DEFAULT_JPEG_QUALITY))
@@ -552,8 +558,9 @@ def _sse_generator(target_camera_uuid=None):
         return
 
     # Subscribe
+    q = None
     q_future = asyncio.run_coroutine_threadsafe(
-        runtime.pipeline.broadcaster.subscribe(), 
+        runtime.pipeline.broadcaster.subscribe(target_camera_uuid),
         runtime.loop
     )
     try:
@@ -563,34 +570,41 @@ def _sse_generator(target_camera_uuid=None):
 
     try:
         while True:
-            # We need to get from queue in a thread-safe way from the async loop
-            # But the queue is in the async loop, and we are in a Flask thread.
-            # We can use run_coroutine_threadsafe to get an item? 
-            # No, that would be very slow for every item.
-            # Better: The queue should be thread-safe?
-            # asyncio.Queue is NOT thread-safe for cross-thread access.
-            #
-            # We need a bridge. 
-            # Or we just use run_coroutine_threadsafe(q.get(), loop)
-            # This is acceptable for SSE scale on Jetson (few clients).
-            
             fut = asyncio.run_coroutine_threadsafe(q.get(), runtime.loop)
             try:
                 msg = fut.result(timeout=1.0) # Check every second to allow disconnect check
-            except Exception:
-                # Timeout, send comment/heartbeat to keep alive
+            except concurrent.futures.TimeoutError:
+                if fut.done():
+                    try:
+                        msg = fut.result()
+                    except Exception:
+                        msg = None
+                    else:
+                        if isinstance(msg, dict):
+                            data_str = json.dumps(msg)
+                            yield f"data: {data_str}\n\n"
+                            continue
+
+                cancelled = fut.cancel()
+                if (not cancelled) and fut.done():
+                    try:
+                        msg = fut.result()
+                    except Exception:
+                        msg = None
+                    else:
+                        if isinstance(msg, dict):
+                            data_str = json.dumps(msg)
+                            yield f"data: {data_str}\n\n"
+                            continue
+
                 yield ": keepalive\n\n"
                 continue
+            except Exception as e:
+                logger.error(f"SSE stream error while waiting for detection: {e}")
+                break
 
             if not isinstance(msg, dict):
                 continue
-
-            # filter if needed
-            if target_camera_uuid:
-                # check msg camera_uuid
-                c_uuid = msg.get("camera_uuid")
-                if str(c_uuid) != str(target_camera_uuid):
-                    continue
 
             # Yield SSE
             data_str = json.dumps(msg)
@@ -598,16 +612,18 @@ def _sse_generator(target_camera_uuid=None):
 
     except GeneratorExit:
         # Client disconnected
-        asyncio.run_coroutine_threadsafe(
-            runtime.pipeline.broadcaster.unsubscribe(q), 
-            runtime.loop
-        )
+        return
     except Exception as e:
         logger.error(f"SSE stream error: {e}")
-        asyncio.run_coroutine_threadsafe(
-            runtime.pipeline.broadcaster.unsubscribe(q), 
-            runtime.loop
-        )
+    finally:
+        if q is not None and runtime.pipeline is not None and runtime.loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    runtime.pipeline.broadcaster.unsubscribe(q),
+                    runtime.loop
+                ).result(timeout=1.0)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

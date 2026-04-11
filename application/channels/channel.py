@@ -1,40 +1,19 @@
-# agents/application/channels/channel.py
-"""
-Azure-side Camera Channel (NO RTSP ingest).
-
-Each channel represents one camera and knows:
-- camera_uuid
-- rtsp_url
-- webrtc_url (immutable in edits)
-- site_uuid / device_uuid
-- device_url (Jetson base URL)
-
-It can pull latest detections from Jetson:
-GET {device_url}/api/cameras/{camera_uuid}/latest
-
-This file intentionally contains NO OpenCV/GStreamer code.
-"""
-
 import asyncio
 import json
 import httpx
 import logging
 import os
-import urllib.request
-import urllib.error
-from dataclasses import dataclass
-from typing import Any, Dict, Optional,List, Tuple
+from typing import Any, AsyncGenerator, Dict, Optional, List, Tuple
 from urllib.parse import urljoin
 from application.channels.channel_config import VideoChannelConfig
-logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
 
 _EDGE_HTTP_TRUST_ENV = _env_bool(
     "EDGE_CHANNEL_HTTP_TRUST_ENV",
@@ -44,72 +23,57 @@ _EDGE_HTTP_TRUST_ENV = _env_bool(
 _http = httpx.AsyncClient(
     timeout=httpx.Timeout(connect=3.0, read=3.0, write=3.0, pool=3.0),
     limits=httpx.Limits(
-        max_connections=50,
-        max_keepalive_connections=20,
+        max_connections=100,
+        max_keepalive_connections=40,
         keepalive_expiry=30.0,
     ),
     trust_env=_EDGE_HTTP_TRUST_ENV,
 )
 
-async def _run_blocking(fn, *args, **kwargs):
-    """Python 3.7+ friendly replacement for asyncio.to_thread()."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
-
 class VideoChannel:
-    """
-    A camera "channel" that pulls detection metadata from Jetson.
-    """
-
     def __init__(self, config: VideoChannelConfig):
         self.config = config
         self._last_good_detection_url: Optional[str] = None
+        self._last_good_stream_url: Optional[str] = None
         self._last_error_sig: Optional[str] = None
-        # Tracks whether the edge device was reachable on the last attempt.
-        # False only when a connection-level failure (ConnectError, ConnectTimeout,
-        # PoolTimeout) occurs. Used by the poll loop to apply a longer backoff when
-        # the device is known to be down rather than just returning no data yet.
         self._device_reachable: bool = True
 
     def key(self) -> str:
         return str(self.config.camera_uuid)
-    
-    def cam_url(self)->str:
-        return str(self.config.webrtc_url)
 
     def _build_detection_url(self, path_template: str) -> str:
         base = (self.config.device_url or "").rstrip("/") + "/"
         path = str(path_template).format(camera_uuid=str(self.config.camera_uuid)).lstrip("/")
-        # urljoin needs base to end with '/'
         return urljoin(base, path)
 
     def detection_urls(self) -> List[str]:
         preferred_tpl = str(getattr(self.config, "detection_path_template", None) or "").strip()
         templates: List[str] = [
-            # Canonical Jetson routes first so one poll does not spend most of its
-            # time walking legacy aliases before reaching a working endpoint.
             "/api/cameras/{camera_uuid}/latest",
             "/api/detections/{camera_uuid}",
         ]
-
         if preferred_tpl:
             templates.append(preferred_tpl)
-
-        # Compatibility with older Jetson services.
-        templates.extend(
-            [
-                "/cameras/{camera_uuid}/latest",
-                "/api/detection/{camera_uuid}",
-                "/detections/{camera_uuid}",
-                "/detection/{camera_uuid}",
-            ]
-        )
+        templates.extend([
+            "/cameras/{camera_uuid}/latest",
+            "/api/detection/{camera_uuid}",
+            "/detections/{camera_uuid}",
+            "/detection/{camera_uuid}",
+        ])
 
         urls = [self._build_detection_url(tpl) for tpl in templates]
         if self._last_good_detection_url:
             urls.insert(0, self._last_good_detection_url)
+        return list(dict.fromkeys(urls))
 
-        # Preserve order while removing duplicates.
+    def detection_stream_urls(self) -> List[str]:
+        templates = [
+            "/api/cameras/{camera_uuid}/detections/stream",
+            "/cameras/{camera_uuid}/detections/stream",
+        ]
+        urls = [self._build_detection_url(tpl) for tpl in templates]
+        if self._last_good_stream_url:
+            urls.insert(0, self._last_good_stream_url)
         return list(dict.fromkeys(urls))
 
     def _detection_enabled(self) -> bool:
@@ -127,9 +91,9 @@ class VideoChannel:
         return list(dict.fromkeys(urls))
         
     async def fetch_detection_json(self) -> Optional[Dict[str, Any]]:
-        return await self.stream()
-    
-    async def stream(self) -> Optional[Dict[str, Any]]:
+        """
+        Keep one-shot GET for refresh/fallback paths.
+        """
         if not self._detection_enabled():
             return None
         if not self.config.device_url:
@@ -143,25 +107,27 @@ class VideoChannel:
         for url in urls:
             attempted += 1
             try:
-                timeout_s = float(self.config.request_timeout_s or 3.0)
-                t = httpx.Timeout(timeout_s, connect=min(3.0, timeout_s), read=timeout_s, write=timeout_s, pool=timeout_s)
+                timeout_s = float(getattr(self.config, "request_timeout_s", 3.0) or 3.0)
+                t = httpx.Timeout(
+                    timeout_s,
+                    connect=min(3.0, timeout_s),
+                    read=timeout_s,
+                    write=timeout_s,
+                    pool=timeout_s,
+                )
                 r = await _http.get(url, timeout=t)
                 if r.status_code in (404, 405):
                     last_err_sig = f"http:{r.status_code}:{url}"
                     continue
                 r.raise_for_status()
-                data = r.json()
 
+                data = r.json()
                 self._last_good_detection_url = url
                 self._last_error_sig = None
                 self._device_reachable = True
                 return data
 
             except (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout):
-                # Device-level failure: ConnectTimeout, ConnectError, or PoolTimeout
-                # (pool exhausted because many connections are stuck waiting on a
-                # down device). Trying more URLs on the same host is pointless — break
-                # immediately instead of falling through to the generic continue path.
                 last_err_sig = f"connect_error:{url}"
                 self._device_reachable = False
                 break
@@ -174,9 +140,111 @@ class VideoChannel:
                 continue
 
         if last_err_sig and last_err_sig != self._last_error_sig:
-            logger.warning("Jetson detection fetch failed camera=%s tried=%d last=%s", self.key(), attempted, last_err_sig)
+            logger.warning(
+                "Jetson latest fetch failed camera=%s tried=%d last=%s",
+                self.key(),
+                attempted,
+                last_err_sig,
+            )
             self._last_error_sig = last_err_sig
         return None
+
+    async def stream_detections(self) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Long-lived SSE reader. Yields detection payloads from Jetson.
+        Reconnect is handled by ModelPipeline, not here.
+        """
+        if not self._detection_enabled():
+            return
+        if not self.config.device_url:
+            logger.warning("Jetson device_url not configured for camera=%s", self.key())
+            return
+
+        urls = self.detection_stream_urls()
+        last_err_sig: Optional[str] = None
+        attempted = 0
+
+        for url in urls:
+            attempted += 1
+            try:
+                # Jetson SSE emits keepalive comments every ~1s, so a finite
+                # read timeout is okay and helps detect dead sockets.
+                timeout_s = max(15.0, float(getattr(self.config, "request_timeout_s", 3.0) or 3.0))
+                t = httpx.Timeout(
+                    timeout_s,
+                    connect=min(3.0, timeout_s),
+                    read=timeout_s,
+                    write=timeout_s,
+                    pool=timeout_s,
+                )
+
+                async with _http.stream(
+                    "GET",
+                    url,
+                    timeout=t,
+                    headers={"Accept": "text/event-stream"},
+                ) as r:
+                    if r.status_code in (404, 405):
+                        last_err_sig = f"http:{r.status_code}:{url}"
+                        continue
+                    r.raise_for_status()
+
+                    self._last_good_stream_url = url
+                    self._last_error_sig = None
+                    self._device_reachable = True
+
+                    data_lines: List[str] = []
+
+                    async for raw_line in r.aiter_lines():
+                        line = (raw_line or "").strip()
+
+                        # event boundary
+                        if not line:
+                            if not data_lines:
+                                continue
+                            try:
+                                payload = json.loads("\n".join(data_lines))
+                            except Exception:
+                                data_lines = []
+                                continue
+                            data_lines = []
+                            if isinstance(payload, dict):
+                                yield payload
+                            continue
+
+                        # SSE keepalive/comment
+                        if line.startswith(":"):
+                            continue
+
+                        if line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+
+                    # stream closed normally; let outer loop reconnect
+                    return
+
+            except asyncio.CancelledError:
+                raise
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout):
+                last_err_sig = f"connect_error:{url}"
+                self._device_reachable = False
+                break
+            except httpx.ReadTimeout:
+                last_err_sig = f"read_timeout:{url}"
+                self._device_reachable = False
+                break
+            except Exception as e:
+                last_err_sig = f"exc:{type(e).__name__}:{url}"
+                continue
+
+        if last_err_sig and last_err_sig != self._last_error_sig:
+            logger.warning(
+                "Jetson detection stream failed camera=%s tried=%d last=%s",
+                self.key(),
+                attempted,
+                last_err_sig,
+            )
+            self._last_error_sig = last_err_sig
+
 
     async def fetch_snapshot_bytes(self) -> Optional[Tuple[bytes, str]]:
         if not self._detection_enabled():

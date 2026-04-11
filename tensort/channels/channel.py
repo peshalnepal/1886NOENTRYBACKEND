@@ -130,12 +130,18 @@ class VideoChannel():
     def _build_gst_pipeline(self, rtsp_url, decoder):
         lat = int(self.config.gst_latency_ms)
         proto = self.config.rtsp_transport
-
-        # Good practice: add a leaky queue so slow consumers don't blow up memory
         q = "queue max-size-buffers=1 leaky=downstream ! "
 
+        resize_caps = ""
+        if self.config.resize is not None:
+            w, h = self.config.resize
+            resize_caps = "nvvidconv interpolation-method=1 ! video/x-raw,width={w},height={h},format=BGRx ! ".format(
+                w=int(w), h=int(h)
+            )
+        else:
+            resize_caps = "nvvidconv ! video/x-raw,format=BGRx ! "
+
         if decoder == "nvv4l2decoder":
-            # Jetson HW decode (NVMM) -> nvvidconv to CPU BGRx -> videoconvert to BGR for OpenCV
             return (
                 "rtspsrc location={url} latency={lat} protocols={proto} "
                 "drop-on-latency=true do-retransmission=false ! "
@@ -144,11 +150,10 @@ class VideoChannel():
                 "h264parse config-interval=1 ! "
                 "video/x-h264,stream-format=byte-stream,alignment=au ! "
                 "nvv4l2decoder enable-max-performance=1 ! "
-                "nvvidconv ! video/x-raw,format=BGRx ! "
+                + resize_caps +
                 "videoconvert ! video/x-raw,format=BGR ! "
                 "appsink drop=true sync=false max-buffers=1"
             ).format(url=rtsp_url, lat=lat, proto=proto)
-
         # CPU fallback decoder (avdec_h264)
         return (
             "rtspsrc location={url} latency={lat} protocols={proto} "
