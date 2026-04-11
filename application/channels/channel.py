@@ -10,7 +10,7 @@ Each channel represents one camera and knows:
 - device_url (Jetson base URL)
 
 It can pull latest detections from Jetson:
-GET {device_url}/detection/{camera_uuid}
+GET {device_url}/api/cameras/{camera_uuid}/latest
 
 This file intentionally contains NO OpenCV/GStreamer code.
 """
@@ -64,27 +64,30 @@ class VideoChannel:
         return urljoin(base, path)
 
     def detection_urls(self) -> List[str]:
-        templates: List[str] = []
+        preferred_tpl = str(getattr(self.config, "detection_path_template", None) or "").strip()
+        templates: List[str] = [
+            # Canonical Jetson routes first so one poll does not spend most of its
+            # time walking legacy aliases before reaching a working endpoint.
+            "/api/cameras/{camera_uuid}/latest",
+            "/api/detections/{camera_uuid}",
+        ]
 
-        preferred_tpl = getattr(self.config, "detection_path_template", None)
         if preferred_tpl:
-            templates.append(str(preferred_tpl))
+            templates.append(preferred_tpl)
 
-        # Compatibility with different Jetson services.
+        # Compatibility with older Jetson services.
         templates.extend(
             [
+                "/cameras/{camera_uuid}/latest",
+                "/api/detection/{camera_uuid}",
                 "/detections/{camera_uuid}",
                 "/detection/{camera_uuid}",
-                "/api/detection/{camera_uuid}",
-                "/api/detections/{camera_uuid}",
-                "/cameras/{camera_uuid}/latest",
-                "/api/cameras/{camera_uuid}/latest",
             ]
         )
 
         urls = [self._build_detection_url(tpl) for tpl in templates]
         if self._last_good_detection_url:
-            urls = [self._last_good_detection_url] + urls
+            urls.insert(0, self._last_good_detection_url)
 
         # Preserve order while removing duplicates.
         return list(dict.fromkeys(urls))
@@ -135,10 +138,10 @@ class VideoChannel:
 
             except (httpx.ConnectTimeout, httpx.ConnectError):
                 last_err_sig = f"connect_error:{url}"
-                continue
+                break
             except httpx.ReadTimeout:
                 last_err_sig = f"read_timeout:{url}"
-                continue
+                break
             except Exception as e:
                 last_err_sig = f"exc:{type(e).__name__}:{url}"
                 continue
@@ -182,7 +185,7 @@ class VideoChannel:
                 content_type = str(resp.headers.get("content-type") or "image/jpeg")
                 return payload, content_type
             except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout):
-                continue
+                break
             except Exception:
                 continue
 

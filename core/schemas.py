@@ -103,7 +103,7 @@ class CameraBaseSchema(BaseModel):
     reconnect_max_ms: Optional[int] = Field(default=8000, ge=1000)
     poll_interval_ms: Optional[int] = Field(default=500, ge=10)
     request_timeout_s: Optional[float] = Field(default=3.0, ge=0.1)
-    detection_path_template: Optional[str] = Field(default="/detection/{camera_uuid}")
+    detection_path_template: Optional[str] = Field(default="/api/cameras/{camera_uuid}/latest")
     timezone: Optional[str] = None
     day_of_week: Optional[List[int]] = None
     start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
@@ -156,7 +156,7 @@ class CameraCreateSchema(BaseModel):
     reconnect_max_ms: int = Field(default=8000, ge=1000)
     poll_interval_ms: int = Field(default=500, ge=10)
     request_timeout_s: float = Field(default=3.0, ge=0.1)
-    detection_path_template: Optional[str] = Field(default="/detection/{camera_uuid}")
+    detection_path_template: Optional[str] = Field(default="/api/cameras/{camera_uuid}/latest")
     timezone: Optional[str] = None
     day_of_week: Optional[List[int]] = None
     start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)

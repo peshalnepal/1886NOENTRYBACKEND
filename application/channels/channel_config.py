@@ -108,7 +108,7 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
     poll_interval_ms: Optional[int] = Field(default=100, ge=10)
     request_timeout_s: Optional[float] = Field(default=3.0, ge=0.1)
     detection_path_template: Optional[str] = Field(
-        default="/detection/{camera_uuid}",
+        default="/api/cameras/{camera_uuid}/latest",
         description="Jetson detection endpoint template.",
     )
     emit_format: Optional[Literal["raw", "jpeg"]] = Field(
