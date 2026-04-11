@@ -203,6 +203,8 @@ class DetectionOut(BaseModel):
     camera_uuid: str
     frame_ts_ms: int
     frame_seq: int
+    event_type: Optional[str] = None
+    reason: Optional[str] = None
     inference_ms: Optional[int] = None
     model_id: Optional[str] = None
 
@@ -251,6 +253,8 @@ def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
         camera_uuid=str(resp.camera_uuid),
         frame_ts_ms=int(resp.frame_ts_ms),
         frame_seq=int(resp.frame_seq),
+        event_type=str(getattr(resp, "event_type", None)) if getattr(resp, "event_type", None) is not None else None,
+        reason=str(getattr(resp, "reason", None)) if getattr(resp, "reason", None) is not None else None,
         inference_ms=int(resp.inference_ms) if getattr(resp, "inference_ms", None) is not None else None,
         model_id=str(getattr(resp, "model_id", None)) if getattr(resp, "model_id", None) is not None else None,
         frame_w=int(fw) if fw is not None else None,

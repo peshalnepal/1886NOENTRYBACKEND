@@ -42,6 +42,8 @@ class ObjDetectResponse:
     frame_ts_ms: int
     frame_seq: int
 
+    event_type: Optional[str] = None
+    reason: Optional[str] = None
     frame_w: Optional[int] = None
     frame_h: Optional[int] = None
 
@@ -1284,6 +1286,8 @@ class ModelPipeline:
         inf_ms = payload.get("inference_ms")
         model_id = payload.get("model_id")
         image_url = payload.get("image_url")
+        event_type = payload.get("type")
+        reason = payload.get("reason")
 
         # NEW: frame size (prefer explicit)
         frame_w = payload.get("frame_w") or payload.get("image_w") or payload.get("width")
@@ -1295,6 +1299,8 @@ class ModelPipeline:
             camera_uuid=cam,
             frame_ts_ms=int(frame_ts_ms),
             frame_seq=int(frame_seq),
+            event_type=str(event_type) if event_type is not None else None,
+            reason=str(reason) if reason is not None else None,
             frame_w=int(frame_w) if frame_w is not None else None,
             frame_h=int(frame_h) if frame_h is not None else None,
             site_uuid=ch.config.site_uuid,
