@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import StreamingResponse
 
 from application.services.notification import WebNotificationHub
+from application.repositories.notification_visibility import notification_visible_supported
 from application.services.user_snapshot_cache import (
     CachedUserSnapshot,
     UserSnapshotCache,
@@ -503,11 +504,11 @@ async def list_notifications(
     limit, offset = _validate_pagination(limit, offset)
     su = _parse_optional_uuid(site_uuid, "site_uuid")
     cu = _parse_optional_uuid(camera_uuid, "camera_uuid")
+    visible_supported = await notification_visible_supported(db)
 
-    stmt = select(Notification).where(
-        Notification.user_id == int(current_user.id),
-        Notification.visible.is_(True),
-    )
+    stmt = select(Notification).where(Notification.user_id == int(current_user.id))
+    if visible_supported:
+        stmt = stmt.where(Notification.visible.is_(True))
 
     if su:
         stmt = stmt.where(Notification.site_uuid == su)
@@ -561,6 +562,7 @@ async def detections_over_time(
 ):
     su = _parse_optional_uuid(site_uuid, "site_uuid")
     class_filter = _normalize_object_class(object_class)
+    visible_supported = await notification_visible_supported(db)
 
     hours_i = max(1, min(int(hours), 24 * 7))
     bucket_minutes = 60 if hours_i <= 24 else 24 * 60
@@ -580,9 +582,10 @@ async def detections_over_time(
         Notification.payload,
     ).where(
         Notification.user_id == int(current_user.id),
-        Notification.visible.is_(True),
         Notification.detected_at >= start,
     )
+    if visible_supported:
+        stmt = stmt.where(Notification.visible.is_(True))
 
     if su:
         stmt = stmt.where(Notification.site_uuid == su)
@@ -638,12 +641,14 @@ async def unread_count(
     current_user: User = Depends(get_current_user),
 ):
     su = _parse_optional_uuid(site_uuid, "site_uuid")
+    visible_supported = await notification_visible_supported(db)
 
     stmt = select(func.count(Notification.id)).where(
         Notification.user_id == int(current_user.id),
         Notification.read_at.is_(None),
-        Notification.visible.is_(True),
     )
+    if visible_supported:
+        stmt = stmt.where(Notification.visible.is_(True))
 
     if su:
         stmt = stmt.where(Notification.site_uuid == su)

@@ -15,7 +15,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import os
 import uuid
-from sqlalchemy import update
+from sqlalchemy import delete, update
 from sqlalchemy.exc import OperationalError
 from core.database_orm import Notification
 
@@ -24,7 +24,7 @@ import numpy as np
 
 from domain.events import DetectionsProducedEvent, DetectionItem
 from application.services.tracker import MultiCameraByteTrack, ROIAlertEngine, ROI
-from sqlalchemy import and_, update, select
+from sqlalchemy import and_, select
 from application.services.alert_image_storage import (
     AlertImageStorageService,
     extract_image_storage_key,
@@ -36,6 +36,7 @@ from application.repositories.notification_repository import (
     SitePrerecordSettings,
     dt_from_ts_ms,
 )
+from application.repositories.notification_visibility import notification_visible_supported
 from application.services.alert_image_storage import AlertImageStorageService
 from application.services.clip_storage import EventClipService
 
@@ -1292,15 +1293,19 @@ class NotificationService:
 
             try:
                 async with self._session_factory() as db:
+                    visible_supported = await notification_visible_supported(db)
+                    fetch_conds = [
+                        Notification.user_id == int(user_id),
+                        Notification.id.in_(batch_ids),
+                    ]
+                    if visible_supported:
+                        fetch_conds.append(Notification.visible.is_(True))
+
                     # Fetch blob keys for this batch BEFORE hiding
                     rows = (
                         await db.execute(
                             select(Notification.id, Notification.payload)
-                            .where(
-                                Notification.user_id == int(user_id),
-                                Notification.id.in_(batch_ids),
-                                Notification.visible.is_(True),
-                            )
+                            .where(*fetch_conds)
                         )
                     ).all()
 
@@ -1326,17 +1331,26 @@ class NotificationService:
                         )
                         continue
 
-                    # Hide this batch (set visible=False)
-                    result = await db.execute(
-                        update(Notification)
-                        .where(
-                            Notification.user_id == int(user_id),
-                            Notification.id.in_(matched_ids),
-                            Notification.visible.is_(True),
+                    if visible_supported:
+                        result = await db.execute(
+                            update(Notification)
+                            .where(
+                                Notification.user_id == int(user_id),
+                                Notification.id.in_(matched_ids),
+                                Notification.visible.is_(True),
+                            )
+                            .values(visible=False)
+                            .execution_options(synchronize_session=False)
                         )
-                        .values(visible=False)
-                        .execution_options(synchronize_session=False)
-                    )
+                    else:
+                        result = await db.execute(
+                            delete(Notification)
+                            .where(
+                                Notification.user_id == int(user_id),
+                                Notification.id.in_(matched_ids),
+                            )
+                            .execution_options(synchronize_session=False)
+                        )
                     await db.commit()
 
                     hidden_count = result.rowcount or len(matched_ids)
@@ -1434,21 +1448,19 @@ class NotificationService:
 
             if su is not None or cu is not None:
                 try:
-                    conds = [
-                        Notification.user_id == int(user_id),
-                        Notification.visible.is_(True),
-                    ]
-                    if su is not None:
-                        conds.append(Notification.site_uuid == su)
-                    if cu is not None:
-                        conds.append(Notification.camera_uuid == cu)
-
                     # Fetch IDs in batches to avoid loading millions of rows at once
                     id_batch_size = 10000
                     id_offset = 0
                     all_ids: set[int] = set()
                     while True:
                         async with self._session_factory() as db:
+                            conds = [Notification.user_id == int(user_id)]
+                            if await notification_visible_supported(db):
+                                conds.append(Notification.visible.is_(True))
+                            if su is not None:
+                                conds.append(Notification.site_uuid == su)
+                            if cu is not None:
+                                conds.append(Notification.camera_uuid == cu)
                             rows = (
                                 await db.execute(
                                     select(Notification.id)
