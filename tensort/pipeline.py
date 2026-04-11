@@ -311,7 +311,8 @@ class SimpleInferencePipeline(object):
         if out_queue_max is None:
             out_queue_max = _env_int("PIPELINE_OUT_QUEUE_MAX", 500, minimum=10)
         if infer_q_max is None:
-            infer_q_max = _env_int("INFER_QUEUE_MAX", 2, minimum=1)
+            # 1 = drop immediately when worker is busy; avoids queuing stale frames
+            infer_q_max = _env_int("INFER_QUEUE_MAX", 1, minimum=1)
 
         # Number of parallel inference threads (one per camera is a good default)
         self._num_workers = _env_int("INFER_NUM_WORKERS", 0, minimum=0)
@@ -336,7 +337,7 @@ class SimpleInferencePipeline(object):
         self._snapshot_jpeg_quality = _env_int("SNAPSHOT_JPEG_QUALITY", 75, minimum=1)
         self._snapshot_on_detection_only = _env_bool("SNAPSHOT_ON_DETECTION_ONLY", False)
         self._emit_empty_detections = _env_bool("EMIT_EMPTY_DETECTIONS", False)
-        self._infer_result_timeout_s = _env_float("INFER_RESULT_TIMEOUT_S", 3.0, minimum=0.0)
+        self._infer_result_timeout_s = _env_float("INFER_RESULT_TIMEOUT_S", 0.5, minimum=0.0)
         self._infer_error_log_interval_s = _env_float("INFER_ERROR_LOG_INTERVAL_S", 10.0, minimum=0.0)
         self._last_infer_error_sig = {}
         self._last_infer_error_ts = {}
@@ -458,13 +459,13 @@ class SimpleInferencePipeline(object):
 
             loop = asyncio.get_event_loop()
 
-            # Auto-size worker count if not set explicitly
+            # Auto-size worker count if not set explicitly.
+            # IMPORTANT: start() is called before cameras are added (len==0 at this point),
+            # so we pre-allocate _num_workers_max workers. Idle workers are cheap threads;
+            # without this, all 5 cameras pin to 1 worker and starve each other.
             num_workers = self._num_workers
             if num_workers == 0:
-                num_workers = min(max(1, len(self._channels)), self._num_workers_max)
-                # Will be re-evaluated when first camera is added if channels are
-                # added after start(); minimum 1 worker to avoid deadlock.
-                num_workers = max(num_workers, 1)
+                num_workers = self._num_workers_max
 
             self._infer_pool = InferenceWorkerPool(
                 loop=loop,

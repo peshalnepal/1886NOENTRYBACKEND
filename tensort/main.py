@@ -22,11 +22,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jetson-app")
 
 app = Flask(__name__)
-DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "5.0"))
-DEFAULT_RESIZE_W = int(os.getenv("DEFAULT_RESIZE_W", "640"))
-DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "480"))
+DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "15.0"))
+# 0 disables pre-resize — TRT letterbox handles any input size so this is just wasted work
+DEFAULT_RESIZE_W = int(os.getenv("DEFAULT_RESIZE_W", "0"))
+DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "0"))
 DEFAULT_JPEG_QUALITY = int(os.getenv("DEFAULT_JPEG_QUALITY", "70"))
-MAX_SAMPLE_FPS = float(os.getenv("MAX_SAMPLE_FPS", "15.0"))
+MAX_SAMPLE_FPS = float(os.getenv("MAX_SAMPLE_FPS", "25.0"))
 # -----------------------------
 # Pipeline runtime (async loop in background thread)
 # -----------------------------
@@ -66,20 +67,10 @@ class PipelineRuntime(object):
 
         cfg_data["sample_fps"] = max(0.1, min(sample_fps, MAX_SAMPLE_FPS))
 
-        resize = cfg_data.get("resize")
-        if resize is None and DEFAULT_RESIZE_W > 0 and DEFAULT_RESIZE_H > 0:
-            resize = (DEFAULT_RESIZE_W, DEFAULT_RESIZE_H)
-
-        if resize is not None:
-            if isinstance(resize, (list, tuple)) and len(resize) == 2:
-                try:
-                    resize_w = max(1, int(resize[0]))
-                    resize_h = max(1, int(resize[1]))
-                    cfg_data["resize"] = (resize_w, resize_h)
-                except Exception:
-                    cfg_data["resize"] = None
-            else:
-                cfg_data["resize"] = None
+        # Pre-resize is disabled (DEFAULT_RESIZE_W/H == 0). TRT letterbox handles any
+        # input resolution, so pre-resizing is pure overhead. Force None so old DB
+        # configs with resize=[640,480] don't re-enable it on restore.
+        cfg_data["resize"] = None
 
         try:
             jpeg_quality = int(cfg_data.get("jpeg_quality", DEFAULT_JPEG_QUALITY))

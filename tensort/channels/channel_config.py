@@ -46,7 +46,7 @@ class VideoChannelConfig(object):
         reconnect_max_ms=8000,
         emit_format="raw",          # "raw" or "jpeg"
         jpeg_quality=80,
-        gst_latency_ms=100,
+        gst_latency_ms=5,
         rtsp_transport="tcp",       # "tcp" or "udp"
         gst_decoder="nvv4l2decoder" # Jetson HW decode; fallback happens in code
     ):
