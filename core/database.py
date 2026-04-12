@@ -358,6 +358,66 @@ class DatabaseManager:
                     except Exception:
                         logger.warning("Could not backfill notification.visible nulls.", exc_info=True)
 
+            if dialect_name.startswith("mysql"):
+                _composite_indexes = [
+                    (
+                        "notification",
+                        "ix_notif_user_visible_detected",
+                        "(user_id, visible, detected_at DESC)",
+                    ),
+                    (
+                        "notification",
+                        "ix_notif_user_site_visible_detected",
+                        "(user_id, site_uuid, visible, detected_at DESC)",
+                    ),
+                    (
+                        "notification",
+                        "ix_notif_user_camera_visible",
+                        "(user_id, camera_uuid, visible, detected_at DESC)",
+                    ),
+                    (
+                        "notification",
+                        "ix_notif_user_visible_unread",
+                        "(user_id, visible, read_at)",
+                    ),
+                    (
+                        "notification",
+                        "ix_notif_user_camera_detected",
+                        "(user_id, camera_uuid, detected_at DESC)",
+                    ),
+                    (
+                        "video_record",
+                        "ix_vr_camera_created",
+                        "(camera_uuid, created_at DESC)",
+                    ),
+                ]
+                for tbl, idx_name, idx_cols in _composite_indexes:
+                    idx_exists = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.STATISTICS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = :tbl "
+                                "  AND INDEX_NAME = :idx "
+                                "LIMIT 1"
+                            ),
+                            {"tbl": tbl, "idx": idx_name},
+                        )
+                    ).fetchone()
+                    if not idx_exists:
+                        try:
+                            await conn.execute(
+                                text(f"ALTER TABLE `{tbl}` ADD INDEX `{idx_name}` {idx_cols}")
+                            )
+                            logger.info("Created composite index %s.%s", tbl, idx_name)
+                        except Exception as exc:
+                            if "1061" in str(exc):
+                                logger.info("Index %s.%s already exists.", tbl, idx_name)
+                            else:
+                                logger.warning(
+                                    "Failed creating index %s.%s: %s", tbl, idx_name, exc
+                                )
+
         # Seed a dev user if DB is empty.
         async with self.AsyncSessionLocal() as db:
             existing = (await db.execute(select(User.id).limit(1))).scalar_one_or_none()

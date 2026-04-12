@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, literal_column, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import StreamingResponse
 
@@ -226,6 +226,59 @@ def _to_out(n: Notification) -> NotificationOut:
         read_at=n.read_at,
         sent_at=n.sent_at,
         status=str(n.status),
+    )
+
+
+def _to_out_row(r) -> NotificationOut:
+    """Build NotificationOut from a column-level select Row (not a full ORM object)."""
+    payload = r.payload
+    msg = _payload_msg(payload)
+    extra = payload.get("extra") if isinstance(payload, dict) else None
+
+    image_url = ""
+    image_storage_key = ""
+    clip_url = ""
+    clip_status = ""
+
+    if isinstance(extra, dict):
+        image_url = str(extra.get("image_url") or "").strip()
+        image_storage_key = str(extra.get("image_storage_key") or "").strip()
+
+    if not image_url:
+        image_url = str(msg.get("image_url") or "").strip()
+    if not image_storage_key:
+        image_storage_key = str(msg.get("image_storage_key") or "").strip()
+
+    clip_url = str(msg.get("clip_url") or "").strip()
+    clip_status = str(msg.get("clip_status") or "").strip()
+
+    if isinstance(extra, dict) and not clip_url:
+        clip_payload = extra.get("clip")
+        if isinstance(clip_payload, dict):
+            clip_url = str(clip_payload.get("recording_url") or "").strip()
+            clip_status = str(clip_payload.get("status") or "").strip()
+
+    return NotificationOut(
+        id=int(r.id),
+        user_id=int(r.user_id),
+        site_uuid=str(r.site_uuid),
+        camera_uuid=str(r.camera_uuid) if r.camera_uuid else None,
+        site_name=str(msg.get("site_name") or "") or None,
+        camera_name=str(msg.get("camera_name") or "") or None,
+        device_uuid=str(r.device_uuid) if r.device_uuid else None,
+        event_type=str(r.event_type),
+        title=r.title,
+        message=r.message,
+        payload=payload,
+        image_url=image_url or None,
+        image_storage_key=image_storage_key or None,
+        clip_url=clip_url or None,
+        clip_status=clip_status or None,
+        detected_at=r.detected_at,
+        created_at=r.created_at,
+        read_at=r.read_at,
+        sent_at=r.sent_at,
+        status=str(r.status),
     )
 
 
@@ -506,7 +559,25 @@ async def list_notifications(
     cu = _parse_optional_uuid(camera_uuid, "camera_uuid")
     visible_supported = await notification_visible_supported(db)
 
-    stmt = select(Notification).where(Notification.user_id == int(current_user.id))
+    # Select only the columns needed by _to_out to avoid loading the full ORM
+    # object (which would also trigger lazy-load descriptors for relationships).
+    _NOTIFICATION_COLS = (
+        Notification.id,
+        Notification.user_id,
+        Notification.site_uuid,
+        Notification.camera_uuid,
+        Notification.device_uuid,
+        Notification.event_type,
+        Notification.title,
+        Notification.message,
+        Notification.payload,
+        Notification.detected_at,
+        Notification.created_at,
+        Notification.read_at,
+        Notification.sent_at,
+        Notification.status,
+    )
+    stmt = select(*_NOTIFICATION_COLS).where(Notification.user_id == int(current_user.id))
     if visible_supported:
         stmt = stmt.where(Notification.visible.is_(True))
 
@@ -519,8 +590,8 @@ async def list_notifications(
 
     stmt = stmt.order_by(desc(Notification.detected_at)).offset(offset).limit(limit)
 
-    rows = (await db.execute(stmt)).scalars().all()
-    return [_to_out(n) for n in rows]
+    rows = (await db.execute(stmt)).all()
+    return [_to_out_row(r) for r in rows]
 
 
 @router.post("/delete")
@@ -574,38 +645,87 @@ async def detections_over_time(
     aligned_start_ms = start_ms - (start_ms % bucket_ms)
     now_ms = int(now.timestamp() * 1000)
 
-    stmt = select(
-        Notification.detected_at,
-        Notification.event_type,
-        Notification.title,
-        Notification.message,
-        Notification.payload,
-    ).where(
-        Notification.user_id == int(current_user.id),
-        Notification.detected_at >= start,
-    )
-    if visible_supported:
-        stmt = stmt.where(Notification.visible.is_(True))
+    needs_payload_filter = bool(class_filter or roi_only)
 
-    if su:
-        stmt = stmt.where(Notification.site_uuid == su)
+    if not needs_payload_filter:
+        # ── Fast path: pure SQL aggregation, no payload scanning ──
+        bucket_seconds = bucket_minutes * 60
+        bucket_expr = literal_column(
+            f"FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(detected_at) / {bucket_seconds}) * {bucket_seconds})"
+        )
+        stmt = (
+            select(bucket_expr.label("bucket_start"), func.count().label("cnt"))
+            .select_from(Notification.__table__)
+            .where(
+                Notification.user_id == int(current_user.id),
+                Notification.detected_at >= start,
+            )
+        )
+        if visible_supported:
+            stmt = stmt.where(Notification.visible.is_(True))
+        if su:
+            stmt = stmt.where(Notification.site_uuid == su)
+        stmt = stmt.group_by(literal_column("bucket_start"))
 
-    rows = (await db.execute(stmt)).all()
+        rows = (await db.execute(stmt)).all()
+        counts: Dict[int, int] = {}
+        for bucket_start_dt, cnt in rows:
+            dt = _as_utc(bucket_start_dt)
+            ts_ms_val = int(dt.timestamp() * 1000)
+            counts[ts_ms_val] = int(cnt)
+    else:
+        # ── Filtered path: stream rows in batches to avoid OOM ──
+        # Only select columns needed for filtering, skip the large payload
+        # when possible.
+        stmt = select(
+            Notification.detected_at,
+            Notification.event_type,
+            Notification.title,
+            Notification.message,
+            Notification.payload,
+        ).where(
+            Notification.user_id == int(current_user.id),
+            Notification.detected_at >= start,
+        )
+        if visible_supported:
+            stmt = stmt.where(Notification.visible.is_(True))
+        if su:
+            stmt = stmt.where(Notification.site_uuid == su)
 
-    counts: Dict[int, int] = {}
-    for raw_dt, event_type, title, message, payload in rows:
-        if roi_only and not _is_roi_notification(event_type, title, message, payload):
-            continue
+        # Hint for ROI: most ROI notifications have "roi" in event_type or title
+        if roi_only and not class_filter:
+            stmt = stmt.where(
+                Notification.event_type.contains("roi")
+                | Notification.title.contains("roi")
+                | Notification.title.contains("ROI")
+            )
 
-        if class_filter:
-            classes = _extract_object_classes(event_type, title, message, payload)
-            if class_filter not in classes:
-                continue
+        # Stream in server-side batches of 5000 to cap memory
+        BATCH_SIZE = 5000
+        counts = {}
+        offset = 0
+        while True:
+            batch_stmt = stmt.order_by(Notification.id).offset(offset).limit(BATCH_SIZE)
+            rows = (await db.execute(batch_stmt)).all()
+            if not rows:
+                break
 
-        dt = _as_utc(raw_dt)
-        ts_ms = int(dt.timestamp() * 1000)
-        bucket = ts_ms - (ts_ms % bucket_ms)
-        counts[bucket] = counts.get(bucket, 0) + 1
+            for raw_dt, event_type, title, message, payload in rows:
+                if roi_only and not _is_roi_notification(event_type, title, message, payload):
+                    continue
+                if class_filter:
+                    classes = _extract_object_classes(event_type, title, message, payload)
+                    if class_filter not in classes:
+                        continue
+
+                dt = _as_utc(raw_dt)
+                ts_ms_val = int(dt.timestamp() * 1000)
+                bucket = ts_ms_val - (ts_ms_val % bucket_ms)
+                counts[bucket] = counts.get(bucket, 0) + 1
+
+            offset += BATCH_SIZE
+            if len(rows) < BATCH_SIZE:
+                break
 
     points: List[ChartPoint] = []
     cursor = aligned_start_ms

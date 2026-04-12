@@ -953,15 +953,21 @@ class NotificationService:
         close_when_done = image_service is not self._image_service
 
         try:
-            for storage_key in unique_keys:
-                try:
-                    await image_service.delete_blob(blob_name=storage_key)
-                except Exception:
-                    logger.warning(
-                        "Failed deleting alert image blob %s after alert hide",
-                        storage_key,
-                        exc_info=True,
-                    )
+            # Parallel blob deletion in batches of 10 to avoid connection exhaustion
+            BLOB_DELETE_CONCURRENCY = 10
+            for i in range(0, len(unique_keys), BLOB_DELETE_CONCURRENCY):
+                batch = unique_keys[i : i + BLOB_DELETE_CONCURRENCY]
+                results = await asyncio.gather(
+                    *(image_service.delete_blob(blob_name=key) for key in batch),
+                    return_exceptions=True,
+                )
+                for key, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "Failed deleting alert image blob %s after alert hide: %s",
+                            key,
+                            result,
+                        )
         finally:
             if close_when_done:
                 try:
@@ -2098,11 +2104,33 @@ class NotificationService:
 
         site_groups: Dict[uuid.UUID, List[int]] = defaultdict(list)
         create_rows: List[Dict[str, Any]] = []
-        for idx, item in enumerate(items):
-            stored_extra_payload, stored_image_url, stored_image_key = await self._materialize_alert_image_payload(
-                msg=item.msg,
-                extra_payload=item.extra_payload,
+
+        # ── Parallelize image materialization (Azure blob uploads) ──
+        # At scale (100+ notifications per batch), sequential uploads are a
+        # bottleneck.  Run up to 10 concurrent uploads via asyncio.gather.
+        IMAGE_UPLOAD_CONCURRENCY = 10
+        materialized: List[Tuple[Dict[str, Any], Optional[str], Optional[str]]] = []
+        for batch_start in range(0, len(items), IMAGE_UPLOAD_CONCURRENCY):
+            batch = items[batch_start : batch_start + IMAGE_UPLOAD_CONCURRENCY]
+            results = await asyncio.gather(
+                *(
+                    self._materialize_alert_image_payload(
+                        msg=item.msg,
+                        extra_payload=item.extra_payload,
+                    )
+                    for item in batch
+                ),
+                return_exceptions=True,
             )
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.warning("Image materialization failed: %s", r)
+                    materialized.append(({}, None, None))
+                else:
+                    materialized.append(r)
+
+        for idx, item in enumerate(items):
+            stored_extra_payload, stored_image_url, stored_image_key = materialized[idx]
             if stored_image_url:
                 updated_msg = item.msg.model_copy(update={"image_url": stored_image_url})
                 items[idx] = BufferedNotification(

@@ -521,6 +521,8 @@ async def _load_clip_overlay_payloads(
     # Keep the lookup bounded to the time window represented by this clip page.
     if earliest_detected_at is not None:
         stmt = stmt.where(Notification.detected_at >= earliest_detected_at - timedelta(days=2))
+    max_scan = min(len(clip_keys) * 10, 2000)
+    stmt = stmt.limit(max_scan)
 
     notifications = (await db.execute(stmt)).scalars().all()
     overlays: Dict[Tuple[str, str], Dict[str, Any]] = {}
