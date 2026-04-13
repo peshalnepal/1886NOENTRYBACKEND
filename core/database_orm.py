@@ -10,6 +10,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -520,6 +521,9 @@ class ChannelConfiguration(Base):
 # =========================
 class VideoRecord(Base):
     __tablename__ = "video_record"
+    __table_args__ = (
+        Index("ix_vr_camera_created", "camera_uuid", "created_at"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 
@@ -554,6 +558,13 @@ class Notification(Base):
     (optionally linked to camera/device).
     """
     __tablename__ = "notification"
+    __table_args__ = (
+        Index("ix_notif_user_visible_detected", "user_id", "visible", "detected_at"),
+        Index("ix_notif_user_site_visible_detected", "user_id", "site_uuid", "visible", "detected_at"),
+        Index("ix_notif_user_camera_visible", "user_id", "camera_uuid", "visible", "detected_at"),
+        Index("ix_notif_user_visible_unread", "user_id", "visible", "read_at"),
+        Index("ix_notif_user_camera_detected", "user_id", "camera_uuid", "detected_at"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 
@@ -571,7 +582,7 @@ class Notification(Base):
     detected_at = Column(DateTime(timezone=True), default=utc_now, index=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
 
-    read_at = Column(DateTime(timezone=True), nullable=True) 
+    read_at = Column(DateTime(timezone=True), nullable=True)
     sent_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(String(32), nullable=False, default="created")
     visible=Column(Boolean,default=True)
