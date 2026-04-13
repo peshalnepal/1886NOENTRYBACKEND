@@ -10,6 +10,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+import uuid
+from sqlalchemy import delete as sql_delete, select, update
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -333,55 +335,13 @@ async def delete_my_account(
             logger.warning(f"[User Delete] Manager cleanup failed — proceeding: {exc}", exc_info=True)
 
     # ========================================
-    # PHASE 3+4: Extract blob storage keys & Delete user from DB
-    # We batch-delete large tables (extracting keys) to prevent long transactions
-    # and OOM errors, then explicitly delete sites and the user to trigger cascades.
+    # PHASE 3: Fast Foreground DB Cleanup (Sites & User)
     # ========================================
-    logger.info(f"[User Delete] Phase 3+4: Extracting blob keys & deleting DB rows")
-    alert_blob_keys: List[str] = []
-    clip_blob_keys: List[str] = []
-
-    from application.repositories.site_repository import SiteRepository
-    repo_for_delete = SiteRepository()
-
-    # Batch delete notifications and extract keys
-    deleted_notifs = await repo_for_delete._batch_delete(
-        AsyncSessionLocal,
-        table=Notification,
-        where_clause=Notification.user_id == user_id,
-        batch_size=2000,
-        label="user_notifications",
-        extract_col=Notification.payload,
-        extract_alert_fn=extract_image_storage_key,
-        extract_clip_fn=_extract_notification_clip_storage_keys,
-        alert_keys_out=alert_blob_keys,
-        clip_keys_out=clip_blob_keys,
-    )
-
-    deleted_vids = 0
-    if camera_uuids:
-        # Batch delete video records and extract keys
-        deleted_vids = await repo_for_delete._batch_delete(
-            AsyncSessionLocal,
-            table=VideoRecord,
-            where_clause=VideoRecord.camera_uuid.in_(camera_uuids),
-            batch_size=2000,
-            label="user_video_records",
-            extract_col=VideoRecord.storage_key,
-            clip_keys_out=clip_blob_keys,
-        )
-
-    logger.info(
-        f"[User Delete] Found {len(alert_blob_keys)} alert image blobs, "
-        f"{len(clip_blob_keys)} clip blobs"
-    )
-
-    logger.info(f"[User Delete] Deleting remaining DB records (sites, user, cascades)")
+    logger.info(f"[User Delete] Phase 3: Deleting DB records (sites, user, cascades) (Foreground)")
     try:
         if site_uuids:
             # Explicitly delete sites; cameras and relationships should cascade 
-            # based on how your DB is configured, but if there's any orphaned data
-            # this ensures the main entities are gone.
+            # based on how your DB is configured.
             await db.execute(sql_delete(Site).where(Site.user_id == user_id))
 
         await db.delete(current_user)
@@ -395,24 +355,7 @@ async def delete_my_account(
         raise
 
     # ========================================
-    # PHASE 5: Async blob deletion
-    # ========================================
-    if alert_blob_keys:
-        logger.info(f"[User Delete] Phase 5a: Scheduling deletion of {len(alert_blob_keys)} alert image blobs")
-        _spawn_bg_task(
-            _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image"),
-            name=f"delete_user_alert_blobs:{user_id}",
-        )
-
-    if clip_blob_keys:
-        logger.info(f"[User Delete] Phase 5b: Scheduling deletion of {len(clip_blob_keys)} clip blobs")
-        _spawn_bg_task(
-            _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip"),
-            name=f"delete_user_clip_blobs:{user_id}",
-        )
-
-    # ========================================
-    # PHASE 6: Invalidate caches
+    # PHASE 4: Invalidate caches
     # ========================================
     for cam_uuid in camera_uuids:
         try:
@@ -420,5 +363,66 @@ async def delete_my_account(
         except Exception:
             pass
 
-    logger.info(f"[User Delete] COMPLETE: user={user_id} has been successfully deleted")
+    # ========================================
+    # PHASE 5: Background Database Cleanup (Notifications & Videos)
+    # ========================================
+    logger.info(f"[User Delete] Phase 5: Spawning background task to clean up heavy tables (Notifications/Videos)")
+
+    async def _heavy_table_cleanup_task(uid: int, cam_uuids: List[uuid.UUID]):
+        logger.info(f"[User Cleanup Task] Starting background heavy cleanup for user={uid}")
+        from application.repositories.site_repository import SiteRepository
+        repo_for_delete = SiteRepository()
+        alert_blob_keys: List[str] = []
+        clip_blob_keys: List[str] = []
+
+        try:
+            # Batch delete notifications and extract keys
+            await repo_for_delete._batch_delete(
+                AsyncSessionLocal,
+                table=Notification,
+                where_clause=Notification.user_id == uid,
+                batch_size=2000,
+                label="user_notifications",
+                extract_col=Notification.payload,
+                extract_alert_fn=extract_image_storage_key,
+                extract_clip_fn=_extract_notification_clip_storage_keys,
+                alert_keys_out=alert_blob_keys,
+                clip_keys_out=clip_blob_keys,
+            )
+
+            if cam_uuids:
+                # Batch delete video records and extract keys
+                await repo_for_delete._batch_delete(
+                    AsyncSessionLocal,
+                    table=VideoRecord,
+                    where_clause=VideoRecord.camera_uuid.in_(cam_uuids),
+                    batch_size=2000,
+                    label="user_video_records",
+                    extract_col=VideoRecord.storage_key,
+                    clip_keys_out=clip_blob_keys,
+                )
+
+            # Schedule the blob deletions
+            if alert_blob_keys:
+                _spawn_bg_task(
+                    _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image"),
+                    name=f"delete_user_alert_blobs:{uid}",
+                )
+
+            if clip_blob_keys:
+                _spawn_bg_task(
+                    _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip"),
+                    name=f"delete_user_clip_blobs:{uid}",
+                )
+            logger.info(f"[User Cleanup Task] Background heavy cleanup COMPLETE for user={uid}")
+
+        except Exception as e:
+            logger.error(f"[User Cleanup Task] Failed heavy cleanup for user={uid}: {e}", exc_info=True)
+
+    _spawn_bg_task(
+        _heavy_table_cleanup_task(user_id, camera_uuids),
+        name=f"delete_user_heavy_tables:{user_id}",
+    )
+
+    logger.info(f"[User Delete] HTTP response ready: user={user_id} effectively deleted from UI")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

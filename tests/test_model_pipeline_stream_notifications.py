@@ -141,6 +141,55 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         pipeline._emit_detection_summary_notification.assert_not_awaited()
         pipeline._build_alert_extra_payload.assert_awaited_once()
 
+    async def test_stream_payload_drops_mismatched_camera_uuid(self):
+        pipeline, channel, service = await self._make_pipeline(scheduled=True)
+        camera_uuid = channel.key()
+        other_camera_uuid = str(uuid.uuid4())
+
+        pipeline._tracker.update_from_event = Mock()
+
+        processed = await pipeline._process_detection_payload(
+            camera_uuid,
+            channel,
+            self._make_payload(other_camera_uuid),
+        )
+
+        self.assertFalse(processed)
+        pipeline._tracker.update_from_event.assert_not_called()
+        latest = await pipeline.get_latest_detection(camera_uuid)
+        self.assertIsNone(latest)
+        service.record_detection_overlay_frame.assert_not_awaited()
+
+    async def test_remove_channel_clears_cached_detection_and_context(self):
+        pipeline, channel, _service = await self._make_pipeline(scheduled=True)
+        camera_uuid = channel.key()
+
+        await pipeline.add_channel(channel)
+        payload = self._make_payload(camera_uuid)
+        processed = await pipeline._process_detection_payload(camera_uuid, channel, payload)
+
+        self.assertTrue(processed)
+        self.assertIsNotNone(await pipeline.get_latest_detection(camera_uuid))
+
+        pipeline._cam_ctx_cache[camera_uuid] = (
+            CameraContext(
+                user_id=7,
+                site_uuid=uuid.UUID(channel.config.site_uuid),
+                site_name="Dock Yard",
+                camera_code="CAM-01",
+                camera_name="Gate Camera",
+                device_uuid=uuid.UUID(channel.config.device_uuid),
+                device_name="Jetson A",
+            ),
+            9999999999.0,
+        )
+
+        removed = await pipeline.remove_channel(camera_uuid)
+
+        self.assertTrue(removed)
+        self.assertIsNone(await pipeline.get_latest_detection(camera_uuid))
+        self.assertNotIn(camera_uuid, pipeline._cam_ctx_cache)
+
 
 if __name__ == "__main__":
     unittest.main()

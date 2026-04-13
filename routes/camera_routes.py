@@ -970,46 +970,9 @@ async def delete_camera(
             logger.warning(f"[Camera Delete] Runtime cleanup failed for cam={camera_uuid}: {exc}", exc_info=True)
 
     # ========================================
-    # PHASE 3+4: Extract blob storage keys & Delete all linked DB rows
-    # Order: notifications first (batch delete + extract keys),
-    # then video records (batch delete + extract keys),
-    # then remaining children, then camera itself.
+    # PHASE 3: Fast Foreground DB Cleanup
     # ========================================
-    logger.info(f"[Camera Delete] Phase 3+4: Deleting database rows and extracting blob keys")
-    alert_blob_keys: List[str] = []
-    clip_blob_keys: List[str] = []
-
-    repo_for_delete = SiteRepository()
-
-    # Batch delete notifications and extract keys
-    deleted_notifs = await repo_for_delete._batch_delete(
-        AsyncSessionLocal,
-        table=Notification,
-        where_clause=Notification.camera_uuid == camera_uuid,
-        batch_size=2000,
-        label="camera_notifications",
-        extract_col=Notification.payload,
-        extract_alert_fn=extract_image_storage_key,
-        extract_clip_fn=_extract_notification_clip_storage_keys,
-        alert_keys_out=alert_blob_keys,
-        clip_keys_out=clip_blob_keys,
-    )
-
-    # Batch delete video records and extract keys
-    deleted_vids = await repo_for_delete._batch_delete(
-        AsyncSessionLocal,
-        table=VideoRecord,
-        where_clause=VideoRecord.camera_uuid == camera_uuid,
-        batch_size=2000,
-        label="camera_video_records",
-        extract_col=VideoRecord.storage_key,
-        clip_keys_out=clip_blob_keys,
-    )
-
-    logger.info(
-        f"[Camera Delete] Found {len(alert_blob_keys)} alert image blobs, "
-        f"{len(clip_blob_keys)} clip blobs"
-    )
+    logger.info(f"[Camera Delete] Phase 3: Deleting camera from DB (Foreground)")
 
     async with AsyncSessionLocal() as del_db:
         # Children with CASCADE FKs (explicit for safety)
@@ -1020,31 +983,73 @@ async def delete_camera(
         await del_db.execute(sql_delete(Camera).where(Camera.camera_uuid == camera_uuid))
         await del_db.commit()
 
-    logger.info(f"[Camera Delete] Database deletion complete (deleted {deleted_notifs} notifications, {deleted_vids} videos)")
+    logger.info(f"[Camera Delete] Camera row deleted")
 
     # ========================================
-    # PHASE 5: Async blob deletion
-    # ========================================
-    if alert_blob_keys:
-        logger.info(f"[Camera Delete] Phase 5a: Scheduling deletion of {len(alert_blob_keys)} alert image blobs")
-        _spawn_bg_task(
-            _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image"),
-            name=f"delete_camera_alert_blobs:{camera_uuid}",
-        )
-
-    if clip_blob_keys:
-        logger.info(f"[Camera Delete] Phase 5b: Scheduling deletion of {len(clip_blob_keys)} clip blobs")
-        _spawn_bg_task(
-            _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip"),
-            name=f"delete_camera_clip_blobs:{camera_uuid}",
-        )
-
-    # ========================================
-    # PHASE 6: Invalidate caches
+    # PHASE 4: Invalidate caches
     # ========================================
     await invalidate_camera_mode_cache(camera_uuid)
 
-    logger.info(f"[Camera Delete] COMPLETE: camera={camera_uuid} has been successfully deleted")
+    # ========================================
+    # PHASE 5: Background Database Cleanup (Notifications & Videos)
+    # ========================================
+    logger.info(f"[Camera Delete] Phase 5: Spawning background task to clean up heavy tables (Notifications/Videos)")
+
+    async def _heavy_table_cleanup_task(cam_uuid: uuid.UUID):
+        logger.info(f"[Camera Cleanup Task] Starting background heavy cleanup for camera={cam_uuid}")
+        repo_for_delete = SiteRepository()
+        alert_blob_keys: List[str] = []
+        clip_blob_keys: List[str] = []
+
+        try:
+            # Batch delete notifications and extract keys
+            await repo_for_delete._batch_delete(
+                AsyncSessionLocal,
+                table=Notification,
+                where_clause=Notification.camera_uuid == cam_uuid,
+                batch_size=2000,
+                label="camera_notifications",
+                extract_col=Notification.payload,
+                extract_alert_fn=extract_image_storage_key,
+                extract_clip_fn=_extract_notification_clip_storage_keys,
+                alert_keys_out=alert_blob_keys,
+                clip_keys_out=clip_blob_keys,
+            )
+
+            # Batch delete video records and extract keys
+            await repo_for_delete._batch_delete(
+                AsyncSessionLocal,
+                table=VideoRecord,
+                where_clause=VideoRecord.camera_uuid == cam_uuid,
+                batch_size=2000,
+                label="camera_video_records",
+                extract_col=VideoRecord.storage_key,
+                clip_keys_out=clip_blob_keys,
+            )
+
+            # Schedule the blob deletions
+            if alert_blob_keys:
+                _spawn_bg_task(
+                    _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image"),
+                    name=f"delete_camera_alert_blobs:{cam_uuid}",
+                )
+
+            if clip_blob_keys:
+                _spawn_bg_task(
+                    _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip"),
+                    name=f"delete_camera_clip_blobs:{cam_uuid}",
+                )
+            logger.info(f"[Camera Cleanup Task] Background heavy cleanup COMPLETE for camera={cam_uuid}")
+
+        except Exception as e:
+            logger.error(f"[Camera Cleanup Task] Failed heavy cleanup for camera={cam_uuid}: {e}", exc_info=True)
+
+    _spawn_bg_task(
+        _heavy_table_cleanup_task(camera_uuid),
+        name=f"delete_camera_heavy_tables:{camera_uuid}",
+    )
+
+    logger.info(f"[Camera Delete] HTTP response ready: camera={camera_uuid} effectively deleted from UI")
     return {"ok": True}
 
 @router.get("/{camera_uuid}/snapshot.jpg")

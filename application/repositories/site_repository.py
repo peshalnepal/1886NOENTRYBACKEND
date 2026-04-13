@@ -324,6 +324,9 @@ class SiteRepository:
         OPTIMIZED deletion with batching to avoid 502/503 errors on large sites.
         Extracts blob keys during deletion to avoid double-scanning.
         
+        Note: The heavy tables (Notifications/VideoRecords) are passed to a background
+        process from the route to make the HTTP response fast.
+        
         Returns: (stats_dict, alert_blob_keys, clip_blob_keys)
         """
         import logging
@@ -343,43 +346,14 @@ class SiteRepository:
         alert_blob_keys = []
         clip_blob_keys = []
 
-        # Phase 1: Batch delete notifications (LARGEST table - often millions)
-        logger.info(f"[Site Delete] Phase 1: Deleting notifications for site={site_uuid}")
-        stats["notifications"] = await self._batch_delete(
-            db,
-            table=Notification,
-            where_clause=Notification.site_uuid == site_uuid,
-            batch_size=batch_size,
-            label="notifications",
-            extract_col=Notification.payload,
-            extract_alert_fn=extract_alert_key_fn,
-            extract_clip_fn=extract_clip_keys_fn,
-            alert_keys_out=alert_blob_keys,
-            clip_keys_out=clip_blob_keys,
-        )
-        logger.info(f"[Site Delete] Deleted {stats['notifications']} notifications")
+        # Phase 1: Fast delete site settings and device links (small tables)
+        site_settings_count = await self._fast_delete(db, SiteSettings, SiteSettings.site_uuid == site_uuid)
+        site_device_count = await self._fast_delete(db, SiteDevice, SiteDevice.site_uuid == site_uuid)
+        logger.info(f"[Site Delete] Phase 1: Deleted {site_settings_count} site settings, {site_device_count} site-device links")
 
-        # Phase 2: Batch delete video records (second largest)
+        # Phase 2: Fast delete camera relationships
         if normalized_camera_uuids:
-            logger.info(f"[Site Delete] Phase 2: Deleting video records for {len(normalized_camera_uuids)} cameras")
-            stats["videos"] = await self._batch_delete(
-                db,
-                table=VideoRecord,
-                where_clause=VideoRecord.camera_uuid.in_(normalized_camera_uuids),
-                batch_size=batch_size,
-                label="video records",
-                extract_col=VideoRecord.storage_key,
-                clip_keys_out=clip_blob_keys,
-            )
-            logger.info(f"[Site Delete] Deleted {stats['videos']} video records")
-
-        # Phase 3: Delete notification emails (faster)
-        notification_email_count = await self._fast_delete(db, NotificationEmail, NotificationEmail.site_uuid == site_uuid)
-        logger.info(f"[Site Delete] Phase 3: Deleted {notification_email_count} notification emails")
-
-        # Phase 4: Delete camera relationships (faster, predictable size)
-        if normalized_camera_uuids:
-            logger.info(f"[Site Delete] Phase 4: Deleting camera relationships")
+            logger.info(f"[Site Delete] Phase 2: Deleting camera relationships")
             pipeline_cam_count = await self._fast_delete(
                 db,
                 PipelineCamera,
@@ -400,20 +374,24 @@ class SiteRepository:
                 f"{camera_device_count} camera-device links, {channel_config_count} channel configs"
             )
 
-        # Phase 5: Delete cameras
+        # Phase 3: Fast delete cameras (so they disappear from frontend immediately)
         camera_count = await self._fast_delete(db, Camera, Camera.site_uuid == site_uuid)
-        logger.info(f"[Site Delete] Phase 5: Deleted {camera_count} cameras")
+        logger.info(f"[Site Delete] Phase 3: Deleted {camera_count} cameras")
 
-        # Phase 6: Delete site settings and device links
-        site_settings_count = await self._fast_delete(db, SiteSettings, SiteSettings.site_uuid == site_uuid)
-        site_device_count = await self._fast_delete(db, SiteDevice, SiteDevice.site_uuid == site_uuid)
-        logger.info(f"[Site Delete] Phase 6: Deleted {site_settings_count} site settings, {site_device_count} site-device links")
-
-        # Phase 7: Delete the site itself
+        # Phase 4: Delete the site itself (so it disappears from frontend immediately)
         site_count = await self._fast_delete(db, Site, Site.site_uuid == site_uuid)
-        logger.info(f"[Site Delete] Phase 7: Deleted {site_count} site rows")
+        logger.info(f"[Site Delete] Phase 4: Deleted {site_count} site rows")
 
-        logger.info(f"[Site Delete] COMPLETE: Deleted {stats['notifications']} notifications, {stats['videos']} videos, {stats['cameras']} cameras")
+        # Phase 5: Fast delete notification emails
+        notification_email_count = await self._fast_delete(db, NotificationEmail, NotificationEmail.site_uuid == site_uuid)
+        logger.info(f"[Site Delete] Phase 5: Deleted {notification_email_count} notification emails")
+
+        logger.info(f"[Site Delete] FOREGROUND COMPLETE: Deleted core site graph (Settings, Relationships, Cameras, Site)")
+        
+        # We NO LONGER delete the massive Notification/VideoRecord tables here because 
+        # it blocks the HTTP response for too long (15-20 seconds per 2000 rows).
+        # This function handles the foreground fast deletes to make the UI snappy.
+        
         return stats, alert_blob_keys, clip_blob_keys
 
     async def _batch_delete(
