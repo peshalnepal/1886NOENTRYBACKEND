@@ -1127,109 +1127,40 @@ async def delete_site(
         )
 
     # ========================================
-    # PHASE 3: Extract blob keys from the now-stable DB
-    # Cameras are stopped so no new rows are being created.
-    # ========================================
-    logger.info(f"[Site Delete] Phase 3: Extracting blob storage keys in batches")
-    alert_blob_keys: List[str] = []
-    notification_clip_blob_keys: List[str] = []
-
-    blob_batch_size = 5000
-    last_seen_id = 0
-    total_scanned = 0
-    batch_num = 0
-    try:
-        while True:
-            async with AsyncSessionLocal() as blob_db:
-                batch = (
-                    await blob_db.execute(
-                        select(Notification.id, Notification.payload)
-                        .where(
-                            Notification.site_uuid == site.site_uuid,
-                            Notification.user_id == int(user.id),
-                            Notification.id > last_seen_id,
-                        )
-                        .order_by(Notification.id)
-                        .limit(blob_batch_size)
-                    )
-                ).all()
-
-            if not batch:
-                break
-
-            last_seen_id = batch[-1][0]
-            batch_num += 1
-
-            for _nid, payload in batch:
-                key = extract_image_storage_key(payload)
-                if key:
-                    alert_blob_keys.append(key)
-                notification_clip_blob_keys.extend(_extract_notification_clip_storage_keys(payload))
-
-            total_scanned += len(batch)
-            logger.info(
-                f"[Site Delete] Blob key scan batch #{batch_num}: scanned {len(batch)} notifications "
-                f"(total={total_scanned}, last_id={last_seen_id})"
-            )
-
-            if len(batch) < blob_batch_size:
-                break
-    except Exception as exc:
-        logger.error(
-            f"[Site Delete] Phase 3 FAILED after scanning {total_scanned} notifications: {exc}",
-            exc_info=True,
-        )
-        raise
-
-    logger.info(
-        f"[Site Delete] Scanned {total_scanned} notifications — "
-        f"found {len(alert_blob_keys)} alert images and {len(notification_clip_blob_keys)} clip files"
-    )
-
-    # Extract clips from video records
-    clip_blob_keys: List[str] = []
-    if camera_uuids:
-        async with AsyncSessionLocal() as clip_db:
-            clip_records = (
-                await clip_db.execute(
-                    select(VideoRecord.storage_key).where(
-                        VideoRecord.camera_uuid.in_(camera_uuids),
-                        VideoRecord.storage_key.isnot(None),
-                    )
-                )
-            ).scalars().all()
-
-        clip_blob_keys = [
-            str(k).strip()
-            for k in clip_records
-            if str(k or "").strip()
-        ]
-        logger.info(f"[Site Delete] Found {len(clip_blob_keys)} clip files in video records")
-
-    clip_blob_keys.extend(notification_clip_blob_keys)
-
-    # ========================================
-    # PHASE 4: Batch delete from database
+    # PHASE 3: Database & Blob Key Extraction (Merged)
     # Cameras are already stopped — no new rows arrive during deletion.
+    # We delete in batches and extract blob keys simultaneously to avoid a double-scan.
     # ========================================
-    logger.info(f"[Site Delete] Phase 4: Starting database cleanup (batched)")
+    logger.info(f"[Site Delete] Phase 3: Starting batched database cleanup and blob key extraction")
+    
+    alert_blob_keys: List[str] = []
+    clip_blob_keys: List[str] = []
+    
     try:
-        stats = await site_repo.delete_site_graph_batched(
+        # Pass extract_image_storage_key and _extract_notification_clip_storage_keys 
+        # so the repository can extract keys while it has the rows loaded for deletion.
+        stats, alert_blob_keys, clip_blob_keys = await site_repo.delete_site_graph_batched(
             AsyncSessionLocal,
             site_uuid=site.site_uuid,
             camera_uuids=camera_uuids,
             batch_size=2000,
+            extract_alert_key_fn=extract_image_storage_key,
+            extract_clip_keys_fn=_extract_notification_clip_storage_keys,
         )
         logger.info(f"[Site Delete] Database cleanup complete: {stats}")
+        logger.info(
+            f"[Site Delete] Extracted {len(alert_blob_keys)} alert images and "
+            f"{len(clip_blob_keys)} clip files for background deletion"
+        )
     except Exception as e:
         logger.error(f"[Site Delete] Database cleanup FAILED: {e}", exc_info=True)
         raise
 
     # ========================================
-    # PHASE 6: Delete blobs from Azure storage (async, parallel batches)
+    # PHASE 4: Delete blobs from Azure storage (async, parallel batches)
     # ========================================
     if alert_blob_keys:
-        logger.info(f"[Site Delete] Phase 6a: Scheduling deletion of {len(alert_blob_keys)} alert image blobs")
+        logger.info(f"[Site Delete] Phase 4a: Scheduling deletion of {len(alert_blob_keys)} alert image blobs")
         _spawn_bg_task(
             _delete_blobs_background(
                 alert_blob_keys,
@@ -1240,7 +1171,7 @@ async def delete_site(
         )
     
     if clip_blob_keys:
-        logger.info(f"[Site Delete] Phase 6b: Scheduling deletion of {len(clip_blob_keys)} clip blobs")
+        logger.info(f"[Site Delete] Phase 4b: Scheduling deletion of {len(clip_blob_keys)} clip blobs")
         _spawn_bg_task(
             _delete_blobs_background(
                 clip_blob_keys,
@@ -1251,9 +1182,9 @@ async def delete_site(
         )
 
     # ========================================
-    # PHASE 7: Invalidate caches
+    # PHASE 5: Invalidate caches
     # ========================================
-    logger.info(f"[Site Delete] Phase 7: Invalidating camera mode caches")
+    logger.info(f"[Site Delete] Phase 5: Invalidating camera mode caches")
     for camera_uuid in camera_uuids:
         try:
             await invalidate_camera_mode_cache(camera_uuid)

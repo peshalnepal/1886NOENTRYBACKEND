@@ -970,73 +970,57 @@ async def delete_camera(
             logger.warning(f"[Camera Delete] Runtime cleanup failed for cam={camera_uuid}: {exc}", exc_info=True)
 
     # ========================================
-    # PHASE 3: Extract blob storage keys from stable DB
-    # Camera is stopped — no new rows being created.
+    # PHASE 3+4: Extract blob storage keys & Delete all linked DB rows
+    # Order: notifications first (batch delete + extract keys),
+    # then video records (batch delete + extract keys),
+    # then remaining children, then camera itself.
     # ========================================
-    logger.info(f"[Camera Delete] Phase 3: Extracting blob storage keys")
+    logger.info(f"[Camera Delete] Phase 3+4: Deleting database rows and extracting blob keys")
     alert_blob_keys: List[str] = []
     clip_blob_keys: List[str] = []
 
-    offset = 0
-    batch_size = 5000
-    while True:
-        async with AsyncSessionLocal() as blob_db:
-            batch = (
-                await blob_db.execute(
-                    select(Notification.id, Notification.payload)
-                    .where(Notification.camera_uuid == camera_uuid)
-                    .order_by(Notification.id)
-                    .offset(offset)
-                    .limit(batch_size)
-                )
-            ).all()
+    repo_for_delete = SiteRepository()
 
-        if not batch:
-            break
+    # Batch delete notifications and extract keys
+    deleted_notifs = await repo_for_delete._batch_delete(
+        AsyncSessionLocal,
+        table=Notification,
+        where_clause=Notification.camera_uuid == camera_uuid,
+        batch_size=2000,
+        label="camera_notifications",
+        extract_col=Notification.payload,
+        extract_alert_fn=extract_image_storage_key,
+        extract_clip_fn=_extract_notification_clip_storage_keys,
+        alert_keys_out=alert_blob_keys,
+        clip_keys_out=clip_blob_keys,
+    )
 
-        for _nid, payload in batch:
-            key = extract_image_storage_key(payload)
-            if key:
-                alert_blob_keys.append(key)
-            clip_blob_keys.extend(_extract_notification_clip_storage_keys(payload))
-
-        offset += batch_size
-        if len(batch) < batch_size:
-            break
-
-    video_clip_keys = (
-        await db.execute(
-            select(VideoRecord.storage_key).where(
-                VideoRecord.camera_uuid == camera_uuid,
-                VideoRecord.storage_key.isnot(None),
-            )
-        )
-    ).scalars().all()
-    clip_blob_keys.extend([str(k).strip() for k in video_clip_keys if str(k or "").strip()])
+    # Batch delete video records and extract keys
+    deleted_vids = await repo_for_delete._batch_delete(
+        AsyncSessionLocal,
+        table=VideoRecord,
+        where_clause=VideoRecord.camera_uuid == camera_uuid,
+        batch_size=2000,
+        label="camera_video_records",
+        extract_col=VideoRecord.storage_key,
+        clip_keys_out=clip_blob_keys,
+    )
 
     logger.info(
         f"[Camera Delete] Found {len(alert_blob_keys)} alert image blobs, "
         f"{len(clip_blob_keys)} clip blobs"
     )
 
-    # ========================================
-    # PHASE 4: Delete all linked DB rows
-    # Order: notifications first (SET NULL FK — must be explicit),
-    # then remaining children, then camera itself.
-    # ========================================
-    logger.info(f"[Camera Delete] Phase 4: Deleting database rows")
     async with AsyncSessionLocal() as del_db:
-        # Notifications have ondelete="SET NULL" — must delete explicitly
-        await del_db.execute(sql_delete(Notification).where(Notification.camera_uuid == camera_uuid))
         # Children with CASCADE FKs (explicit for safety)
-        await del_db.execute(sql_delete(VideoRecord).where(VideoRecord.camera_uuid == camera_uuid))
         await del_db.execute(sql_delete(PipelineCamera).where(PipelineCamera.camera_uuid == camera_uuid))
         await del_db.execute(sql_delete(CameraDevice).where(CameraDevice.camera_uuid == camera_uuid))
         await del_db.execute(sql_delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
         # Finally delete the camera row itself
         await del_db.execute(sql_delete(Camera).where(Camera.camera_uuid == camera_uuid))
         await del_db.commit()
-    logger.info(f"[Camera Delete] Database deletion complete")
+
+    logger.info(f"[Camera Delete] Database deletion complete (deleted {deleted_notifs} notifications, {deleted_vids} videos)")
 
     # ========================================
     # PHASE 5: Async blob deletion

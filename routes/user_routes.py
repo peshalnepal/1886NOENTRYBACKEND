@@ -333,63 +333,57 @@ async def delete_my_account(
             logger.warning(f"[User Delete] Manager cleanup failed — proceeding: {exc}", exc_info=True)
 
     # ========================================
-    # PHASE 3: Extract blob storage keys from stable DB
-    # Cameras are stopped — no new rows being created.
+    # PHASE 3+4: Extract blob storage keys & Delete user from DB
+    # We batch-delete large tables (extracting keys) to prevent long transactions
+    # and OOM errors, then explicitly delete sites and the user to trigger cascades.
     # ========================================
-    logger.info(f"[User Delete] Phase 3: Extracting blob storage keys")
+    logger.info(f"[User Delete] Phase 3+4: Extracting blob keys & deleting DB rows")
     alert_blob_keys: List[str] = []
     clip_blob_keys: List[str] = []
 
-    offset = 0
-    batch_size = 5000
-    while True:
-        async with AsyncSessionLocal() as blob_db:
-            batch = (
-                await blob_db.execute(
-                    select(Notification.id, Notification.payload)
-                    .where(Notification.user_id == user_id)
-                    .order_by(Notification.id)
-                    .offset(offset)
-                    .limit(batch_size)
-                )
-            ).all()
+    from application.repositories.site_repository import SiteRepository
+    repo_for_delete = SiteRepository()
 
-        if not batch:
-            break
+    # Batch delete notifications and extract keys
+    deleted_notifs = await repo_for_delete._batch_delete(
+        AsyncSessionLocal,
+        table=Notification,
+        where_clause=Notification.user_id == user_id,
+        batch_size=2000,
+        label="user_notifications",
+        extract_col=Notification.payload,
+        extract_alert_fn=extract_image_storage_key,
+        extract_clip_fn=_extract_notification_clip_storage_keys,
+        alert_keys_out=alert_blob_keys,
+        clip_keys_out=clip_blob_keys,
+    )
 
-        for _nid, notif_payload in batch:
-            key = extract_image_storage_key(notif_payload)
-            if key:
-                alert_blob_keys.append(key)
-            clip_blob_keys.extend(_extract_notification_clip_storage_keys(notif_payload))
-
-        offset += batch_size
-        if len(batch) < batch_size:
-            break
-
+    deleted_vids = 0
     if camera_uuids:
-        video_clip_keys = (
-            await db.execute(
-                select(VideoRecord.storage_key).where(
-                    VideoRecord.camera_uuid.in_(camera_uuids),
-                    VideoRecord.storage_key.isnot(None),
-                )
-            )
-        ).scalars().all()
-        clip_blob_keys.extend([str(k).strip() for k in video_clip_keys if str(k or "").strip()])
+        # Batch delete video records and extract keys
+        deleted_vids = await repo_for_delete._batch_delete(
+            AsyncSessionLocal,
+            table=VideoRecord,
+            where_clause=VideoRecord.camera_uuid.in_(camera_uuids),
+            batch_size=2000,
+            label="user_video_records",
+            extract_col=VideoRecord.storage_key,
+            clip_keys_out=clip_blob_keys,
+        )
 
     logger.info(
         f"[User Delete] Found {len(alert_blob_keys)} alert image blobs, "
         f"{len(clip_blob_keys)} clip blobs"
     )
 
-    # ========================================
-    # PHASE 4: Delete user from DB
-    # DB cascade (passive_deletes=True) removes sites → cameras → video_records,
-    # channel_configurations, camera_devices, pipeline_cameras, notifications.
-    # ========================================
-    logger.info(f"[User Delete] Phase 4: Deleting user from database")
+    logger.info(f"[User Delete] Deleting remaining DB records (sites, user, cascades)")
     try:
+        if site_uuids:
+            # Explicitly delete sites; cameras and relationships should cascade 
+            # based on how your DB is configured, but if there's any orphaned data
+            # this ensures the main entities are gone.
+            await db.execute(sql_delete(Site).where(Site.user_id == user_id))
+
         await db.delete(current_user)
         await db.commit()
         _invalidate_user_snapshot_cache(request, user_id)

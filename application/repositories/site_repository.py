@@ -317,19 +317,14 @@ class SiteRepository:
         site_uuid: uuid.UUID,
         camera_uuids: Optional[List[uuid.UUID]] = None,
         batch_size: int = 2000,
-    ) -> dict:
+        extract_alert_key_fn = None,
+        extract_clip_keys_fn = None,
+    ) -> tuple[dict, list[str], list[str]]:
         """
         OPTIMIZED deletion with batching to avoid 502/503 errors on large sites.
+        Extracts blob keys during deletion to avoid double-scanning.
         
-        Deletes in this order:
-        1. Notifications (largest table, batched)
-        2. VideoRecords (batched)
-        3. Camera relationships
-        4. Cameras
-        5. Site settings & links
-        6. Site itself
-        
-        Returns: {"notifications": count, "videos": count, "cameras": count}
+        Returns: (stats_dict, alert_blob_keys, clip_blob_keys)
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -345,6 +340,8 @@ class SiteRepository:
             normalized_camera_uuids.append(parsed)
 
         stats = {"notifications": 0, "videos": 0, "cameras": len(normalized_camera_uuids)}
+        alert_blob_keys = []
+        clip_blob_keys = []
 
         # Phase 1: Batch delete notifications (LARGEST table - often millions)
         logger.info(f"[Site Delete] Phase 1: Deleting notifications for site={site_uuid}")
@@ -354,6 +351,11 @@ class SiteRepository:
             where_clause=Notification.site_uuid == site_uuid,
             batch_size=batch_size,
             label="notifications",
+            extract_col=Notification.payload,
+            extract_alert_fn=extract_alert_key_fn,
+            extract_clip_fn=extract_clip_keys_fn,
+            alert_keys_out=alert_blob_keys,
+            clip_keys_out=clip_blob_keys,
         )
         logger.info(f"[Site Delete] Deleted {stats['notifications']} notifications")
 
@@ -366,6 +368,8 @@ class SiteRepository:
                 where_clause=VideoRecord.camera_uuid.in_(normalized_camera_uuids),
                 batch_size=batch_size,
                 label="video records",
+                extract_col=VideoRecord.storage_key,
+                clip_keys_out=clip_blob_keys,
             )
             logger.info(f"[Site Delete] Deleted {stats['videos']} video records")
 
@@ -410,7 +414,7 @@ class SiteRepository:
         logger.info(f"[Site Delete] Phase 7: Deleted {site_count} site rows")
 
         logger.info(f"[Site Delete] COMPLETE: Deleted {stats['notifications']} notifications, {stats['videos']} videos, {stats['cameras']} cameras")
-        return stats
+        return stats, alert_blob_keys, clip_blob_keys
 
     async def _batch_delete(
         self,
@@ -420,10 +424,15 @@ class SiteRepository:
         where_clause,
         batch_size: int = 2000,
         label: str = "records",
+        extract_col=None,
+        extract_alert_fn=None,
+        extract_clip_fn=None,
+        alert_keys_out=None,
+        clip_keys_out=None,
     ) -> int:
         """
         Delete large tables in batches to avoid locking and memory issues.
-        Each batch uses a separate transaction.
+        Each batch uses a separate transaction. Optionally extracts blob keys.
 
         Uses a subquery approach because SQLAlchemy's delete() does not
         support .limit(). The pattern is:
@@ -439,13 +448,35 @@ class SiteRepository:
         while True:
             async with session_factory() as session:
                 try:
-                    # Select a batch of IDs to delete
-                    id_stmt = (
-                        select(pk)
-                        .where(where_clause)
-                        .limit(batch_size)
-                    )
-                    batch_ids = (await session.execute(id_stmt)).scalars().all()
+                    # Select a batch of IDs (and optionally extract columns)
+                    if extract_col is not None:
+                        stmt = select(pk, extract_col).where(where_clause).limit(batch_size)
+                        rows = (await session.execute(stmt)).all()
+                        batch_ids = [r[0] for r in rows]
+
+                        for r in rows:
+                            col_val = r[1]
+                            if not col_val:
+                                continue
+
+                            if extract_alert_fn or extract_clip_fn:
+                                # Dictionary payload (Notification)
+                                if extract_alert_fn and alert_keys_out is not None:
+                                    k = extract_alert_fn(col_val)
+                                    if k:
+                                        alert_keys_out.append(k)
+                                if extract_clip_fn and clip_keys_out is not None:
+                                    k_list = extract_clip_fn(col_val)
+                                    if k_list:
+                                        clip_keys_out.extend(k_list)
+                            elif isinstance(col_val, str) and clip_keys_out is not None:
+                                # Plain string key (VideoRecord)
+                                k = col_val.strip()
+                                if k:
+                                    clip_keys_out.append(k)
+                    else:
+                        id_stmt = select(pk).where(where_clause).limit(batch_size)
+                        batch_ids = (await session.execute(id_stmt)).scalars().all()
 
                     if not batch_ids:
                         break
