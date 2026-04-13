@@ -127,10 +127,12 @@ def _recursively_make_mutable(value, root):
 
 class JSONDict(TypeDecorator):
     impl = JSON
+    cache_ok = True
 
 
 class JSONList(TypeDecorator):
     impl = JSON
+    cache_ok = True
 
 
 DeepMutableDict.associate_with(JSONDict)
