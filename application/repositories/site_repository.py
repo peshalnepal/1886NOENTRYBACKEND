@@ -147,21 +147,21 @@ class SiteRepository:
         return out
 
     async def get_site(self,db:AsyncSession,*,site_uuid: uuid.UUID,user_id:int=None)->Optional[Site]:
-        smt = select(Site).where(Site.site_uuid == site_uuid)
+        smt = select(Site).where(Site.site_uuid == site_uuid, Site.is_deleted == False)
         if user_id is not None:
             smt = smt.where(Site.user_id == int(user_id))
         site = (await db.execute(smt)).scalar_one_or_none()
         if not site:
             raise HTTPException(status_code=404, detail="Site not found")
         return site
-    
+
     async def get_sites(self, db: AsyncSession, *, user_id: int) -> List[Site]:
         if user_id is None:
             raise HTTPException(status_code=400, detail="user_id is required")
 
         stmt = (
             select(Site)
-            .where(Site.user_id == int(user_id))
+            .where(Site.user_id == int(user_id), Site.is_deleted == False)
             .order_by(Site.created_at.desc())
         )
         return (await db.execute(stmt)).scalars().all()

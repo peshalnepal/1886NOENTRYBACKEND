@@ -418,6 +418,36 @@ class DatabaseManager:
                                     "Failed creating index %s.%s: %s", tbl, idx_name, exc
                                 )
 
+            # Migrate: add sites.is_deleted soft-delete flag if missing.
+            # During site/user deletion the site row stays alive while the
+            # background task batch-deletes notifications and extracts blob
+            # keys.  is_deleted hides the site from all list/get queries so
+            # it never reappears in the frontend.
+            if dialect_name.startswith("mysql"):
+                is_deleted_col = (
+                    await conn.execute(
+                        text("""
+                            SELECT 1
+                            FROM information_schema.COLUMNS
+                            WHERE TABLE_SCHEMA = DATABASE()
+                              AND TABLE_NAME   = 'sites'
+                              AND COLUMN_NAME  = 'is_deleted'
+                            LIMIT 1
+                        """)
+                    )
+                ).fetchone()
+                if not is_deleted_col:
+                    try:
+                        await conn.execute(
+                            text("ALTER TABLE sites ADD COLUMN is_deleted TINYINT(1) NOT NULL DEFAULT 0")
+                        )
+                        logger.info("Added sites.is_deleted column.")
+                    except Exception as exc:
+                        if _is_duplicate_column_error(exc):
+                            logger.info("sites.is_deleted column already exists.")
+                        else:
+                            raise
+
         # Seed a dev user if DB is empty.
         async with self.AsyncSessionLocal() as db:
             existing = (await db.execute(select(User.id).limit(1))).scalar_one_or_none()

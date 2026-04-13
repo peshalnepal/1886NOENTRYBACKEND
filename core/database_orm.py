@@ -199,6 +199,8 @@ class Site(Base):
     address = Column(String(255), nullable=True)
     timezone = Column(String(50), nullable=True, default="UTC")
 
+    is_deleted = Column(Boolean, default=False, nullable=False, server_default="0")
+
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 

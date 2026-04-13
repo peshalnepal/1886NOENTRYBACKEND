@@ -114,7 +114,7 @@ async def add_notification_email(
     """
     normalized_email = payload.email.lower().strip()
 
-    site_stmt = select(Site.site_uuid).where(Site.user_id == int(user.id))
+    site_stmt = select(Site.site_uuid).where(Site.user_id == int(user.id), Site.is_deleted == False)
     if payload.site_uuid is not None:
         site_stmt = site_stmt.where(Site.site_uuid == payload.site_uuid)
 

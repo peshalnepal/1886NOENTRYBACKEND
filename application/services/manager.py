@@ -1997,7 +1997,7 @@ class Manager:
             logger.exception("Error during device cleanup for %s", device_uuid)
             
     async def _get_site(self, db: AsyncSession, user_id: int, site_uuid: uuid.UUID) -> Site:
-        q = select(Site).where(Site.site_uuid == site_uuid, Site.user_id == user_id)
+        q = select(Site).where(Site.site_uuid == site_uuid, Site.user_id == user_id, Site.is_deleted == False)
         site = (await db.execute(q)).scalar_one_or_none()
         if not site:
             raise HTTPException(status_code=404, detail="Site not found")

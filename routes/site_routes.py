@@ -727,7 +727,7 @@ async def get_site_settings(
     result = await db.execute(
         select(Site, SiteSettings)
         .outerjoin(SiteSettings, SiteSettings.site_uuid == Site.site_uuid)
-        .where(Site.site_uuid == site_uuid, Site.user_id == int(user.id))
+        .where(Site.site_uuid == site_uuid, Site.user_id == int(user.id), Site.is_deleted == False)
     )
     row = result.one_or_none()
     if row is None:
@@ -1164,7 +1164,16 @@ async def delete_site(
             batch_size=2000,
             keep_site_row=True,
         )
-        logger.info(f"[Site Delete] Foreground database cleanup complete (site row kept)")
+        # Mark site as soft-deleted so it disappears from all queries immediately
+        async with AsyncSessionLocal() as sd_session:
+            await sd_session.execute(
+                update(Site)
+                .where(Site.site_uuid == site.site_uuid)
+                .values(is_deleted=True)
+                .execution_options(synchronize_session=False)
+            )
+            await sd_session.commit()
+        logger.info(f"[Site Delete] Foreground database cleanup complete (site row soft-deleted)")
     except Exception as e:
         logger.error(f"[Site Delete] Database cleanup FAILED: {e}", exc_info=True)
         raise

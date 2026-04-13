@@ -381,6 +381,17 @@ async def delete_my_account(
                 )
                 await del_session.commit()
 
+        # Mark all sites as soft-deleted so they disappear from queries immediately
+        if site_uuids:
+            async with AsyncSessionLocal() as sd_session:
+                await sd_session.execute(
+                    update(Site)
+                    .where(Site.user_id == user_id)
+                    .values(is_deleted=True)
+                    .execution_options(synchronize_session=False)
+                )
+                await sd_session.commit()
+
         _invalidate_user_snapshot_cache(request, user_id)
     except Exception:
         raise

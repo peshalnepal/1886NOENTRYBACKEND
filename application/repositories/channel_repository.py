@@ -392,7 +392,7 @@ class ChannelRepository:
             raise ValueError(f"Pipeline not found: {pipeline_id}")
 
     async def _ensure_site_exists(self, db: AsyncSession, site_uuid: uuid.UUID) -> None:
-        exists = (await db.execute(select(Site).where(Site.site_uuid == site_uuid))).scalar_one_or_none()
+        exists = (await db.execute(select(Site).where(Site.site_uuid == site_uuid, Site.is_deleted == False))).scalar_one_or_none()
         if exists is None:
             raise ValueError(f"Site not found: {site_uuid}")
 
