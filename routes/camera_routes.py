@@ -970,16 +970,48 @@ async def delete_camera(
             logger.warning(f"[Camera Delete] Runtime cleanup failed for cam={camera_uuid}: {exc}", exc_info=True)
 
     # ========================================
-    # PHASE 3: Fast Foreground DB Cleanup
+    # PHASE 3a: Extract video record blob keys BEFORE camera deletion.
+    # Camera deletion CASCADE-deletes VideoRecords, losing storage_key.
     # ========================================
-    logger.info(f"[Camera Delete] Phase 3: Deleting camera from DB (Foreground)")
+    video_clip_keys: List[str] = []
+    async with AsyncSessionLocal() as vr_session:
+        vr_rows = (
+            await vr_session.execute(
+                select(VideoRecord.storage_key)
+                .where(VideoRecord.camera_uuid == camera_uuid)
+            )
+        ).scalars().all()
+        video_clip_keys = [k.strip() for k in vr_rows if k and k.strip()]
+    logger.info(f"[Camera Delete] Phase 3a: Extracted {len(video_clip_keys)} video record blob keys")
+
+    # ========================================
+    # PHASE 3b: Snapshot notification IDs for this camera BEFORE
+    # camera deletion SET NULLs Notification.camera_uuid.
+    # We store just the IDs so the background task can query by ID
+    # instead of by camera_uuid (which will be NULL after this).
+    # For cameras with millions of notifications this list may be
+    # large, but IDs are just integers so memory is bounded.
+    # ========================================
+    notification_ids: List[int] = []
+    async with AsyncSessionLocal() as nid_session:
+        nid_rows = (
+            await nid_session.execute(
+                select(Notification.id)
+                .where(Notification.camera_uuid == camera_uuid)
+            )
+        ).scalars().all()
+        notification_ids = list(nid_rows)
+    logger.info(f"[Camera Delete] Phase 3b: Snapshotted {len(notification_ids)} notification IDs")
+
+    # ========================================
+    # PHASE 3c: Fast Foreground DB Cleanup
+    # ========================================
+    logger.info(f"[Camera Delete] Phase 3c: Deleting camera from DB (Foreground)")
 
     async with AsyncSessionLocal() as del_db:
-        # Children with CASCADE FKs (explicit for safety)
         await del_db.execute(sql_delete(PipelineCamera).where(PipelineCamera.camera_uuid == camera_uuid))
         await del_db.execute(sql_delete(CameraDevice).where(CameraDevice.camera_uuid == camera_uuid))
         await del_db.execute(sql_delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
-        # Finally delete the camera row itself
         await del_db.execute(sql_delete(Camera).where(Camera.camera_uuid == camera_uuid))
         await del_db.commit()
 
@@ -991,41 +1023,40 @@ async def delete_camera(
     await invalidate_camera_mode_cache(camera_uuid)
 
     # ========================================
-    # PHASE 5: Background Database Cleanup (Notifications & Videos)
+    # PHASE 5: Background Database Cleanup (Notifications & Blobs)
+    # Camera row is gone.  VideoRecords were cascade-deleted but their
+    # blob keys were captured in Phase 3a.  Notification.camera_uuid
+    # was SET NULL but we captured notification IDs in Phase 3b.
     # ========================================
     logger.info(f"[Camera Delete] Phase 5: Spawning background task to clean up heavy tables (Notifications/Videos)")
 
-    async def _heavy_table_cleanup_task(cam_uuid: uuid.UUID):
+    async def _heavy_table_cleanup_task(
+        cam_uuid: uuid.UUID,
+        notif_ids: List[int],
+        pre_video_keys: List[str],
+    ):
         logger.info(f"[Camera Cleanup Task] Starting background heavy cleanup for camera={cam_uuid}")
         repo_for_delete = SiteRepository()
         alert_blob_keys: List[str] = []
-        clip_blob_keys: List[str] = []
+        clip_blob_keys: List[str] = list(pre_video_keys)
 
         try:
-            # Batch delete notifications and extract keys
-            await repo_for_delete._batch_delete(
-                AsyncSessionLocal,
-                table=Notification,
-                where_clause=Notification.camera_uuid == cam_uuid,
-                batch_size=2000,
-                label="camera_notifications",
-                extract_col=Notification.payload,
-                extract_alert_fn=extract_image_storage_key,
-                extract_clip_fn=_extract_notification_clip_storage_keys,
-                alert_keys_out=alert_blob_keys,
-                clip_keys_out=clip_blob_keys,
-            )
-
-            # Batch delete video records and extract keys
-            await repo_for_delete._batch_delete(
-                AsyncSessionLocal,
-                table=VideoRecord,
-                where_clause=VideoRecord.camera_uuid == cam_uuid,
-                batch_size=2000,
-                label="camera_video_records",
-                extract_col=VideoRecord.storage_key,
-                clip_keys_out=clip_blob_keys,
-            )
+            # Batch delete notifications by ID (camera_uuid is NULL now)
+            if notif_ids:
+                for i in range(0, len(notif_ids), 2000):
+                    batch_ids = notif_ids[i : i + 2000]
+                    await repo_for_delete._batch_delete(
+                        AsyncSessionLocal,
+                        table=Notification,
+                        where_clause=Notification.id.in_(batch_ids),
+                        batch_size=2000,
+                        label="camera_notifications",
+                        extract_col=Notification.payload,
+                        extract_alert_fn=extract_image_storage_key,
+                        extract_clip_fn=_extract_notification_clip_storage_keys,
+                        alert_keys_out=alert_blob_keys,
+                        clip_keys_out=clip_blob_keys,
+                    )
 
             # Schedule the blob deletions
             if alert_blob_keys:
@@ -1045,7 +1076,7 @@ async def delete_camera(
             logger.error(f"[Camera Cleanup Task] Failed heavy cleanup for camera={cam_uuid}: {e}", exc_info=True)
 
     _spawn_bg_task(
-        _heavy_table_cleanup_task(camera_uuid),
+        _heavy_table_cleanup_task(camera_uuid, notification_ids, video_clip_keys),
         name=f"delete_camera_heavy_tables:{camera_uuid}",
     )
 

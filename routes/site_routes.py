@@ -1127,69 +1127,125 @@ async def delete_site(
         )
 
     # ========================================
-    # PHASE 3: Database & Blob Key Extraction (Merged)
-    # Cameras are already stopped — no new rows arrive during deletion.
-    # We delete in batches and extract blob keys simultaneously to avoid a double-scan.
+    # PHASE 3a: Extract video record blob keys BEFORE camera deletion.
+    # Camera deletion CASCADE-deletes VideoRecords, so we must snapshot
+    # storage_key values now.  10K videos = small SELECT, fast.
     # ========================================
-    logger.info(f"[Site Delete] Phase 3: Starting batched database cleanup and blob key extraction")
-    
-    alert_blob_keys: List[str] = []
-    clip_blob_keys: List[str] = []
-    
+    video_clip_keys: List[str] = []
+    if camera_uuids:
+        async with AsyncSessionLocal() as vr_session:
+            vr_rows = (
+                await vr_session.execute(
+                    select(VideoRecord.storage_key)
+                    .where(VideoRecord.camera_uuid.in_(camera_uuids))
+                )
+            ).scalars().all()
+            video_clip_keys = [k.strip() for k in vr_rows if k and k.strip()]
+        logger.info(f"[Site Delete] Phase 3a: Extracted {len(video_clip_keys)} video record blob keys")
+
+    # ========================================
+    # PHASE 3b: Fast Foreground DB Cleanup (site graph minus heavy tables)
+    # Delete settings, relationships, cameras, and notification emails
+    # so the UI reflects the deletion immediately.
+    # keep_site_row=True keeps the site row alive so FK CASCADE on
+    # Notification.site_uuid does NOT wipe notifications before the
+    # background task can extract their blob storage keys.
+    # Camera deletion CASCADE-deletes VideoRecords (keys already saved
+    # above) and SET NULLs Notification.camera_uuid (notifications
+    # survive because the site row is kept).
+    # ========================================
+    logger.info(f"[Site Delete] Phase 3b: Starting foreground database cleanup (site graph)")
+
     try:
-        # Pass extract_image_storage_key and _extract_notification_clip_storage_keys 
-        # so the repository can extract keys while it has the rows loaded for deletion.
-        stats, alert_blob_keys, clip_blob_keys = await site_repo.delete_site_graph_batched(
+        await site_repo.delete_site_graph_batched(
             AsyncSessionLocal,
             site_uuid=site.site_uuid,
             camera_uuids=camera_uuids,
             batch_size=2000,
-            extract_alert_key_fn=extract_image_storage_key,
-            extract_clip_keys_fn=_extract_notification_clip_storage_keys,
+            keep_site_row=True,
         )
-        logger.info(f"[Site Delete] Database cleanup complete: {stats}")
-        logger.info(
-            f"[Site Delete] Extracted {len(alert_blob_keys)} alert images and "
-            f"{len(clip_blob_keys)} clip files for background deletion"
-        )
+        logger.info(f"[Site Delete] Foreground database cleanup complete (site row kept)")
     except Exception as e:
         logger.error(f"[Site Delete] Database cleanup FAILED: {e}", exc_info=True)
         raise
 
     # ========================================
-    # PHASE 4: Delete blobs from Azure storage (async, parallel batches)
+    # PHASE 4: Invalidate caches
     # ========================================
-    if alert_blob_keys:
-        logger.info(f"[Site Delete] Phase 4a: Scheduling deletion of {len(alert_blob_keys)} alert image blobs")
-        _spawn_bg_task(
-            _delete_blobs_background(
-                alert_blob_keys,
-                service_cls=AlertImageStorageService,
-                label="alert image",
-            ),
-            name=f"delete_site_alert_blobs:{site_uuid}",
-        )
-    
-    if clip_blob_keys:
-        logger.info(f"[Site Delete] Phase 4b: Scheduling deletion of {len(clip_blob_keys)} clip blobs")
-        _spawn_bg_task(
-            _delete_blobs_background(
-                clip_blob_keys,
-                service_cls=EventClipService,
-                label="clip",
-            ),
-            name=f"delete_site_clip_blobs:{site_uuid}",
-        )
-
-    # ========================================
-    # PHASE 5: Invalidate caches
-    # ========================================
-    logger.info(f"[Site Delete] Phase 5: Invalidating camera mode caches")
+    logger.info(f"[Site Delete] Phase 4: Invalidating camera mode caches")
     for camera_uuid in camera_uuids:
         try:
             await invalidate_camera_mode_cache(camera_uuid)
         except Exception as e:
             logger.warning(f"[Site Delete] Failed to invalidate cache for camera={camera_uuid}: {e}")
+
+    # ========================================
+    # PHASE 5: Background Heavy Table Cleanup (Notifications, Blobs, Site Row)
+    # The site row is still alive (keep_site_row=True) so Notification
+    # rows with site_uuid FK have NOT been cascade-deleted.
+    # VideoRecords WERE cascade-deleted when cameras were removed in
+    # Phase 3b, but their blob keys were captured in Phase 3a.
+    # After heavy cleanup, the background task deletes the site row.
+    # ========================================
+    logger.info(f"[Site Delete] Phase 5: Spawning background task to clean up heavy tables (Notifications/Videos)")
+
+    async def _heavy_table_cleanup_task(
+        s_uuid: uuid.UUID,
+        preextracted_video_keys: List[str],
+    ):
+        logger.info(f"[Site Cleanup Task] Starting background heavy cleanup for site={s_uuid}")
+        alert_blob_keys: List[str] = []
+        clip_blob_keys: List[str] = list(preextracted_video_keys)
+
+        try:
+            # Batch delete notifications by site_uuid (site row still exists)
+            await site_repo._batch_delete(
+                AsyncSessionLocal,
+                table=Notification,
+                where_clause=Notification.site_uuid == s_uuid,
+                batch_size=2000,
+                label="site_notifications",
+                extract_col=Notification.payload,
+                extract_alert_fn=extract_image_storage_key,
+                extract_clip_fn=_extract_notification_clip_storage_keys,
+                alert_keys_out=alert_blob_keys,
+                clip_keys_out=clip_blob_keys,
+            )
+
+            # Schedule the blob deletions
+            if alert_blob_keys:
+                _spawn_bg_task(
+                    _delete_blobs_background(
+                        alert_blob_keys,
+                        service_cls=AlertImageStorageService,
+                        label="alert image",
+                    ),
+                    name=f"delete_site_alert_blobs:{s_uuid}",
+                )
+
+            if clip_blob_keys:
+                _spawn_bg_task(
+                    _delete_blobs_background(
+                        clip_blob_keys,
+                        service_cls=EventClipService,
+                        label="clip",
+                    ),
+                    name=f"delete_site_clip_blobs:{s_uuid}",
+                )
+
+            # Finally delete the site row (CASCADE cleans up any stragglers)
+            await site_repo._fast_delete(
+                AsyncSessionLocal, Site, Site.site_uuid == s_uuid
+            )
+            logger.info(f"[Site Cleanup Task] Background heavy cleanup COMPLETE for site={s_uuid}")
+
+        except Exception as e:
+            logger.error(f"[Site Cleanup Task] Failed heavy cleanup for site={s_uuid}: {e}", exc_info=True)
+
+    _spawn_bg_task(
+        _heavy_table_cleanup_task(site.site_uuid, video_clip_keys),
+        name=f"delete_site_heavy_tables:{site.site_uuid}",
+    )
 
     logger.info(f"[Site Delete] COMPLETE: site={site_uuid} has been successfully deleted")
     return None

@@ -319,6 +319,7 @@ class SiteRepository:
         batch_size: int = 2000,
         extract_alert_key_fn = None,
         extract_clip_keys_fn = None,
+        keep_site_row: bool = False,
     ) -> tuple[dict, list[str], list[str]]:
         """
         OPTIMIZED deletion with batching to avoid 502/503 errors on large sites.
@@ -375,16 +376,23 @@ class SiteRepository:
             )
 
         # Phase 3: Fast delete cameras (so they disappear from frontend immediately)
+        # NOTE: Camera deletion CASCADE-deletes VideoRecords and SET NULLs
+        # Notification.camera_uuid.  If keep_site_row=True the caller is
+        # responsible for deleting VideoRecords before this point and for
+        # deleting the site row later.
         camera_count = await self._fast_delete(db, Camera, Camera.site_uuid == site_uuid)
         logger.info(f"[Site Delete] Phase 3: Deleted {camera_count} cameras")
 
-        # Phase 4: Delete the site itself (so it disappears from frontend immediately)
-        site_count = await self._fast_delete(db, Site, Site.site_uuid == site_uuid)
-        logger.info(f"[Site Delete] Phase 4: Deleted {site_count} site rows")
-
-        # Phase 5: Fast delete notification emails
+        # Phase 4: Fast delete notification emails
         notification_email_count = await self._fast_delete(db, NotificationEmail, NotificationEmail.site_uuid == site_uuid)
-        logger.info(f"[Site Delete] Phase 5: Deleted {notification_email_count} notification emails")
+        logger.info(f"[Site Delete] Phase 4: Deleted {notification_email_count} notification emails")
+
+        # Phase 5: Delete the site itself (CASCADE-deletes remaining Notifications)
+        if not keep_site_row:
+            site_count = await self._fast_delete(db, Site, Site.site_uuid == site_uuid)
+            logger.info(f"[Site Delete] Phase 5: Deleted {site_count} site rows")
+        else:
+            logger.info(f"[Site Delete] Phase 5: Keeping site row (caller will delete after heavy cleanup)")
 
         logger.info(f"[Site Delete] FOREGROUND COMPLETE: Deleted core site graph (Settings, Relationships, Cameras, Site)")
         

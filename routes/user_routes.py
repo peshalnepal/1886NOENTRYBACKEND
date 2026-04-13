@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from application.services.user_snapshot_cache import UserSnapshotCache
 
-from core.database_orm import Camera, CameraDevice, Device, Notification, Site, User, VideoRecord
+from core.database_orm import Camera, CameraDevice, ChannelConfiguration, Device, Notification, PipelineCamera, Site, User, VideoRecord
 from core.database import AsyncSessionLocal
 from core.security.hashing import get_password_hash, verify_password
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
@@ -252,12 +252,13 @@ async def delete_my_account(
 ):
     """
     Full account deletion:
-    1. Snapshot all camera info for this user
-    2. Stop cameras (edge/WebRTC/pipeline) + purge notification service state
-    3. Extract all blob keys (notification images + clips, video record clips)
-    4. Delete user from DB (DB cascade removes sites, cameras, notifications, video records, etc.)
-    5. Async blob deletion
-    6. Invalidate caches
+    1. Snapshot camera/site info, disable cameras in DB
+    2. Stop cameras on edge/WebRTC/pipeline + purge notification service state
+    3a. Extract video record blob keys (foreground)
+    3b. Delete camera rows + relationships (foreground, makes UI clean)
+    4. Invalidate caches
+    5. Background: batch-delete notifications (extract blob keys),
+       schedule blob deletion, delete sites, delete user row
     """
     from routes.notifications_routes import invalidate_camera_mode_cache
 
@@ -335,23 +336,53 @@ async def delete_my_account(
             logger.warning(f"[User Delete] Manager cleanup failed — proceeding: {exc}", exc_info=True)
 
     # ========================================
-    # PHASE 3: Fast Foreground DB Cleanup (Sites & User)
+    # PHASE 3a: Extract video record blob keys BEFORE site/camera
+    # deletion.  Site deletion CASCADE-deletes cameras, which
+    # CASCADE-deletes VideoRecords, losing their storage_key values.
     # ========================================
-    logger.info(f"[User Delete] Phase 3: Deleting DB records (sites, user, cascades) (Foreground)")
-    try:
-        if site_uuids:
-            # Explicitly delete sites; cameras and relationships should cascade 
-            # based on how your DB is configured.
-            await db.execute(sql_delete(Site).where(Site.user_id == user_id))
+    video_clip_keys: List[str] = []
+    if camera_uuids:
+        async with AsyncSessionLocal() as vr_session:
+            vr_rows = (
+                await vr_session.execute(
+                    select(VideoRecord.storage_key)
+                    .where(VideoRecord.camera_uuid.in_(camera_uuids))
+                )
+            ).scalars().all()
+            video_clip_keys = [k.strip() for k in vr_rows if k and k.strip()]
+        logger.info(f"[User Delete] Phase 3a: Extracted {len(video_clip_keys)} video record blob keys")
 
-        await db.delete(current_user)
-        await db.commit()
+    # ========================================
+    # PHASE 3b: Fast Foreground DB Cleanup
+    # Delete camera relationships and camera rows so the UI is clean.
+    # Do NOT delete site or user rows yet — their FK CASCADEs would
+    # wipe Notification rows before the background task can extract
+    # blob storage keys.
+    # Cameras are disabled (Phase 1b) and runtime-stopped (Phase 2),
+    # so no new data arrives.
+    # Camera deletion SET NULLs Notification.camera_uuid and
+    # CASCADE-deletes VideoRecords (keys saved in Phase 3a).
+    # ========================================
+    logger.info(f"[User Delete] Phase 3b: Deleting camera rows (Foreground)")
+    try:
+        if camera_uuids:
+            async with AsyncSessionLocal() as del_session:
+                await del_session.execute(
+                    sql_delete(PipelineCamera).where(PipelineCamera.camera_uuid.in_(camera_uuids))
+                )
+                await del_session.execute(
+                    sql_delete(CameraDevice).where(CameraDevice.camera_uuid.in_(camera_uuids))
+                )
+                await del_session.execute(
+                    sql_delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid.in_(camera_uuids))
+                )
+                await del_session.execute(
+                    sql_delete(Camera).where(Camera.user_id == user_id)
+                )
+                await del_session.commit()
+
         _invalidate_user_snapshot_cache(request, user_id)
-    except HTTPException:
-        await db.rollback()
-        raise
     except Exception:
-        await db.rollback()
         raise
 
     # ========================================
@@ -364,16 +395,21 @@ async def delete_my_account(
             pass
 
     # ========================================
-    # PHASE 5: Background Database Cleanup (Notifications & Videos)
+    # PHASE 5: Background Heavy Table Cleanup (Notifications, Blobs, Sites, User)
+    # User and site rows are still alive, so Notification rows with
+    # user_id / site_uuid FKs have NOT been cascade-deleted.
+    # After batch-deleting notifications (extracting blob keys) and
+    # scheduling blob deletion, the background task deletes the
+    # site rows and user row.
     # ========================================
     logger.info(f"[User Delete] Phase 5: Spawning background task to clean up heavy tables (Notifications/Videos)")
 
-    async def _heavy_table_cleanup_task(uid: int, cam_uuids: List[uuid.UUID]):
+    async def _heavy_table_cleanup_task(uid: int, s_uuids: List, pre_video_keys: List[str]):
         logger.info(f"[User Cleanup Task] Starting background heavy cleanup for user={uid}")
         from application.repositories.site_repository import SiteRepository
         repo_for_delete = SiteRepository()
         alert_blob_keys: List[str] = []
-        clip_blob_keys: List[str] = []
+        clip_blob_keys: List[str] = list(pre_video_keys)
 
         try:
             # Batch delete notifications and extract keys
@@ -390,18 +426,6 @@ async def delete_my_account(
                 clip_keys_out=clip_blob_keys,
             )
 
-            if cam_uuids:
-                # Batch delete video records and extract keys
-                await repo_for_delete._batch_delete(
-                    AsyncSessionLocal,
-                    table=VideoRecord,
-                    where_clause=VideoRecord.camera_uuid.in_(cam_uuids),
-                    batch_size=2000,
-                    label="user_video_records",
-                    extract_col=VideoRecord.storage_key,
-                    clip_keys_out=clip_blob_keys,
-                )
-
             # Schedule the blob deletions
             if alert_blob_keys:
                 _spawn_bg_task(
@@ -414,13 +438,33 @@ async def delete_my_account(
                     _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip"),
                     name=f"delete_user_clip_blobs:{uid}",
                 )
+
+            # Delete sites (CASCADE cleans up SiteSettings, SiteDevices, NotificationEmails)
+            async with AsyncSessionLocal() as del_session:
+                if s_uuids:
+                    await del_session.execute(
+                        sql_delete(Site).where(Site.user_id == uid)
+                    )
+                    await del_session.commit()
+
+            # Finally delete the user row
+            async with AsyncSessionLocal() as del_session:
+                user_row = (
+                    await del_session.execute(
+                        select(User).where(User.id == uid)
+                    )
+                ).scalar_one_or_none()
+                if user_row is not None:
+                    await del_session.delete(user_row)
+                    await del_session.commit()
+
             logger.info(f"[User Cleanup Task] Background heavy cleanup COMPLETE for user={uid}")
 
         except Exception as e:
             logger.error(f"[User Cleanup Task] Failed heavy cleanup for user={uid}: {e}", exc_info=True)
 
     _spawn_bg_task(
-        _heavy_table_cleanup_task(user_id, camera_uuids),
+        _heavy_table_cleanup_task(user_id, site_uuids, video_clip_keys),
         name=f"delete_user_heavy_tables:{user_id}",
     )
 
