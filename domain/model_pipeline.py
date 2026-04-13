@@ -268,6 +268,14 @@ class InMemoryObjDetectStore:
         async with self._lock:
             return self._latest.get(str(camera_uuid))
 
+    async def forget(self, camera_uuid: str) -> None:
+        key = str(camera_uuid)
+        async with self._lock:
+            self._latest.pop(key, None)
+            evt = self._signal.get(key)
+            if evt is not None:
+                evt.clear()
+
     async def wait_new(
         self,
         camera_uuid: str,
@@ -573,12 +581,23 @@ class ModelPipeline:
     async def remove_channel(self, camera_uuid: str) -> bool:
         key = str(camera_uuid)
         async with self._lock:
-            self._channels.pop(key, None)
+            ch = self._channels.pop(key, None)
             t = self._poll_tasks.pop(key, None)
             self._last_seq.pop(key, None)
             self._last_seen.pop(key, None)
             self._last_ok_s.pop(key, None)
             self._last_detection_summary_s.pop(key, None)
+        if isinstance(self.detect_store, InMemoryObjDetectStore):
+            await self.detect_store.forget(key)
+        async with self._cam_ctx_cache_lock:
+            self._cam_ctx_cache.pop(key, None)
+            future = self._cam_ctx_inflight.pop(key, None)
+            if future is not None and not future.done():
+                future.cancel()
+        site_uuid = getattr(getattr(ch, "config", None), "site_uuid", None) if ch is not None else None
+        if site_uuid is not None:
+            async with self._site_cache_lock:
+                self._site_cache.pop(str(site_uuid), None)
         self._tracker.remove_camera(key)
         self._roi_engine.reset_camera(key)
 
@@ -827,7 +846,9 @@ class ModelPipeline:
         if not self._is_new_detection(key, resp):
             return False
 
-        tracker_out = self._tracker.update_from_event(payload or {})
+        tracker_payload = dict(payload or {})
+        tracker_payload["camera_uuid"] = str(resp.camera_uuid)
+        tracker_out = self._tracker.update_from_event(tracker_payload)
         tracks = tuple(tracker_out.get("tracks", []) or [])
         track_events = tuple(tracker_out.get("events", []) or [])
 
@@ -1329,7 +1350,17 @@ class ModelPipeline:
         frame_w = payload.get("frame_w") or payload.get("image_w") or payload.get("width")
         frame_h = payload.get("frame_h") or payload.get("image_h") or payload.get("height")
 
-        cam = str(payload.get("camera_uuid") or ch.config.camera_uuid)
+        expected_cam = str(ch.config.camera_uuid)
+        payload_cam = payload.get("camera_uuid")
+        if payload_cam is not None and str(payload_cam) != expected_cam:
+            logger.warning(
+                "Dropping detection payload with mismatched camera_uuid expected=%s got=%s",
+                expected_cam,
+                payload_cam,
+            )
+            return None
+
+        cam = expected_cam
 
         return ObjDetectResponse(
             camera_uuid=cam,

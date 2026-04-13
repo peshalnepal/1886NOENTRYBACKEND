@@ -805,6 +805,71 @@ def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
     return list(dict.fromkeys(keys))
 
 
+async def _cleanup_camera_runtime(
+    manager: Manager,
+    *,
+    user_id: int,
+    camera_uuid: uuid.UUID,
+    camera_code: Optional[str],
+    device_urls: List[str],
+) -> None:
+    """
+    Best-effort runtime cleanup for a single camera without creating a fresh
+    pipeline as a side effect.
+    """
+    device_url_targets = list(dict.fromkeys(str(url or "").strip() for url in device_urls if str(url or "").strip()))
+
+    active_pipeline = None
+    try:
+        active_pipeline = manager.get_loaded_pipeline(user_id=user_id)
+        if active_pipeline is not None:
+            logger.info(f"[Camera Delete] Using already-loaded pipeline for cam={camera_uuid} user={user_id}")
+        else:
+            logger.info(f"[Camera Delete] No in-memory pipeline loaded for cam={camera_uuid} user={user_id}")
+    except Exception as exc:
+        logger.warning(
+            f"[Camera Delete] Could not inspect loaded pipeline for cam={camera_uuid}: {exc}",
+            exc_info=True,
+        )
+        active_pipeline = None
+
+    if active_pipeline is not None:
+        try:
+            cfg = await active_pipeline.get_channel_config(camera_uuid)
+            runtime_device_url = str(getattr(cfg, "device_url", "") or "").strip() if cfg is not None else ""
+            if runtime_device_url:
+                device_url_targets = list(dict.fromkeys(device_url_targets + [runtime_device_url]))
+        except Exception as exc:
+            logger.warning(
+                f"[Camera Delete] Failed reading loaded pipeline config for cam={camera_uuid}: {exc}",
+                exc_info=True,
+            )
+
+    for dev_url in device_url_targets:
+        try:
+            await manager._edge.delete_camera(device_url=dev_url, camera_uuid=str(camera_uuid))
+            logger.info(f"[Camera Delete] Deleted camera={camera_uuid} from edge device url={dev_url}")
+        except Exception as exc:
+            logger.warning(f"[Camera Delete] Edge delete failed cam={camera_uuid} url={dev_url}: {exc}")
+
+    if camera_code:
+        try:
+            deleted = await manager._webrtc.delete_stream(stream_key=str(camera_code))
+            if deleted:
+                logger.info(f"[Camera Delete] Deleted WebRTC stream for camera={camera_uuid}")
+            else:
+                logger.info(f"[Camera Delete] WebRTC stream already absent for camera={camera_uuid}")
+        except Exception as exc:
+            logger.warning(f"[Camera Delete] WebRTC delete failed cam={camera_uuid} code={camera_code}: {exc}")
+
+    if active_pipeline is not None:
+        try:
+            await active_pipeline.remove_channel(camera_uuid)
+            logger.info(f"[Camera Delete] Evicted camera={camera_uuid} from loaded pipeline")
+        except Exception as exc:
+            logger.warning(f"[Camera Delete] Pipeline evict failed cam={camera_uuid}: {exc}")
+
+
 
 @router.delete("/{camera_uuid}")
 async def delete_camera(
@@ -887,30 +952,22 @@ async def delete_camera(
     # 2b: Stop on edge device, WebRTC, and evict from pipeline
     if manager is not None:
         try:
-            active_pipeline = await asyncio.wait_for(
-                manager.get_activepipeline(user_id=int(user.id)), timeout=10.0
+            await asyncio.wait_for(
+                _cleanup_camera_runtime(
+                    manager,
+                    user_id=int(user.id),
+                    camera_uuid=camera_uuid,
+                    camera_code=cam_code,
+                    device_urls=device_urls,
+                ),
+                timeout=30.0,
             )
-        except Exception:
-            active_pipeline = None
-            logger.warning(f"[Camera Delete] Could not get active pipeline for cam={camera_uuid}")
-
-        for dev_url in device_urls:
-            try:
-                await manager._edge.delete_camera(device_url=dev_url, camera_uuid=str(camera_uuid))
-            except Exception as exc:
-                logger.warning(f"[Camera Delete] Edge delete failed cam={camera_uuid} url={dev_url}: {exc}")
-
-        if cam_code:
-            try:
-                await manager._webrtc.delete_stream(stream_key=str(cam_code))
-            except Exception as exc:
-                logger.warning(f"[Camera Delete] WebRTC delete failed cam={camera_uuid} code={cam_code}: {exc}")
-
-        if active_pipeline is not None:
-            try:
-                await active_pipeline.remove_channel(camera_uuid)
-            except Exception as exc:
-                logger.warning(f"[Camera Delete] Pipeline evict failed cam={camera_uuid}: {exc}")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[Camera Delete] Runtime cleanup timed out for cam={camera_uuid}; proceeding with DB delete"
+            )
+        except Exception as exc:
+            logger.warning(f"[Camera Delete] Runtime cleanup failed for cam={camera_uuid}: {exc}", exc_info=True)
 
     # ========================================
     # PHASE 3: Extract blob storage keys from stable DB

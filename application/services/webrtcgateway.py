@@ -239,15 +239,24 @@ class WebRTCGatewayClient:
             else:
                 logger.error("MediaMTX update failed for %s", stream_key, exc_info=True)
 
-    async def delete_stream(self, *, stream_key: str) -> None:
+    async def delete_stream(self, *, stream_key: str) -> bool:
         if not self.admin_api_url:
-            return
+            return False
             
         safe_name = quote(stream_key, safe="")
         url = f"{self.admin_api_url}/v3/config/paths/delete/{safe_name}"
         
         try:
-            await self._client.delete(url, auth=self._auth())
+            response = await self._client.delete(url, auth=self._auth())
+            if response.status_code == 404:
+                logger.info("MediaMTX stream already absent for %s", stream_key)
+                return False
+            response.raise_for_status()
+            return True
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                self._response_error_message(action="MediaMTX delete", response=exc.response)
+            ) from exc
         except Exception as exc:
             if self._is_timeout_or_network_error(exc):
                 self._warn_throttled(
@@ -258,6 +267,7 @@ class WebRTCGatewayClient:
                 )
             else:
                 logger.warning("MediaMTX delete failed for %s", stream_key, exc_info=True)
+            raise
 
 
     async def list_configured_paths(self) -> List[Dict[str, Any]]:

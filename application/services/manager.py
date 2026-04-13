@@ -995,6 +995,14 @@ class Manager:
                     mp = await self._create_pipeline_unlocked(uid)
         await mp.start()
         return mp
+
+    def get_loaded_pipeline(self, user_id: int | None = None) -> Optional[ModelPipeline]:
+        """
+        Return the already-loaded in-memory pipeline for a user without creating
+        or starting a new one as a side effect.
+        """
+        uid = int(user_id or self._default_user_id)
+        return self._pipelines_by_user.get(uid)
     
     async def update_pipeline(
         self,

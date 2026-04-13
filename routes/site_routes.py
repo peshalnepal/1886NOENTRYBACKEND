@@ -318,6 +318,7 @@ async def _cleanup_cameras_background(
     cam_snapshot: List[dict],
     *,
     user_id: int,
+    site_uuid: uuid.UUID,
 ) -> None:
     """
     Best-effort runtime cleanup after the site DB rows are gone.
@@ -334,21 +335,63 @@ async def _cleanup_cameras_background(
     """
     logger.info(f"[Cleanup] Starting background cleanup of {len(cam_snapshot)} cameras for user={user_id}")
     
+    cleanup_targets: Dict[str, dict] = {
+        str(cam["camera_uuid"]): {
+            "camera_uuid": cam["camera_uuid"],
+            "camera_code": cam.get("camera_code"),
+            "device_urls": list(dict.fromkeys(cam.get("device_urls") or [])),
+        }
+        for cam in cam_snapshot
+    }
+
     active_pipeline = None
     try:
-        active_pipeline = await asyncio.wait_for(
-            manager.get_activepipeline(user_id=user_id),
-            timeout=30.0,
-        )
-        logger.info(f"[Cleanup] Obtained active pipeline for user={user_id}")
+        active_pipeline = manager.get_loaded_pipeline(user_id=user_id)
+        if active_pipeline is not None:
+            logger.info(f"[Cleanup] Using already-loaded pipeline for user={user_id}")
+        else:
+            logger.info(f"[Cleanup] No in-memory pipeline loaded for user={user_id}; channel eviction limited to DB snapshot")
     except Exception as e:
         logger.warning(
-            f"[Cleanup] Could not resolve active pipeline user={user_id}: {e}; "
-            "channel eviction skipped",
+            f"[Cleanup] Could not inspect loaded pipeline user={user_id}: {e}; "
+            "channel eviction limited to DB snapshot",
             exc_info=True,
         )
+        active_pipeline = None
 
-    for cam in cam_snapshot:
+    if active_pipeline is not None:
+        try:
+            for channel_id in active_pipeline.list_channel_ids():
+                cfg = await active_pipeline.get_channel_config(channel_id)
+                if cfg is None or getattr(cfg, "site_uuid", None) != site_uuid:
+                    continue
+
+                runtime_cam_uuid = getattr(cfg, "camera_uuid", None) or channel_id
+                runtime_key = str(runtime_cam_uuid)
+                entry = cleanup_targets.get(runtime_key)
+                if entry is None:
+                    device_url = str(getattr(cfg, "device_url", "") or "").strip()
+                    cleanup_targets[runtime_key] = {
+                        "camera_uuid": runtime_cam_uuid,
+                        "camera_code": None,
+                        "device_urls": [device_url] if device_url else [],
+                    }
+                    logger.warning(
+                        f"[Cleanup] Found runtime-only site camera={runtime_key} in loaded pipeline; adding it to cleanup set"
+                    )
+                else:
+                    device_url = str(getattr(cfg, "device_url", "") or "").strip()
+                    if device_url:
+                        entry["device_urls"] = list(
+                            dict.fromkeys(list(entry.get("device_urls") or []) + [device_url])
+                        )
+        except Exception as e:
+            logger.warning(
+                f"[Cleanup] Failed scanning loaded pipeline for site={site_uuid}: {e}",
+                exc_info=True,
+            )
+
+    for cam in cleanup_targets.values():
         cam_uuid = cam["camera_uuid"]
         cam_code = cam.get("camera_code")
         device_urls = list(dict.fromkeys(cam.get("device_urls") or []))
@@ -372,8 +415,11 @@ async def _cleanup_cameras_background(
         if cam_code:
             try:
                 logger.info(f"[Cleanup] Deleting WebRTC stream for camera={cam_uuid} code={cam_code}")
-                await manager._webrtc.delete_stream(stream_key=str(cam_code))
-                logger.info(f"[Cleanup] Successfully deleted WebRTC stream for camera={cam_uuid}")
+                deleted = await manager._webrtc.delete_stream(stream_key=str(cam_code))
+                if deleted:
+                    logger.info(f"[Cleanup] Successfully deleted WebRTC stream for camera={cam_uuid}")
+                else:
+                    logger.info(f"[Cleanup] WebRTC stream already absent for camera={cam_uuid}")
             except Exception as e:
                 logger.warning(
                     f"[Cleanup] WebRTC delete failed cam={cam_uuid} code={cam_code}: {e}",
@@ -392,7 +438,7 @@ async def _cleanup_cameras_background(
                     exc_info=True,
                 )
 
-    logger.info(f"[Cleanup] COMPLETE: Background cleanup finished for {len(cam_snapshot)} cameras")
+    logger.info(f"[Cleanup] COMPLETE: Background cleanup finished for {len(cleanup_targets)} cameras")
 
 
 def _spawn_bg_task(coro, *, name: str) -> None:
@@ -1050,13 +1096,18 @@ async def delete_site(
 
     # 2b: Remove cameras from edge devices, WebRTC, and pipeline (synchronous with timeout).
     #     After this call completes (or times out), no new detections/clips arrive.
-    if manager is not None and cam_snapshot:
+    if manager is not None:
         logger.info(
             f"[Site Delete] Stopping {len(cam_snapshot)} cameras on edge/WebRTC/pipeline"
         )
         try:
             await asyncio.wait_for(
-                _cleanup_cameras_background(manager, cam_snapshot, user_id=int(user.id)),
+                _cleanup_cameras_background(
+                    manager,
+                    cam_snapshot,
+                    user_id=int(user.id),
+                    site_uuid=site.site_uuid,
+                ),
                 timeout=90.0,
             )
             logger.info(f"[Site Delete] Cameras stopped successfully")
