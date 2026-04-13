@@ -10,7 +10,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from application.services.user_snapshot_cache import UserSnapshotCache
@@ -280,6 +280,21 @@ async def delete_my_account(
     ).scalars().all()
 
     logger.info(f"[User Delete] Snapshotted {len(camera_uuids)} cameras, {len(site_uuids)} sites")
+
+    # ========================================
+    # PHASE 1b: Disable all cameras in DB BEFORE edge/MediaMTX cleanup.
+    # Reconcile reads is_enabled/is_detection_enabled from DB; if it fires
+    # between our edge cleanup and DB deletion it re-adds the cameras.
+    # ========================================
+    if camera_uuids:
+        logger.info(f"[User Delete] Phase 1b: Disabling {len(camera_uuids)} cameras in DB to prevent reconcile re-adds")
+        await db.execute(
+            update(Camera)
+            .where(Camera.user_id == user_id)
+            .values(is_enabled=False, is_detection_enabled=False)
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
 
     # ========================================
     # PHASE 2: Stop cameras BEFORE any DB changes

@@ -15,7 +15,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete as sql_delete, select
+from sqlalchemy import delete as sql_delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dependencies import get_async_db, get_current_user, get_manager
@@ -847,6 +847,20 @@ async def delete_camera(
         )
     ).all()
     device_urls = [str(row[1]).strip() for row in device_url_rows if str(row[1] or "").strip()]
+
+    # ========================================
+    # PHASE 1b: Disable camera in DB BEFORE edge/MediaMTX cleanup.
+    # Reconcile reads is_enabled/is_detection_enabled from DB; if it fires
+    # between our edge cleanup and DB deletion it re-adds the camera.
+    # ========================================
+    logger.info(f"[Camera Delete] Phase 1b: Disabling camera in DB to prevent reconcile re-adds")
+    await db.execute(
+        update(Camera)
+        .where(Camera.camera_uuid == camera_uuid, Camera.user_id == int(user.id))
+        .values(is_enabled=False, is_detection_enabled=False)
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
 
     # ========================================
     # PHASE 2: Stop camera BEFORE any DB changes
