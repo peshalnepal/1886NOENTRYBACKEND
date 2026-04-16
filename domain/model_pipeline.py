@@ -397,6 +397,12 @@ class ModelPipeline:
         self._session_factory: Optional[SessionFactory] = None
         self._site_cache: Dict[str, Tuple[str, float]] = {}
         self._site_cache_lock = asyncio.Lock()
+        self._site_trigger_mode_cache: Dict[str, Tuple[str, float]] = {}
+        self._site_trigger_mode_cache_lock = asyncio.Lock()
+        self._site_trigger_mode_ttl_s = max(
+            5.0,
+            float(os.getenv("SITE_TRIGGER_MODE_CACHE_TTL_S", "30.0")),
+        )
         self._device_fetch_limits: Dict[str, asyncio.Semaphore] = {}
         self._max_concurrent_fetch_per_device = max(
             1,
@@ -501,6 +507,79 @@ class ModelPipeline:
         Clear per-camera ROI edge-trigger state so ROI edits take effect immediately.
         """
         self._roi_engine.reset_camera(str(camera_uuid))
+
+    async def _get_site_trigger_mode(self, site_uuid: Optional[str]) -> str:
+        """
+        Return the trigger_mode from the site's multi_camera_prerecord settings.
+
+        Values: "roi_enter" | "any_detection"
+
+        - "roi_enter"      → only emit ROI-enter notifications
+        - "any_detection"  → emit all notification types (default / backward-compatible)
+
+        Result is cached per site_uuid for _site_trigger_mode_ttl_s seconds.
+        Falls back to "any_detection" (permissive) when the setting cannot be loaded.
+        """
+        if not site_uuid:
+            return "roi_enter"
+
+        key = str(site_uuid)
+        now = time.monotonic()
+
+        async with self._site_trigger_mode_cache_lock:
+            cached = self._site_trigger_mode_cache.get(key)
+            if cached and (now - cached[1]) < self._site_trigger_mode_ttl_s:
+                return cached[0]
+
+        sf = self._session_factory
+        if sf is None:
+            return "roi_enter"
+
+        try:
+            su = UUID(key)
+        except Exception:
+            return "roi_enter"
+
+        trigger_mode = "roi_enter"
+        try:
+            from core.database_orm import SiteSettings
+            async with sf() as db:
+                res = await db.execute(
+                    select(SiteSettings.config).where(SiteSettings.site_uuid == su)
+                )
+                config = res.scalar_one_or_none()
+                if isinstance(config, dict):
+                    rule = config.get("multi_camera_prerecord") or {}
+                    if isinstance(rule, dict):
+                        raw = str(rule.get("trigger_mode") or "roi_enter").strip().lower()
+                        if raw in {"roi_enter", "any_detection"}:
+                            trigger_mode = raw
+        except Exception:
+            logger.exception("Failed to load site trigger_mode site_uuid=%s", site_uuid)
+            trigger_mode = "roi_enter"
+
+        async with self._site_trigger_mode_cache_lock:
+            self._site_trigger_mode_cache[key] = (trigger_mode, time.monotonic())
+
+        return trigger_mode
+
+    def invalidate_site_trigger_mode_cache(self, site_uuid: str) -> None:
+        """
+        Invalidate the cached trigger_mode for a site (e.g., after settings are saved).
+        """
+        key = str(site_uuid)
+        async def _clear():
+            async with self._site_trigger_mode_cache_lock:
+                self._site_trigger_mode_cache.pop(key, None)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_clear())
+            else:
+                loop.run_until_complete(_clear())
+        except Exception:
+            # Fallback: clear synchronously (lock may not be acquired but best-effort)
+            self._site_trigger_mode_cache.pop(key, None)
 
     async def _get_site_name(self, site_uuid: Optional[str]) -> str:
         if not site_uuid:
@@ -903,6 +982,11 @@ class ModelPipeline:
         if not self._notifications_allowed_now(ch):
             return True
 
+        site_uuid_for_trigger = getattr(ch.config, "site_uuid", None)
+        site_trigger_mode = await self._get_site_trigger_mode(
+            str(site_uuid_for_trigger) if site_uuid_for_trigger else None
+        )
+        allow_broad_notifications = (site_trigger_mode == "any_detection")
         extra_payload: Optional[Dict[str, Any]] = None
         extra_payload_loaded = False
 
@@ -915,7 +999,7 @@ class ModelPipeline:
 
         emitted_detail = False
 
-        if getattr(svc, "notify_on_confirmed", False) and track_events:
+        if allow_broad_notifications and getattr(svc, "notify_on_confirmed", False) and track_events:
             try:
                 emitted_detail = (
                     await self._emit_item_detected_notifications(
@@ -940,7 +1024,7 @@ class ModelPipeline:
             except Exception:
                 logger.exception("Failed to emit ROI notifications camera=%s", cam_uuid)
 
-        if not emitted_detail:
+        if not emitted_detail and allow_broad_notifications:
             summary_classes = self._interesting_detection_classes(resp2, svc)
             if summary_classes and self._reserve_detection_summary_alert(cam_uuid, summary_classes):
                 try:
@@ -1346,7 +1430,6 @@ class ModelPipeline:
         event_type = payload.get("type")
         reason = payload.get("reason")
 
-        # NEW: frame size (prefer explicit)
         frame_w = payload.get("frame_w") or payload.get("image_w") or payload.get("width")
         frame_h = payload.get("frame_h") or payload.get("image_h") or payload.get("height")
 

@@ -896,6 +896,8 @@ class NotificationService:
         )
         self._roi_cache: Dict[str, Tuple[float, List[ROI]]] = {}
         self._roi_ttl_s = 15.0
+        self._site_trigger_mode_cache: Dict[str, Tuple[float, str]] = {}
+        self._site_trigger_mode_ttl_s = _env_float("SITE_TRIGGER_MODE_CACHE_TTL_S", 30.0, minimum=5.0)
         self._recipient_cache: Dict[Tuple[int, str], Tuple[float, List[str]]] = {}
         self._recipient_ttl_s = _env_float("NOTIFICATION_RECIPIENT_CACHE_TTL_S", 60.0, minimum=1.0)
 
@@ -2512,6 +2514,56 @@ class NotificationService:
     def _clamp_unit_points(self, points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         return [(max(0.0, min(1.0, x)), max(0.0, min(1.0, y))) for (x, y) in points]
 
+    async def _get_site_trigger_mode(self, site_uuid_str: str) -> str:
+        """
+        Return the trigger_mode from the site's multi_camera_prerecord settings.
+
+        Values: "roi_enter" | "any_detection"
+
+        - "roi_enter"      → only emit ROI-enter notifications
+        - "any_detection"  → emit all notification types (backward-compatible default)
+
+        Cached per site_uuid for _site_trigger_mode_ttl_s seconds to avoid DB
+        queries on every detection frame.
+        """
+        if not site_uuid_str:
+            return "any_detection"
+
+        key = str(site_uuid_str)
+        now = time.monotonic()
+
+        hit = self._site_trigger_mode_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+
+        if not self._session_factory:
+            return "any_detection"
+
+        trigger_mode = "any_detection"
+        try:
+            from core.database_orm import SiteSettings
+            site_uuid = uuid.UUID(key)
+            async with self._session_factory() as db:
+                res = await db.execute(
+                    select(SiteSettings.config).where(SiteSettings.site_uuid == site_uuid)
+                )
+                config = res.scalar_one_or_none()
+                if isinstance(config, dict):
+                    rule = config.get("multi_camera_prerecord") or {}
+                    if isinstance(rule, dict):
+                        raw = str(rule.get("trigger_mode") or "roi_enter").strip().lower()
+                        if raw in {"roi_enter", "any_detection"}:
+                            trigger_mode = raw
+        except Exception:
+            logger.exception("Failed to load site trigger_mode site_uuid=%s", site_uuid_str)
+
+        self._site_trigger_mode_cache[key] = (now + self._site_trigger_mode_ttl_s, trigger_mode)
+        return trigger_mode
+
+    def invalidate_site_trigger_mode_cache(self, site_uuid_str: str) -> None:
+        """Invalidate the cached trigger_mode for a site (call after settings are saved)."""
+        self._site_trigger_mode_cache.pop(str(site_uuid_str), None)
+
     def invalidate_camera_roi_state(self, camera_uuid: str) -> None:
         cam = str(camera_uuid)
         self._roi_cache.pop(cam, None)
@@ -2624,6 +2676,8 @@ class NotificationService:
         msg_frame_h = overlay_payload.get("frame_h")
         msg_frame_seq = overlay_payload.get("frame_seq")
         msg_detections = list(overlay_payload.get("detections") or [])
+        site_trigger_mode = await self._get_site_trigger_mode(site_uuid_str)
+        allow_broad_notifications = (site_trigger_mode == "any_detection")
 
         # -------------------------
         # Tracking path
@@ -2653,8 +2707,8 @@ class NotificationService:
 
             _any_notification_fired = False
 
-            # A) notify-on-confirmed-track
-            if self.notify_on_confirmed:
+            # A) notify-on-confirmed-track: only fires when trigger_mode is "any_detection"
+            if allow_broad_notifications and self.notify_on_confirmed:
                 for ev_type, track_id in events:
                     if ev_type != "track_confirmed":
                         continue
@@ -2762,7 +2816,8 @@ class NotificationService:
                                 )
                             )
 
-            if not _any_notification_fired:
+            # Detection summary fallback: only fires when trigger_mode is "any_detection"
+            if not _any_notification_fired and allow_broad_notifications:
                 now = time.monotonic()
                 async with self._lock:
                     send_classes: List[str] = []
@@ -2812,6 +2867,10 @@ class NotificationService:
                         )
                     )
 
+            return
+
+        # Non-tracking path: detection_summary only fires when trigger_mode is "any_detection"
+        if not allow_broad_notifications:
             return
 
         now = time.monotonic()
