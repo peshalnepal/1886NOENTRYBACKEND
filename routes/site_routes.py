@@ -684,7 +684,7 @@ def _camera_out_to_response(cam_out) -> CameraWithConfigSchema:
         is_detection_enabled=cam_out.detection_enabled,
         is_notification_enabled=cam_out.notification_enabled,
         notification_trigger_mode=str(getattr(cam_out, "notification_trigger_mode", None) or "roi_enter"),
-        camera_playback_enabled=getattr(cam_out, "camera_playback_enabled", None),
+        camera_playback_enabled=bool(getattr(cam_out, "camera_playback_enabled", False) or False),
         use_site_schedule=bool(getattr(cam_out, "use_site_schedule", True)),
         roi=cam_out.roi,
         configuration=cam_out.configuration,
