@@ -901,11 +901,7 @@ async def update_site_settings(
         is_enabled=True,
     )
     await db.commit()
-    if payload.schedule is not None:
-        await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     if payload.multi_camera_prerecord is not None:
-        # Invalidate prerecord eligibility cache so cameras pick up the
-        # change without waiting for the TTL to expire.
         try:
             svc = getattr(manager, "_notification_service", None) if manager else None
             if svc is not None and hasattr(svc, "invalidate_prerecord_eligible_cache"):
@@ -914,8 +910,6 @@ async def update_site_settings(
             pass
         await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     if payload.notification is not None:
-        # Invalidate cached notification trigger_mode on pipeline and notification
-        # service so the new setting takes effect without waiting for TTL.
         try:
             svc = getattr(manager, "_notification_service", None) if manager else None
             if svc is not None and hasattr(svc, "invalidate_site_trigger_mode_cache"):
@@ -925,7 +919,6 @@ async def update_site_settings(
                 pipeline.invalidate_site_trigger_mode_cache(str(site.site_uuid))
         except Exception:
             pass
-        await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     await db.refresh(row)
     if payload.schedule is not None and manager is not None:
         try:
@@ -940,6 +933,7 @@ async def update_site_settings(
                 site.site_uuid,
                 exc_info=True,
             )
+    await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
 
 
