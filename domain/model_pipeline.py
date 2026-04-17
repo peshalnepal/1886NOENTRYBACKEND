@@ -999,6 +999,9 @@ class ModelPipeline:
         if _cam_trigger_mode is not None:
             allow_broad_notifications = (str(_cam_trigger_mode) == "any_detection")
         else:
+            site_eligible = await svc.is_camera_prerecord_eligible(cam_uuid)
+            if not site_eligible:
+                return True
             site_uuid_for_trigger = getattr(ch.config, "site_uuid", None)
             site_trigger_mode = await self._get_site_trigger_mode(
                 str(site_uuid_for_trigger) if site_uuid_for_trigger else None

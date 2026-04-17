@@ -2679,6 +2679,9 @@ class NotificationService:
         if _cam_trigger_mode is not None:
             allow_broad_notifications = (str(_cam_trigger_mode) == "any_detection")
         else:
+            site_eligible = await self.is_camera_prerecord_eligible(cam)
+            if not site_eligible:
+                return
             site_trigger_mode = await self._get_site_trigger_mode(site_uuid_str)
             allow_broad_notifications = (site_trigger_mode == "any_detection")
         raw_image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
