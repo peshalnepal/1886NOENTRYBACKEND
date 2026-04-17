@@ -912,6 +912,7 @@ async def update_site_settings(
                 svc.invalidate_prerecord_eligible_cache()
         except Exception:
             pass
+        await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     if payload.notification is not None:
         # Invalidate cached notification trigger_mode on pipeline and notification
         # service so the new setting takes effect without waiting for TTL.
@@ -924,6 +925,7 @@ async def update_site_settings(
                 pipeline.invalidate_site_trigger_mode_cache(str(site.site_uuid))
         except Exception:
             pass
+        await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
     await db.refresh(row)
     if payload.schedule is not None and manager is not None:
         try:
