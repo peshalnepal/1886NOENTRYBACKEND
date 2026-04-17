@@ -41,6 +41,8 @@ class CameraContext:
     camera_name: Optional[str]
     device_uuid: Optional[uuid.UUID]
     device_name: Optional[str]
+    notification_trigger_mode: Optional[str] = None
+    camera_playback_enabled: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,8 @@ class NotificationRepository:
                 Camera.camera_code,
                 Device.device_uuid,
                 Device.name,
+                Camera.notification_trigger_mode,
+                Camera.camera_playback_enabled,
             )
             .select_from(Camera)
             .join(Site, Site.site_uuid == Camera.site_uuid)
@@ -115,7 +119,11 @@ class NotificationRepository:
         if not row:
             return None
 
-        user_id, site_uuid, site_name, camera_name, camera_code, device_uuid, device_name = row
+        (
+            user_id, site_uuid, site_name, camera_name, camera_code,
+            device_uuid, device_name,
+            notification_trigger_mode, camera_playback_enabled,
+        ) = row
         display_camera_name = camera_name or camera_code
 
         return CameraContext(
@@ -126,6 +134,8 @@ class NotificationRepository:
             camera_name=display_camera_name,
             device_uuid=device_uuid,
             device_name=device_name,
+            notification_trigger_mode=str(notification_trigger_mode) if notification_trigger_mode else None,
+            camera_playback_enabled=bool(camera_playback_enabled) if camera_playback_enabled is not None else None,
         )
 
     async def list_camera_contexts(

@@ -378,6 +378,8 @@ class Camera(Base):
     is_enabled = Column(Boolean, default=True)
     is_detection_enabled = Column(Boolean, default=True)
     is_notification_enabled = Column(Boolean, default=True)
+    notification_trigger_mode = Column(String(32), nullable=True)  # "roi_enter" | "any_detection" | null
+    camera_playback_enabled = Column(Boolean, nullable=True)       # True | False | null
 
     roi = Column(JSONDict, nullable=True)
 

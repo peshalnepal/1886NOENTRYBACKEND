@@ -964,9 +964,22 @@ class ModelPipeline:
 
         cam_uuid = str(resp2.camera_uuid)
 
-        if self._playback_enabled_for_channel(ch):
+        _cam_cfg = getattr(ch, "config", None)
+        _cam_playback_override = getattr(_cam_cfg, "camera_playback_enabled", None)
+        _do_playback = (
+            _cam_playback_override is True
+            or (
+                _cam_playback_override is None
+                and self._playback_enabled_for_channel(ch)
+            )
+        )
+        if _do_playback:
             try:
-                if await svc.is_camera_prerecord_eligible(cam_uuid):
+                _prerecord_ok = (
+                    _cam_playback_override is True          # explicit override bypasses site list
+                    or await svc.is_camera_prerecord_eligible(cam_uuid)
+                )
+                if _prerecord_ok:
                     overlay_payload = _overlay_payload_from_resp(resp2)
                     await svc.record_detection_overlay_frame(
                         camera_uuid=cam_uuid,
@@ -982,11 +995,15 @@ class ModelPipeline:
         if not self._notifications_allowed_now(ch):
             return True
 
-        site_uuid_for_trigger = getattr(ch.config, "site_uuid", None)
-        site_trigger_mode = await self._get_site_trigger_mode(
-            str(site_uuid_for_trigger) if site_uuid_for_trigger else None
-        )
-        allow_broad_notifications = (site_trigger_mode == "any_detection")
+        _cam_trigger_mode = getattr(_cam_cfg, "notification_trigger_mode", None)
+        if _cam_trigger_mode is not None:
+            allow_broad_notifications = (str(_cam_trigger_mode) == "any_detection")
+        else:
+            site_uuid_for_trigger = getattr(ch.config, "site_uuid", None)
+            site_trigger_mode = await self._get_site_trigger_mode(
+                str(site_uuid_for_trigger) if site_uuid_for_trigger else None
+            )
+            allow_broad_notifications = (site_trigger_mode == "any_detection")
         extra_payload: Optional[Dict[str, Any]] = None
         extra_payload_loaded = False
 

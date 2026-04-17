@@ -96,6 +96,14 @@ class CameraBaseSchema(BaseModel):
     is_enabled: bool = True
     is_detection_enabled: bool = True
     is_notification_enabled: bool = True
+    notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
+        default="roi_enter",
+        description="Per-camera notification trigger mode. null = inherit site-level Trigger Condition.",
+    )
+    camera_playback_enabled: Optional[bool] = Field(
+        default=False,
+        description="Per-camera clip recording override. null = inherit site default (prerecord list).",
+    )
     sample_fps: Optional[float] = Field(default=5.0, ge=0.1)
     decode_backend: Optional[Literal["gstreamer", "opencv"]] = "gstreamer"
     resize: Optional[Tuple[int, int]] = None
@@ -145,6 +153,15 @@ class CameraCreateSchema(BaseModel):
     is_enabled: bool = True
     is_detection_enabled: bool = True
     is_notification_enabled: bool = True
+
+    notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
+        default="roi_enter",
+        description="Per-camera notification trigger mode. null = inherit site-level Trigger Condition.",
+    )
+    camera_playback_enabled: Optional[bool] = Field(
+        default=False,
+        description="Per-camera clip recording override. null = inherit site default (prerecord list).",
+    )
 
     # ROI for detection alerts (optional)
     roi: Optional[ROISchema] = None
@@ -206,6 +223,14 @@ class CameraEditSchema(BaseModel):
     is_enabled: Optional[bool] = None
     is_detection_enabled: Optional[bool] = None
     is_notification_enabled: Optional[bool] = None
+    notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
+        default="roi_enter",
+        description="Per-camera notification trigger mode. null = inherit site-level Trigger Condition.",
+    )
+    camera_playback_enabled: Optional[bool] = Field(
+        default=False,
+        description="Per-camera clip recording override. null = inherit site default (prerecord list).",
+    )
 
     # ROI for detection alerts (optional)
     roi: Optional[ROISchema] = None
@@ -260,6 +285,8 @@ class CameraSchema(BaseModel):
     is_detection_enabled: bool
     is_notification_enabled: bool
     use_site_schedule: bool = True
+    notification_trigger_mode: str = "roi_enter"
+    camera_playback_enabled: bool = False
 
     roi: Optional[Dict[str, Any]] = None
 

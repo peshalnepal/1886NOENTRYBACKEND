@@ -2636,8 +2636,21 @@ class NotificationService:
         cam = str(det_ev.camera_uuid)
         ts_ms = int(det_ev.frame_ts_ms)
 
-        if bool(getattr(camera_mode, "playback_enabled", True)):
-            if await self.is_camera_prerecord_eligible(cam):
+        ctx = await self._get_camera_ctx_cached(cam)
+        _cam_playback_override = getattr(ctx, "camera_playback_enabled", None) if ctx else None
+        _do_playback = (
+            _cam_playback_override is True
+            or (
+                _cam_playback_override is not False
+                and bool(getattr(camera_mode, "playback_enabled", True))
+            )
+        )
+        if _do_playback:
+            _prerecord_ok = (
+                _cam_playback_override is True
+                or await self.is_camera_prerecord_eligible(cam)
+            )
+            if _prerecord_ok:
                 await self.record_detection_overlay_frame(
                     camera_uuid=cam,
                     frame_ts_ms=ts_ms,
@@ -2654,7 +2667,6 @@ class NotificationService:
         if not matches:
             return
 
-        ctx = await self._get_camera_ctx_cached(cam)
         if ctx is None:
             logger.warning("Skipping alert publish because camera context was not found camera=%s", cam)
             return
@@ -2663,9 +2675,13 @@ class NotificationService:
         site_uuid_str = str(ctx.site_uuid)
         device_name = ctx.device_name
         camera_name = ctx.camera_name
+        _cam_trigger_mode = getattr(ctx, "notification_trigger_mode", None)
+        if _cam_trigger_mode is not None:
+            allow_broad_notifications = (str(_cam_trigger_mode) == "any_detection")
+        else:
+            site_trigger_mode = await self._get_site_trigger_mode(site_uuid_str)
+            allow_broad_notifications = (site_trigger_mode == "any_detection")
         raw_image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
-        # Don't send base64 data: URLs over SSE — materialization to blob happens during flush.
-        # extra_payload still carries raw_image_url so the flush path can store it correctly.
         image_url = None if (raw_image_url or "").startswith("data:") else raw_image_url
         overlay_payload = _event_overlay_payload(
             det_ev,
@@ -2676,8 +2692,6 @@ class NotificationService:
         msg_frame_h = overlay_payload.get("frame_h")
         msg_frame_seq = overlay_payload.get("frame_seq")
         msg_detections = list(overlay_payload.get("detections") or [])
-        site_trigger_mode = await self._get_site_trigger_mode(site_uuid_str)
-        allow_broad_notifications = (site_trigger_mode == "any_detection")
 
         # -------------------------
         # Tracking path
