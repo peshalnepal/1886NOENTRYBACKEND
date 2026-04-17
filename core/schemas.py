@@ -97,11 +97,11 @@ class CameraBaseSchema(BaseModel):
     is_detection_enabled: bool = True
     is_notification_enabled: bool = True
     notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
-        default="roi_enter",
+        default=None,
         description="Per-camera notification trigger mode. null = inherit site-level Trigger Condition.",
     )
     camera_playback_enabled: Optional[bool] = Field(
-        default=False,
+        default=None,
         description="Per-camera clip recording override. null = inherit site default (prerecord list).",
     )
     sample_fps: Optional[float] = Field(default=5.0, ge=0.1)
@@ -155,11 +155,11 @@ class CameraCreateSchema(BaseModel):
     is_notification_enabled: bool = True
 
     notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
-        default="roi_enter",
+        default=None,
         description="Per-camera notification trigger mode. null = inherit site-level Trigger Condition.",
     )
     camera_playback_enabled: Optional[bool] = Field(
-        default=False,
+        default=None,
         description="Per-camera clip recording override. null = inherit site default (prerecord list).",
     )
 
@@ -224,11 +224,11 @@ class CameraEditSchema(BaseModel):
     is_detection_enabled: Optional[bool] = None
     is_notification_enabled: Optional[bool] = None
     notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
-        default="roi_enter",
+        default=None,
         description="Per-camera notification trigger mode. null = inherit site-level Trigger Condition.",
     )
     camera_playback_enabled: Optional[bool] = Field(
-        default=False,
+        default=None,
         description="Per-camera clip recording override. null = inherit site default (prerecord list).",
     )
 
@@ -285,8 +285,8 @@ class CameraSchema(BaseModel):
     is_detection_enabled: bool
     is_notification_enabled: bool
     use_site_schedule: bool = True
-    notification_trigger_mode: str = "roi_enter"
-    camera_playback_enabled: bool = False
+    notification_trigger_mode: Optional[str] = None
+    camera_playback_enabled: Optional[bool] = None
 
     roi: Optional[Dict[str, Any]] = None
 

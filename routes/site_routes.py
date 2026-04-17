@@ -532,12 +532,12 @@ class SiteCameraCreate(BaseModel):
     is_detection_enabled: bool = True
     is_notification_enabled: bool = True
     notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
-        default="roi_enter",
-        description="Per-camera notification trigger mode.",
+        default=None,
+        description="Per-camera notification trigger mode. null = inherit site-level setting.",
     )
     camera_playback_enabled: Optional[bool] = Field(
-        default=False,
-        description="Per-camera clip recording override.",
+        default=None,
+        description="Per-camera clip recording override. null = inherit site default (prerecord list).",
     )
     sample_fps: float = Field(default=5.0, ge=0.1)
     timezone: Optional[str] = None
@@ -683,8 +683,8 @@ def _camera_out_to_response(cam_out) -> CameraWithConfigSchema:
         is_enabled=cam_out.enabled,
         is_detection_enabled=cam_out.detection_enabled,
         is_notification_enabled=cam_out.notification_enabled,
-        notification_trigger_mode=str(getattr(cam_out, "notification_trigger_mode", None) or "roi_enter"),
-        camera_playback_enabled=bool(getattr(cam_out, "camera_playback_enabled", False) or False),
+        notification_trigger_mode=getattr(cam_out, "notification_trigger_mode", None),
+        camera_playback_enabled=getattr(cam_out, "camera_playback_enabled", None),
         use_site_schedule=bool(getattr(cam_out, "use_site_schedule", True)),
         roi=cam_out.roi,
         configuration=cam_out.configuration,
