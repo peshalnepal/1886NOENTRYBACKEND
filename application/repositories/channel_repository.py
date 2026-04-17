@@ -104,6 +104,16 @@ class ChannelRepository:
         has_roi = "roi" in d
         roi = d.get("roi")
 
+        has_notification_trigger_mode = "notification_trigger_mode" in d
+        notification_trigger_mode_val = d.get("notification_trigger_mode")
+        if isinstance(notification_trigger_mode_val, str):
+            notification_trigger_mode_val = notification_trigger_mode_val.strip() or None
+
+        has_camera_playback_enabled = "camera_playback_enabled" in d
+        camera_playback_enabled_val = d.get("camera_playback_enabled")
+        if camera_playback_enabled_val is not None:
+            camera_playback_enabled_val = bool(camera_playback_enabled_val)
+
         if not rtsp_url:
             raise ValueError("channel_config.rtsp_url is required")
 
@@ -120,6 +130,11 @@ class ChannelRepository:
 
             if has_roi:
                 cam.roi = roi
+
+            if has_notification_trigger_mode:
+                cam.notification_trigger_mode = notification_trigger_mode_val
+            if has_camera_playback_enabled:
+                cam.camera_playback_enabled = camera_playback_enabled_val
 
             if webrtc_url is not None:
                 if cam.webrtc_url is None:
@@ -179,6 +194,8 @@ class ChannelRepository:
                 is_notification_enabled=bool(notification_enabled),
                 use_site_schedule=bool(use_site_schedule),
                 roi=roi,
+                notification_trigger_mode=notification_trigger_mode_val if has_notification_trigger_mode else None,
+                camera_playback_enabled=camera_playback_enabled_val if has_camera_playback_enabled else None,
             )
             if cam_uuid is not None:
                 cam.camera_uuid = cam_uuid

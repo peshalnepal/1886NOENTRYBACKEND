@@ -339,6 +339,7 @@ class Manager:
         return summary
 
     def _patch_to_dict(self, obj: Any) -> Dict[str, Any]:
+        nullable_keep = {"roi", "notification_trigger_mode", "camera_playback_enabled"}
         if obj is None:
             out: Dict[str, Any] = {}
         elif hasattr(obj, "model_dump"):
@@ -348,9 +349,9 @@ class Manager:
                 fields_set = getattr(obj, "__fields_set__", None)
             if fields_set is not None and "roi" in fields_set and "roi" not in out:
                 out["roi"] = None
-            out = {k: v for k, v in out.items() if v is not None or k == "roi"}
+            out = {k: v for k, v in out.items() if v is not None or k in nullable_keep}
         elif isinstance(obj, dict):
-            out = {k: v for k, v in obj.items() if v is not None or k == "roi"}
+            out = {k: v for k, v in obj.items() if v is not None or k in nullable_keep}
         else:
             out = {}
 
