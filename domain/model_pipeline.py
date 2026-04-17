@@ -549,11 +549,17 @@ class ModelPipeline:
                 )
                 config = res.scalar_one_or_none()
                 if isinstance(config, dict):
-                    rule = config.get("multi_camera_prerecord") or {}
-                    if isinstance(rule, dict):
-                        raw = str(rule.get("trigger_mode") or "roi_enter").strip().lower()
-                        if raw in {"roi_enter", "any_detection"}:
-                            trigger_mode = raw
+                    notification_rule = config.get("notification")
+                    notif_raw = None
+                    if isinstance(notification_rule, dict):
+                        notif_raw = notification_rule.get("trigger_mode")
+                    if notif_raw is None:
+                        legacy = config.get("multi_camera_prerecord") or {}
+                        if isinstance(legacy, dict):
+                            notif_raw = legacy.get("trigger_mode")
+                    raw = str(notif_raw or "roi_enter").strip().lower()
+                    if raw in {"roi_enter", "any_detection"}:
+                        trigger_mode = raw
         except Exception:
             logger.exception("Failed to load site trigger_mode site_uuid=%s", site_uuid)
             trigger_mode = "roi_enter"

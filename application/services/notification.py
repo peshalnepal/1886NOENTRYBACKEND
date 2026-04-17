@@ -2549,11 +2549,17 @@ class NotificationService:
                 )
                 config = res.scalar_one_or_none()
                 if isinstance(config, dict):
-                    rule = config.get("multi_camera_prerecord") or {}
-                    if isinstance(rule, dict):
-                        raw = str(rule.get("trigger_mode") or "roi_enter").strip().lower()
-                        if raw in {"roi_enter", "any_detection"}:
-                            trigger_mode = raw
+                    notification_rule = config.get("notification")
+                    raw_value = None
+                    if isinstance(notification_rule, dict):
+                        raw_value = notification_rule.get("trigger_mode")
+                    if raw_value is None:
+                        legacy = config.get("multi_camera_prerecord") or {}
+                        if isinstance(legacy, dict):
+                            raw_value = legacy.get("trigger_mode")
+                    raw = str(raw_value or "roi_enter").strip().lower()
+                    if raw in {"roi_enter", "any_detection"}:
+                        trigger_mode = raw
         except Exception:
             logger.exception("Failed to load site trigger_mode site_uuid=%s", site_uuid_str)
 

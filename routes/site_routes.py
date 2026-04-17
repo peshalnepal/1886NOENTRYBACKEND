@@ -564,6 +564,14 @@ class SiteMultiCameraPrerecordRuleUpdate(BaseModel):
     trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
 
 
+class SiteNotificationRule(BaseModel):
+    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
+
+
+class SiteNotificationRuleUpdate(BaseModel):
+    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
+
+
 class SiteScheduleRule(BaseModel):
     timezone: str = Field(default="UTC", max_length=50)
     day_of_week: List[int] = Field(default_factory=lambda: list(SUNDAY_TO_SATURDAY))
@@ -590,11 +598,13 @@ class SiteSettingsOut(BaseModel):
     multi_camera_prerecord: SiteMultiCameraPrerecordRule = Field(
         default_factory=SiteMultiCameraPrerecordRule
     )
+    notification: SiteNotificationRule = Field(default_factory=SiteNotificationRule)
 
 
 class SiteSettingsUpdate(BaseModel):
     schedule: Optional[SiteScheduleRuleUpdate] = None
     multi_camera_prerecord: Optional[SiteMultiCameraPrerecordRuleUpdate] = None
+    notification: Optional[SiteNotificationRuleUpdate] = None
 
 
 async def _validate_site_prerecord_camera_uuids(
@@ -648,6 +658,11 @@ def _serialize_site_settings(
     camera_uuids = _dedupe_uuid_list(camera_uuids)
     schedule = _site_schedule_payload_from_row(row, fallback_timezone=fallback_timezone)
 
+    notification_block = config.get("notification")
+    if isinstance(notification_block, dict) and notification_block.get("trigger_mode") is not None:
+        notification_trigger_mode = _normalize_trigger_mode(notification_block.get("trigger_mode"))
+    else:
+        notification_trigger_mode = _normalize_trigger_mode(prerecord.get("trigger_mode"))
     return SiteSettingsOut(
         site_uuid=site_uuid,
         schedule=SiteScheduleRule(
@@ -662,6 +677,9 @@ def _serialize_site_settings(
             enabled=bool(prerecord.get("enabled")),
             camera_uuids=camera_uuids,
             trigger_mode=_normalize_trigger_mode(prerecord.get("trigger_mode")),
+        ),
+        notification=SiteNotificationRule(
+            trigger_mode=notification_trigger_mode,
         ),
     )
 
@@ -841,6 +859,11 @@ async def update_site_settings(
             "trigger_mode": trigger_mode,
         }
 
+    if payload.notification is not None:
+        config["notification"] = {
+            "trigger_mode": _normalize_trigger_mode(payload.notification.trigger_mode),
+        }
+
     if payload.schedule is not None:
         schedule_windows = _build_schedule_windows(
             day_of_week=list(payload.schedule.day_of_week or schedule_payload.get("day_of_week") or list(SUNDAY_TO_SATURDAY)),
@@ -860,7 +883,11 @@ async def update_site_settings(
         config["schedule"] = schedule_windows
         site.timezone = schedule_payload["timezone"]
 
-    if payload.schedule is None and payload.multi_camera_prerecord is None:
+    if (
+        payload.schedule is None
+        and payload.multi_camera_prerecord is None
+        and payload.notification is None
+    ):
         return _serialize_site_settings(site.site_uuid, row, fallback_timezone=site.timezone)
 
     row = await site_repo.upsert_site_settings(
@@ -883,6 +910,18 @@ async def update_site_settings(
             svc = getattr(manager, "_notification_service", None) if manager else None
             if svc is not None and hasattr(svc, "invalidate_prerecord_eligible_cache"):
                 svc.invalidate_prerecord_eligible_cache()
+        except Exception:
+            pass
+    if payload.notification is not None:
+        # Invalidate cached notification trigger_mode on pipeline and notification
+        # service so the new setting takes effect without waiting for TTL.
+        try:
+            svc = getattr(manager, "_notification_service", None) if manager else None
+            if svc is not None and hasattr(svc, "invalidate_site_trigger_mode_cache"):
+                svc.invalidate_site_trigger_mode_cache(str(site.site_uuid))
+            pipeline = manager.get_loaded_pipeline(user_id=int(user.id)) if manager else None
+            if pipeline is not None and hasattr(pipeline, "invalidate_site_trigger_mode_cache"):
+                pipeline.invalidate_site_trigger_mode_cache(str(site.site_uuid))
         except Exception:
             pass
     await db.refresh(row)
