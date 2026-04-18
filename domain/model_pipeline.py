@@ -651,6 +651,12 @@ class ModelPipeline:
             old_task = self._poll_tasks.pop(key, None)
             started = self._started and (not self._closing)
 
+        async with self._cam_ctx_cache_lock:
+            self._cam_ctx_cache.pop(key, None)
+            future = self._cam_ctx_inflight.pop(key, None)
+            if future is not None and not future.done():
+                future.cancel()
+
         if old_task and not old_task.done():
             old_task.cancel()
             try:

@@ -444,6 +444,11 @@ class ChannelRepository:
             cfg.pop(k, None)
         return cfg
 
+    # Keys whose explicit None means "clear per-camera override; inherit site default".
+    # These must NOT be stripped by exclude_none — otherwise stale values persist in the JSON
+    # and leak back onto the Camera row on the next edit.
+    _CONFIG_NULLABLE_KEEP = {"notification_trigger_mode", "camera_playback_enabled"}
+
     async def _upsert_channel_configuration(
         self,
         db: AsyncSession,
@@ -455,7 +460,10 @@ class ChannelRepository:
         start_time: time,
         end_time: time,
     ) -> ChannelConfiguration:
-        configuration = jsonable_encoder(configuration, exclude_none=True)
+        encoded = jsonable_encoder(configuration, exclude_none=True)
+        for key in self._CONFIG_NULLABLE_KEEP:
+            if key in configuration:
+                encoded[key] = configuration[key]
 
         row = (
             await db.execute(select(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
@@ -464,7 +472,7 @@ class ChannelRepository:
         if row is None:
             row = ChannelConfiguration(
                 camera_uuid=camera_uuid,
-                configuration=configuration,
+                configuration=encoded,
                 timezone=timezone,
                 day_of_week=day_of_week,
                 start_time=start_time,
@@ -475,8 +483,11 @@ class ChannelRepository:
             return row
 
         merged = dict(row.configuration or {})
-        merged.update(configuration)
-        merged["schedule"] = configuration.get("schedule", merged.get("schedule", self._default_weekly_schedule()))
+        merged.update(encoded)
+        for key in self._CONFIG_NULLABLE_KEEP:
+            if key in encoded and encoded[key] is None:
+                merged.pop(key, None)
+        merged["schedule"] = encoded.get("schedule", merged.get("schedule", self._default_weekly_schedule()))
 
         row.configuration = merged
         if timezone is not None:

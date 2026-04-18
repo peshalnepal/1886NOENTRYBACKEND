@@ -47,6 +47,9 @@ class CameraOut(BaseModel):
     roi: Optional[Dict[str, Any]] = None
     configuration: Dict[str, Any] = Field(default_factory=dict)
     timezone: Optional[str] = None
+    notification_trigger_mode: Optional[str] = None
+    camera_playback_enabled: Optional[bool] = None
+    use_site_schedule: Optional[bool] = None
 
     device_uuid: uuid.UUID
     device_url: str
@@ -150,6 +153,7 @@ RUNTIME_CONFIG_FORBIDDEN_KEYS = {
 }
 
 RUNTIME_CONFIG_ALLOWED_KEYS = set(VideoChannelConfig.model_fields.keys())
+RUNTIME_CONFIG_NULLABLE_KEYS = {"notification_trigger_mode", "camera_playback_enabled"}
 
 def _runtime_config_overrides(cfg: Dict[str, Any], *, extra_forbidden: Optional[set] = None) -> Dict[str, Any]:
     forbidden = set(RUNTIME_CONFIG_FORBIDDEN_KEYS)
@@ -158,11 +162,11 @@ def _runtime_config_overrides(cfg: Dict[str, Any], *, extra_forbidden: Optional[
 
     out: Dict[str, Any] = {}
     for k, v in (cfg or {}).items():
-        if v is None:
-            continue
         if k not in RUNTIME_CONFIG_ALLOWED_KEYS:
             continue
         if k in forbidden:
+            continue
+        if v is None and k not in RUNTIME_CONFIG_NULLABLE_KEYS:
             continue
         out[k] = v
     return out
@@ -1599,6 +1603,9 @@ class Manager:
                 roi=cam.roi,
                 configuration=cfg_json or {},
                 timezone=tz,
+                notification_trigger_mode=getattr(cam, "notification_trigger_mode", None),
+                camera_playback_enabled=getattr(cam, "camera_playback_enabled", None),
+                use_site_schedule=schedule_state.get("use_site_schedule"),
                 created_at=getattr(cam, "created_at", None),
                 updated_at=getattr(cam, "updated_at", None),
             )
@@ -1816,6 +1823,9 @@ class Manager:
                 roi=cam2.roi,
                 configuration=cfg_json or {},
                 timezone=tz,
+                notification_trigger_mode=getattr(cam2, "notification_trigger_mode", None),
+                camera_playback_enabled=getattr(cam2, "camera_playback_enabled", None),
+                use_site_schedule=schedule_state.get("use_site_schedule"),
                 created_at=getattr(cam2, "created_at", None),
                 updated_at=getattr(cam2, "updated_at", None),
             )

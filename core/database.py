@@ -448,6 +448,26 @@ class DatabaseManager:
                         else:
                             raise
 
+            # One-time cleanup: strip stale notification_trigger_mode from
+            # channel_configurations.configuration JSON. Historical bug left
+            # per-camera trigger values frozen in JSON even after the user
+            # chose "Inherit from site", which then reverted the camera on
+            # subsequent edits.
+            if dialect_name.startswith("mysql"):
+                try:
+                    result = await conn.execute(
+                        text(
+                            "UPDATE channel_configurations "
+                            "SET configuration = JSON_REMOVE(configuration, '$.notification_trigger_mode') "
+                            "WHERE JSON_EXTRACT(configuration, '$.notification_trigger_mode') IS NOT NULL"
+                        )
+                    )
+                    rc = getattr(result, "rowcount", 0) or 0
+                    if rc:
+                        logger.info("Cleaned stale notification_trigger_mode from %d channel_configurations.", rc)
+                except Exception as exc:
+                    logger.warning("Skipping channel_configurations.notification_trigger_mode cleanup: %s", exc)
+
         # Seed a dev user if DB is empty.
         async with self.AsyncSessionLocal() as db:
             existing = (await db.execute(select(User.id).limit(1))).scalar_one_or_none()
