@@ -154,6 +154,24 @@ RUNTIME_CONFIG_FORBIDDEN_KEYS = {
 
 RUNTIME_CONFIG_ALLOWED_KEYS = set(VideoChannelConfig.model_fields.keys())
 
+def _coerce_tri_trigger_mode(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if s in ("roi_enter", "any_detection", "inherit"):
+        return s
+    return "inherit"
+
+
+def _coerce_tri_playback_mode(v: Any) -> str:
+    if v is True:
+        return "always"
+    if v is False:
+        return "never"
+    s = str(v or "").strip().lower()
+    if s in ("always", "never", "inherit"):
+        return s
+    return "inherit"
+
+
 def _runtime_config_overrides(cfg: Dict[str, Any], *, extra_forbidden: Optional[set] = None) -> Dict[str, Any]:
     forbidden = set(RUNTIME_CONFIG_FORBIDDEN_KEYS)
     if extra_forbidden:
@@ -167,7 +185,12 @@ def _runtime_config_overrides(cfg: Dict[str, Any], *, extra_forbidden: Optional[
             continue
         if v is None:
             continue
-        out[k] = v
+        if k == "notification_trigger_mode":
+            out[k] = _coerce_tri_trigger_mode(v)
+        elif k == "camera_playback_enabled":
+            out[k] = _coerce_tri_playback_mode(v)
+        else:
+            out[k] = v
     return out
 
 
