@@ -96,13 +96,13 @@ class CameraBaseSchema(BaseModel):
     is_enabled: bool = True
     is_detection_enabled: bool = True
     is_notification_enabled: bool = True
-    notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
-        default=None,
-        description="Per-camera notification trigger mode. null = inherit site-level Trigger Condition.",
+    notification_trigger_mode: Literal["inherit", "roi_enter", "any_detection"] = Field(
+        default="inherit",
+        description="Per-camera notification trigger mode. 'inherit' = use site-level Trigger Condition.",
     )
-    camera_playback_enabled: Optional[bool] = Field(
-        default=None,
-        description="Per-camera clip recording override. null = inherit site default (prerecord list).",
+    camera_playback_enabled: Literal["inherit", "always", "never"] = Field(
+        default="inherit",
+        description="Per-camera clip recording override. 'inherit' = use site default (prerecord list).",
     )
     sample_fps: Optional[float] = Field(default=5.0, ge=0.1)
     decode_backend: Optional[Literal["gstreamer", "opencv"]] = "gstreamer"
@@ -154,13 +154,13 @@ class CameraCreateSchema(BaseModel):
     is_detection_enabled: bool = True
     is_notification_enabled: bool = True
 
-    notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
-        default=None,
-        description="Per-camera notification trigger mode. null = inherit site-level Trigger Condition.",
+    notification_trigger_mode: Literal["inherit", "roi_enter", "any_detection"] = Field(
+        default="inherit",
+        description="Per-camera notification trigger mode. 'inherit' = use site-level Trigger Condition.",
     )
-    camera_playback_enabled: Optional[bool] = Field(
-        default=None,
-        description="Per-camera clip recording override. null = inherit site default (prerecord list).",
+    camera_playback_enabled: Literal["inherit", "always", "never"] = Field(
+        default="inherit",
+        description="Per-camera clip recording override. 'inherit' = use site default (prerecord list).",
     )
 
     # ROI for detection alerts (optional)
@@ -223,13 +223,13 @@ class CameraEditSchema(BaseModel):
     is_enabled: Optional[bool] = None
     is_detection_enabled: Optional[bool] = None
     is_notification_enabled: Optional[bool] = None
-    notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
+    notification_trigger_mode: Optional[Literal["inherit", "roi_enter", "any_detection"]] = Field(
         default=None,
-        description="Per-camera notification trigger mode. null = inherit site-level Trigger Condition.",
+        description="Per-camera notification trigger mode. 'inherit' = use site-level Trigger Condition. Omit on PATCH to leave unchanged.",
     )
-    camera_playback_enabled: Optional[bool] = Field(
+    camera_playback_enabled: Optional[Literal["inherit", "always", "never"]] = Field(
         default=None,
-        description="Per-camera clip recording override. null = inherit site default (prerecord list).",
+        description="Per-camera clip recording override. 'inherit' = use site default (prerecord list). Omit on PATCH to leave unchanged.",
     )
 
     # ROI for detection alerts (optional)
@@ -285,8 +285,8 @@ class CameraSchema(BaseModel):
     is_detection_enabled: bool
     is_notification_enabled: bool
     use_site_schedule: bool = True
-    notification_trigger_mode: Optional[str] = None
-    camera_playback_enabled: Optional[bool] = None
+    notification_trigger_mode: str = "inherit"
+    camera_playback_enabled: str = "inherit"
 
     roi: Optional[Dict[str, Any]] = None
 

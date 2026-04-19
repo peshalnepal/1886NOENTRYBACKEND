@@ -531,13 +531,13 @@ class SiteCameraCreate(BaseModel):
     is_enabled: bool = True
     is_detection_enabled: bool = True
     is_notification_enabled: bool = True
-    notification_trigger_mode: Optional[Literal["roi_enter", "any_detection"]] = Field(
-        default=None,
-        description="Per-camera notification trigger mode. null = inherit site-level setting.",
+    notification_trigger_mode: Literal["inherit", "roi_enter", "any_detection"] = Field(
+        default="inherit",
+        description="Per-camera notification trigger mode. 'inherit' = use site-level setting.",
     )
-    camera_playback_enabled: Optional[bool] = Field(
-        default=None,
-        description="Per-camera clip recording override. null = inherit site default (prerecord list).",
+    camera_playback_enabled: Literal["inherit", "always", "never"] = Field(
+        default="inherit",
+        description="Per-camera clip recording override. 'inherit' = use site default (prerecord list).",
     )
     sample_fps: float = Field(default=5.0, ge=0.1)
     timezone: Optional[str] = None
@@ -701,8 +701,8 @@ def _camera_out_to_response(cam_out) -> CameraWithConfigSchema:
         is_enabled=cam_out.enabled,
         is_detection_enabled=cam_out.detection_enabled,
         is_notification_enabled=cam_out.notification_enabled,
-        notification_trigger_mode=getattr(cam_out, "notification_trigger_mode", None),
-        camera_playback_enabled=getattr(cam_out, "camera_playback_enabled", None),
+        notification_trigger_mode=str(getattr(cam_out, "notification_trigger_mode", "inherit") or "inherit"),
+        camera_playback_enabled=str(getattr(cam_out, "camera_playback_enabled", "inherit") or "inherit"),
         use_site_schedule=bool(getattr(cam_out, "use_site_schedule", True)),
         roi=cam_out.roi,
         configuration=cam_out.configuration,

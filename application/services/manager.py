@@ -47,8 +47,8 @@ class CameraOut(BaseModel):
     roi: Optional[Dict[str, Any]] = None
     configuration: Dict[str, Any] = Field(default_factory=dict)
     timezone: Optional[str] = None
-    notification_trigger_mode: Optional[str] = None
-    camera_playback_enabled: Optional[bool] = None
+    notification_trigger_mode: str = "inherit"
+    camera_playback_enabled: str = "inherit"
     use_site_schedule: Optional[bool] = None
 
     device_uuid: uuid.UUID
@@ -153,7 +153,6 @@ RUNTIME_CONFIG_FORBIDDEN_KEYS = {
 }
 
 RUNTIME_CONFIG_ALLOWED_KEYS = set(VideoChannelConfig.model_fields.keys())
-RUNTIME_CONFIG_NULLABLE_KEYS = {"notification_trigger_mode", "camera_playback_enabled"}
 
 def _runtime_config_overrides(cfg: Dict[str, Any], *, extra_forbidden: Optional[set] = None) -> Dict[str, Any]:
     forbidden = set(RUNTIME_CONFIG_FORBIDDEN_KEYS)
@@ -166,7 +165,7 @@ def _runtime_config_overrides(cfg: Dict[str, Any], *, extra_forbidden: Optional[
             continue
         if k in forbidden:
             continue
-        if v is None and k not in RUNTIME_CONFIG_NULLABLE_KEYS:
+        if v is None:
             continue
         out[k] = v
     return out
@@ -343,7 +342,7 @@ class Manager:
         return summary
 
     def _patch_to_dict(self, obj: Any) -> Dict[str, Any]:
-        nullable_keep = {"roi", "notification_trigger_mode", "camera_playback_enabled"}
+        nullable_keep = {"roi"}
         if obj is None:
             out: Dict[str, Any] = {}
         elif hasattr(obj, "model_dump"):
@@ -1603,8 +1602,8 @@ class Manager:
                 roi=cam.roi,
                 configuration=cfg_json or {},
                 timezone=tz,
-                notification_trigger_mode=getattr(cam, "notification_trigger_mode", None),
-                camera_playback_enabled=getattr(cam, "camera_playback_enabled", None),
+                notification_trigger_mode=str(getattr(cam, "notification_trigger_mode", "inherit") or "inherit"),
+                camera_playback_enabled=str(getattr(cam, "camera_playback_enabled", "inherit") or "inherit"),
                 use_site_schedule=schedule_state.get("use_site_schedule"),
                 created_at=getattr(cam, "created_at", None),
                 updated_at=getattr(cam, "updated_at", None),
@@ -1823,8 +1822,8 @@ class Manager:
                 roi=cam2.roi,
                 configuration=cfg_json or {},
                 timezone=tz,
-                notification_trigger_mode=getattr(cam2, "notification_trigger_mode", None),
-                camera_playback_enabled=getattr(cam2, "camera_playback_enabled", None),
+                notification_trigger_mode=str(getattr(cam2, "notification_trigger_mode", "inherit") or "inherit"),
+                camera_playback_enabled=str(getattr(cam2, "camera_playback_enabled", "inherit") or "inherit"),
                 use_site_schedule=schedule_state.get("use_site_schedule"),
                 created_at=getattr(cam2, "created_at", None),
                 updated_at=getattr(cam2, "updated_at", None),

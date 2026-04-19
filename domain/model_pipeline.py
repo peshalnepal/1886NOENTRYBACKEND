@@ -977,18 +977,18 @@ class ModelPipeline:
         cam_uuid = str(resp2.camera_uuid)
 
         _cam_cfg = getattr(ch, "config", None)
-        _cam_playback_override = getattr(_cam_cfg, "camera_playback_enabled", None)
+        _cam_playback_override = str(getattr(_cam_cfg, "camera_playback_enabled", "inherit") or "inherit")
         _do_playback = (
-            _cam_playback_override is True
+            _cam_playback_override == "always"
             or (
-                _cam_playback_override is None
+                _cam_playback_override == "inherit"
                 and self._playback_enabled_for_channel(ch)
             )
         )
         if _do_playback:
             try:
                 _prerecord_ok = (
-                    _cam_playback_override is True          # explicit override bypasses site list
+                    _cam_playback_override == "always"       # explicit override bypasses site list
                     or await svc.is_camera_prerecord_eligible(cam_uuid)
                 )
                 if _prerecord_ok:
@@ -1007,9 +1007,9 @@ class ModelPipeline:
         if not self._notifications_allowed_now(ch):
             return True
 
-        _cam_trigger_mode = getattr(_cam_cfg, "notification_trigger_mode", None)
-        if _cam_trigger_mode is not None:
-            allow_broad_notifications = (str(_cam_trigger_mode) == "any_detection")
+        _cam_trigger_mode = str(getattr(_cam_cfg, "notification_trigger_mode", "inherit") or "inherit")
+        if _cam_trigger_mode in ("roi_enter", "any_detection"):
+            allow_broad_notifications = (_cam_trigger_mode == "any_detection")
         else:
             site_uuid_for_trigger = getattr(ch.config, "site_uuid", None)
             site_trigger_mode = await self._get_site_trigger_mode(

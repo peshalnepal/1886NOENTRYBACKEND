@@ -2643,17 +2643,17 @@ class NotificationService:
         ts_ms = int(det_ev.frame_ts_ms)
 
         ctx = await self._get_camera_ctx_cached(cam)
-        _cam_playback_override = getattr(ctx, "camera_playback_enabled", None) if ctx else None
+        _cam_playback_override = str(getattr(ctx, "camera_playback_enabled", "inherit") or "inherit") if ctx else "inherit"
         _do_playback = (
-            _cam_playback_override is True
+            _cam_playback_override == "always"
             or (
-                _cam_playback_override is not False
+                _cam_playback_override != "never"
                 and bool(getattr(camera_mode, "playback_enabled", True))
             )
         )
         if _do_playback:
             _prerecord_ok = (
-                _cam_playback_override is True
+                _cam_playback_override == "always"
                 or await self.is_camera_prerecord_eligible(cam)
             )
             if _prerecord_ok:
@@ -2681,9 +2681,9 @@ class NotificationService:
         site_uuid_str = str(ctx.site_uuid)
         device_name = ctx.device_name
         camera_name = ctx.camera_name
-        _cam_trigger_mode = getattr(ctx, "notification_trigger_mode", None)
-        if _cam_trigger_mode is not None:
-            allow_broad_notifications = (str(_cam_trigger_mode) == "any_detection")
+        _cam_trigger_mode = str(getattr(ctx, "notification_trigger_mode", "inherit") or "inherit")
+        if _cam_trigger_mode in ("roi_enter", "any_detection"):
+            allow_broad_notifications = (_cam_trigger_mode == "any_detection")
         else:
             site_trigger_mode = await self._get_site_trigger_mode(site_uuid_str)
             allow_broad_notifications = (site_trigger_mode == "any_detection")

@@ -107,12 +107,26 @@ class ChannelRepository:
         has_notification_trigger_mode = "notification_trigger_mode" in d
         notification_trigger_mode_val = d.get("notification_trigger_mode")
         if isinstance(notification_trigger_mode_val, str):
-            notification_trigger_mode_val = notification_trigger_mode_val.strip() or None
+            notification_trigger_mode_val = notification_trigger_mode_val.strip() or "inherit"
+        elif notification_trigger_mode_val is None:
+            notification_trigger_mode_val = "inherit"
+        else:
+            notification_trigger_mode_val = str(notification_trigger_mode_val)
+        if notification_trigger_mode_val not in ("inherit", "roi_enter", "any_detection"):
+            notification_trigger_mode_val = "inherit"
 
         has_camera_playback_enabled = "camera_playback_enabled" in d
         camera_playback_enabled_val = d.get("camera_playback_enabled")
-        if camera_playback_enabled_val is not None:
-            camera_playback_enabled_val = bool(camera_playback_enabled_val)
+        if camera_playback_enabled_val is True:
+            camera_playback_enabled_val = "always"
+        elif camera_playback_enabled_val is False:
+            camera_playback_enabled_val = "never"
+        elif camera_playback_enabled_val is None:
+            camera_playback_enabled_val = "inherit"
+        else:
+            camera_playback_enabled_val = str(camera_playback_enabled_val).strip() or "inherit"
+        if camera_playback_enabled_val not in ("inherit", "always", "never"):
+            camera_playback_enabled_val = "inherit"
 
         if not rtsp_url:
             raise ValueError("channel_config.rtsp_url is required")
@@ -194,8 +208,8 @@ class ChannelRepository:
                 is_notification_enabled=bool(notification_enabled),
                 use_site_schedule=bool(use_site_schedule),
                 roi=roi,
-                notification_trigger_mode=notification_trigger_mode_val if has_notification_trigger_mode else None,
-                camera_playback_enabled=camera_playback_enabled_val if has_camera_playback_enabled else None,
+                notification_trigger_mode=notification_trigger_mode_val if has_notification_trigger_mode else "inherit",
+                camera_playback_enabled=camera_playback_enabled_val if has_camera_playback_enabled else "inherit",
             )
             if cam_uuid is not None:
                 cam.camera_uuid = cam_uuid
@@ -444,11 +458,6 @@ class ChannelRepository:
             cfg.pop(k, None)
         return cfg
 
-    # Keys whose explicit None means "clear per-camera override; inherit site default".
-    # These must NOT be stripped by exclude_none — otherwise stale values persist in the JSON
-    # and leak back onto the Camera row on the next edit.
-    _CONFIG_NULLABLE_KEEP = {"notification_trigger_mode", "camera_playback_enabled"}
-
     async def _upsert_channel_configuration(
         self,
         db: AsyncSession,
@@ -461,9 +470,6 @@ class ChannelRepository:
         end_time: time,
     ) -> ChannelConfiguration:
         encoded = jsonable_encoder(configuration, exclude_none=True)
-        for key in self._CONFIG_NULLABLE_KEEP:
-            if key in configuration:
-                encoded[key] = configuration[key]
 
         row = (
             await db.execute(select(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
@@ -484,9 +490,6 @@ class ChannelRepository:
 
         merged = dict(row.configuration or {})
         merged.update(encoded)
-        for key in self._CONFIG_NULLABLE_KEEP:
-            if key in encoded and encoded[key] is None:
-                merged.pop(key, None)
         merged["schedule"] = encoded.get("schedule", merged.get("schedule", self._default_weekly_schedule()))
 
         row.configuration = merged

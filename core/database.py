@@ -468,6 +468,89 @@ class DatabaseManager:
                 except Exception as exc:
                     logger.warning("Skipping channel_configurations.notification_trigger_mode cleanup: %s", exc)
 
+            # Migrate camera.notification_trigger_mode and camera.camera_playback_enabled
+            # to explicit tri-state strings ("inherit" | "roi_enter" | "any_detection"
+            # and "inherit" | "always" | "never"). Historical schema used NULL for
+            # "inherit" and a TINYINT bool for playback.
+            if dialect_name.startswith("mysql"):
+                try:
+                    trig_col = (
+                        await conn.execute(
+                            text(
+                                "SELECT IS_NULLABLE, COLUMN_DEFAULT "
+                                "FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'camera' "
+                                "  AND COLUMN_NAME = 'notification_trigger_mode' "
+                                "LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if trig_col is not None:
+                        is_nullable = str(trig_col[0]).upper() == "YES"
+                        default_val = trig_col[1]
+                        if is_nullable or default_val != "inherit":
+                            await conn.execute(
+                                text(
+                                    "UPDATE camera SET notification_trigger_mode = 'inherit' "
+                                    "WHERE notification_trigger_mode IS NULL OR notification_trigger_mode = ''"
+                                )
+                            )
+                            await conn.execute(
+                                text(
+                                    "ALTER TABLE camera MODIFY COLUMN notification_trigger_mode "
+                                    "VARCHAR(32) NOT NULL DEFAULT 'inherit'"
+                                )
+                            )
+                            logger.info("Migrated camera.notification_trigger_mode to tri-state NOT NULL.")
+                except Exception as exc:
+                    logger.warning("Skipping camera.notification_trigger_mode migration: %s", exc)
+
+                try:
+                    pb_col = (
+                        await conn.execute(
+                            text(
+                                "SELECT DATA_TYPE, COLUMN_TYPE "
+                                "FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'camera' "
+                                "  AND COLUMN_NAME = 'camera_playback_enabled' "
+                                "LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if pb_col is not None:
+                        data_type = str(pb_col[0]).lower()
+                        if data_type not in ("varchar", "char", "text"):
+                            # Rename existing column, add new string column, migrate data, drop old.
+                            await conn.execute(
+                                text(
+                                    "ALTER TABLE camera "
+                                    "ADD COLUMN camera_playback_enabled_new VARCHAR(16) "
+                                    "NOT NULL DEFAULT 'inherit'"
+                                )
+                            )
+                            await conn.execute(
+                                text(
+                                    "UPDATE camera SET camera_playback_enabled_new = CASE "
+                                    "WHEN camera_playback_enabled = 1 THEN 'always' "
+                                    "WHEN camera_playback_enabled = 0 THEN 'never' "
+                                    "ELSE 'inherit' END"
+                                )
+                            )
+                            await conn.execute(
+                                text("ALTER TABLE camera DROP COLUMN camera_playback_enabled")
+                            )
+                            await conn.execute(
+                                text(
+                                    "ALTER TABLE camera CHANGE COLUMN camera_playback_enabled_new "
+                                    "camera_playback_enabled VARCHAR(16) NOT NULL DEFAULT 'inherit'"
+                                )
+                            )
+                            logger.info("Migrated camera.camera_playback_enabled BOOL -> VARCHAR tri-state.")
+                except Exception as exc:
+                    logger.warning("Skipping camera.camera_playback_enabled migration: %s", exc)
+
         # Seed a dev user if DB is empty.
         async with self.AsyncSessionLocal() as db:
             existing = (await db.execute(select(User.id).limit(1))).scalar_one_or_none()

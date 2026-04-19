@@ -41,8 +41,8 @@ class CameraContext:
     camera_name: Optional[str]
     device_uuid: Optional[uuid.UUID]
     device_name: Optional[str]
-    notification_trigger_mode: Optional[str] = None
-    camera_playback_enabled: Optional[bool] = None
+    notification_trigger_mode: str = "inherit"
+    camera_playback_enabled: str = "inherit"
 
 
 @dataclass(frozen=True)
@@ -57,6 +57,24 @@ def _normalize_trigger_mode(raw: Any) -> str:
     if value == "any_detection":
         return "any_detection"
     return "roi_enter"
+
+
+def _coerce_trigger_mode(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if value in ("roi_enter", "any_detection", "inherit"):
+        return value
+    return "inherit"
+
+
+def _coerce_playback_mode(raw: Any) -> str:
+    if raw is True:
+        return "always"
+    if raw is False:
+        return "never"
+    value = str(raw or "").strip().lower()
+    if value in ("always", "never", "inherit"):
+        return value
+    return "inherit"
 
 
 def _normalize_uuid_list(raw: Any) -> List[uuid.UUID]:
@@ -134,8 +152,8 @@ class NotificationRepository:
             camera_name=display_camera_name,
             device_uuid=device_uuid,
             device_name=device_name,
-            notification_trigger_mode=str(notification_trigger_mode) if notification_trigger_mode else None,
-            camera_playback_enabled=bool(camera_playback_enabled) if camera_playback_enabled is not None else None,
+            notification_trigger_mode=_coerce_trigger_mode(notification_trigger_mode),
+            camera_playback_enabled=_coerce_playback_mode(camera_playback_enabled),
         )
 
     async def list_camera_contexts(
@@ -159,6 +177,8 @@ class NotificationRepository:
                 Camera.camera_code,
                 Device.device_uuid,
                 Device.name,
+                Camera.notification_trigger_mode,
+                Camera.camera_playback_enabled,
             )
             .select_from(Camera)
             .join(Site, Site.site_uuid == Camera.site_uuid)
@@ -181,6 +201,8 @@ class NotificationRepository:
             camera_code,
             device_uuid,
             device_name,
+            notification_trigger_mode,
+            camera_playback_enabled,
         ) in rows:
             display_camera_name = camera_name or camera_code
             out[camera_uuid] = CameraContext(
@@ -191,6 +213,8 @@ class NotificationRepository:
                 camera_name=display_camera_name,
                 device_uuid=device_uuid,
                 device_name=device_name,
+                notification_trigger_mode=_coerce_trigger_mode(notification_trigger_mode),
+                camera_playback_enabled=_coerce_playback_mode(camera_playback_enabled),
             )
         return out
 
