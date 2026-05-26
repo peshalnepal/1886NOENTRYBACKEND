@@ -589,12 +589,15 @@ class ModelPipeline:
             track_events=track_events,
             alerts=tuple(alerts),
         )
-        #TODO Understand from here 
+
         now = time.monotonic()
         self._last_seen[key] = (int(resp2.frame_ts_ms), int(resp2.frame_seq))
         self._last_ok_s[key] = now
         self._last_seq[key] = int(resp2.frame_seq)
 
+        # Publish for the live overlay first. Anything slow (clip recording,
+        # snapshot fetch, notification persistence) must happen AFTER this so
+        # the SSE stream to the frontend sees the freshest frame ASAP.
         await self.detect_store.put(resp2)
         await self.detection_hub.publish(resp2)
 
@@ -602,93 +605,137 @@ class ModelPipeline:
         if svc is None:
             return True
 
-        cam_uuid = str(resp2.camera_uuid)
-
-        _cam_cfg = getattr(ch, "config", None)
-        _cam_playback_override = str(getattr(_cam_cfg, "camera_playback_enabled", "inherit") or "inherit")
-        _do_playback = (
-            _cam_playback_override == "always" or _cam_playback_override == "inherit"
-        ) and self.is_channel_enable(ch)
-        if _do_playback:
-            try:
-                _prerecord_ok = (
-                    _cam_playback_override == "always"       # explicit override bypasses site list
-                    or await svc.is_camera_prerecord_eligible(cam_uuid)
-                )
-                if _prerecord_ok:
-                    overlay_payload = _overlay_payload_from_resp(resp2,fallback_detections=resp2.tracks)
-                    await svc.record_detection_overlay_frame(
-                        camera_uuid=cam_uuid,
-                        frame_ts_ms=overlay_payload.get("frame_ts_ms"),
-                        frame_seq=overlay_payload.get("frame_seq"),
-                        frame_w=overlay_payload.get("frame_w"),
-                        frame_h=overlay_payload.get("frame_h"),
-                        detections=list(overlay_payload.get("detections") or []),
-                    )
-            except Exception:
-                logger.exception("Failed to record detection overlay frame camera=%s", cam_uuid)
-
-        if not self._notifications_allowed_now(ch):
-            return True
-
-        _cam_trigger_mode = str(getattr(_cam_cfg, "notification_trigger_mode", "inherit") or "inherit")
-        if _cam_trigger_mode in ("roi_enter", "any_detection"):
-            allow_broad_notifications = (_cam_trigger_mode == "any_detection")
-        else:
-            site_uuid_for_trigger = getattr(ch.config, "site_uuid", None)
-            site_trigger_mode = await self._trigger_mode_resolver.resolve(
-                str(site_uuid_for_trigger) if site_uuid_for_trigger else None
-            )
-            allow_broad_notifications = (site_trigger_mode == "any_detection")
-        extra_payload: Optional[Dict[str, Any]] = None
-        extra_payload_loaded = False
-
-        async def _ensure_alert_extra_payload() -> Optional[Dict[str, Any]]:
-            nonlocal extra_payload, extra_payload_loaded
-            if not extra_payload_loaded:
-                extra_payload = await self._build_alert_extra_payload(resp=resp2, ch=ch)
-                extra_payload_loaded = True
-            return extra_payload
-
-        emitted_detail = False
-
-        if allow_broad_notifications and self.notify_on_confirmed and track_events:
-            try:
-                emitted_detail = (
-                    await self._emit_item_detected_notifications(
-                        resp2,
-                        tracks,
-                        track_events,
-                        extra_payload=await _ensure_alert_extra_payload(),
-                    )
-                ) or emitted_detail
-            except Exception:
-                logger.exception("Failed to emit item-detected notifications camera=%s", cam_uuid)
-
-        if self.notify_on_roi_enter and alerts:
-            try:
-                emitted_detail = (
-                    await self._emit_roi_alert_notifications(
-                        resp2,
-                        alerts,
-                        extra_payload=await _ensure_alert_extra_payload(),
-                    )
-                ) or emitted_detail
-            except Exception:
-                logger.exception("Failed to emit ROI notifications camera=%s", cam_uuid)
-
-        if not emitted_detail and allow_broad_notifications:
-            summary_classes = self._interesting_detection_classes(resp2)
-            if summary_classes and self._reserve_detection_summary_alert(cam_uuid, summary_classes):
-                try:
-                    await self._emit_detection_summary_notification(
-                        resp2,
-                        extra_payload=await _ensure_alert_extra_payload(),
-                    )
-                except Exception:
-                    logger.exception("Failed to emit detection-summary notification camera=%s", cam_uuid)
+        # Fire-and-forget the post-publish work. Previously this block was
+        # awaited inline, which blocked the per-camera Jetson SSE consumer
+        # (the `async for payload in ch.stream_detections()` loop) on every
+        # frame and pushed the overlay several frames behind the live video.
+        # Spawning a task lets the consumer immediately read the next frame.
+        self._task_spawner(
+            self._post_publish_work(resp2, ch),
+            f"detection_post_publish:{key}",
+        )
 
         return True
+
+    async def _post_publish_work(
+        self,
+        resp2: ObjDetectResponse,
+        ch: VideoChannel,
+    ) -> None:
+        """
+        Runs off the stream-consumer hot path. Handles:
+          - overlay-frame recording for clip playback
+          - alert snapshot fetch (was the worst per-frame stall on alert frames)
+          - ROI / item-detected / detection-summary notifications
+
+        Any exception here is logged but never propagated, since it's detached
+        from the caller.
+        """
+        try:
+            svc = self._notification_service
+            if svc is None:
+                return
+
+            cam_uuid = str(resp2.camera_uuid)
+            _cam_cfg = getattr(ch, "config", None)
+
+            # Compute the base overlay payload exactly once for the recorder.
+            # The per-alert notification emitters still build their own overlays
+            # because each one appends a different alert/track-specific detection
+            # on top of the base.
+            base_overlay: Optional[Dict[str, Any]] = None
+
+            _cam_playback_override = str(getattr(_cam_cfg, "camera_playback_enabled", "inherit") or "inherit")
+            _do_playback = (
+                _cam_playback_override == "always" or _cam_playback_override == "inherit"
+            ) and self.is_channel_enable(ch)
+            if _do_playback:
+                try:
+                    _prerecord_ok = (
+                        _cam_playback_override == "always"       # explicit override bypasses site list
+                        or await svc.is_camera_prerecord_eligible(cam_uuid)
+                    )
+                    if _prerecord_ok:
+                        base_overlay = _overlay_payload_from_resp(resp2, fallback_detections=resp2.tracks)
+                        await svc.record_detection_overlay_frame(
+                            camera_uuid=cam_uuid,
+                            frame_ts_ms=base_overlay.get("frame_ts_ms"),
+                            frame_seq=base_overlay.get("frame_seq"),
+                            frame_w=base_overlay.get("frame_w"),
+                            frame_h=base_overlay.get("frame_h"),
+                            detections=list(base_overlay.get("detections") or []),
+                        )
+                except Exception:
+                    logger.exception("Failed to record detection overlay frame camera=%s", cam_uuid)
+
+            if not self._notifications_allowed_now(ch):
+                return
+
+            _cam_trigger_mode = str(getattr(_cam_cfg, "notification_trigger_mode", "inherit") or "inherit")
+            if _cam_trigger_mode in ("roi_enter", "any_detection"):
+                allow_broad_notifications = (_cam_trigger_mode == "any_detection")
+            else:
+                site_uuid_for_trigger = getattr(ch.config, "site_uuid", None)
+                site_trigger_mode = await self._trigger_mode_resolver.resolve(
+                    str(site_uuid_for_trigger) if site_uuid_for_trigger else None
+                )
+                allow_broad_notifications = (site_trigger_mode == "any_detection")
+
+            # _build_alert_extra_payload may HTTP-fetch a snapshot from Jetson
+            # (hundreds of ms). It was previously awaited on the stream loop;
+            # now it only runs here, off the hot path, and still lazily.
+            extra_payload: Optional[Dict[str, Any]] = None
+            extra_payload_loaded = False
+
+            async def _ensure_alert_extra_payload() -> Optional[Dict[str, Any]]:
+                nonlocal extra_payload, extra_payload_loaded
+                if not extra_payload_loaded:
+                    extra_payload = await self._build_alert_extra_payload(resp=resp2, ch=ch)
+                    extra_payload_loaded = True
+                return extra_payload
+
+            tracks = resp2.tracks
+            track_events = resp2.track_events
+            alerts = list(resp2.alerts or ())
+            emitted_detail = False
+
+            if allow_broad_notifications and self.notify_on_confirmed and track_events:
+                try:
+                    emitted_detail = (
+                        await self._emit_item_detected_notifications(
+                            resp2,
+                            tracks,
+                            track_events,
+                            extra_payload=await _ensure_alert_extra_payload(),
+                        )
+                    ) or emitted_detail
+                except Exception:
+                    logger.exception("Failed to emit item-detected notifications camera=%s", cam_uuid)
+
+            if self.notify_on_roi_enter and alerts:
+                try:
+                    emitted_detail = (
+                        await self._emit_roi_alert_notifications(
+                            resp2,
+                            alerts,
+                            extra_payload=await _ensure_alert_extra_payload(),
+                        )
+                    ) or emitted_detail
+                except Exception:
+                    logger.exception("Failed to emit ROI notifications camera=%s", cam_uuid)
+
+            if not emitted_detail and allow_broad_notifications:
+                summary_classes = self._interesting_detection_classes(resp2)
+                if summary_classes and self._reserve_detection_summary_alert(cam_uuid, summary_classes):
+                    try:
+                        await self._emit_detection_summary_notification(
+                            resp2,
+                            extra_payload=await _ensure_alert_extra_payload(),
+                        )
+                    except Exception:
+                        logger.exception("Failed to emit detection-summary notification camera=%s", cam_uuid)
+        except Exception:
+            logger.exception("post-publish detection work failed camera=%s", str(resp2.camera_uuid))
 
     @staticmethod
     def _parse_roi_points(raw: Any) -> List[Tuple[float, float]]:
