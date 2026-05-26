@@ -195,8 +195,8 @@ async def signup_request_code(
     if existing is not None:
         raise HTTPException(status_code=409, detail="Account already exists")
 
-    verify_repo = EmailVerificationRepository(db)
-    active_verification = await verify_repo.get_latest_active(email)
+    verify_repo = EmailVerificationRepository()
+    active_verification = await verify_repo.get_latest_active(db, email)
     now = utc_now()
     if active_verification is not None and active_verification.sent_at is not None:
         age = (now - _as_utc(active_verification.sent_at)).total_seconds()
@@ -213,8 +213,9 @@ async def signup_request_code(
     signup_expires_at = now + timedelta(seconds=SIGNUP_TEMP_TTL_SECONDS)
 
     try:
-        await verify_repo.invalidate_active(email)
+        await verify_repo.invalidate_active(db, email)
         await verify_repo.create(
+            db,
             email=email,
             code_hash=code_hash,
             ip=_request_ip(request),
@@ -310,13 +311,13 @@ async def signup_verify(
         await db.commit()
         raise HTTPException(status_code=409, detail="Account already exists")
 
-    verify_repo = EmailVerificationRepository(db)
-    verification = await verify_repo.get_latest_active(email)
+    verify_repo = EmailVerificationRepository()
+    verification = await verify_repo.get_latest_active(db, email)
     if verification is None:
         raise HTTPException(status_code=400, detail="Verification code expired or missing. Request a new code.")
 
     if verification.attempts >= OTP_MAX_ATTEMPTS:
-        await verify_repo.consume(int(verification.id))
+        await verify_repo.consume(db, int(verification.id))
         await db.commit()
         raise HTTPException(
             status_code=429,
@@ -330,14 +331,14 @@ async def signup_verify(
         stored_hash=verification.code_hash,
     )
     if not is_valid_code:
-        await verify_repo.increment_attempts(int(verification.id))
+        await verify_repo.increment_attempts(db, int(verification.id))
         if verification.attempts + 1 >= OTP_MAX_ATTEMPTS:
-            await verify_repo.consume(int(verification.id))
+            await verify_repo.consume(db, int(verification.id))
         await db.commit()
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
     temp.used = True
-    await verify_repo.consume(int(verification.id))
+    await verify_repo.consume(db, int(verification.id))
 
     try:
         user = User(

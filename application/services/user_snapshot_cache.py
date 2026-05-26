@@ -114,7 +114,7 @@ class UserSnapshotCache:
         try:
             async with self._lookup_limit:
                 async with session_factory() as db:
-                    row = await UserRepository(db).get_by_id(uid)
+                    row = await UserRepository().get_by_id(db, uid)
 
                 if row is not None:
                     snapshot = CachedUserSnapshot(

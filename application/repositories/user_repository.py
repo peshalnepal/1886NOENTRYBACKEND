@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional,List
+from typing import Optional, List
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,34 +11,30 @@ from core.database_orm import User, utc_now
 
 
 class UserRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
     @staticmethod
     def normalize_email(email: str) -> str:
         return email.strip().lower()
 
-
-    async def get_by_id(self, user_id: int) -> Optional[User]:
+    async def get_by_id(self, db: AsyncSession, user_id: int) -> Optional[User]:
         stmt = select(User).where(User.id == user_id).limit(1)
-        res = await self.db.execute(stmt)
+        res = await db.execute(stmt)
         return res.scalar_one_or_none()
 
-    async def get_by_email(self, email: str) -> Optional[User]:
+    async def get_by_email(self, db: AsyncSession, email: str) -> Optional[User]:
         email = self.normalize_email(email)
         stmt = select(User).where(User.email == email).limit(1)
-        res = await self.db.execute(stmt)
+        res = await db.execute(stmt)
         return res.scalar_one_or_none()
 
-    async def exists_email(self, email: str) -> bool:
-        return (await self.get_by_email(email)) is not None
-    
-    async def get_exisiting_users_id(self)->List[int]:
+    async def exists_email(self, db: AsyncSession, email: str) -> bool:
+        return (await self.get_by_email(db, email)) is not None
+
+    async def get_exisiting_users_id(self, db: AsyncSession) -> List[int]:
         stmt = select(User.id).where(User.id.is_not(None))
-        res = await self.db.execute(stmt)
+        res = await db.execute(stmt)
         return res.scalars().all()
-    
-    async def create_user(self, dto: UserCreateDTO) -> User:
+
+    async def create_user(self, db: AsyncSession, dto: UserCreateDTO) -> User:
         """
         Creates a user row from a `UserCreateDTO`. Does NOT commit automatically.
         Call await db.commit() in your service/route when ready.
@@ -53,40 +49,39 @@ class UserRepository:
             created_at=utc_now(),
         )
 
-        self.db.add(user)
+        db.add(user)
         try:
-            await self.db.flush()  
+            await db.flush()
         except IntegrityError:
             raise ValueError("Email already exists")
 
         return user
 
-    async def mark_email_verified(self, user_id: int) -> None:
+    async def mark_email_verified(self, db: AsyncSession, user_id: int) -> None:
         stmt = (
             update(User)
             .where(User.id == user_id)
             .values(email_verified=True, verified_at=utc_now())
         )
-        await self.db.execute(stmt)
+        await db.execute(stmt)
 
-    async def update_last_login(self, user_id: int) -> None:
+    async def update_last_login(self, db: AsyncSession, user_id: int) -> None:
         stmt = (
             update(User)
             .where(User.id == user_id)
             .values(last_login_at=utc_now())
         )
-        await self.db.execute(stmt)
+        await db.execute(stmt)
 
-    async def update_password_hash(self, user_id: int, new_password_hash: str) -> None:
+    async def update_password_hash(self, db: AsyncSession, user_id: int, new_password_hash: str) -> None:
         stmt = (
             update(User)
             .where(User.id == user_id)
             .values(hashed_password=new_password_hash)
         )
-        await self.db.execute(stmt)
+        await db.execute(stmt)
 
-
-    async def update_profile(self, user_id: int, dto: UserProfileUpdateDTO) -> None:
+    async def update_profile(self, db: AsyncSession, user_id: int, dto: UserProfileUpdateDTO) -> None:
         """Update the User columns set on `dto`."""
         values = dto.model_dump(exclude_unset=True)
         if "email" in values and values["email"] is not None:
@@ -96,11 +91,11 @@ class UserRepository:
             return
 
         stmt = update(User).where(User.id == user_id).values(**values)
-        await self.db.execute(stmt)
+        await db.execute(stmt)
 
-    async def delete_by_id(self, user_id: int) -> int:
+    async def delete_by_id(self, db: AsyncSession, user_id: int) -> int:
         """Hard-delete a user row. Does NOT commit; caller owns the transaction."""
-        result = await self.db.execute(
+        result = await db.execute(
             delete(User)
             .where(User.id == user_id)
             .execution_options(synchronize_session=False)

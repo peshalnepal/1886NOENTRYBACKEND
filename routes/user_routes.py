@@ -113,7 +113,7 @@ async def update_me(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ):
-    user_repo = UserRepository(db)
+    user_repo = UserRepository()
 
     next_user_name: Optional[str] = None
     next_email: Optional[str] = None
@@ -126,7 +126,7 @@ async def update_me(
         current_email = str(current_user.email).lower().strip()
 
         if candidate_email != current_email:
-            existing = await user_repo.get_by_email(candidate_email)
+            existing = await user_repo.get_by_email(db, candidate_email)
             if existing is not None and int(existing.id) != int(current_user.id):
                 raise HTTPException(status_code=409, detail="Email is already in use")
 
@@ -137,6 +137,7 @@ async def update_me(
 
     try:
         await user_repo.update_profile(
+            db,
             int(current_user.id),
             UserProfileUpdateDTO(user_name=next_user_name, email=next_email),
         )
@@ -173,8 +174,8 @@ async def change_my_password(
         )
 
     try:
-        await UserRepository(db).update_password_hash(
-            int(current_user.id), get_password_hash(new_password)
+        await UserRepository().update_password_hash(
+            db, int(current_user.id), get_password_hash(new_password)
         )
         await db.commit()
         _invalidate_user_snapshot_cache(request, int(current_user.id))
@@ -371,7 +372,7 @@ async def delete_my_account(
 
             # Finally delete the user row
             async with AsyncSessionLocal() as del_session:
-                deleted = await UserRepository(del_session).delete_by_id(uid)
+                deleted = await UserRepository().delete_by_id(del_session, uid)
                 if deleted:
                     await del_session.commit()
 

@@ -11,19 +11,17 @@ OTP_TTL_SECONDS = env_int("OTP_TTL_SECONDS", 600, minimum=60)
 
 
 class EmailVerificationRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
-    async def invalidate_active(self, email: str) -> None:
+    async def invalidate_active(self, db: AsyncSession, email: str) -> None:
         stmt = (
             update(EmailVerification)
             .where(EmailVerification.email == email, EmailVerification.used == False)
             .values(used=True, consumed_at=utc_now())
         )
-        await self.db.execute(stmt)
+        await db.execute(stmt)
 
     async def create(
         self,
+        db: AsyncSession,
         email: str,
         code_hash: str,
         ip: str | None = None,
@@ -40,11 +38,11 @@ class EmailVerificationRepository:
             ip=ip,
             user_agent=user_agent,
         )
-        self.db.add(v)
-        await self.db.flush()
+        db.add(v)
+        await db.flush()
         return v
 
-    async def get_latest_active(self, email: str) -> EmailVerification | None:
+    async def get_latest_active(self, db: AsyncSession, email: str) -> EmailVerification | None:
         now = utc_now()
         stmt = (
             select(EmailVerification)
@@ -56,21 +54,21 @@ class EmailVerificationRepository:
             .order_by(EmailVerification.id.desc())
             .limit(1)
         )
-        res = await self.db.execute(stmt)
+        res = await db.execute(stmt)
         return res.scalar_one_or_none()
 
-    async def increment_attempts(self, verification_id: int) -> None:
+    async def increment_attempts(self, db: AsyncSession, verification_id: int) -> None:
         stmt = (
             update(EmailVerification)
             .where(EmailVerification.id == verification_id)
             .values(attempts=EmailVerification.attempts + 1)
         )
-        await self.db.execute(stmt)
+        await db.execute(stmt)
 
-    async def consume(self, verification_id: int) -> None:
+    async def consume(self, db: AsyncSession, verification_id: int) -> None:
         stmt = (
             update(EmailVerification)
             .where(EmailVerification.id == verification_id)
             .values(used=True, consumed_at=utc_now())
         )
-        await self.db.execute(stmt)
+        await db.execute(stmt)
