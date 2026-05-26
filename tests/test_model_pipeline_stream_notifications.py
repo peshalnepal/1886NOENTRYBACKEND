@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from application.repositories.notification_repository import CameraContext
-from domain.model_pipeline import ModelPipeline
+from application.services.pipeline import ModelPipeline
 
 
 class _FakeConfig:
@@ -15,6 +15,7 @@ class _FakeConfig:
         self.device_url = "http://jetson.example:8080"
         self.enabled = True
         self.notification_enabled = True
+        self.notification_trigger_mode = "inherit"
         self._scheduled = bool(scheduled)
 
     def is_scheduled_now(self, *, now_utc=None):
@@ -34,9 +35,6 @@ class _FakeChannel:
 
 class _FakeNotificationService:
     def __init__(self):
-        self.notify_on_confirmed = False
-        self.notify_on_roi_enter = False
-        self.interesting = {"person"}
         self.hub = SimpleNamespace(publish=AsyncMock())
         self.is_camera_prerecord_eligible = AsyncMock(return_value=False)
         self.record_detection_overlay_frame = AsyncMock()
@@ -61,13 +59,20 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
 
-    async def _make_pipeline(self, *, scheduled: bool = True):
+    async def _make_pipeline(self, *, scheduled: bool = True, trigger_mode: str = "inherit"):
         camera_uuid = str(uuid.uuid4())
         config = _FakeConfig(camera_uuid, scheduled=scheduled)
+        config.notification_trigger_mode = trigger_mode
         channel = _FakeChannel(config)
-        pipeline = ModelPipeline(pipeline_id=uuid.uuid4())
         service = _FakeNotificationService()
+        pipeline = ModelPipeline(
+            pipeline_id=uuid.uuid4(),
+            notify_on_confirmed=False,
+            notify_on_roi_enter=False,
+            interesting_classes={"person"},
+        )
         pipeline.set_notification_service(service)
+        pipeline._trigger_mode_resolver.resolve = AsyncMock(return_value="any_detection")
         pipeline._get_camera_ctx = AsyncMock(
             return_value=CameraContext(
                 user_id=7,
@@ -83,7 +88,7 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         return pipeline, channel, service
 
     async def test_stream_payload_restores_summary_and_overlay_side_effects(self):
-        pipeline, channel, service = await self._make_pipeline(scheduled=True)
+        pipeline, channel, service = await self._make_pipeline(scheduled=True, trigger_mode="any_detection")
         camera_uuid = channel.key()
 
         service.is_camera_prerecord_eligible.return_value = True
@@ -120,10 +125,10 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         service.record_detection_overlay_frame.assert_not_awaited()
 
     async def test_stream_payload_prefers_confirmed_track_alerts_over_summary(self):
-        pipeline, channel, service = await self._make_pipeline(scheduled=True)
+        pipeline, channel, service = await self._make_pipeline(scheduled=True, trigger_mode="any_detection")
         camera_uuid = channel.key()
 
-        service.notify_on_confirmed = True
+        pipeline.notify_on_confirmed = True
         pipeline._tracker.update_from_event = Mock(
             return_value={
                 "tracks": [{"track_id": 11, "cls_name": "person", "conf": 0.88, "box": {"x1": 10, "y1": 20, "x2": 110, "y2": 220}}],
@@ -171,7 +176,8 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(processed)
         self.assertIsNotNone(await pipeline.get_latest_detection(camera_uuid))
 
-        pipeline._cam_ctx_cache[camera_uuid] = (
+        pipeline._ctx_resolver._cache[camera_uuid] = (
+            9999999999.0,
             CameraContext(
                 user_id=7,
                 site_uuid=uuid.UUID(channel.config.site_uuid),
@@ -181,14 +187,13 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
                 device_uuid=uuid.UUID(channel.config.device_uuid),
                 device_name="Jetson A",
             ),
-            9999999999.0,
         )
 
         removed = await pipeline.remove_channel(camera_uuid)
 
         self.assertTrue(removed)
         self.assertIsNone(await pipeline.get_latest_detection(camera_uuid))
-        self.assertNotIn(camera_uuid, pipeline._cam_ctx_cache)
+        self.assertNotIn(camera_uuid, pipeline._ctx_resolver._cache)
 
 
 if __name__ == "__main__":

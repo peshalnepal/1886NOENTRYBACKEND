@@ -7,13 +7,18 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from application.repositories.notification_repository import NotificationRepository
+from application.repositories.site_repository import SiteRepository
+from application.dtos import NotificationEmailCreateDTO
 from dependencies import get_async_db, get_current_user
-from core.database_orm import NotificationEmail, Site, User
+from core.database_orm import User
 
 router = APIRouter(prefix="/notification-emails", tags=["notification-emails"])
+
+notif_repo = NotificationRepository()
+site_repo = SiteRepository()
 
 
 def _get_notification_service(request: Request):
@@ -82,13 +87,9 @@ async def list_notification_emails(
     List notification emails for a user.
     Optional site_uuid filter narrows results to one site.
     """
-    stmt = select(NotificationEmail).where(NotificationEmail.user_id == int(user.id))
-    if site_uuid is not None:
-        stmt = stmt.where(NotificationEmail.site_uuid == site_uuid)
-    stmt = stmt.order_by(NotificationEmail.email.asc(), NotificationEmail.site_uuid.asc())
-
-    result = await db.execute(stmt)
-    rows = result.scalars().all()
+    rows = await notif_repo.list_notification_email_rows(
+        db, user_id=int(user.id), site_uuid=site_uuid
+    )
     return [
         NotificationEmailOut(
             id=row.id,
@@ -114,12 +115,13 @@ async def add_notification_email(
     """
     normalized_email = payload.email.lower().strip()
 
-    site_stmt = select(Site.site_uuid).where(Site.user_id == int(user.id), Site.is_deleted == False)
     if payload.site_uuid is not None:
-        site_stmt = site_stmt.where(Site.site_uuid == payload.site_uuid)
-
-    site_rows = (await db.execute(site_stmt)).all()
-    target_site_uuids = [row[0] for row in site_rows]
+        site = await site_repo.get_site(
+            db, site_uuid=payload.site_uuid, user_id=int(user.id), raise_if_missing=False
+        )
+        target_site_uuids = [site.site_uuid] if site is not None else []
+    else:
+        target_site_uuids = await site_repo.list_site_uuids(db, user_id=int(user.id))
 
     if not target_site_uuids:
         if payload.site_uuid is not None:
@@ -132,26 +134,22 @@ async def add_notification_email(
             detail="Create at least one site before adding notification emails",
         )
 
-    existing_stmt = select(NotificationEmail.site_uuid).where(
-        NotificationEmail.user_id == int(user.id),
-        NotificationEmail.email == normalized_email,
-        NotificationEmail.site_uuid.in_(target_site_uuids),
-    )
-    existing_rows = (await db.execute(existing_stmt)).all()
-    existing_site_uuids = {row[0] for row in existing_rows}
-
-    created_rows: List[NotificationEmail] = []
+    created_rows = []
     for target_site_uuid in target_site_uuids:
-        if target_site_uuid in existing_site_uuids:
+        if await notif_repo.notification_email_exists(
+            db, user_id=int(user.id), site_uuid=target_site_uuid, email=normalized_email
+        ):
             continue
 
-        row = NotificationEmail(
-            user_id=int(user.id),
-            site_uuid=target_site_uuid,
-            email=normalized_email,
-            is_enabled=True,
+        row = await notif_repo.create_notification_email(
+            db,
+            dto=NotificationEmailCreateDTO(
+                user_id=int(user.id),
+                site_uuid=target_site_uuid,
+                email=normalized_email,
+                is_enabled=True,
+            ),
         )
-        db.add(row)
         created_rows.append(row)
 
     if not created_rows:
@@ -195,34 +193,31 @@ async def delete_notification_email(
     Delete one notification email entry by ID.
     If all_sites=true, remove the same user/email pair from all sites.
     """
-    result = await db.execute(
-        select(NotificationEmail).where(
-            NotificationEmail.id == email_id,
-            NotificationEmail.user_id == int(user.id),
-        )
+    email = await notif_repo.get_notification_email(
+        db, email_id=email_id, user_id=int(user.id)
     )
-    email = result.scalar_one_or_none()
     if not email:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Notification email not found",
         )
 
+    email_user_id = email.user_id
+    email_email = email.email
+    email_site_uuid = email.site_uuid
+
     if all_sites:
-        await db.execute(
-            delete(NotificationEmail).where(
-                NotificationEmail.user_id == email.user_id,
-                NotificationEmail.email == email.email,
-            )
+        await notif_repo.delete_notification_email(
+            db, user_id=email_user_id, email=email_email
         )
     else:
-        await db.delete(email)
+        await notif_repo.delete_notification_email(db, email_id=email_id)
 
     await db.commit()
     if request is not None:
         _invalidate_notification_email_cache(
             request,
-            user_id=email.user_id,
-            site_uuid=None if all_sites else email.site_uuid,
+            user_id=email_user_id,
+            site_uuid=None if all_sites else email_site_uuid,
         )
     return None

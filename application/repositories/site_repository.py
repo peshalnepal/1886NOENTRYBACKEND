@@ -1,20 +1,30 @@
 # application/repositories/site_repository.py
+"""
+Site + SiteSettings + SiteDevice persistence.
 
+Owns the `sites`, `site_settings` and `site_devices` tables. Camera queries
+belong to ChannelRepository; Device queries belong to DeviceRepository.
+
+Transaction policy: ordinary methods never commit (caller owns the
+transaction). The site-graph deletion helpers are the exception: they take a
+session *factory* and manage their own per-batch transactions because they
+must stream through very large tables.
+"""
+
+import logging
 import uuid
 from datetime import time as dt_time
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from application.channels.channel_config import VideoChannelConfig
+from application.dtos import SiteCreateDTO, SiteSettingsUpsertDTO, SiteUpdateDTO
 from core.database_orm import (
     Camera,
-    CameraDevice,
     ChannelConfiguration,
-    Device,
     Notification,
     NotificationEmail,
     PipelineCamera,
@@ -24,181 +34,143 @@ from core.database_orm import (
     VideoRecord,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _as_uuid(value: Any) -> Optional[uuid.UUID]:
+    if value is None:
+        return None
+    if isinstance(value, uuid.UUID):
+        return value
+    return uuid.UUID(str(value))
+
+
 class SiteRepository:
-    """
-    Site-centric queries.
+    """All persistence for Site, SiteSettings and the SiteDevice link table."""
 
-    Your ORM facts:
-      - Camera.site_uuid -> FK to Site.site_uuid
-      - Camera.devices is M:N via camera_devices
-      - ChannelConfiguration is 1:1 via camera_uuid
-    """
-
-    async def list_cameras_by_site(
+    # ------------------------------------------------------------------
+    # Site reads
+    # ------------------------------------------------------------------
+    async def get_site(
         self,
         db: AsyncSession,
         *,
         site_uuid: uuid.UUID,
-        user_id:int,
-        include_config: bool = True,
-        include_device: bool = True,
-
-        only_enabled: Optional[bool] = None,
-
-    ) -> List[Camera]:
-        """
-        Returns all cameras linked to a site_uuid.
-
-        include_config=True  -> eager-load Camera.channel_configuration
-        include_device=True  -> eager-load Camera.devices (via camera_devices)
-        only_enabled:
-          - None  -> all
-          - True  -> only Camera.is_enabled == True
-          - False -> only Camera.is_enabled == False
-        """
-        opts = []
-
-        if include_config:
-            opts.append(selectinload(Camera.channel_configuration))
-
-        if include_device:
-            # loads Camera.devices (Device objects) using the secondary table camera_devices
-            opts.append(selectinload(Camera.devices))
-
-        stmt = select(Camera).where(Camera.site_uuid == site_uuid,Camera.user_id==user_id)
-
-        if only_enabled is True:
-            stmt = stmt.where(Camera.is_enabled.is_(True))
-        elif only_enabled is False:
-            stmt = stmt.where(Camera.is_enabled.is_(False))
-
-        if opts:
-            stmt = stmt.options(*opts)
-
-        stmt = stmt.order_by(Camera.created_at.asc())
-
-        return (await db.execute(stmt)).scalars().all()
-    
-    async def list_camera_uuids_by_site(
-        self,
-        db: AsyncSession,
-        *,
-        site_uuid: uuid.UUID,
-        user_id: int,
-        only_enabled: Optional[bool] = None,
-    ) -> List[uuid.UUID]:
-        stmt = select(Camera.camera_uuid).where(
-            Camera.site_uuid == site_uuid,
-            Camera.user_id == int(user_id),
-        )
-
-        if only_enabled is True:
-            stmt = stmt.where(Camera.is_enabled.is_(True))
-        elif only_enabled is False:
-            stmt = stmt.where(Camera.is_enabled.is_(False))
-
-        stmt = stmt.order_by(Camera.created_at.asc())
-        return (await db.execute(stmt)).scalars().all()
-    
-    async def list_cameras_with_device_details_by_site(
-        self,
-        db: AsyncSession,
-        *,
-        site_uuid: uuid.UUID,
-        user_id: int,
-        only_enabled: Optional[bool] = None,
-    ) -> List[dict]:
-        stmt = (
-            select(Camera, Device)
-            .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid, isouter=True)
-            .join(Device, Device.device_uuid == CameraDevice.device_uuid, isouter=True)
-            .where(
-                Camera.site_uuid == site_uuid,
-                Camera.user_id == int(user_id),
-            )
-            .order_by(Camera.created_at.asc())
-        )
-
-        if only_enabled is True:
-            stmt = stmt.where(Camera.is_enabled.is_(True))
-        elif only_enabled is False:
-            stmt = stmt.where(Camera.is_enabled.is_(False))
-
-        rows = (await db.execute(stmt)).all()
-
-        out: List[dict] = []
-        for cam, dev in rows:
-            out.append(
-                {
-                    "camera_uuid": cam.camera_uuid,
-                    "camera_code": cam.camera_code,
-                    "site_uuid": cam.site_uuid,
-                    "rtsp_url": cam.rtsp_url,
-                    "webrtc_url": cam.webrtc_url,
-                    "is_enabled": cam.is_enabled,
-                    "is_detection_enabled": cam.is_detection_enabled,
-                    "is_notification_enabled": cam.is_notification_enabled,
-                    "roi": cam.roi,
-                    "device_uuid": getattr(dev, "device_uuid", None),
-                    "device_url": getattr(dev, "device_url", None),
-                }
-            )
-
-        return out
-
-    async def get_site(self,db:AsyncSession,*,site_uuid: uuid.UUID,user_id:int=None)->Optional[Site]:
-        smt = select(Site).where(Site.site_uuid == site_uuid, Site.is_deleted == False)
+        user_id: Optional[int] = None,
+        raise_if_missing: bool = True,
+    ) -> Optional[Site]:
+        stmt = select(Site).where(Site.site_uuid == _as_uuid(site_uuid), Site.is_deleted == False)
         if user_id is not None:
-            smt = smt.where(Site.user_id == int(user_id))
-        site = (await db.execute(smt)).scalar_one_or_none()
-        if not site:
+            stmt = stmt.where(Site.user_id == int(user_id))
+        site = (await db.execute(stmt)).scalar_one_or_none()
+        if site is None and raise_if_missing:
             raise HTTPException(status_code=404, detail="Site not found")
         return site
 
     async def get_sites(self, db: AsyncSession, *, user_id: int) -> List[Site]:
         if user_id is None:
             raise HTTPException(status_code=400, detail="user_id is required")
-
         stmt = (
             select(Site)
             .where(Site.user_id == int(user_id), Site.is_deleted == False)
             .order_by(Site.created_at.desc())
         )
         return (await db.execute(stmt)).scalars().all()
-    
-    async def get_site_settings(self,db: AsyncSession,*,site_uuid: uuid.UUID,user_id: int=None) -> Optional[SiteSettings]:
-        smt = select(SiteSettings).where(
-            
-            SiteSettings.site_uuid == site_uuid,
+
+    async def list_site_uuids(self, db: AsyncSession, *, user_id: int) -> List[uuid.UUID]:
+        """Return just the site uuids owned by a user (active sites only)."""
+        rows = (
+            await db.execute(
+                select(Site.site_uuid).where(
+                    Site.user_id == int(user_id), Site.is_deleted == False
+                )
+            )
+        ).scalars().all()
+        return list(rows)
+
+    # ------------------------------------------------------------------
+    # Site writes
+    # ------------------------------------------------------------------
+    async def create_site(self, db: AsyncSession, *, dto: SiteCreateDTO) -> Site:
+        """Insert a new Site from a `SiteCreateDTO`. Flush only; caller commits."""
+        site = Site(
+            user_id=int(dto.user_id),
+            name=dto.name,
+            address=dto.address,
+            timezone=dto.timezone or "UTC",
+            site_code=dto.site_code,
         )
-        if user_id:
-            smt=smt.where(SiteSettings.user_id == int(user_id),)
-        site_settings = (await db.execute(smt)).scalar_one_or_none()
-        return site_settings
+        db.add(site)
+        await db.flush()
+        return site
+
+    async def update_site(
+        self,
+        db: AsyncSession,
+        *,
+        site_uuid: uuid.UUID,
+        dto: SiteUpdateDTO,
+    ) -> int:
+        """Update the Site columns set on `dto`. Returns affected row count."""
+        values = dto.model_dump(exclude_unset=True)
+        if not values:
+            return 0
+        result = await db.execute(
+            update(Site)
+            .where(Site.site_uuid == _as_uuid(site_uuid))
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    async def soft_delete_site(self, db: AsyncSession, *, site_uuid: uuid.UUID) -> int:
+        """Mark a site as deleted without removing rows. Returns affected count."""
+        result = await db.execute(
+            update(Site)
+            .where(Site.site_uuid == _as_uuid(site_uuid))
+            .values(is_deleted=True)
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # SiteSettings
+    # ------------------------------------------------------------------
+    async def get_site_settings(
+        self,
+        db: AsyncSession,
+        *,
+        site_uuid: uuid.UUID,
+        user_id: Optional[int] = None,
+    ) -> Optional[SiteSettings]:
+        stmt = select(SiteSettings).where(SiteSettings.site_uuid == _as_uuid(site_uuid))
+        if user_id is not None:
+            stmt = stmt.where(SiteSettings.user_id == int(user_id))
+        return (await db.execute(stmt)).scalar_one_or_none()
 
     async def upsert_site_settings(
         self,
         db: AsyncSession,
         *,
-        user_id: int,
-        site_uuid: uuid.UUID,
-        config: Optional[Dict[str, Any]] = None,
-        day_of_week: Optional[List[int]] = None,
-        start_time: Optional[dt_time] = None,
-        end_time: Optional[dt_time] = None,
-        is_enabled: bool = True,
+        dto: SiteSettingsUpsertDTO,
     ) -> SiteSettings:
         """
-        Persist one SiteSettings row per site.
+        Persist one SiteSettings row per site from a `SiteSettingsUpsertDTO`.
 
-        Real multi-day schedule is stored in config["schedule"].
-        Scalar columns are stored as representative values for backward compatibility.
+        The real multi-day schedule lives in config["schedule"]; the scalar
+        columns store a representative window for backward compatibility.
         """
-        row = await self.get_site_settings(
-            db,
-            site_uuid=site_uuid,
-            user_id=user_id,
-        )
+        user_id = dto.user_id
+        site_uuid = dto.site_uuid
+        config = dto.config
+        day_of_week = dto.day_of_week
+        start_time = dto.start_time
+        end_time = dto.end_time
+        is_enabled = dto.is_enabled
+
+        row = await self.get_site_settings(db, site_uuid=site_uuid, user_id=user_id)
 
         merged_config = dict(config or {})
         normalized_schedule = VideoChannelConfig.normalize_schedule(merged_config.get("schedule"))
@@ -228,7 +200,7 @@ class SiteRepository:
         if row is None:
             row = SiteSettings(
                 user_id=int(user_id),
-                site_uuid=site_uuid,
+                site_uuid=_as_uuid(site_uuid),
                 config=merged_config,
                 day_of_week=representative_day,
                 start_time=resolved_start,
@@ -247,10 +219,59 @@ class SiteRepository:
 
         await db.flush()
         return row
-    
-    async def create_site(self,db: AsyncSession):
-        pass
 
+    # ------------------------------------------------------------------
+    # SiteDevice link table
+    # ------------------------------------------------------------------
+    async def site_device_exists(
+        self, db: AsyncSession, *, site_uuid: uuid.UUID, device_uuid: uuid.UUID
+    ) -> bool:
+        row = (
+            await db.execute(
+                select(SiteDevice.id).where(
+                    SiteDevice.site_uuid == _as_uuid(site_uuid),
+                    SiteDevice.device_uuid == _as_uuid(device_uuid),
+                )
+            )
+        ).scalar_one_or_none()
+        return row is not None
+
+    async def add_device_to_site(
+        self, db: AsyncSession, *, site_uuid: uuid.UUID, device_uuid: uuid.UUID
+    ) -> SiteDevice:
+        """Link a device to a site (idempotent). Flush only; caller commits."""
+        existing = (
+            await db.execute(
+                select(SiteDevice).where(
+                    SiteDevice.site_uuid == _as_uuid(site_uuid),
+                    SiteDevice.device_uuid == _as_uuid(device_uuid),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        row = SiteDevice(site_uuid=_as_uuid(site_uuid), device_uuid=_as_uuid(device_uuid))
+        db.add(row)
+        await db.flush()
+        return row
+
+    async def remove_device_from_site(
+        self, db: AsyncSession, *, site_uuid: uuid.UUID, device_uuid: uuid.UUID
+    ) -> int:
+        result = await db.execute(
+            delete(SiteDevice)
+            .where(
+                SiteDevice.site_uuid == _as_uuid(site_uuid),
+                SiteDevice.device_uuid == _as_uuid(device_uuid),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # Site-graph deletion
+    # ------------------------------------------------------------------
     async def delete_site_graph(
         self,
         db: AsyncSession,
@@ -258,153 +279,120 @@ class SiteRepository:
         site_uuid: uuid.UUID,
         camera_uuids: Optional[List[uuid.UUID]] = None,
     ) -> None:
-        """DEPRECATED: Use delete_site_graph_batched() for large sites."""
-        normalized_camera_uuids: List[uuid.UUID] = []
-        seen = set()
-        for value in camera_uuids or []:
-            parsed = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
-            key = str(parsed)
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized_camera_uuids.append(parsed)
+        """
+        Delete a site and every row that hangs off it, in one transaction.
 
-        # Delete site-owned rows explicitly instead of depending only on FK
-        # cascades. This protects deployed databases that may predate newer
-        # ON DELETE rules in the ORM metadata.
-        await db.execute(
-            delete(Notification).where(Notification.site_uuid == site_uuid)
-        )
-        await db.execute(
-            delete(NotificationEmail).where(NotificationEmail.site_uuid == site_uuid)
-        )
-        await db.execute(
-            delete(SiteSettings).where(SiteSettings.site_uuid == site_uuid)
-        )
-        await db.execute(
-            delete(SiteDevice).where(SiteDevice.site_uuid == site_uuid)
-        )
+        Use delete_site_graph_batched() for large sites — this variant is kept
+        for small sites and tests. Flush only; caller commits.
+        """
+        normalized = self._normalize_uuid_list(camera_uuids)
+        sid = _as_uuid(site_uuid)
 
-        if normalized_camera_uuids:
+        await db.execute(delete(Notification).where(Notification.site_uuid == sid))
+        await db.execute(delete(NotificationEmail).where(NotificationEmail.site_uuid == sid))
+        await db.execute(delete(SiteSettings).where(SiteSettings.site_uuid == sid))
+        await db.execute(delete(SiteDevice).where(SiteDevice.site_uuid == sid))
+
+        if normalized:
             await db.execute(
-                delete(PipelineCamera).where(
-                    PipelineCamera.camera_uuid.in_(normalized_camera_uuids)
-                )
-            )
-            await db.execute(
-                delete(CameraDevice).where(
-                    CameraDevice.camera_uuid.in_(normalized_camera_uuids)
-                )
+                delete(PipelineCamera).where(PipelineCamera.camera_uuid.in_(normalized))
             )
             await db.execute(
                 delete(ChannelConfiguration).where(
-                    ChannelConfiguration.camera_uuid.in_(normalized_camera_uuids)
+                    ChannelConfiguration.camera_uuid.in_(normalized)
                 )
             )
             await db.execute(
-                delete(VideoRecord).where(
-                    VideoRecord.camera_uuid.in_(normalized_camera_uuids)
-                )
+                delete(VideoRecord).where(VideoRecord.camera_uuid.in_(normalized))
             )
 
-        await db.execute(delete(Camera).where(Camera.site_uuid == site_uuid))
-        await db.execute(delete(Site).where(Site.site_uuid == site_uuid))
+        await db.execute(delete(Camera).where(Camera.site_uuid == sid))
+        await db.execute(delete(Site).where(Site.site_uuid == sid))
+        await db.flush()
 
     async def delete_site_graph_batched(
         self,
-        db,  # SessionFactory - returns AsyncSession
+        session_factory,  # callable returning an AsyncSession context manager
         *,
         site_uuid: uuid.UUID,
         camera_uuids: Optional[List[uuid.UUID]] = None,
         batch_size: int = 2000,
-        extract_alert_key_fn = None,
-        extract_clip_keys_fn = None,
+        extract_alert_key_fn=None,
+        extract_clip_keys_fn=None,
         keep_site_row: bool = False,
     ) -> tuple[dict, list[str], list[str]]:
         """
-        OPTIMIZED deletion with batching to avoid 502/503 errors on large sites.
-        Extracts blob keys during deletion to avoid double-scanning.
-        
-        Note: The heavy tables (Notifications/VideoRecords) are passed to a background
-        process from the route to make the HTTP response fast.
-        
+        Foreground fast-delete of the core site graph (settings, device links,
+        camera relationships, cameras, the site row). The heavy tables
+        (Notification / VideoRecord) are deliberately left for a background
+        sweep so the HTTP response stays fast.
+
         Returns: (stats_dict, alert_blob_keys, clip_blob_keys)
         """
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        normalized_camera_uuids: List[uuid.UUID] = []
+        normalized = self._normalize_uuid_list(camera_uuids)
+        sid = _as_uuid(site_uuid)
+
+        stats = {"notifications": 0, "videos": 0, "cameras": len(normalized)}
+        alert_blob_keys: list[str] = []
+        clip_blob_keys: list[str] = []
+
+        # Phase 1: small tables — site settings + device links.
+        s1 = await self._fast_delete(session_factory, SiteSettings, SiteSettings.site_uuid == sid)
+        s2 = await self._fast_delete(session_factory, SiteDevice, SiteDevice.site_uuid == sid)
+        logger.info("[Site Delete] Phase 1: %s site settings, %s site-device links", s1, s2)
+
+        # Phase 2: camera relationship tables.
+        if normalized:
+            pc = await self._fast_delete(
+                session_factory, PipelineCamera, PipelineCamera.camera_uuid.in_(normalized)
+            )
+            cc = await self._fast_delete(
+                session_factory, ChannelConfiguration,
+                ChannelConfiguration.camera_uuid.in_(normalized),
+            )
+            logger.info("[Site Delete] Phase 2: %s pipeline-camera links, %s channel configs", pc, cc)
+
+        # Phase 3: cameras (CASCADE-deletes VideoRecords, SET NULLs Notification.camera_uuid).
+        camera_count = await self._fast_delete(session_factory, Camera, Camera.site_uuid == sid)
+        logger.info("[Site Delete] Phase 3: %s cameras", camera_count)
+
+        # Phase 4: notification emails.
+        ne = await self._fast_delete(
+            session_factory, NotificationEmail, NotificationEmail.site_uuid == sid
+        )
+        logger.info("[Site Delete] Phase 4: %s notification emails", ne)
+
+        # Phase 5: the site row itself (CASCADE-deletes remaining Notifications).
+        if not keep_site_row:
+            sc = await self._fast_delete(session_factory, Site, Site.site_uuid == sid)
+            logger.info("[Site Delete] Phase 5: %s site rows", sc)
+        else:
+            logger.info("[Site Delete] Phase 5: keeping site row for caller cleanup")
+
+        logger.info("[Site Delete] FOREGROUND COMPLETE")
+        return stats, alert_blob_keys, clip_blob_keys
+
+    # ------------------------------------------------------------------
+    # Deletion internals
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_uuid_list(values: Optional[List[uuid.UUID]]) -> List[uuid.UUID]:
+        out: List[uuid.UUID] = []
         seen = set()
-        for value in camera_uuids or []:
-            parsed = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+        for value in values or []:
+            parsed = _as_uuid(value)
+            if parsed is None:
+                continue
             key = str(parsed)
             if key in seen:
                 continue
             seen.add(key)
-            normalized_camera_uuids.append(parsed)
-
-        stats = {"notifications": 0, "videos": 0, "cameras": len(normalized_camera_uuids)}
-        alert_blob_keys = []
-        clip_blob_keys = []
-
-        # Phase 1: Fast delete site settings and device links (small tables)
-        site_settings_count = await self._fast_delete(db, SiteSettings, SiteSettings.site_uuid == site_uuid)
-        site_device_count = await self._fast_delete(db, SiteDevice, SiteDevice.site_uuid == site_uuid)
-        logger.info(f"[Site Delete] Phase 1: Deleted {site_settings_count} site settings, {site_device_count} site-device links")
-
-        # Phase 2: Fast delete camera relationships
-        if normalized_camera_uuids:
-            logger.info(f"[Site Delete] Phase 2: Deleting camera relationships")
-            pipeline_cam_count = await self._fast_delete(
-                db,
-                PipelineCamera,
-                PipelineCamera.camera_uuid.in_(normalized_camera_uuids)
-            )
-            camera_device_count = await self._fast_delete(
-                db,
-                CameraDevice,
-                CameraDevice.camera_uuid.in_(normalized_camera_uuids)
-            )
-            channel_config_count = await self._fast_delete(
-                db,
-                ChannelConfiguration,
-                ChannelConfiguration.camera_uuid.in_(normalized_camera_uuids)
-            )
-            logger.info(
-                f"[Site Delete] Deleted {pipeline_cam_count} pipeline-camera links, "
-                f"{camera_device_count} camera-device links, {channel_config_count} channel configs"
-            )
-
-        # Phase 3: Fast delete cameras (so they disappear from frontend immediately)
-        # NOTE: Camera deletion CASCADE-deletes VideoRecords and SET NULLs
-        # Notification.camera_uuid.  If keep_site_row=True the caller is
-        # responsible for deleting VideoRecords before this point and for
-        # deleting the site row later.
-        camera_count = await self._fast_delete(db, Camera, Camera.site_uuid == site_uuid)
-        logger.info(f"[Site Delete] Phase 3: Deleted {camera_count} cameras")
-
-        # Phase 4: Fast delete notification emails
-        notification_email_count = await self._fast_delete(db, NotificationEmail, NotificationEmail.site_uuid == site_uuid)
-        logger.info(f"[Site Delete] Phase 4: Deleted {notification_email_count} notification emails")
-
-        # Phase 5: Delete the site itself (CASCADE-deletes remaining Notifications)
-        if not keep_site_row:
-            site_count = await self._fast_delete(db, Site, Site.site_uuid == site_uuid)
-            logger.info(f"[Site Delete] Phase 5: Deleted {site_count} site rows")
-        else:
-            logger.info(f"[Site Delete] Phase 5: Keeping site row (caller will delete after heavy cleanup)")
-
-        logger.info(f"[Site Delete] FOREGROUND COMPLETE: Deleted core site graph (Settings, Relationships, Cameras, Site)")
-        
-        # We NO LONGER delete the massive Notification/VideoRecord tables here because 
-        # it blocks the HTTP response for too long (15-20 seconds per 2000 rows).
-        # This function handles the foreground fast deletes to make the UI snappy.
-        
-        return stats, alert_blob_keys, clip_blob_keys
+            out.append(parsed)
+        return out
 
     async def _batch_delete(
         self,
-        session_factory,  # callable returning AsyncSession
+        session_factory,
         *,
         table,
         where_clause,
@@ -417,24 +405,16 @@ class SiteRepository:
         clip_keys_out=None,
     ) -> int:
         """
-        Delete large tables in batches to avoid locking and memory issues.
-        Each batch uses a separate transaction. Optionally extracts blob keys.
-
-        Uses a subquery approach because SQLAlchemy's delete() does not
-        support .limit(). The pattern is:
-            DELETE FROM table WHERE id IN (SELECT id FROM table WHERE … LIMIT N)
+        Delete a large table in batches, each in its own transaction, to avoid
+        long locks and big memory spikes. Optionally extracts blob keys.
         """
-        import logging
-        logger = logging.getLogger(__name__)
         total_deleted = 0
         batch_num = 0
-
-        pk = table.id  # assumes every table has an `id` primary key column
+        pk = table.id
 
         while True:
             async with session_factory() as session:
                 try:
-                    # Select a batch of IDs (and optionally extract columns)
                     if extract_col is not None:
                         stmt = select(pk, extract_col).where(where_clause).limit(batch_size)
                         rows = (await session.execute(stmt)).all()
@@ -444,9 +424,7 @@ class SiteRepository:
                             col_val = r[1]
                             if not col_val:
                                 continue
-
                             if extract_alert_fn or extract_clip_fn:
-                                # Dictionary payload (Notification)
                                 if extract_alert_fn and alert_keys_out is not None:
                                     k = extract_alert_fn(col_val)
                                     if k:
@@ -456,7 +434,6 @@ class SiteRepository:
                                     if k_list:
                                         clip_keys_out.extend(k_list)
                             elif isinstance(col_val, str) and clip_keys_out is not None:
-                                # Plain string key (VideoRecord)
                                 k = col_val.strip()
                                 if k:
                                     clip_keys_out.append(k)
@@ -467,38 +444,108 @@ class SiteRepository:
                     if not batch_ids:
                         break
 
-                    delete_stmt = delete(table).where(pk.in_(batch_ids))
-                    result = await session.execute(delete_stmt)
+                    result = await session.execute(delete(table).where(pk.in_(batch_ids)))
                     await session.commit()
 
                     deleted_in_batch = result.rowcount or 0
                     total_deleted += deleted_in_batch
                     batch_num += 1
-
                     logger.info(
-                        f"[Batch Delete] {label}: batch #{batch_num} deleted {deleted_in_batch}, "
-                        f"total={total_deleted}"
+                        "[Batch Delete] %s: batch #%s deleted %s, total=%s",
+                        label, batch_num, deleted_in_batch, total_deleted,
                     )
-
                     if deleted_in_batch == 0:
                         break
-
                 except Exception as e:
                     await session.rollback()
-                    logger.error(f"[Batch Delete] {label}: batch #{batch_num} failed: {e}")
+                    logger.error("[Batch Delete] %s: batch #%s failed: %s", label, batch_num, e)
                     raise
 
         return total_deleted
 
-    async def _fast_delete(
-        self,
-        session_factory,  # callable returning AsyncSession context manager
-        table,
-        where_clause,
-    ) -> int:
+    async def _fast_delete(self, session_factory, table, where_clause) -> int:
         """Single-transaction delete for smaller tables."""
         async with session_factory() as session:
-            delete_stmt = delete(table).where(where_clause)
-            result = await session.execute(delete_stmt)
+            result = await session.execute(delete(table).where(where_clause))
+            await session.commit()
+            return result.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # User-account deletion helpers
+    # ------------------------------------------------------------------
+    async def list_video_record_keys_for_cameras(
+        self,
+        session_factory,
+        *,
+        camera_uuids: List[uuid.UUID],
+    ) -> List[str]:
+        """Return non-blank VideoRecord.storage_key values for the given cameras."""
+        normalized = self._normalize_uuid_list(camera_uuids)
+        if not normalized:
+            return []
+        async with session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(VideoRecord.storage_key).where(
+                        VideoRecord.camera_uuid.in_(normalized)
+                    )
+                )
+            ).scalars().all()
+        return [k.strip() for k in rows if k and k.strip()]
+
+    async def delete_cameras_for_user(
+        self,
+        session_factory,
+        *,
+        user_id: int,
+        camera_uuids: List[uuid.UUID],
+    ) -> None:
+        """
+        Foreground delete of a user's camera rows and their relationship rows
+        (pipeline membership + channel configs). Each in its own transaction.
+        """
+        normalized = self._normalize_uuid_list(camera_uuids)
+        if not normalized:
+            return
+        async with session_factory() as session:
+            await session.execute(
+                delete(PipelineCamera).where(PipelineCamera.camera_uuid.in_(normalized))
+            )
+            await session.execute(
+                delete(ChannelConfiguration).where(
+                    ChannelConfiguration.camera_uuid.in_(normalized)
+                )
+            )
+            await session.execute(delete(Camera).where(Camera.user_id == int(user_id)))
+            await session.commit()
+
+    async def soft_delete_sites_for_user(
+        self,
+        session_factory,
+        *,
+        user_id: int,
+    ) -> int:
+        """Mark every site owned by a user as deleted. Returns affected count."""
+        async with session_factory() as session:
+            result = await session.execute(
+                update(Site)
+                .where(Site.user_id == int(user_id))
+                .values(is_deleted=True)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return result.rowcount or 0
+
+    async def delete_sites_for_user(
+        self,
+        session_factory,
+        *,
+        user_id: int,
+    ) -> int:
+        """Hard-delete every site owned by a user. Returns affected count."""
+        async with session_factory() as session:
+            result = await session.execute(
+                delete(Site).where(Site.user_id == int(user_id))
+            )
             await session.commit()
             return result.rowcount or 0

@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from core.database_orm import Base
 from sqlalchemy import select
 from core.database_orm import User
+from core.env import env_float, env_int
 from core.security.hashing import get_password_hash
 
 logger = logging.getLogger(__name__)
@@ -27,38 +28,20 @@ def _is_duplicate_column_error(exc: Exception) -> bool:
     )
 
 
-def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
-    raw = os.getenv(name)
-    try:
-        value = int(raw) if raw is not None else int(default)
-    except (TypeError, ValueError):
-        value = int(default)
-    return max(minimum, value)
-
-
-def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
-    raw = os.getenv(name)
-    try:
-        value = float(raw) if raw is not None else float(default)
-    except (TypeError, ValueError):
-        value = float(default)
-    return max(minimum, value)
-
-
 def _engine_pool_kwargs() -> dict:
     return {
         "pool_pre_ping": True,
-        "pool_size": _env_int("DB_POOL_SIZE", 30, minimum=1),
-        "max_overflow": _env_int("DB_MAX_OVERFLOW", 20, minimum=0),
-        "pool_timeout": _env_int("DB_POOL_TIMEOUT_S", 30, minimum=1),
-        "pool_recycle": _env_int("DB_POOL_RECYCLE_S", 1800, minimum=0),
+        "pool_size": env_int("DB_POOL_SIZE", 30, minimum=1),
+        "max_overflow": env_int("DB_MAX_OVERFLOW", 20, minimum=0),
+        "pool_timeout": env_int("DB_POOL_TIMEOUT_S", 30, minimum=1),
+        "pool_recycle": env_int("DB_POOL_RECYCLE_S", 1800, minimum=0),
         "pool_use_lifo": True,
     }
 
 
 def _mysql_sync_connect_args() -> dict:
-    timeout_s = _env_int("DB_CONNECT_TIMEOUT_S", 5, minimum=1)
-    io_timeout_s = _env_int("DB_IO_TIMEOUT_S", 15, minimum=1)
+    timeout_s = env_int("DB_CONNECT_TIMEOUT_S", 5, minimum=1)
+    io_timeout_s = env_int("DB_IO_TIMEOUT_S", 15, minimum=1)
     return {
         "connect_timeout": timeout_s,
         "read_timeout": io_timeout_s,
@@ -68,7 +51,7 @@ def _mysql_sync_connect_args() -> dict:
 
 def _mysql_async_connect_args() -> dict:
     return {
-        "connect_timeout": _env_int("DB_CONNECT_TIMEOUT_S", 5, minimum=1),
+        "connect_timeout": env_int("DB_CONNECT_TIMEOUT_S", 5, minimum=1),
     }
 
 
@@ -551,6 +534,70 @@ class DatabaseManager:
                 except Exception as exc:
                     logger.warning("Skipping camera.camera_playback_enabled migration: %s", exc)
 
+            # Migrate: the camera<->device M:N link table (camera_devices) is
+            # replaced by a direct camera.device_uuid FK column. One device can
+            # host many cameras; each camera has at most one device.
+            # create_all adds the column on fresh DBs; existing DBs are fixed here.
+            if dialect_name.startswith("mysql"):
+                try:
+                    has_device_uuid = (
+                        await conn.execute(
+                            text("""
+                                SELECT 1
+                                FROM information_schema.COLUMNS
+                                WHERE TABLE_SCHEMA = DATABASE()
+                                  AND TABLE_NAME   = 'camera'
+                                  AND COLUMN_NAME  = 'device_uuid'
+                                LIMIT 1
+                            """)
+                        )
+                    ).fetchone()
+                    if not has_device_uuid:
+                        await conn.execute(
+                            text("ALTER TABLE camera ADD COLUMN device_uuid BINARY(16) NULL")
+                        )
+                        await conn.execute(
+                            text("ALTER TABLE camera ADD INDEX ix_camera_device_uuid (device_uuid)")
+                        )
+                        logger.info("Added camera.device_uuid column.")
+
+                    has_camera_devices = (
+                        await conn.execute(
+                            text("""
+                                SELECT 1
+                                FROM information_schema.TABLES
+                                WHERE TABLE_SCHEMA = DATABASE()
+                                  AND TABLE_NAME   = 'camera_devices'
+                                LIMIT 1
+                            """)
+                        )
+                    ).fetchone()
+                    if has_camera_devices:
+                        # Backfill the single most-recent device per camera.
+                        await conn.execute(
+                            text("""
+                                UPDATE camera c
+                                JOIN (
+                                    SELECT cd.camera_uuid, cd.device_uuid
+                                    FROM camera_devices cd
+                                    JOIN (
+                                        SELECT camera_uuid, MAX(id) AS max_id
+                                        FROM camera_devices
+                                        GROUP BY camera_uuid
+                                    ) latest
+                                      ON latest.camera_uuid = cd.camera_uuid
+                                     AND latest.max_id = cd.id
+                                ) pick
+                                  ON pick.camera_uuid = c.camera_uuid
+                                SET c.device_uuid = pick.device_uuid
+                                WHERE c.device_uuid IS NULL
+                            """)
+                        )
+                        await conn.execute(text("DROP TABLE camera_devices"))
+                        logger.info("Backfilled camera.device_uuid and dropped camera_devices table.")
+                except Exception as exc:
+                    logger.warning("Skipping camera.device_uuid migration: %s", exc)
+
         # Seed a dev user if DB is empty.
         async with self.AsyncSessionLocal() as db:
             existing = (await db.execute(select(User.id).limit(1))).scalar_one_or_none()
@@ -568,8 +615,8 @@ class DatabaseManager:
         return True
 
     async def initialize_tables_and_data(self) -> bool:
-        max_attempts = _env_int("DB_INIT_MAX_ATTEMPTS", 1, minimum=1)
-        retry_delay_s = _env_float("DB_INIT_RETRY_DELAY_S", 5.0, minimum=0.0)
+        max_attempts = env_int("DB_INIT_MAX_ATTEMPTS", 1, minimum=1)
+        retry_delay_s = env_float("DB_INIT_RETRY_DELAY_S", 5.0, minimum=0.0)
         logger.info(
             "Initializing database schema and seed data (max_attempts=%s, retry_delay_s=%.1f).",
             max_attempts,

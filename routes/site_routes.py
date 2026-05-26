@@ -6,36 +6,46 @@ from datetime import datetime, time as dt_time, timezone
 from typing import Any, Dict, List, Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select, delete, update
-from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.database_orm import Site, Device, SiteDevice, Camera, CameraDevice, SiteSettings, Notification, VideoRecord
+from core.database_orm import Site, SiteSettings, Notification
 from dependencies import get_async_db, get_current_user, get_manager
 from application.channels.channel_config import VideoChannelConfig
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
+from application.dtos import SiteCreateDTO, SiteSettingsUpsertDTO, SiteUpdateDTO
+from application.repositories.device_repository import DeviceRepository
+from application.repositories.video_repository import VideoRepository
 from domain.events import ChannelCreateEvent
 from application.services.manager import Manager
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
-from application.services.clip_storage import EventClipService
+from application.services.clip_storage import (
+    EventClipService,
+    extract_notification_clip_storage_keys as _extract_notification_clip_storage_keys,
+)
 from application.services.webrtcgateway import resolve_camera_webrtc_url
-from core.schemas import CameraWithConfigSchema
-from routes.device_routes import DeviceOut
+from core.schemas import (
+    CameraWithConfigSchema,
+    DeviceOut,
+    LinkDeviceRequest,
+    SITE_PRERECORD_TRIGGER_MODES,
+    SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER,
+    SUNDAY_TO_SATURDAY,
+    SiteCameraCreate,
+    SiteCreate,
+    SiteMultiCameraPrerecordRule,
+    SiteNotificationRule,
+    SiteOut,
+    SiteScheduleRule,
+    SiteSettingsOut,
+    SiteSettingsUpdate,
+    SiteUpdate,
+)
 from core.database import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sites", tags=["sites"])
-SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER = "roi_enter"
-SITE_PRERECORD_TRIGGER_MODE_ANY_DETECTION = "any_detection"
-SITE_PRERECORD_TRIGGER_MODES = {
-    SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER,
-    SITE_PRERECORD_TRIGGER_MODE_ANY_DETECTION,
-}
-SUNDAY_TO_SATURDAY = [6, 0, 1, 2, 3, 4, 5]
-SCHEDULE_TIME_PATTERN = r"^\d{2}:\d{2}(:\d{2})?$"
 
 
 # -----------------------
@@ -53,58 +63,6 @@ def _normalize_trigger_mode(value: Optional[str]) -> str:
     if normalized in SITE_PRERECORD_TRIGGER_MODES:
         return normalized
     return SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
-
-
-def _normalize_camera_schedule_inputs(model: BaseModel) -> BaseModel:
-    for attr in ("timezone", "start_time", "end_time"):
-        value = getattr(model, attr, None)
-        if isinstance(value, str):
-            cleaned = value.strip()
-            setattr(model, attr, cleaned or None)
-
-    raw_schedule = getattr(model, "schedule", None)
-    if raw_schedule is not None:
-        normalized_schedule = VideoChannelConfig.normalize_schedule(raw_schedule)
-        if raw_schedule and not normalized_schedule:
-            raise ValueError("schedule must contain at least one valid day/time window.")
-        setattr(model, "schedule", normalized_schedule)
-        if normalized_schedule:
-            return model
-
-    raw_days = getattr(model, "day_of_week", None)
-    if raw_days is not None:
-        normalized_days: List[int] = []
-        seen_days = set()
-        for value in raw_days:
-            try:
-                day = int(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("day_of_week values must be integers from 0 to 6.") from exc
-            if day < 0 or day > 6:
-                raise ValueError("day_of_week values must be between 0 and 6.")
-            if day in seen_days:
-                continue
-            seen_days.add(day)
-            normalized_days.append(day)
-        setattr(model, "day_of_week", normalized_days)
-
-    day_of_week = getattr(model, "day_of_week", None)
-    start_time = getattr(model, "start_time", None)
-    end_time = getattr(model, "end_time", None)
-    if any(value is not None for value in (day_of_week, start_time, end_time)):
-        if not day_of_week:
-            raise ValueError("Select at least one day when providing a schedule.")
-        if not start_time or not end_time:
-            raise ValueError("start_time and end_time are required when providing a schedule.")
-        try:
-            start_obj = dt_time.fromisoformat(str(start_time))
-            end_obj = dt_time.fromisoformat(str(end_time))
-        except ValueError as exc:
-            raise ValueError("start_time and end_time must use HH:MM or HH:MM:SS format.") from exc
-        if start_obj == end_obj:
-            raise ValueError("start_time and end_time must be different.")
-
-    return model
 
 
 def _sort_days_sunday_first(values: List[int]) -> List[int]:
@@ -186,19 +144,6 @@ def _site_schedule_payload_from_row(
     }
 
 
-def _sync_site_settings_timezone_row(
-    row: Optional[SiteSettings],
-    *,
-    timezone_name: Optional[str],
-) -> None:
-    if row is None:
-        return
-
-    config = dict(row.config or {}) if isinstance(getattr(row, "config", None), dict) else {}
-    config["timezone"] = str(timezone_name or "UTC")
-    row.config = config
-
-
 def _build_schedule_windows(
     *,
     day_of_week: List[int],
@@ -237,80 +182,7 @@ def _dedupe_uuid_list(values: Optional[List[uuid.UUID]]) -> List[uuid.UUID]:
     return out
 
 
-async def _delete_blobs_background(keys: List[str], *, service_cls: type, label: str) -> None:
-    """
-    OPTIMIZED: Delete blobs in parallel batches instead of sequentially.
-    
-    Deletes up to 10 blobs concurrently, then moves to batch of 10.
-    This is 10x faster than sequential deletion for large blob sets.
-    """
-    unique = list(dict.fromkeys(k for k in keys if k))
-    if not unique:
-        return
-    
-    logger.info(f"[Blob Cleanup] Starting deletion of {len(unique)} {label} blobs (parallel, batch size=10)")
-    svc = service_cls()
-    deleted = 0
-    failed = 0
-    batch_size = 10
-
-    try:
-        for i in range(0, len(unique), batch_size):
-            batch = unique[i : i + batch_size]
-            # Delete up to 10 blobs concurrently
-            tasks = [svc.delete_blob(blob_name=k) for k in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for key, result in zip(batch, results):
-                if isinstance(result, Exception):
-                    failed += 1
-                    logger.warning(
-                        f"[Blob Cleanup] Failed to delete {label} blob {key}: {result}"
-                    )
-                else:
-                    deleted += 1
-            
-            logger.info(
-                f"[Blob Cleanup] Batch {i // batch_size + 1}: "
-                f"deleted {sum(1 for r in results if not isinstance(r, Exception))}/{len(batch)} {label} blobs"
-            )
-    finally:
-        try:
-            await svc.close()
-        except Exception:
-            pass
-    
-    logger.info(f"[Blob Cleanup] COMPLETE: deleted {deleted} {label} blobs, {failed} failed")
-
-
-def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
-    if not isinstance(payload, dict):
-        return []
-
-    keys: List[str] = []
-
-    def _append_from_clip_dict(raw_clip: Any) -> None:
-        if not isinstance(raw_clip, dict):
-            return
-        key = str(raw_clip.get("storage_key") or "").strip()
-        if key:
-            keys.append(key)
-
-    msg = payload.get("msg")
-    if isinstance(msg, dict):
-        _append_from_clip_dict(msg)
-        _append_from_clip_dict(msg.get("clip"))
-
-    extra = payload.get("extra")
-    if isinstance(extra, dict):
-        _append_from_clip_dict(extra)
-        _append_from_clip_dict(extra.get("clip"))
-        for raw_clip in list(extra.get("multi_camera_prerecordings") or []):
-            _append_from_clip_dict(raw_clip)
-
-    _append_from_clip_dict(payload.get("clip"))
-
-    return list(dict.fromkeys(keys))
+from routes._background import _delete_blobs_background, _spawn_bg_task  # noqa: E402
 
 
 async def _cleanup_cameras_background(
@@ -441,22 +313,6 @@ async def _cleanup_cameras_background(
     logger.info(f"[Cleanup] COMPLETE: Background cleanup finished for {len(cleanup_targets)} cameras")
 
 
-def _spawn_bg_task(coro, *, name: str) -> None:
-    """Spawn a background task with proper error handling and completion logging."""
-    task = asyncio.create_task(coro, name=name)
-
-    def _on_done(done_task: asyncio.Task) -> None:
-        try:
-            done_task.result()
-            logger.info(f"[Background Task] {name}: SUCCESS")
-        except asyncio.CancelledError:
-            logger.info(f"[Background Task] {name}: CANCELLED")
-        except Exception as e:
-            logger.exception(f"[Background Task] {name}: FAILED with error: {e}")
-
-    task.add_done_callback(_on_done)
-
-
 async def _invalidate_site_camera_mode_cache(
     *,
     db: AsyncSession,
@@ -464,11 +320,10 @@ async def _invalidate_site_camera_mode_cache(
 ) -> None:
     from routes.notifications_routes import invalidate_camera_mode_cache
 
-    camera_uuids = (
-        await db.execute(select(Camera.camera_uuid).where(Camera.site_uuid == site_uuid))
-    ).scalars().all()
-    for camera_uuid in camera_uuids:
-        await invalidate_camera_mode_cache(camera_uuid)
+    channel_repo = ChannelRepository()
+    cameras = await channel_repo.list_cameras(db, site_uuid=site_uuid)
+    for cam in cameras:
+        await invalidate_camera_mode_cache(cam.camera_uuid)
 
 
 async def _refresh_site_schedule_runtime(
@@ -490,123 +345,6 @@ async def _refresh_site_schedule_runtime(
         )
 
 
-# -----------------------
-# Schemas
-# -----------------------
-class SiteCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=255)
-    site_code: Optional[str] = Field(default=None, max_length=64)
-    address: Optional[str] = Field(default=None, max_length=255)
-    timezone: Optional[str] = Field(default="UTC", max_length=50)
-
-
-class SiteUpdate(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    site_code: Optional[str] = Field(default=None, max_length=64)
-    address: Optional[str] = Field(default=None, max_length=255)
-    timezone: Optional[str] = Field(default=None, max_length=50)
-
-
-class SiteOut(BaseModel):
-    site_uuid: uuid.UUID
-    user_id: int
-    name: str
-    site_code: Optional[str] = None
-    address: Optional[str] = None
-    timezone: Optional[str] = "UTC"
-
-    class Config:
-        from_attributes = True
-
-
-class LinkDeviceRequest(BaseModel):
-    device_uuid: uuid.UUID
-
-
-class SiteCameraCreate(BaseModel):
-    device_uuid: uuid.UUID
-    rtsp_url: str = Field(..., min_length=1, max_length=2048)
-    name: Optional[str] = Field(default=None, max_length=255)
-    location: Optional[str] = Field(default=None, max_length=255)
-    is_enabled: bool = True
-    is_detection_enabled: bool = True
-    is_notification_enabled: bool = True
-    notification_trigger_mode: Literal["inherit", "roi_enter", "any_detection"] = Field(
-        default="inherit",
-        description="Per-camera notification trigger mode. 'inherit' = use site-level setting.",
-    )
-    camera_playback_enabled: Literal["inherit", "always", "never"] = Field(
-        default="inherit",
-        description="Per-camera clip recording override. 'inherit' = use site default (prerecord list).",
-    )
-    sample_fps: float = Field(default=5.0, ge=0.1)
-    timezone: Optional[str] = None
-    day_of_week: Optional[List[int]] = None
-    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
-    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
-    schedule: Optional[List[Dict[str, Any]]] = None
-    use_site_schedule: Optional[bool] = None
-
-    @model_validator(mode="after")
-    def _validate_schedule(self):
-        return _normalize_camera_schedule_inputs(self)
-
-
-class SiteMultiCameraPrerecordRule(BaseModel):
-    enabled: bool = False
-    camera_uuids: List[uuid.UUID] = Field(default_factory=list)
-    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
-
-
-class SiteMultiCameraPrerecordRuleUpdate(BaseModel):
-    enabled: bool = False
-    camera_uuids: List[uuid.UUID] = Field(default_factory=list)
-    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
-
-
-class SiteNotificationRule(BaseModel):
-    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
-
-
-class SiteNotificationRuleUpdate(BaseModel):
-    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
-
-
-class SiteScheduleRule(BaseModel):
-    timezone: str = Field(default="UTC", max_length=50)
-    day_of_week: List[int] = Field(default_factory=lambda: list(SUNDAY_TO_SATURDAY))
-    start_time: str = Field(default="00:00:00", pattern=SCHEDULE_TIME_PATTERN)
-    end_time: str = Field(default="23:59:59", pattern=SCHEDULE_TIME_PATTERN)
-    schedule: List[Dict[str, Any]] = Field(default_factory=VideoChannelConfig.default_schedule)
-
-
-class SiteScheduleRuleUpdate(BaseModel):
-    timezone: Optional[str] = Field(default=None, max_length=50)
-    day_of_week: Optional[List[int]] = None
-    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
-    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
-    schedule: Optional[List[Dict[str, Any]]] = None
-
-    @model_validator(mode="after")
-    def _validate_schedule(self):
-        return _normalize_camera_schedule_inputs(self)
-
-
-class SiteSettingsOut(BaseModel):
-    site_uuid: uuid.UUID
-    schedule: SiteScheduleRule = Field(default_factory=SiteScheduleRule)
-    multi_camera_prerecord: SiteMultiCameraPrerecordRule = Field(
-        default_factory=SiteMultiCameraPrerecordRule
-    )
-    notification: SiteNotificationRule = Field(default_factory=SiteNotificationRule)
-
-
-class SiteSettingsUpdate(BaseModel):
-    schedule: Optional[SiteScheduleRuleUpdate] = None
-    multi_camera_prerecord: Optional[SiteMultiCameraPrerecordRuleUpdate] = None
-    notification: Optional[SiteNotificationRuleUpdate] = None
-
-
 async def _validate_site_prerecord_camera_uuids(
     db: AsyncSession,
     *,
@@ -618,13 +356,14 @@ async def _validate_site_prerecord_camera_uuids(
     if not normalized:
         return []
 
-    stmt = select(Camera.camera_uuid).where(
-        Camera.user_id == int(user_id),
-        Camera.site_uuid == site_uuid,
-        Camera.camera_uuid.in_(normalized),
+    channel_repo = ChannelRepository()
+    site_cameras = await channel_repo.list_cameras(
+        db,
+        site_uuid=site_uuid,
+        user_id=int(user_id),
+        camera_uuids=normalized,
     )
-    rows = (await db.execute(stmt)).scalars().all()
-    found = {str(value) for value in rows}
+    found = {str(cam.camera_uuid) for cam in site_cameras}
     missing = [str(value) for value in normalized if str(value) not in found]
     if missing:
         raise HTTPException(
@@ -730,19 +469,17 @@ async def list_site_devices(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    # Single query: join Site for ownership check + fetch devices in one round-trip.
-    q = (
-        select(Device)
-        .join(SiteDevice, SiteDevice.device_uuid == Device.device_uuid)
-        .join(Site, Site.site_uuid == SiteDevice.site_uuid)
-        .where(
-            SiteDevice.site_uuid == site_uuid,
-            Site.user_id == int(user.id),
-            Device.user_id == int(user.id),
-        )
-        .order_by(Device.created_at.desc())
+    # Ownership check via Site, then fetch devices linked to the site.
+    site_repo = SiteRepository()
+    await site_repo.get_site(db, user_id=user.id, site_uuid=site_uuid)
+
+    device_repo = DeviceRepository()
+    return await device_repo.list_devices(
+        db,
+        site_uuid=site_uuid,
+        user_id=int(user.id),
+        order_by_recent=True,
     )
-    return (await db.execute(q)).scalars().all()
 
 
 @router.get("/{site_uuid}/settings", response_model=SiteSettingsOut)
@@ -751,16 +488,12 @@ async def get_site_settings(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    # Single query: fetch site + settings together, ownership check via Site.user_id.
-    result = await db.execute(
-        select(Site, SiteSettings)
-        .outerjoin(SiteSettings, SiteSettings.site_uuid == Site.site_uuid)
-        .where(Site.site_uuid == site_uuid, Site.user_id == int(user.id), Site.is_deleted == False)
+    # Fetch site (ownership check) + settings.
+    site_repo = SiteRepository()
+    site = await site_repo.get_site(db, user_id=int(user.id), site_uuid=site_uuid)
+    settings_row = await site_repo.get_site_settings(
+        db, user_id=int(user.id), site_uuid=site.site_uuid
     )
-    row = result.one_or_none()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Site not found")
-    site, settings_row = row
     return _serialize_site_settings(site.site_uuid, settings_row, fallback_timezone=site.timezone)
 
 
@@ -775,18 +508,13 @@ async def create_site_camera(
     site_repo=SiteRepository()
     site = await site_repo.get_site(db,user_id=user.id,site_uuid= site_uuid)
 
-    device = (
-        await db.execute(
-            select(Device)
-            .join(SiteDevice, SiteDevice.device_uuid == Device.device_uuid)
-            .where(
-                Device.user_id == int(user.id),
-                Device.device_uuid == payload.device_uuid,
-                SiteDevice.site_uuid == site.site_uuid,
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    device_repo = DeviceRepository()
+    device = await device_repo.get_device(
+        db,
+        device_uuid=payload.device_uuid,
+        site_uuid=site.site_uuid,
+        user_id=int(user.id),
+    )
     if device is None:
         raise HTTPException(
             status_code=422,
@@ -882,6 +610,11 @@ async def update_site_settings(
         config["timezone"] = schedule_payload["timezone"]
         config["schedule"] = schedule_windows
         site.timezone = schedule_payload["timezone"]
+        await site_repo.update_site(
+            db,
+            site_uuid=site.site_uuid,
+            dto=SiteUpdateDTO(timezone=schedule_payload["timezone"]),
+        )
 
     if (
         payload.schedule is None
@@ -892,13 +625,15 @@ async def update_site_settings(
 
     row = await site_repo.upsert_site_settings(
         db,
-        user_id=int(user.id),
-        site_uuid=site.site_uuid,
-        config=config,
-        day_of_week=list(schedule_payload.get("day_of_week") or list(SUNDAY_TO_SATURDAY)),
-        start_time=dt_time.fromisoformat(str(schedule_payload.get("start_time") or "00:00:00")),
-        end_time=dt_time.fromisoformat(str(schedule_payload.get("end_time") or "23:59:59")),
-        is_enabled=True,
+        dto=SiteSettingsUpsertDTO(
+            user_id=int(user.id),
+            site_uuid=site.site_uuid,
+            config=config,
+            day_of_week=list(schedule_payload.get("day_of_week") or list(SUNDAY_TO_SATURDAY)),
+            start_time=dt_time.fromisoformat(str(schedule_payload.get("start_time") or "00:00:00")),
+            end_time=dt_time.fromisoformat(str(schedule_payload.get("end_time") or "23:59:59")),
+            is_enabled=True,
+        ),
     )
     await db.commit()
     if payload.multi_camera_prerecord is not None:
@@ -947,15 +682,17 @@ async def create_site(
     if _is_blank(site_code):
         site_code = _gen_code("site")
 
-    site = Site(
-        user_id=user.id,
-        name=payload.name,
-        site_code=site_code,
-        address=payload.address,
-        timezone=payload.timezone or "UTC",
+    site_repo = SiteRepository()
+    site = await site_repo.create_site(
+        db,
+        dto=SiteCreateDTO(
+            user_id=user.id,
+            name=payload.name,
+            address=payload.address,
+            timezone=payload.timezone or "UTC",
+            site_code=site_code,
+        ),
     )
-
-    db.add(site)
     await db.commit()
     await db.refresh(site)
     return site
@@ -990,8 +727,12 @@ async def update_site(
         data["site_code"] = _gen_code("site")
 
     # Apply patch
-    for k, v in data.items():
-        if v is not None:
+    update_fields = {k: v for k, v in data.items() if v is not None}
+    if update_fields:
+        await site_repo.update_site(
+            db, site_uuid=site.site_uuid, dto=SiteUpdateDTO(**update_fields)
+        )
+        for k, v in update_fields.items():
             setattr(site, k, v)
 
     if data.get("timezone") is not None:
@@ -1000,7 +741,21 @@ async def update_site(
             user_id=int(user.id),
             site_uuid=site.site_uuid,
         )
-        _sync_site_settings_timezone_row(row, timezone_name=site.timezone)
+        if row is not None:
+            config = dict(row.config or {}) if isinstance(getattr(row, "config", None), dict) else {}
+            config["timezone"] = str(site.timezone or "UTC")
+            await site_repo.upsert_site_settings(
+                db,
+                dto=SiteSettingsUpsertDTO(
+                    user_id=int(user.id),
+                    site_uuid=site.site_uuid,
+                    config=config,
+                    day_of_week=[int(getattr(row, "day_of_week", 6))],
+                    start_time=getattr(row, "start_time", None),
+                    end_time=getattr(row, "end_time", None),
+                    is_enabled=bool(getattr(row, "is_enabled", True)),
+                ),
+            )
 
     await db.commit()
     if data.get("timezone") is not None:
@@ -1051,32 +806,23 @@ async def delete_site(
     # PHASE 1: Snapshot camera info BEFORE any changes
     # ========================================
     logger.info(f"[Site Delete] Phase 1: Gathering camera info")
-    camera_rows = (
-        await db.execute(
-            select(Camera.camera_uuid, Camera.camera_code).where(
-                Camera.site_uuid == site.site_uuid,
-                Camera.user_id == int(user.id),
-            )
-        )
-    ).all()
+    channel_repo = ChannelRepository()
+    camera_rows = await channel_repo.list_cameras_with_device_details(
+        db,
+        site_uuid=site.site_uuid,
+        user_id=int(user.id),
+    )
 
-    camera_uuids = [row[0] for row in camera_rows]
-    cam_to_urls: Dict[uuid.UUID, set[str]] = {row[0]: set() for row in camera_rows}
-    cam_to_code: Dict[uuid.UUID, Optional[str]] = {row[0]: row[1] for row in camera_rows}
-
-    if camera_uuids:
-        device_url_rows = (
-            await db.execute(
-                select(CameraDevice.camera_uuid, Device.device_url)
-                .join(Device, Device.device_uuid == CameraDevice.device_uuid)
-                .where(CameraDevice.camera_uuid.in_(camera_uuids))
-            )
-        ).all()
-
-        for cam_uuid_key, dev_url in device_url_rows:
-            url = str(dev_url or "").strip()
-            if url:
-                cam_to_urls.setdefault(cam_uuid_key, set()).add(url)
+    camera_uuids = [row["camera_uuid"] for row in camera_rows]
+    cam_to_urls: Dict[uuid.UUID, set[str]] = {}
+    cam_to_code: Dict[uuid.UUID, Optional[str]] = {}
+    for row in camera_rows:
+        cam_uuid_key = row["camera_uuid"]
+        cam_to_code[cam_uuid_key] = row.get("camera_code")
+        url = str(row.get("device_url") or "").strip()
+        bucket = cam_to_urls.setdefault(cam_uuid_key, set())
+        if url:
+            bucket.add(url)
 
     cam_snapshot = [
         {
@@ -1099,11 +845,8 @@ async def delete_site(
     # ========================================
     if camera_uuids:
         logger.info(f"[Site Delete] Phase 1b: Disabling {len(camera_uuids)} cameras in DB to prevent reconcile re-adds")
-        await db.execute(
-            update(Camera)
-            .where(Camera.site_uuid == site.site_uuid, Camera.user_id == int(user.id))
-            .values(is_enabled=False, is_detection_enabled=False)
-            .execution_options(synchronize_session=False)
+        await channel_repo.disable_cameras(
+            db, site_uuid=site.site_uuid, user_id=int(user.id)
         )
         await db.commit()
         logger.info(f"[Site Delete] Cameras disabled in DB")
@@ -1178,13 +921,11 @@ async def delete_site(
     # ========================================
     video_clip_keys: List[str] = []
     if camera_uuids:
+        video_repo = VideoRepository()
         async with AsyncSessionLocal() as vr_session:
-            vr_rows = (
-                await vr_session.execute(
-                    select(VideoRecord.storage_key)
-                    .where(VideoRecord.camera_uuid.in_(camera_uuids))
-                )
-            ).scalars().all()
+            vr_rows = await video_repo.list_storage_keys(
+                vr_session, camera_uuids=camera_uuids
+            )
             video_clip_keys = [k.strip() for k in vr_rows if k and k.strip()]
         logger.info(f"[Site Delete] Phase 3a: Extracted {len(video_clip_keys)} video record blob keys")
 
@@ -1211,12 +952,7 @@ async def delete_site(
         )
         # Mark site as soft-deleted so it disappears from all queries immediately
         async with AsyncSessionLocal() as sd_session:
-            await sd_session.execute(
-                update(Site)
-                .where(Site.site_uuid == site.site_uuid)
-                .values(is_deleted=True)
-                .execution_options(synchronize_session=False)
-            )
+            await site_repo.soft_delete_site(sd_session, site_uuid=site.site_uuid)
             await sd_session.commit()
         logger.info(f"[Site Delete] Foreground database cleanup complete (site row soft-deleted)")
     except Exception as e:
@@ -1318,21 +1054,21 @@ async def link_device_to_site(
     site_repo=SiteRepository()
     site = await site_repo.get_site(db,user_id=user.id,site_uuid=site_uuid)
 
-
-    qd = select(Device).where(Device.device_uuid == payload.device_uuid, Device.user_id == user.id)
-    device = (await db.execute(qd)).scalar_one_or_none()
+    device_repo = DeviceRepository()
+    device = await device_repo.get_device(
+        db, device_uuid=payload.device_uuid, user_id=user.id
+    )
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    qlink = select(SiteDevice).where(
-        SiteDevice.site_uuid == site.site_uuid,
-        SiteDevice.device_uuid == device.device_uuid,
-    )
-    exists = (await db.execute(qlink)).scalar_one_or_none()
-    if exists:
+    if await site_repo.site_device_exists(
+        db, site_uuid=site.site_uuid, device_uuid=device.device_uuid
+    ):
         return {"linked": True, "already": True}
 
-    db.add(SiteDevice(site_uuid=site.site_uuid, device_uuid=device.device_uuid))
+    await site_repo.add_device_to_site(
+        db, site_uuid=site.site_uuid, device_uuid=device.device_uuid
+    )
     await db.commit()
     return {"linked": True, "already": False}
 
@@ -1347,28 +1083,18 @@ async def unlink_device_from_site(
     site_repo=SiteRepository()
     site = await site_repo.get_site(db,user_id=user.id,site_uuid=site_uuid)
 
-
-    camera_using_device = (
-        await db.execute(
-            select(Camera.camera_uuid)
-            .join(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
-            .where(
-                Camera.site_uuid == site.site_uuid,
-                CameraDevice.device_uuid == device_uuid,
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if camera_using_device is not None:
+    channel_repo = ChannelRepository()
+    cameras_using_device = await channel_repo.list_cameras(
+        db, site_uuid=site.site_uuid, device_uuid=device_uuid
+    )
+    if cameras_using_device:
         raise HTTPException(
             status_code=409,
             detail="Cannot unlink device while cameras in this site are assigned to it. Move or delete those cameras first.",
         )
 
-    stmt = delete(SiteDevice).where(
-        SiteDevice.site_uuid == site.site_uuid,
-        SiteDevice.device_uuid == device_uuid,
+    await site_repo.remove_device_from_site(
+        db, site_uuid=site.site_uuid, device_uuid=device_uuid
     )
-    await db.execute(stmt)
     await db.commit()
     return None

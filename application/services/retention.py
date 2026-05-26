@@ -2,42 +2,15 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Optional
 
-from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from application.repositories.notification_repository import NotificationRepository
+from application.repositories.video_repository import VideoRepository
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
-from application.services.clip_storage import EventClipService
-from core.database_orm import Notification, VideoRecord
-from typing import Any, List
-
-
-def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
-    """Extract clip storage_key values embedded in a notification payload."""
-    if not isinstance(payload, dict):
-        return []
-    keys: List[str] = []
-
-    def _collect(raw: Any) -> None:
-        if not isinstance(raw, dict):
-            return
-        key = str(raw.get("storage_key") or "").strip()
-        if key:
-            keys.append(key)
-
-    msg = payload.get("msg")
-    if isinstance(msg, dict):
-        _collect(msg)
-        _collect(msg.get("clip"))
-
-    extra = payload.get("extra")
-    if isinstance(extra, dict):
-        _collect(extra)
-        _collect(extra.get("clip"))
-        for item in list(extra.get("multi_camera_prerecordings") or []):
-            _collect(item)
-
-    _collect(payload.get("clip"))
-    return list(dict.fromkeys(keys))
+from application.services.clip_storage import (
+    EventClipService,
+    extract_notification_clip_storage_keys as _extract_notification_clip_storage_keys,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -92,14 +65,12 @@ class RetentionService:
 
         while True:
             async with self._session_factory() as db:
-                rows = (
-                    await db.execute(
-                        select(Notification)
-                        .where(Notification.detected_at < cutoff)
-                        .order_by(Notification.id.asc())
-                        .limit(max(1, int(batch_size)))
-                    )
-                ).scalars().all()
+                rows = await NotificationRepository().list_notifications(
+                    db,
+                    detected_before=cutoff,
+                    limit=max(1, int(batch_size)),
+                    order_desc=False,
+                )
 
                 if not rows:
                     break
@@ -139,7 +110,7 @@ class RetentionService:
                 break
 
             async with self._session_factory() as db:
-                await db.execute(delete(Notification).where(Notification.id.in_(ids)))
+                await NotificationRepository().delete_notifications(db, ids=ids)
                 await db.commit()
 
             total_deleted += len(ids)
@@ -155,14 +126,12 @@ class RetentionService:
 
         while True:
             async with self._session_factory() as db:
-                rows = (
-                    await db.execute(
-                        select(VideoRecord)
-                        .where(VideoRecord.created_at < cutoff)
-                        .order_by(VideoRecord.id.asc())
-                        .limit(max(1, int(batch_size)))
-                    )
-                ).scalars().all()
+                rows = await VideoRepository().list_video_records(
+                    db,
+                    created_before=cutoff,
+                    limit=max(1, int(batch_size)),
+                    order_asc=True,
+                )
 
                 if not rows:
                     break
@@ -192,7 +161,7 @@ class RetentionService:
                 break
 
             async with self._session_factory() as db:
-                await db.execute(delete(VideoRecord).where(VideoRecord.id.in_(ids)))
+                await VideoRepository().delete_video_records(db, ids=ids)
                 await db.commit()
 
             total_deleted += len(ids)

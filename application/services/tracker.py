@@ -55,6 +55,20 @@ def _assign(cost: np.ndarray) -> List[Tuple[int, int]]:
         out.append((i, j))
     return out
 
+def _xyxy_to_cxcyah(b: BBox) -> np.ndarray:
+    w = b[2] - b[0]                                # box width  = x2 - x1
+    h = b[3] - b[1]                                # box height = y2 - y1
+    cx = b[0] + 0.5 * w                            # center x   = left edge + half width
+    cy = b[1] + 0.5 * h                            # center y   = top edge + half height
+    a = w / max(h, 1e-6)                           # aspect ratio = w/h (guard against div-by-zero)
+    return np.array([cx, cy, a, h], dtype=np.float32)
+
+def _cxcyah_to_xyxy(s: np.ndarray) -> BBox:
+    cx, cy, a, h = s                               # unpack state
+    w = a * h                                      # recover width from aspect * height
+    return np.array([cx - 0.5*w, cy - 0.5*h,       # x1, y1 (top-left)
+                     cx + 0.5*w, cy + 0.5*h],      # x2, y2 (bottom-right)
+                    dtype=np.float32)
 
 @dataclass
 class Track:
@@ -70,25 +84,37 @@ class Track:
     misses: int = 0
     confirmed: bool = False
 
-    # very light motion model (OC-SORT-ish flavor): constant velocity on bbox coords
-    vel: BBox = field(default_factory=lambda: np.zeros(4, dtype=np.float32))
+    # velocity is now 3D: [vcx, vcy, vh]. Aspect ratio is held constant — see predict().
+    vel: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
 
     def predict(self, now_ts: float) -> BBox:
-        dt = max(1e-3, now_ts - self.last_ts)
-        return self.bbox + self.vel * dt
+        dt = min(max(1e-3, now_ts - self.last_ts), 0.15)
+        state = _xyxy_to_cxcyah(self.bbox)                 # convert current bbox into (cx, cy, a, h)
+        state[0] += self.vel[0] * dt                       # advance center x by vcx*dt
+        state[1] += self.vel[1] * dt                       # advance center y by vcy*dt
+        state[3] += self.vel[2] * dt                       # advance height by vh*dt (aspect 'a' is untouched)
+        return _cxcyah_to_xyxy(state)                      # convert back to xyxy for IoU computation
 
     def update(self, det_bbox: BBox, det_score: float, now_ts: float, alpha: float = 0.65) -> None:
-        dt = max(1e-3, now_ts - self.last_ts)
-        new_vel = (det_bbox - self.bbox) / dt
+        dt = max(1e-3, now_ts - self.last_ts)              # time since last observation
+        old = _xyxy_to_cxcyah(self.bbox)                   # previous state in cxcyah
+        new = _xyxy_to_cxcyah(det_bbox)                    # new detection in cxcyah
+        new_vel = np.array([
+            (new[0] - old[0]) / dt,                        # vcx = Δcx / dt
+            (new[1] - old[1]) / dt,                        # vcy = Δcy / dt
+            (new[3] - old[3]) / dt,                        # vh  = Δh  / dt  (no va — aspect ignored)
+        ], dtype=np.float32)
         self.vel = alpha * self.vel + (1.0 - alpha) * new_vel
-
         self.bbox = det_bbox
         self.score = float(det_score)
         self.last_ts = now_ts
         self.last_update_ts = now_ts
-
         self.hits += 1
         self.misses = 0
+
+    def on_miss(self, decay: float = 0.9) -> None:
+        self.misses += 1                                   # count this missed frame
+        self.vel *= decay                                  # damp velocity — confidence in our extrapolation drops with each miss
 
 
 class ByteTrackLite:
@@ -102,8 +128,8 @@ class ByteTrackLite:
     """
     def __init__(
         self,
-        high_th: float = 0.45,
-        low_th: float = 0.1,
+        high_th: float = 0.5,
+        low_th: float = 0.3,
         min_iou_high: float = 0.30,
         min_iou_low: float = 0.20,
         min_hits: int = 2,
@@ -133,95 +159,97 @@ class ByteTrackLite:
                 continue
             kept.append(t)
         self._tracks = kept
-
+        
     def update(self, detections: List[Dict[str, Any]], ts_s: Optional[float] = None) -> Dict[str, Any]:
         now_ts = float(ts_s if ts_s is not None else time.time())
         self._purge(now_ts)
-        hi = [d for d in detections if float(d["conf"]) >= self.high_th]
-        lo = [d for d in detections if self.low_th <= float(d["conf"]) < self.high_th]
+        hi = [d for d in detections if float(d["conf"]) >= self.high_th]                 # high-conf dets
+        lo = [d for d in detections if self.low_th <= float(d["conf"]) < self.high_th]   # low-conf dets
 
-        events: List[Tuple[str, int]] = [] 
-        pred = [t.predict(now_ts) for t in self._tracks]
-        unmatched_tracks = set(range(len(self._tracks)))
-        unmatched_hi = set(range(len(hi)))
+        events: List[Tuple[str, int]] = []
+        pred = [t.predict(now_ts) for t in self._tracks]                                 # predicted bbox per track
 
-        if self._tracks and hi:
-            cost = np.ones((len(self._tracks), len(hi)), dtype=np.float32)
-            for i, t in enumerate(self._tracks):
-                for j, d in enumerate(hi):
-                    if self.match_same_class and t.cls_name != d["cls_name"]:
-                        continue
-                    cost[i, j] = 1.0 - _iou(pred[i], d["bbox"])
+        # split tracks: confirmed get priority access to high-conf detections
+        confirmed_idxs = [i for i, t in enumerate(self._tracks) if t.confirmed]
+        tentative_idxs = [i for i, t in enumerate(self._tracks) if not t.confirmed]
+        matched_track_idxs: set = set()                                                  # tracks that got a det this frame
 
-            for ti, dj in _assign(cost):
-                iou_val = 1.0 - float(cost[ti, dj])
-                if iou_val < self.min_iou_high:
-                    continue
-                unmatched_tracks.discard(ti)
-                unmatched_hi.discard(dj)
-
+        def _match(track_idxs, det_idxs, det_list, min_iou):
+            """Hungarian match between a subset of tracks and a subset of detections."""
+            if not track_idxs or not det_idxs:
+                return []
+            track_idxs = list(track_idxs)
+            det_idxs = list(det_idxs)
+            # 1e6 = "impossible pair" — much safer than 1.0 because Hungarian won't pick it as locally optimal
+            cost = np.full((len(track_idxs), len(det_idxs)), 1e6, dtype=np.float32)
+            for ii, ti in enumerate(track_idxs):
                 t = self._tracks[ti]
-                was_confirmed = t.confirmed
-                t.update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts)
+                for jj, dj in enumerate(det_idxs):
+                    d = det_list[dj]
+                    if self.match_same_class and t.cls_name != d["cls_name"]:
+                        continue                                                          # leave at 1e6 → effectively forbidden
+                    cost[ii, jj] = 1.0 - _iou(pred[ti], d["bbox"])                       # standard 1 - IoU cost
+            matches = []
+            for ii, jj in _assign(cost):
+                if cost[ii, jj] > 1.0 - min_iou:                                          # IoU too low → reject this pairing
+                    continue
+                matches.append((track_idxs[ii], det_idxs[jj]))                            # remap to original indices
+            return matches
 
-                if (not was_confirmed) and (t.hits >= self.min_hits):
-                    t.confirmed = True
-                    events.append(("track_confirmed", t.track_id))
+        unmatched_hi = set(range(len(hi)))                                                # all high-conf dets up for grabs
 
-        # Stage 2: match remaining tracks to LOW detections
+        # ─── Stage 1a: confirmed tracks ↔ high-conf detections (priority pass) ───
+        for ti, dj in _match(confirmed_idxs, unmatched_hi, hi, self.min_iou_high):
+            matched_track_idxs.add(ti)
+            unmatched_hi.discard(dj)                                                      # this det is taken
+            self._tracks[ti].update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts)
+            # no confirmation event needed — track was already confirmed
+
+        # ─── Stage 1b: tentative tracks ↔ remaining high-conf detections ───
+        for ti, dj in _match(tentative_idxs, unmatched_hi, hi, self.min_iou_high):
+            matched_track_idxs.add(ti)
+            unmatched_hi.discard(dj)
+            t = self._tracks[ti]
+            t.update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts)
+            if t.hits >= self.min_hits:                                                   # graduate to confirmed if enough hits
+                t.confirmed = True
+                events.append(("track_confirmed", t.track_id))
+
+        # ─── Stage 2: any still-unmatched track ↔ low-conf detections (flicker rescue) ───
+        still_unmatched = [i for i in range(len(self._tracks)) if i not in matched_track_idxs]
         unmatched_lo = set(range(len(lo)))
-        if unmatched_tracks and lo:
-            remaining_tracks = sorted(unmatched_tracks)
-            cost2 = np.ones((len(remaining_tracks), len(lo)), dtype=np.float32)
-            for ii, ti in enumerate(remaining_tracks):
-                t = self._tracks[ti]
-                for j, d in enumerate(lo):
-                    if self.match_same_class and t.cls_name != d["cls_name"]:
-                        continue
-                    cost2[ii, j] = 1.0 - _iou(pred[ti], d["bbox"])
+        for ti, dj in _match(still_unmatched, unmatched_lo, lo, self.min_iou_low):
+            matched_track_idxs.add(ti)
+            unmatched_lo.discard(dj)
+            t = self._tracks[ti]
+            was_confirmed = t.confirmed
+            t.update(lo[dj]["bbox"], float(lo[dj]["conf"]), now_ts)
+            if (not was_confirmed) and t.hits >= self.min_hits:
+                t.confirmed = True
+                events.append(("track_confirmed", t.track_id))
 
-            for r_i, dj in _assign(cost2):
-                ti = remaining_tracks[r_i]
-                iou_val = 1.0 - float(cost2[r_i, dj])
-                if iou_val < self.min_iou_low:
-                    continue
-                if ti not in unmatched_tracks or dj not in unmatched_lo:
-                    continue
+        # ─── Tracks that got nothing this frame: bump misses, decay velocity ───
+        for ti in range(len(self._tracks)):
+            if ti not in matched_track_idxs:
+                self._tracks[ti].on_miss()                                                # misses++ AND vel *= 0.9
 
-                unmatched_tracks.discard(ti)
-                unmatched_lo.discard(dj)
-
-                t = self._tracks[ti]
-                was_confirmed = t.confirmed
-                t.update(lo[dj]["bbox"], float(lo[dj]["conf"]), now_ts)
-
-                if (not was_confirmed) and (t.hits >= self.min_hits):
-                    t.confirmed = True
-                    events.append(("track_confirmed", t.track_id))
-
-        # Any tracks still unmatched -> miss++
-        for ti in list(unmatched_tracks):
-            self._tracks[ti].misses += 1
-
-        # Create new tracks from unmatched HIGH detections only (ByteTrack behavior)
+        # ─── New tracks from leftover high-conf dets (unchanged behavior) ───
         for dj in sorted(unmatched_hi):
             d = hi[dj]
             tid = self._next_id
             self._next_id += 1
-            self._tracks.append(
-                Track(
-                    track_id=tid,
-                    cls_name=str(d["cls_name"]),
-                    bbox=d["bbox"].copy(),
-                    score=float(d["conf"]),
-                    start_ts=now_ts,
-                    last_ts=now_ts,
-                    last_update_ts=now_ts,
-                )
-            )
+            self._tracks.append(Track(
+                track_id=tid,
+                cls_name=str(d["cls_name"]),
+                bbox=d["bbox"].copy(),
+                score=float(d["conf"]),
+                start_ts=now_ts,
+                last_ts=now_ts,
+                last_update_ts=now_ts,
+            ))
             events.append(("track_created", tid))
 
-        # Output
+        # Output (unchanged)
         out_tracks = []
         for t in self._tracks:
             out_tracks.append({
@@ -235,9 +263,7 @@ class ByteTrackLite:
                 "age_s": now_ts - t.start_ts,
                 "last_seen_s": now_ts - t.last_update_ts,
             })
-
         return {"events": events, "tracks": out_tracks}
-
 
 # --------------------------
 # ROI + Alerting (notify on confirmed + ROI enter)
@@ -250,7 +276,17 @@ class ROI:
     normalized: bool = False
     frame_w: Optional[int] = None
     frame_h: Optional[int] = None
-
+    anchor: str = "bbox"
+    allowed_classes: Optional[Tuple[str, ...]] = None
+    enter_after_n: int = 2
+    
+    
+def _bbox_anchor(b: List[float], mode: str) -> Tuple[float, float]:
+    """Pick the point on the bbox that represents 'where the object is'."""
+    x1, y1, x2, y2 = b
+    if mode == "center":
+        return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)  # geometric center
+    return ((x1 + x2) * 0.5, max(y1, y2))
 
 def _point_in_poly(x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
     inside = False
@@ -390,7 +426,10 @@ class ROIAlertEngine:
     def __init__(self) -> None:
         self._notified: Dict[Tuple[str, str, int], bool] = {}
         self._in_roi: Dict[Tuple[str, str, int], bool] = {}
-
+        self._in_roi: Dict[Tuple[str, str, int], bool] = {}
+        self._inside_streak: Dict[Tuple[str, str, int], int] = {}
+        self._outside_streak: Dict[Tuple[str, str, int], int] = {}
+        
     def process(
         self,
         camera_uuid: str,
@@ -403,48 +442,86 @@ class ROIAlertEngine:
         alerts: List[Dict[str, Any]] = []
         ts_ms = int(ts_ms if ts_ms is not None else time.time() * 1000)
 
+        # set of track_ids alive this frame for this camera — used for cleanup at the end
+        active_ids = {int(t["track_id"]) for t in tracks}
+
         for roi in rois:
             poly = _roi_points_px(roi, frame_w, frame_h)
 
             for t in tracks:
                 if not t.get("confirmed", False):
                     continue
+                if roi.allowed_classes is not None and t["cls_name"] not in roi.allowed_classes:
+                    continue
 
                 track_id = int(t["track_id"])
                 key = (camera_uuid, roi.roi_id, track_id)
 
-                inside = _bbox_intersects_poly(t["bbox"], poly)
+                if roi.anchor == "bbox":
+                    raw_inside = _bbox_intersects_poly(t["bbox"], poly)   # any-overlap
+                else:
+                    ax, ay = _bbox_anchor(t["bbox"], roi.anchor)
+                    raw_inside = _point_in_poly(ax, ay, poly)
 
+                in_streak = self._inside_streak.get(key, 0)
+                out_streak = self._outside_streak.get(key, 0)
+                if raw_inside:
+                    in_streak += 1
+                    out_streak = 0
+                else:
+                    out_streak += 1
+                    in_streak = 0
+                self._inside_streak[key] = in_streak
+                self._outside_streak[key] = out_streak
                 prev_inside = self._in_roi.get(key, False)
+                if prev_inside:
+                    inside = out_streak < roi.enter_after_n
+                else:
+                    inside = in_streak >= roi.enter_after_n
                 self._in_roi[key] = inside
 
-                if not inside:
-                    if prev_inside:
-                        self._notified.pop(key, None)
-                    continue
-
-                # ROI enter = edge: False -> True
                 if inside and not prev_inside:
-                    if not self._notified.get(key, False):
-                        self._notified[key] = True
-                        alerts.append({
-                            "type": "roi_enter",
-                            "ts_ms": ts_ms,
-                            "camera_uuid": camera_uuid,
-                            "roi_id": roi.roi_id,
-                            "track_id": track_id,
-                            "cls_name": t["cls_name"],
-                            "conf": float(t["conf"]),
-                            "bbox": t["bbox"],
-                        })
+                    alerts.append({
+                        "type": "roi_enter",
+                        "ts_ms": ts_ms,
+                        "camera_uuid": camera_uuid,
+                        "roi_id": roi.roi_id,
+                        "track_id": track_id,
+                        "cls_name": t["cls_name"],
+                        "conf": float(t["conf"]),
+                        "bbox": t["bbox"],
+                    })
+        self._in_roi = {k: v for k, v in self._in_roi.items()
+                        if k[0] != camera_uuid or k[2] in active_ids}
+        self._inside_streak = {k: v for k, v in self._inside_streak.items()
+                               if k[0] != camera_uuid or k[2] in active_ids}
+        self._outside_streak = {k: v for k, v in self._outside_streak.items()
+                                if k[0] != camera_uuid or k[2] in active_ids}
 
         return alerts
 
+    def cleanup_dead_tracks(self, camera_uuid: str, active_track_ids) -> None:
+        """
+        Manual cleanup hook. Only needed if you filter `tracks` upstream of
+        process() (e.g. drop low-confidence tracks before passing them in),
+        because process()'s auto-cleanup uses whatever it received as the
+        source of truth for 'alive'.
+        """
+        cam = str(camera_uuid)
+        active = {int(i) for i in active_track_ids}
+        self._in_roi = {k: v for k, v in self._in_roi.items()
+                        if k[0] != cam or k[2] in active}
+        self._inside_streak = {k: v for k, v in self._inside_streak.items()
+                               if k[0] != cam or k[2] in active}
+        self._outside_streak = {k: v for k, v in self._outside_streak.items()
+                                if k[0] != cam or k[2] in active}
 
     def reset_camera(self, camera_uuid: str) -> None:
+        """Wipe all ROI state for a camera (use on stream restart / reconfig)."""
         cam = str(camera_uuid)
-        self._notified = {k: v for k, v in self._notified.items() if k[0] != cam}
         self._in_roi = {k: v for k, v in self._in_roi.items() if k[0] != cam}
+        self._inside_streak = {k: v for k, v in self._inside_streak.items() if k[0] != cam}
+        self._outside_streak = {k: v for k, v in self._outside_streak.items() if k[0] != cam}
 
 
 

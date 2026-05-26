@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.verify_repository import EmailVerificationRepository
 from core.database_orm import SignupTempData, User,EmailVerification, utc_now
+from core.env import env_bool, env_int
 from core.security.hashing import get_password_hash, verify_password
 from core.security.tokens import create_access_token
 from dependencies import get_async_db, get_current_user
@@ -26,45 +27,27 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
-OTP_TTL_SECONDS = max(60, _env_int("OTP_TTL_SECONDS", 600))
-OTP_MAX_ATTEMPTS = max(1, _env_int("OTP_MAX_ATTEMPTS", 5))
-OTP_RESEND_COOLDOWN_SECONDS = max(0, _env_int("OTP_RESEND_COOLDOWN_SECONDS", 30))
-SIGNUP_TEMP_TTL_SECONDS = max(
-    OTP_TTL_SECONDS,
-    _env_int("SIGNUP_TEMP_TTL_SECONDS", OTP_TTL_SECONDS),
+OTP_TTL_SECONDS = env_int("OTP_TTL_SECONDS", 600, minimum=60)
+OTP_MAX_ATTEMPTS = env_int("OTP_MAX_ATTEMPTS", 5, minimum=1)
+OTP_RESEND_COOLDOWN_SECONDS = env_int("OTP_RESEND_COOLDOWN_SECONDS", 30, minimum=0)
+SIGNUP_TEMP_TTL_SECONDS = env_int(
+    "SIGNUP_TEMP_TTL_SECONDS", OTP_TTL_SECONDS, minimum=OTP_TTL_SECONDS,
 )
 OTP_SECRET_PEPPER = os.getenv("SECRET_KEY", "")
-AUTH_DEBUG_RETURN_OTP = _env_bool("AUTH_DEBUG_RETURN_OTP", False)
+AUTH_DEBUG_RETURN_OTP = env_bool("AUTH_DEBUG_RETURN_OTP", False)
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = _env_int("SMTP_PORT", 587)
+SMTP_PORT = env_int("SMTP_PORT", 587)
 SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
 SMTP_FROM = (os.getenv("FROM_EMAIL") or os.getenv("SMTP_FROM") or SMTP_USERNAME).strip()
-SMTP_USE_TLS = _env_bool("SMTP_USE_TLS", True)
+SMTP_USE_TLS = env_bool("SMTP_USE_TLS", True)
 
 
 class AuthUserOut(BaseModel):

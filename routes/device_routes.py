@@ -7,15 +7,24 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 
 logger = logging.getLogger(__name__)
-from pydantic import BaseModel, Field
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from application.dtos import DeviceCreateDTO, DeviceUpdateDTO
+from application.repositories.device_repository import DeviceRepository
 from core.database_orm import Device  # adjust import path
+from core.schemas import (
+    DeviceCreate,
+    DeviceUpdate,
+    DeviceOut,
+    EdgeCameraListOut,
+    EdgeReconcileOut,
+)
 from dependencies import get_db, get_async_db, get_current_user, get_manager
 from application.services.manager import EdgeDeviceUnavailableError, Manager
 
 router = APIRouter(prefix="/devices", tags=["devices"])
+
+device_repo = DeviceRepository()
 
 
 
@@ -26,59 +35,10 @@ def _gen_code(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:6]}"
 
 async def _get_device_or_404(db: AsyncSession, user_id: int, device_uuid: uuid.UUID) -> Device:
-    q = select(Device).where(Device.device_uuid == device_uuid, Device.user_id == user_id)
-    device = (await db.execute(q)).scalar_one_or_none()
+    device = await device_repo.get_device(db, device_uuid=device_uuid, user_id=user_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     return device
-
-class EdgeCameraListOut(BaseModel):
-    device_uuid: uuid.UUID
-    device_url: str
-    camera_uuids: List[str] = Field(default_factory=list)
-
-
-class EdgeReconcileOut(BaseModel):
-    device_uuid: uuid.UUID
-    device_url: str
-
-    to_add: List[str] = Field(default_factory=list)
-    to_remove: List[str] = Field(default_factory=list)
-
-    added: List[str] = Field(default_factory=list)
-    removed: List[str] = Field(default_factory=list)
-
-    errors: List[str] = Field(default_factory=list)
-    warnings: List[str] = Field(default_factory=list)
-    
-# -----------------------
-# Schemas
-# -----------------------
-class DeviceCreate(BaseModel):
-    device_url: str = Field(..., min_length=1, max_length=2048)
-    name: Optional[str] = Field(default=None, max_length=255)
-    device_code: Optional[str] = Field(default=None, max_length=64)
-    is_enabled: bool = True
-
-
-class DeviceUpdate(BaseModel):
-    device_url: Optional[str] = Field(default=None, min_length=1, max_length=2048)
-    name: Optional[str] = Field(default=None, max_length=255)
-    device_code: Optional[str] = Field(default=None, max_length=64)
-    is_enabled: Optional[bool] = None
-
-
-class DeviceOut(BaseModel):
-    device_uuid: uuid.UUID
-    user_id: int
-    device_url: str
-    name: Optional[str] = None
-    device_code: Optional[str] = None
-    is_enabled: bool
-
-    class Config:
-        from_attributes = True
-
 
 # -----------------------
 # Routes
@@ -88,8 +48,7 @@ async def list_devices(
     db: AsyncSession = Depends(get_async_db),
     user=Depends(get_current_user),
 ):
-    q = select(Device).where(Device.user_id == user.id).order_by(Device.created_at.desc())
-    return (await db.execute(q)).scalars().all()
+    return await device_repo.list_devices(db, user_id=user.id, order_by_recent=True)
 
 
 @router.post("", response_model=DeviceOut, status_code=status.HTTP_201_CREATED)
@@ -102,15 +61,16 @@ async def create_device(
     if _is_blank(device_code):
         device_code = _gen_code("dev")
 
-    device = Device(
-        user_id=user.id,
-        device_url=payload.device_url,
-        name=payload.name,
-        device_code=device_code,
-        is_enabled=payload.is_enabled,
+    device = await device_repo.create_device(
+        db,
+        dto=DeviceCreateDTO(
+            user_id=user.id,
+            device_url=payload.device_url,
+            name=payload.name,
+            device_code=device_code,
+            is_enabled=payload.is_enabled,
+        ),
     )
-
-    db.add(device)
     await db.commit()
     await db.refresh(device)
     return device
@@ -140,10 +100,13 @@ async def update_device(
     if "device_code" in data and _is_blank(data.get("device_code")):
         data["device_code"] = _gen_code("dev")
 
-    for k, v in data.items():
-        if v is not None:
-            setattr(device, k, v)
-
+    update_fields = {k: v for k, v in data.items() if v is not None}
+    if update_fields:
+        await device_repo.update_device(
+            db,
+            device_uuid=device.device_uuid,
+            dto=DeviceUpdateDTO(**update_fields),
+        )
     await db.commit()
     await db.refresh(device)
     return device
@@ -176,7 +139,7 @@ async def delete_device(
                 device_uuid, exc_info=True,
             )
 
-    await db.delete(device)
+    await device_repo.delete_device(db, device_uuid=device.device_uuid)
     await db.commit()
     return None
 

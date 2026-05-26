@@ -4,7 +4,16 @@ from datetime import datetime, time as dt_time
 from typing import Any, Dict, List, Optional, Tuple, Literal
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    PositiveInt,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 from application.channels.channel_config import VideoChannelConfig
 
@@ -81,54 +90,6 @@ def _normalize_schedule_fields(model: BaseModel) -> BaseModel:
 # -------------------------
 # Shared / base shapes
 # -------------------------
-
-class CameraBaseSchema(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    site_uuid: uuid.UUID = Field(..., description="Site that owns this camera.")
-    device_uuid: Optional[uuid.UUID] = Field(
-        default=None,
-        description="Assigned device UUID (Jetson). Required on create; optional on edit if you allow moving devices."
-    )
-
-    rtsp_url: str = Field(..., min_length=1, description="RTSP URL for the camera.")
-    name: Optional[str] = None
-    location: Optional[str] = None
-    is_enabled: bool = True
-    is_detection_enabled: bool = True
-    is_notification_enabled: bool = True
-    notification_trigger_mode: Literal["inherit", "roi_enter", "any_detection"] = Field(
-        default="inherit",
-        description="Per-camera notification trigger mode. 'inherit' = use site-level Trigger Condition.",
-    )
-    camera_playback_enabled: Literal["inherit", "always", "never"] = Field(
-        default="inherit",
-        description="Per-camera clip recording override. 'inherit' = use site default (prerecord list).",
-    )
-    sample_fps: Optional[float] = Field(default=5.0, ge=0.1)
-    decode_backend: Optional[Literal["gstreamer", "opencv"]] = "gstreamer"
-    resize: Optional[Tuple[int, int]] = None
-    reconnect_base_ms: Optional[int] = Field(default=1000, ge=100)
-    reconnect_max_ms: Optional[int] = Field(default=8000, ge=1000)
-    poll_interval_ms: Optional[int] = Field(default=500, ge=10)
-    request_timeout_s: Optional[float] = Field(default=3.0, ge=0.1)
-    detection_path_template: Optional[str] = Field(default="/api/cameras/{camera_uuid}/latest")
-    timezone: Optional[str] = None
-    day_of_week: Optional[List[int]] = None
-    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
-    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
-    schedule: Optional[List[Dict[str, Any]]] = None
-    use_site_schedule: Optional[bool] = None
-
-    @model_validator(mode="after")
-    def _strip_blank_strings(self):
-        for attr in ("rtsp_url", "name", "location", "detection_path_template"):
-            v = getattr(self, attr, None)
-            if isinstance(v, str) and not v.strip():
-                setattr(self, attr, None)
-        if not self.rtsp_url:
-            raise ValueError("rtsp_url must not be empty.")
-        return _normalize_schedule_fields(self)
-
 
 class CameraCreateSchema(BaseModel):
     """
@@ -305,3 +266,446 @@ class CameraPlaybackSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
     camera_uuid: str
     webrtc_url: str
+
+
+# -------------------------
+# Site schedule helpers / constants
+# -------------------------
+SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER = "roi_enter"
+SITE_PRERECORD_TRIGGER_MODE_ANY_DETECTION = "any_detection"
+SITE_PRERECORD_TRIGGER_MODES = {
+    SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER,
+    SITE_PRERECORD_TRIGGER_MODE_ANY_DETECTION,
+}
+SUNDAY_TO_SATURDAY = [6, 0, 1, 2, 3, 4, 5]
+
+
+# --- Site schemas ---
+class SiteCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    site_code: Optional[str] = Field(default=None, max_length=64)
+    address: Optional[str] = Field(default=None, max_length=255)
+    timezone: Optional[str] = Field(default="UTC", max_length=50)
+
+
+class SiteUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    site_code: Optional[str] = Field(default=None, max_length=64)
+    address: Optional[str] = Field(default=None, max_length=255)
+    timezone: Optional[str] = Field(default=None, max_length=50)
+
+
+class SiteOut(BaseModel):
+    site_uuid: uuid.UUID
+    user_id: int
+    name: str
+    site_code: Optional[str] = None
+    address: Optional[str] = None
+    timezone: Optional[str] = "UTC"
+
+    class Config:
+        from_attributes = True
+
+
+class LinkDeviceRequest(BaseModel):
+    device_uuid: uuid.UUID
+
+
+class SiteCameraCreate(BaseModel):
+    device_uuid: uuid.UUID
+    rtsp_url: str = Field(..., min_length=1, max_length=2048)
+    name: Optional[str] = Field(default=None, max_length=255)
+    location: Optional[str] = Field(default=None, max_length=255)
+    is_enabled: bool = True
+    is_detection_enabled: bool = True
+    is_notification_enabled: bool = True
+    notification_trigger_mode: Literal["inherit", "roi_enter", "any_detection"] = Field(
+        default="inherit",
+        description="Per-camera notification trigger mode. 'inherit' = use site-level setting.",
+    )
+    camera_playback_enabled: Literal["inherit", "always", "never"] = Field(
+        default="inherit",
+        description="Per-camera clip recording override. 'inherit' = use site default (prerecord list).",
+    )
+    sample_fps: float = Field(default=5.0, ge=0.1)
+    timezone: Optional[str] = None
+    day_of_week: Optional[List[int]] = None
+    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    schedule: Optional[List[Dict[str, Any]]] = None
+    use_site_schedule: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _validate_schedule(self):
+        return _normalize_schedule_fields(self)
+
+
+class SiteMultiCameraPrerecordRule(BaseModel):
+    enabled: bool = False
+    camera_uuids: List[uuid.UUID] = Field(default_factory=list)
+    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
+
+
+class SiteMultiCameraPrerecordRuleUpdate(BaseModel):
+    enabled: bool = False
+    camera_uuids: List[uuid.UUID] = Field(default_factory=list)
+    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
+
+
+class SiteNotificationRule(BaseModel):
+    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
+
+
+class SiteNotificationRuleUpdate(BaseModel):
+    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
+
+
+class SiteScheduleRule(BaseModel):
+    timezone: str = Field(default="UTC", max_length=50)
+    day_of_week: List[int] = Field(default_factory=lambda: list(SUNDAY_TO_SATURDAY))
+    start_time: str = Field(default="00:00:00", pattern=SCHEDULE_TIME_PATTERN)
+    end_time: str = Field(default="23:59:59", pattern=SCHEDULE_TIME_PATTERN)
+    schedule: List[Dict[str, Any]] = Field(default_factory=VideoChannelConfig.default_schedule)
+
+
+class SiteScheduleRuleUpdate(BaseModel):
+    timezone: Optional[str] = Field(default=None, max_length=50)
+    day_of_week: Optional[List[int]] = None
+    start_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    end_time: Optional[str] = Field(default=None, pattern=SCHEDULE_TIME_PATTERN)
+    schedule: Optional[List[Dict[str, Any]]] = None
+
+    @model_validator(mode="after")
+    def _validate_schedule(self):
+        return _normalize_schedule_fields(self)
+
+
+class SiteSettingsOut(BaseModel):
+    site_uuid: uuid.UUID
+    schedule: SiteScheduleRule = Field(default_factory=SiteScheduleRule)
+    multi_camera_prerecord: SiteMultiCameraPrerecordRule = Field(
+        default_factory=SiteMultiCameraPrerecordRule
+    )
+    notification: SiteNotificationRule = Field(default_factory=SiteNotificationRule)
+
+
+class SiteSettingsUpdate(BaseModel):
+    schedule: Optional[SiteScheduleRuleUpdate] = None
+    multi_camera_prerecord: Optional[SiteMultiCameraPrerecordRuleUpdate] = None
+    notification: Optional[SiteNotificationRuleUpdate] = None
+
+
+# --- Device schemas ---
+class EdgeCameraListOut(BaseModel):
+    device_uuid: uuid.UUID
+    device_url: str
+    camera_uuids: List[str] = Field(default_factory=list)
+
+
+class EdgeReconcileOut(BaseModel):
+    device_uuid: uuid.UUID
+    device_url: str
+
+    to_add: List[str] = Field(default_factory=list)
+    to_remove: List[str] = Field(default_factory=list)
+
+    added: List[str] = Field(default_factory=list)
+    removed: List[str] = Field(default_factory=list)
+
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class DeviceCreate(BaseModel):
+    device_url: str = Field(..., min_length=1, max_length=2048)
+    name: Optional[str] = Field(default=None, max_length=255)
+    device_code: Optional[str] = Field(default=None, max_length=64)
+    is_enabled: bool = True
+
+
+class DeviceUpdate(BaseModel):
+    device_url: Optional[str] = Field(default=None, min_length=1, max_length=2048)
+    name: Optional[str] = Field(default=None, max_length=255)
+    device_code: Optional[str] = Field(default=None, max_length=64)
+    is_enabled: Optional[bool] = None
+
+
+class DeviceOut(BaseModel):
+    device_uuid: uuid.UUID
+    user_id: int
+    device_url: str
+    name: Optional[str] = None
+    device_code: Optional[str] = None
+    is_enabled: bool
+
+    class Config:
+        from_attributes = True
+
+
+# --- Notification schemas ---
+class NotificationOut(BaseModel):
+    id: int
+    user_id: int
+    site_uuid: str
+    camera_uuid: Optional[str] = None
+    site_name: Optional[str] = None
+    camera_name: Optional[str] = None
+    device_uuid: Optional[str] = None
+    event_type: str
+    title: Optional[str] = None
+    message: Optional[str] = None
+    payload: Optional[Dict[str, Any]] = None
+    image_url: Optional[str] = None
+    image_storage_key: Optional[str] = None
+    clip_url: Optional[str] = None
+    clip_status: Optional[str] = None
+    detected_at: datetime
+    created_at: datetime
+    read_at: Optional[datetime] = None
+    sent_at: Optional[datetime] = None
+    status: str
+
+
+class ChartPoint(BaseModel):
+    bucket_start: datetime
+    count: int
+
+
+class DetectionsOverTimeOut(BaseModel):
+    user_id: int
+    site_uuid: Optional[str] = None
+    hours: int
+    object_class: Optional[str] = None
+    roi_only: bool
+    bucket_minutes: int
+    from_time: datetime = Field(alias="from")
+    to: datetime
+    total: int
+    points: List[ChartPoint]
+
+    class Config:
+        populate_by_name = True
+
+
+class ClearNotificationsRequest(BaseModel):
+    site_uuid: Optional[str] = None
+    camera_uuid: Optional[str] = None
+
+
+class DeleteNotificationsRequest(BaseModel):
+    site_uuid: Optional[str] = None
+    camera_uuid: Optional[str] = None
+    notification_ids: Optional[List[int]] = None
+
+
+# --- Notification email schemas ---
+class NotificationEmailCreate(BaseModel):
+    email: EmailStr
+    # If omitted, email is applied to all sites owned by the user.
+    site_uuid: Optional[uuid.UUID] = None
+
+
+class NotificationEmailOut(BaseModel):
+    id: int
+    user_id: int
+    site_uuid: uuid.UUID
+    email: str
+    is_enabled: bool
+
+
+class NotificationEmailCreateResult(BaseModel):
+    created: List[NotificationEmailOut]
+    created_count: int
+    skipped_count: int
+    target_site_count: int
+
+
+# --- User schemas ---
+class UserOut(BaseModel):
+    id: int
+    user_name: str
+    user_email: EmailStr
+
+
+class UserProfileUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    user_name: str | None = Field(default=None, min_length=1, max_length=255)
+    user_email: EmailStr | None = None
+
+    @field_validator("user_email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr | None) -> str | None:
+        if value is None:
+            return None
+        return str(value).lower().strip()
+
+    @model_validator(mode="after")
+    def validate_has_fields(self):
+        if self.user_name is None and self.user_email is None:
+            raise ValueError("Provide at least one field to update")
+        return self
+
+
+class ChangePasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: SecretStr
+    new_password: SecretStr
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, value: SecretStr) -> SecretStr:
+        if len(value.get_secret_value()) < 8:
+            raise ValueError("New password must be at least 8 characters long")
+        return value
+
+
+class DeleteAccountRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    password: SecretStr
+
+
+# --- Detection schemas ---
+class BoxPx(BaseModel):
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+class BoxNorm(BaseModel):
+    x: float  # 0..1 left
+    y: float  # 0..1 top
+    w: float  # 0..1 width
+    h: float  # 0..1 height
+
+
+class DetectionItemOut(BaseModel):
+    box: BoxPx
+    cls_name: str
+    conf: float
+    box_norm: Optional[BoxNorm] = None
+
+
+class DetectionOut(BaseModel):
+    camera_uuid: str
+    frame_ts_ms: int
+    frame_seq: int
+    event_type: Optional[str] = None
+    reason: Optional[str] = None
+    inference_ms: Optional[int] = None
+    model_id: Optional[str] = None
+
+    frame_w: Optional[int] = None
+    frame_h: Optional[int] = None
+
+    detections: List[DetectionItemOut] = Field(default_factory=list)
+    pose: Optional[Any] = None
+
+
+# --- Clip schemas ---
+class ClipOut(BaseModel):
+    id: int
+    camera_uuid: str
+    camera_name: Optional[str] = None
+    camera_code: Optional[str] = None
+    site_uuid: Optional[str] = None
+    site_name: Optional[str] = None
+    site_code: Optional[str] = None
+    external_id: str
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    duration: Optional[int] = None
+    status: str
+    recording_url: Optional[str] = None
+    overlay_payload: Optional[Dict[str, Any]] = None
+    storage_key: Optional[str] = None
+    error: Optional[str] = None
+    created_at: datetime
+
+
+class BulkClipDeleteRequest(BaseModel):
+    clip_ids: List[PositiveInt] = Field(..., min_length=1)
+
+
+class BulkClipDeleteResponse(BaseModel):
+    requested: int
+    deleted: int
+    deleted_ids: List[int] = Field(default_factory=list)
+
+
+# --- Auth schemas ---
+class AuthUserOut(BaseModel):
+    id: int
+    user_name: str
+    user_email: EmailStr
+
+
+class AuthTokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: AuthUserOut
+
+
+class SignupRequestCode(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    user_name: str = Field(..., min_length=1, max_length=255)
+    user_email: EmailStr
+    password: SecretStr
+
+    @field_validator("user_email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return str(value).lower().strip()
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: SecretStr) -> SecretStr:
+        if len(value.get_secret_value()) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        return value
+
+
+class SignupVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    signup_token: str = Field(..., min_length=16, max_length=255)
+    code: str = Field(..., min_length=6, max_length=10)
+
+    @field_validator("signup_token")
+    @classmethod
+    def normalize_token(cls, value: str) -> str:
+        token = value.strip()
+        if not token:
+            raise ValueError("signup_token is required")
+        return token
+
+    @field_validator("code")
+    @classmethod
+    def normalize_code(cls, value: str) -> str:
+        code = value.strip()
+        if not code.isdigit():
+            raise ValueError("Verification code must contain digits only")
+        return code
+
+
+class SignupCodeOut(BaseModel):
+    message: str
+    signup_token: str
+    expires_at: datetime
+    debug_code: str | None = None
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    user_email: EmailStr
+    password: SecretStr
+
+    @field_validator("user_email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return str(value).lower().strip()

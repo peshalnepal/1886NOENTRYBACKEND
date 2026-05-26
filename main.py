@@ -17,8 +17,8 @@ from routes.user_routes import router as users_router
 
 from core.config import DEBUG
 from core.database import db_manager, async_engine
-from application.services.manager import Manager  # adjust if your path is different
-from application.models.yolo_config import YoloModelConfig
+from core.env import env_bool
+from application.services.manager import Manager
 from application.services.notification import WebNotificationHub, NotificationService, EmailNotifier, EmailConfig
 from application.services.retention import RetentionService
 from application.services.user_snapshot_cache import UserSnapshotCache
@@ -40,16 +40,9 @@ CLIP_RETENTION_DAYS = max(0, int(os.environ.get("CLIP_RETENTION_DAYS", "30")))
 ALERT_RETENTION_DAYS = max(0, int(os.environ.get("ALERT_RETENTION_DAYS", "7")))
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
 async def _edge_reconcile_loop(app: FastAPI) -> None:
     manager = app.state.manager
-    delete_unknown = _env_bool("EDGE_RECONCILE_DELETE_UNKNOWN", False)
+    delete_unknown = env_bool("EDGE_RECONCILE_DELETE_UNKNOWN", False)
     
     # Exponential backoff for failures
     base_wait_s = max(1.0, float(os.environ.get("EDGE_RECONCILE_FAILURE_BASE_S", "5.0")))
@@ -145,8 +138,6 @@ async def lifespan(app: FastAPI):
     app.state.session_factory = SessionLocal
     app.state.user_snapshot_cache = UserSnapshotCache()
     hub = WebNotificationHub()
-    
-    # Configure email notifier with proper SMTP settings
     email_cfg = EmailConfig(
         enabled=bool(SMTP_USERNAME and SMTP_PASSWORD),
         smtp_host=SMTP_HOST,
@@ -158,16 +149,13 @@ async def lifespan(app: FastAPI):
     )
     email_notifier = EmailNotifier(email_cfg)
     
-    # Create notification service with session factory for DB lookups
-    # NOTIFY_ON_CONFIRMED=true → emit "item_detected" alerts when a track is confirmed.
-    #   Needed for trigger_mode="any_detection" prerecording to fire without a configured ROI.
-    notify_on_confirmed = _env_bool("NOTIFY_ON_CONFIRMED", False)
-    svc = NotificationService(hub=hub, email=email_notifier, notify_on_confirmed=notify_on_confirmed)
-    svc.set_session_factory(SessionLocal)  # Enable DB lookups for ROI and emails
-
+    notify_on_confirmed = env_bool("NOTIFY_ON_CONFIRMED", False)
+    svc = NotificationService(hub=hub, email=email_notifier)
+    svc.set_session_factory(SessionLocal)
     app.state.notification_hub = hub
     app.state.notification_service = svc
     app.state.manager.set_notification_service(svc)
+    svc.start()
     app.state.retention_service = RetentionService(session_factory=SessionLocal)
     app.state.alert_blob_cleanup_tasks = set()
 
@@ -193,7 +181,6 @@ async def lifespan(app: FastAPI):
     )
 
     yield
-    # Shutdown
     try:
         task = getattr(app.state, "edge_reconcile_task", None)
         if task:
@@ -236,8 +223,6 @@ async def lifespan(app: FastAPI):
             logger.exception("Retention service shutdown failed")
 
 app = FastAPI(debug=DEBUG, lifespan=lifespan)
-
-# Cache-control middleware (good for MJPEG)
 @app.middleware("http")
 async def add_cache_control_headers(request, call_next):
     response = await call_next(request)
@@ -249,7 +234,7 @@ async def add_cache_control_headers(request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # IMPORTANT: must be False if allow_origins is "*"
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -257,7 +242,6 @@ app.add_middleware(
 )
 
 
-# Routers
 app.include_router(cameras_router, prefix="/api")
 app.include_router(clips_router, prefix="/api")
 app.include_router(sites_router,prefix="/api")
@@ -267,7 +251,6 @@ app.include_router(notification_emails_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 
-# Health
 @app.get("/")
 async def root():
     return {"status": "healthy", "message": "API is running"}

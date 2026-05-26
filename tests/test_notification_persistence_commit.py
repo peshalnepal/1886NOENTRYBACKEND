@@ -56,21 +56,20 @@ class NotificationPersistenceCommitTests(unittest.IsolatedAsyncioTestCase):
         prepared_item = object()
 
         with patch.object(
-            service,
+            service.flusher,
             "_prepare_notification_item",
             AsyncMock(return_value=prepared_item),
         ) as prepare_mock, patch.object(
-            service,
+            service.flusher,
             "_flush_user_batch",
             AsyncMock(return_value=True),
         ) as flush_mock:
-            await service._persist_notification_now(msg, ctx)
+            await service.enqueue_notification(msg, ctx)
 
         prepare_mock.assert_awaited_once_with(
             msg=msg,
             ctx=ctx,
             extra_payload=None,
-            db=session,
         )
         flush_mock.assert_awaited_once_with(int(ctx.user_id), [prepared_item], db=session)
         session.commit.assert_awaited_once()
@@ -86,15 +85,15 @@ class NotificationPersistenceCommitTests(unittest.IsolatedAsyncioTestCase):
         prepared_item = object()
 
         with patch.object(
-            service,
+            service.flusher,
             "_prepare_notification_item",
             AsyncMock(return_value=prepared_item),
         ), patch.object(
-            service,
+            service.flusher,
             "_flush_user_batch",
             AsyncMock(return_value=False),
-        ), self.assertLogs("application.services.notification", level="WARNING") as captured:
-            await service._persist_notification_now(msg, ctx)
+        ), self.assertLogs("application.services.notification.flusher", level="WARNING") as captured:
+            await service.enqueue_notification(msg, ctx)
 
         session.commit.assert_not_awaited()
         session.rollback.assert_awaited_once()

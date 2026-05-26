@@ -9,18 +9,18 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, literal_column, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import StreamingResponse
 
 from application.services.notification import WebNotificationHub
+from application.repositories.notification_repository import NotificationRepository
 from application.repositories.notification_visibility import notification_visible_supported
 from application.services.user_snapshot_cache import (
     CachedUserSnapshot,
     UserSnapshotCache,
     UserSnapshotLookupError,
 )
-from core.database_orm import Camera, Notification, Site, SiteSettings, User
+from core.database_orm import Notification, User
 from core.security.tokens import decode_access_token
 from dependencies import (
     get_async_db,
@@ -34,6 +34,8 @@ from application.services.notification import NotificationService
 
 router = APIRouter(prefix="/notifications")
 logger = logging.getLogger(__name__)
+
+notif_repo = NotificationRepository()
 
 
 # -------------------------------------------------------------------
@@ -452,23 +454,7 @@ async def _get_camera_mode_cached(
     try:
         session_factory = request.app.state.session_factory
         async with session_factory() as db:
-            row = (
-                await db.execute(
-                    select(
-                        Camera.is_enabled,
-                        Camera.is_detection_enabled,
-                        Camera.is_notification_enabled,
-                        Camera.use_site_schedule,
-                        Camera.roi,
-                        SiteSettings.config,
-                        SiteSettings.id,
-                        Site.timezone,
-                    )
-                    .join(Site, Site.site_uuid == Camera.site_uuid)
-                    .outerjoin(SiteSettings, SiteSettings.site_uuid == Camera.site_uuid)
-                    .where(Camera.camera_uuid == cam_uuid_obj)
-                )
-            ).first()
+            row = await notif_repo.get_camera_mode_row(db, camera_uuid=cam_uuid_obj)
 
         mode = (
             _CameraMode(*row)
@@ -559,39 +545,18 @@ async def list_notifications(
     cu = _parse_optional_uuid(camera_uuid, "camera_uuid")
     visible_supported = await notification_visible_supported(db)
 
-    # Select only the columns needed by _to_out to avoid loading the full ORM
-    # object (which would also trigger lazy-load descriptors for relationships).
-    _NOTIFICATION_COLS = (
-        Notification.id,
-        Notification.user_id,
-        Notification.site_uuid,
-        Notification.camera_uuid,
-        Notification.device_uuid,
-        Notification.event_type,
-        Notification.title,
-        Notification.message,
-        Notification.payload,
-        Notification.detected_at,
-        Notification.created_at,
-        Notification.read_at,
-        Notification.sent_at,
-        Notification.status,
+    rows = await notif_repo.list_notifications(
+        db,
+        user_id=int(current_user.id),
+        site_uuid=su,
+        camera_uuid=cu,
+        only_visible=True if visible_supported else None,
+        only_unread=True if unread_only else None,
+        limit=limit,
+        offset=offset,
+        order_desc=True,
     )
-    stmt = select(*_NOTIFICATION_COLS).where(Notification.user_id == int(current_user.id))
-    if visible_supported:
-        stmt = stmt.where(Notification.visible.is_(True))
-
-    if su:
-        stmt = stmt.where(Notification.site_uuid == su)
-    if cu:
-        stmt = stmt.where(Notification.camera_uuid == cu)
-    if unread_only:
-        stmt = stmt.where(Notification.read_at.is_(None))
-
-    stmt = stmt.order_by(desc(Notification.detected_at)).offset(offset).limit(limit)
-
-    rows = (await db.execute(stmt)).all()
-    return [_to_out_row(r) for r in rows]
+    return [_to_out(r) for r in rows]
 
 
 @router.post("/delete")
@@ -647,85 +612,21 @@ async def detections_over_time(
 
     needs_payload_filter = bool(class_filter or roi_only)
 
-    if not needs_payload_filter:
-        # ── Fast path: pure SQL aggregation, no payload scanning ──
-        bucket_seconds = bucket_minutes * 60
-        bucket_expr = literal_column(
-            f"FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(detected_at) / {bucket_seconds}) * {bucket_seconds})"
-        )
-        stmt = (
-            select(bucket_expr.label("bucket_start"), func.count().label("cnt"))
-            .select_from(Notification.__table__)
-            .where(
-                Notification.user_id == int(current_user.id),
-                Notification.detected_at >= start,
-            )
-        )
-        if visible_supported:
-            stmt = stmt.where(Notification.visible.is_(True))
-        if su:
-            stmt = stmt.where(Notification.site_uuid == su)
-        stmt = stmt.group_by(literal_column("bucket_start"))
-
-        rows = (await db.execute(stmt)).all()
-        counts: Dict[int, int] = {}
-        for bucket_start_dt, cnt in rows:
-            dt = _as_utc(bucket_start_dt)
-            ts_ms_val = int(dt.timestamp() * 1000)
-            counts[ts_ms_val] = int(cnt)
-    else:
-        # ── Filtered path: stream rows in batches to avoid OOM ──
-        # Only select columns needed for filtering, skip the large payload
-        # when possible.
-        stmt = select(
-            Notification.detected_at,
-            Notification.event_type,
-            Notification.title,
-            Notification.message,
-            Notification.payload,
-        ).where(
-            Notification.user_id == int(current_user.id),
-            Notification.detected_at >= start,
-        )
-        if visible_supported:
-            stmt = stmt.where(Notification.visible.is_(True))
-        if su:
-            stmt = stmt.where(Notification.site_uuid == su)
-
-        # Hint for ROI: most ROI notifications have "roi" in event_type or title
-        if roi_only and not class_filter:
-            stmt = stmt.where(
-                Notification.event_type.contains("roi")
-                | Notification.title.contains("roi")
-                | Notification.title.contains("ROI")
-            )
-
-        # Stream in server-side batches of 5000 to cap memory
-        BATCH_SIZE = 5000
-        counts = {}
-        offset = 0
-        while True:
-            batch_stmt = stmt.order_by(Notification.id).offset(offset).limit(BATCH_SIZE)
-            rows = (await db.execute(batch_stmt)).all()
-            if not rows:
-                break
-
-            for raw_dt, event_type, title, message, payload in rows:
-                if roi_only and not _is_roi_notification(event_type, title, message, payload):
-                    continue
-                if class_filter:
-                    classes = _extract_object_classes(event_type, title, message, payload)
-                    if class_filter not in classes:
-                        continue
-
-                dt = _as_utc(raw_dt)
-                ts_ms_val = int(dt.timestamp() * 1000)
-                bucket = ts_ms_val - (ts_ms_val % bucket_ms)
-                counts[bucket] = counts.get(bucket, 0) + 1
-
-            offset += BATCH_SIZE
-            if len(rows) < BATCH_SIZE:
-                break
+    counts: Dict[int, int] = await notif_repo.aggregate_detections_over_time(
+        db,
+        user_id=int(current_user.id),
+        start=start,
+        bucket_minutes=bucket_minutes,
+        bucket_ms=bucket_ms,
+        site_uuid=su,
+        visible_supported=visible_supported,
+        needs_payload_filter=needs_payload_filter,
+        roi_only=bool(roi_only),
+        class_filter=class_filter,
+        as_utc_fn=_as_utc,
+        is_roi_fn=_is_roi_notification,
+        extract_classes_fn=_extract_object_classes,
+    )
 
     points: List[ChartPoint] = []
     cursor = aligned_start_ms
@@ -763,17 +664,13 @@ async def unread_count(
     su = _parse_optional_uuid(site_uuid, "site_uuid")
     visible_supported = await notification_visible_supported(db)
 
-    stmt = select(func.count(Notification.id)).where(
-        Notification.user_id == int(current_user.id),
-        Notification.read_at.is_(None),
+    count = await notif_repo.count_notifications(
+        db,
+        user_id=int(current_user.id),
+        site_uuid=su,
+        only_unread=True,
+        only_visible=True if visible_supported else None,
     )
-    if visible_supported:
-        stmt = stmt.where(Notification.visible.is_(True))
-
-    if su:
-        stmt = stmt.where(Notification.site_uuid == su)
-
-    count = (await db.execute(stmt)).scalar_one()
 
     return {
         "user_id": int(current_user.id),

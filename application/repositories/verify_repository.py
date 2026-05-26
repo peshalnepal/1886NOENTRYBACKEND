@@ -1,23 +1,13 @@
-import os
 from datetime import timedelta
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database_orm import EmailVerification, utc_now
+from core.env import env_int
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-OTP_TTL_SECONDS = max(60, _env_int("OTP_TTL_SECONDS", 600))
+OTP_TTL_SECONDS = env_int("OTP_TTL_SECONDS", 600, minimum=60)
 
 
 class EmailVerificationRepository:

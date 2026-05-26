@@ -22,7 +22,7 @@ from domain.events import (
 
 
 from domain.model import VisionModel  # or from domain.model import VisionTask
-from dto import VisionTask
+from application.models.vision_config import VisionTask
 
 import logging
 logger = logging.getLogger(__name__)

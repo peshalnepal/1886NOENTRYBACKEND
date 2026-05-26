@@ -1,7 +1,7 @@
 import unittest
 import uuid
 
-from domain.model_pipeline import ModelPipeline, ObjDetectResponse
+from application.services.pipeline import ModelPipeline, ObjDetectResponse
 from routes.camera_routes import _resp_to_detection_out
 
 

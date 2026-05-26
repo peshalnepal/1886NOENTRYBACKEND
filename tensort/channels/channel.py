@@ -380,8 +380,6 @@ class VideoChannel():
         cam = getattr(self.config, "camera_uuid", None) or getattr(self.config, "channel_id", "unknown")
         logger.info(f"[{cam}] Stopping channel thread...")
         self._stop_thread_evt.set()
-
-        # Signal stream() to end cleanly (unblocks async consumers)
         if self._loop:
             self._loop.call_soon_threadsafe(self._put_latest, _DONE)
 

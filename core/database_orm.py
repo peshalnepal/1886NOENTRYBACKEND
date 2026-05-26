@@ -285,10 +285,10 @@ class Device(Base):
     )
 
     # Device <-> Cameras (M:N)
+    # Device 1 -> N Cameras (one device can run many cameras)
     cameras = relationship(
         "Camera",
-        secondary="camera_devices",
-        back_populates="devices",
+        back_populates="device",
         passive_deletes=True,
     )
 
@@ -366,6 +366,9 @@ class Camera(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     site_uuid = Column(GUID, ForeignKey("sites.site_uuid", ondelete="CASCADE"), nullable=False, index=True)
 
+    # Each camera runs on at most one device; a device may host many cameras.
+    device_uuid = Column(GUID, ForeignKey("devices.device_uuid", ondelete="SET NULL"), nullable=True, index=True)
+
     camera_uuid = Column(GUID, default=uuid.uuid4, unique=True, nullable=False, index=True)
     camera_code = Column(String(64), nullable=False, index=True)
 
@@ -390,12 +393,7 @@ class Camera(Base):
     user = relationship("User", back_populates="cameras")
     site = relationship("Site", back_populates="cameras")
 
-    devices = relationship(
-        "Device",
-        secondary="camera_devices",
-        back_populates="cameras",
-        passive_deletes=True,
-    )
+    device = relationship("Device", back_populates="cameras")
 
     channel_configuration = relationship(
         "ChannelConfiguration",
@@ -421,29 +419,6 @@ class Camera(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "camera_code", name="uq_camera_user_camera_code"),
-    )
-
-
-# =========================
-# CAMERA <-> DEVICE association
-# =========================
-class CameraDevice(Base):
-    """
-    Link table: cameras <-> devices (M:N)
-
-    Use this to decide which Jetson device(s) can run inference for a camera.
-
-    (DB cannot easily enforce "only one primary" cross-db; do that in service layer.)
-    """
-    __tablename__ = "camera_devices"
-
-    id = Column(Integer, primary_key=True, index=True)
-    camera_uuid = Column(GUID, ForeignKey("camera.camera_uuid", ondelete="CASCADE"), nullable=False, index=True)
-    device_uuid = Column(GUID, ForeignKey("devices.device_uuid", ondelete="CASCADE"), nullable=False, index=True)
-    created_at = Column(DateTime(timezone=True), default=utc_now)
-
-    __table_args__ = (
-        UniqueConstraint("camera_uuid", name="uq_camera_one_device"),
     )
 
 # =========================

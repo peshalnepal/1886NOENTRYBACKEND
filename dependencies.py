@@ -4,9 +4,9 @@ from typing import Any, Optional
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from application.repositories.user_repository import UserRepository
 from application.services.manager import Manager
 from application.services.notification import NotificationService, WebNotificationHub
 from application.services.retention import RetentionService
@@ -148,9 +148,7 @@ async def get_current_user(
         raise _auth_error("Invalid token payload")
 
     try:
-        user = (
-            await db.execute(select(User).where(User.id == user_id).limit(1))
-        ).scalar_one_or_none()
+        user = await UserRepository(db).get_by_id(user_id)
 
         if user is None:
             raise _auth_error("User not found")

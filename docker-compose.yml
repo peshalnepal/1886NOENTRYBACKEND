@@ -1,0 +1,96 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_MODULE: main:app
+    container_name: noentry-api-local
+    ports:
+      - "8080:8080"
+    environment:
+      # General
+      - ENVIRONMENT=local
+      - DEBUG=true
+      - PORT=8080
+      
+      # DB
+      - DB_INIT_MAX_ATTEMPTS=40
+      - DB_INIT_RETRY_DELAY_S=5
+      - DB_CONNECT_TIMEOUT_S=5
+      - DB_IO_TIMEOUT_S=15
+      - DATABASE_URL=Driver={MySQL ODBC 8.0 Unicode Driver};Server=mysql;Port=3306;Database=appdb;User=appuser;Password=ChangeThis_AppPassword_2026!;Option=3;
+      
+      # SMTP
+      - SMTP_USERNAME=peshalnepal3@gmail.com
+      - SMTP_PASSWORD=kfco nzvt goqq urzy
+      - SMTP_FROM=peshalnepal3@gmail.com
+      
+      # Pipeline/Video limits
+      - DEFAULT_SAMPLE_FPS=3.0
+      - INFER_QUEUE_MAX=8
+      - CHANNEL_OUT_Q_MAX=4
+      - PIPELINE_OUT_QUEUE_MAX=500
+      - PENDING_KEY_MAX=1000
+      - PIPELINE_LOG_EVERY_N_FRAMES=0
+      
+      # WebRTC / MediaMTX API configuration
+      - WEBRTC_ADMIN_API_URL=http://mediamtx:9997
+      - WEBRTC_PUBLIC_BASE_URL=http://localhost:8889
+      - WEBRTC_ADMIN_API_KEY=
+      - WEBRTC_ADMIN_UPSERT_PATH=
+      - WEBRTC_ADMIN_UPDATE_PATH=
+      - WEBRTC_ADMIN_DELETE_PATH=
+      - MTX_API_USER=api
+      - MTX_API_PASS=api_pass_123
+      
+      # Video clip capture settings
+      - VIDEO_CLIP_CAPTURE_ENABLED=true
+      - VIDEO_CLIP_DURATION_S=120
+      - VIDEO_CLIP_COOLDOWN_S=120
+      - VIDEO_CLIP_MIN_DURATION_S=10
+      - VIDEO_CLIP_SAS_TTL_HOURS=168
+      - ALERT_RETENTION_DAYS=7
+      - VIDEO_CLIP_HTTP_TIMEOUT_S=180
+      - VIDEO_CLIP_BLOB_CONTAINER=event-clips
+      - MEDIAMTX_PLAYBACK_BASE_URL=http://mediamtx:9996/playback
+      - VIDEO_CLIP_BLOB_CONNECTION_STRING=
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mediamtx:
+        condition: service_started
+        
+  mysql:
+    image: mysql:8.0.21
+    container_name: noentry-mysql-local
+    ports:
+      - "3307:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=ChangeThis_AdminPassword_2026!
+      - MYSQL_DATABASE=appdb
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=ChangeThis_AppPassword_2026!
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mediamtx:
+    image: bluenviron/mediamtx:1.16.1
+    container_name: noentry-mediamtx-local
+    ports:
+      - "8889:8889"       # WebRTC HTTP
+      - "8189:8189/udp"   # WebRTC UDP
+      - "9996:9996"       # Playback server
+      - "9997:9997"       # API server
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+      - mediamtx_recordings:/recordings
+
+volumes:
+  mysql_data:
+  mediamtx_recordings:

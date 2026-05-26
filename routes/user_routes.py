@@ -11,17 +11,22 @@ from pydantic import (
     model_validator,
 )
 import uuid
-from sqlalchemy import delete as sql_delete, select, update
-from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from application.services.user_snapshot_cache import UserSnapshotCache
 
-from core.database_orm import Camera, CameraDevice, ChannelConfiguration, Device, Notification, PipelineCamera, Site, User, VideoRecord
+from application.repositories.channel_repository import ChannelRepository
+from application.repositories.site_repository import SiteRepository
+from application.repositories.user_repository import UserRepository
+from application.dtos import UserProfileUpdateDTO
+from core.database_orm import Notification, User
 from core.database import AsyncSessionLocal
 from core.security.hashing import get_password_hash, verify_password
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
-from application.services.clip_storage import EventClipService
+from application.services.clip_storage import (
+    EventClipService,
+    extract_notification_clip_storage_keys as _extract_notification_clip_storage_keys,
+)
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional
@@ -108,35 +113,33 @@ async def update_me(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user),
 ):
-    changed = False
+    user_repo = UserRepository(db)
+
+    next_user_name: Optional[str] = None
+    next_email: Optional[str] = None
 
     if payload.user_name is not None and payload.user_name != current_user.user_name:
-        current_user.user_name = payload.user_name
-        changed = True
+        next_user_name = payload.user_name
 
     if payload.user_email is not None:
-        next_email = str(payload.user_email).lower().strip()
+        candidate_email = str(payload.user_email).lower().strip()
         current_email = str(current_user.email).lower().strip()
 
-        if next_email != current_email:
-            exists = (
-                await db.execute(
-                    select(User.id).where(
-                        User.email == next_email,
-                        User.id != int(current_user.id),
-                    ).limit(1)
-                )
-            ).scalar_one_or_none()
-            if exists is not None:
+        if candidate_email != current_email:
+            existing = await user_repo.get_by_email(candidate_email)
+            if existing is not None and int(existing.id) != int(current_user.id):
                 raise HTTPException(status_code=409, detail="Email is already in use")
 
-            current_user.email = next_email
-            changed = True
+            next_email = candidate_email
 
-    if not changed:
+    if next_user_name is None and next_email is None:
         return _to_user_out(current_user)
 
     try:
+        await user_repo.update_profile(
+            int(current_user.id),
+            UserProfileUpdateDTO(user_name=next_user_name, email=next_email),
+        )
         await db.commit()
         _invalidate_user_snapshot_cache(request, int(current_user.id))
     except IntegrityError:
@@ -169,9 +172,10 @@ async def change_my_password(
             detail="New password must be different from current password",
         )
 
-    current_user.hashed_password = get_password_hash(new_password)
-
     try:
+        await UserRepository(db).update_password_hash(
+            int(current_user.id), get_password_hash(new_password)
+        )
         await db.commit()
         _invalidate_user_snapshot_cache(request, int(current_user.id))
     except Exception:
@@ -181,65 +185,7 @@ async def change_my_password(
     return {"message": "Password updated successfully"}
 
 
-def _spawn_bg_task(coro, *, name: str) -> None:
-    task = asyncio.create_task(coro, name=name)
-
-    def _on_done(done_task: asyncio.Task) -> None:
-        try:
-            done_task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.exception(f"[Background Task] {name}: FAILED with error: {e}")
-
-    task.add_done_callback(_on_done)
-
-
-async def _delete_blobs_background(keys: List[str], *, service_cls: type, label: str) -> None:
-    unique = list(dict.fromkeys(k for k in keys if k))
-    if not unique:
-        return
-    svc = service_cls()
-    try:
-        for i in range(0, len(unique), 10):
-            batch = unique[i: i + 10]
-            results = await asyncio.gather(*[svc.delete_blob(blob_name=k) for k in batch], return_exceptions=True)
-            for key, result in zip(batch, results):
-                if isinstance(result, Exception):
-                    logger.warning(f"[Blob Cleanup] Failed to delete {label} blob {key}: {result}")
-    finally:
-        try:
-            await svc.close()
-        except Exception:
-            pass
-
-
-def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
-    if not isinstance(payload, dict):
-        return []
-    keys: List[str] = []
-
-    def _collect(raw: Any) -> None:
-        if not isinstance(raw, dict):
-            return
-        key = str(raw.get("storage_key") or "").strip()
-        if key:
-            keys.append(key)
-
-    msg = payload.get("msg")
-    if isinstance(msg, dict):
-        _collect(msg)
-        _collect(msg.get("clip"))
-
-    extra = payload.get("extra")
-    if isinstance(extra, dict):
-        _collect(extra)
-        _collect(extra.get("clip"))
-        for item in list(extra.get("multi_camera_prerecordings") or []):
-            _collect(item)
-
-    _collect(payload.get("clip"))
-    return list(dict.fromkeys(keys))
+from routes._background import _delete_blobs_background, _spawn_bg_task
 
 
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
@@ -271,16 +217,13 @@ async def delete_my_account(
     # ========================================
     # PHASE 1: Snapshot camera + site info BEFORE any changes
     # ========================================
-    camera_rows = (
-        await db.execute(
-            select(Camera.camera_uuid, Camera.camera_code).where(Camera.user_id == user_id)
-        )
-    ).all()
-    camera_uuids = [row[0] for row in camera_rows]
+    channel_repo = ChannelRepository()
+    site_repo = SiteRepository()
 
-    site_uuids = (
-        await db.execute(select(Site.site_uuid).where(Site.user_id == user_id))
-    ).scalars().all()
+    camera_rows = await channel_repo.list_cameras(db, user_id=user_id)
+    camera_uuids = [cam.camera_uuid for cam in camera_rows]
+
+    site_uuids = await site_repo.list_site_uuids(db, user_id=user_id)
 
     logger.info(f"[User Delete] Snapshotted {len(camera_uuids)} cameras, {len(site_uuids)} sites")
 
@@ -291,12 +234,7 @@ async def delete_my_account(
     # ========================================
     if camera_uuids:
         logger.info(f"[User Delete] Phase 1b: Disabling {len(camera_uuids)} cameras in DB to prevent reconcile re-adds")
-        await db.execute(
-            update(Camera)
-            .where(Camera.user_id == user_id)
-            .values(is_enabled=False, is_detection_enabled=False)
-            .execution_options(synchronize_session=False)
-        )
+        await channel_repo.disable_cameras(db, user_id=user_id)
         await db.commit()
 
     # ========================================
@@ -342,14 +280,9 @@ async def delete_my_account(
     # ========================================
     video_clip_keys: List[str] = []
     if camera_uuids:
-        async with AsyncSessionLocal() as vr_session:
-            vr_rows = (
-                await vr_session.execute(
-                    select(VideoRecord.storage_key)
-                    .where(VideoRecord.camera_uuid.in_(camera_uuids))
-                )
-            ).scalars().all()
-            video_clip_keys = [k.strip() for k in vr_rows if k and k.strip()]
+        video_clip_keys = await site_repo.list_video_record_keys_for_cameras(
+            AsyncSessionLocal, camera_uuids=camera_uuids
+        )
         logger.info(f"[User Delete] Phase 3a: Extracted {len(video_clip_keys)} video record blob keys")
 
     # ========================================
@@ -366,31 +299,13 @@ async def delete_my_account(
     logger.info(f"[User Delete] Phase 3b: Deleting camera rows (Foreground)")
     try:
         if camera_uuids:
-            async with AsyncSessionLocal() as del_session:
-                await del_session.execute(
-                    sql_delete(PipelineCamera).where(PipelineCamera.camera_uuid.in_(camera_uuids))
-                )
-                await del_session.execute(
-                    sql_delete(CameraDevice).where(CameraDevice.camera_uuid.in_(camera_uuids))
-                )
-                await del_session.execute(
-                    sql_delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid.in_(camera_uuids))
-                )
-                await del_session.execute(
-                    sql_delete(Camera).where(Camera.user_id == user_id)
-                )
-                await del_session.commit()
+            await site_repo.delete_cameras_for_user(
+                AsyncSessionLocal, user_id=user_id, camera_uuids=camera_uuids
+            )
 
         # Mark all sites as soft-deleted so they disappear from queries immediately
         if site_uuids:
-            async with AsyncSessionLocal() as sd_session:
-                await sd_session.execute(
-                    update(Site)
-                    .where(Site.user_id == user_id)
-                    .values(is_deleted=True)
-                    .execution_options(synchronize_session=False)
-                )
-                await sd_session.commit()
+            await site_repo.soft_delete_sites_for_user(AsyncSessionLocal, user_id=user_id)
 
         _invalidate_user_snapshot_cache(request, user_id)
     except Exception:
@@ -451,22 +366,13 @@ async def delete_my_account(
                 )
 
             # Delete sites (CASCADE cleans up SiteSettings, SiteDevices, NotificationEmails)
-            async with AsyncSessionLocal() as del_session:
-                if s_uuids:
-                    await del_session.execute(
-                        sql_delete(Site).where(Site.user_id == uid)
-                    )
-                    await del_session.commit()
+            if s_uuids:
+                await repo_for_delete.delete_sites_for_user(AsyncSessionLocal, user_id=uid)
 
             # Finally delete the user row
             async with AsyncSessionLocal() as del_session:
-                user_row = (
-                    await del_session.execute(
-                        select(User).where(User.id == uid)
-                    )
-                ).scalar_one_or_none()
-                if user_row is not None:
-                    await del_session.delete(user_row)
+                deleted = await UserRepository(del_session).delete_by_id(uid)
+                if deleted:
                     await del_session.commit()
 
             logger.info(f"[User Cleanup Task] Background heavy cleanup COMPLETE for user={uid}")

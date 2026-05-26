@@ -1,0 +1,57 @@
+logLevel: info
+logDestinations: [stdout]
+writeQueueSize: 1024
+udpReadBufferSize: 0
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass: ""
+    ips: []
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
+  - user: "api"
+    pass: "api_pass_123"
+    ips: []
+    permissions:
+      - action: api
+
+api: yes
+apiAddress: :9997
+apiAllowOrigins: ['*']
+
+playback: yes
+playbackAddress: :9996
+playbackAllowOrigins: ['*']
+
+webrtc: yes
+webrtcAddress: :8889
+
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: ''
+webrtcAllowOrigins: ['*']
+webrtcIPsFromInterfaces: no
+webrtcAdditionalHosts: ['localhost']
+
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+
+pathDefaults:
+  record: yes
+  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 15s
+  recordDeleteAfter: 7m
+
+hls: false
+rtmp: false
+srt: false
+
+paths:
+  all_others: {}

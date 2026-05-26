@@ -8,7 +8,7 @@ from typing import Optional, Protocol, Tuple, runtime_checkable
 from pydantic import BaseModel, Field
 
 from domain.events import ChannelEvent, RTSPEvent
-from dto import VisionModelConfig
+from application.models.vision_config import VisionModelConfig
 
 
 @runtime_checkable

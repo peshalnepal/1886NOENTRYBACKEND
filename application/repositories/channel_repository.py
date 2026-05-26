@@ -1,24 +1,34 @@
+# application/repositories/channel_repository.py
+"""
+Camera + ChannelConfiguration persistence.
+
+Owns the `camera` and `channel_configurations` tables, and the camera side of
+`pipeline_cameras` membership. Device rows belong to DeviceRepository; site
+rows belong to SiteRepository.
+
+Transaction policy: never commits, only flushes. Caller owns the transaction.
+"""
+
 import uuid
 import logging
 from datetime import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import delete, select, func
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from application.channels.channel_config import VideoChannelConfig
+from application.dtos import CameraUpdateDTO, CameraUpsertDTO
 from core.database_orm import (
     Camera,
-    CameraDevice,
     ChannelConfiguration,
     Device,
     Pipeline,
     PipelineCamera,
     Site,
-    SiteSettings,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,34 +52,336 @@ DEFAULT_START_TIME = time(0, 0, 0)
 DEFAULT_END_TIME = time(23, 59, 59)
 
 
+def _as_uuid(value: Any) -> Optional[uuid.UUID]:
+    if value is None:
+        return None
+    if isinstance(value, uuid.UUID):
+        return value
+    return uuid.UUID(str(value))
+
+
 class ChannelRepository:
     """
-    Camera + ChannelConfiguration + PipelineCamera consistency.
+    Camera + ChannelConfiguration + PipelineCamera-membership consistency.
 
-    each camera MUST have exactly 1 device assigned
+    Each camera MUST have exactly 1 device assigned.
     """
+
+    # ------------------------------------------------------------------
+    # Reads
+    # ------------------------------------------------------------------
+    async def get_camera(
+        self,
+        db: AsyncSession,
+        *,
+        camera_uuid: uuid.UUID,
+        include_config: bool = False,
+        include_device: bool = False,
+    ) -> Optional[Camera]:
+        """Return a single Camera by uuid, optionally eager-loading relations."""
+        stmt = select(Camera).where(Camera.camera_uuid == _as_uuid(camera_uuid))
+        opts = []
+        if include_config:
+            opts.append(selectinload(Camera.channel_configuration))
+        if include_device:
+            opts.append(selectinload(Camera.device))
+        if opts:
+            stmt = stmt.options(*opts)
+        return (await db.execute(stmt)).scalar_one_or_none()
+
+    async def get_camera_full(
+        self,
+        db: AsyncSession,
+        *,
+        camera_uuid: uuid.UUID,
+    ) -> Optional[Tuple[Camera, Optional[ChannelConfiguration], Optional[uuid.UUID]]]:
+        """Return (Camera, ChannelConfiguration, pipeline_id) for one camera."""
+        cam = await self.get_camera(
+            db, camera_uuid=camera_uuid, include_config=True, include_device=True
+        )
+        if cam is None:
+            return None
+
+        pipeline_id = (
+            await db.execute(
+                select(PipelineCamera.pipeline_id).where(
+                    PipelineCamera.camera_uuid == cam.camera_uuid
+                )
+            )
+        ).scalar_one_or_none()
+
+        return cam, cam.channel_configuration, pipeline_id
+
+    async def list_cameras(
+        self,
+        db: AsyncSession,
+        *,
+        camera_uuids: Optional[List[uuid.UUID]] = None,
+        user_id: Optional[int] = None,
+        site_uuid: Optional[uuid.UUID] = None,
+        device_uuid: Optional[uuid.UUID] = None,
+        device_uuids: Optional[List[uuid.UUID]] = None,
+        pipeline_id: Optional[uuid.UUID] = None,
+        only_enabled: Optional[bool] = None,
+        only_detection_enabled: Optional[bool] = None,
+        include_config: bool = False,
+        include_device: bool = False,
+        order_by_created: bool = True,
+    ) -> List[Camera]:
+        """
+        Return cameras matching any combination of the given filters.
+
+        only_enabled / only_detection_enabled:
+          - None  -> no filter
+          - True  -> column is True
+          - False -> column is False
+        """
+        stmt = select(Camera)
+
+        if pipeline_id is not None:
+            stmt = stmt.join(
+                PipelineCamera, PipelineCamera.camera_uuid == Camera.camera_uuid
+            ).where(PipelineCamera.pipeline_id == _as_uuid(pipeline_id))
+
+        if camera_uuids is not None:
+            clean = [_as_uuid(c) for c in (camera_uuids or []) if c is not None]
+            if not clean:
+                return []
+            stmt = stmt.where(Camera.camera_uuid.in_(clean))
+
+        if user_id is not None:
+            stmt = stmt.where(Camera.user_id == int(user_id))
+
+        if site_uuid is not None:
+            stmt = stmt.where(Camera.site_uuid == _as_uuid(site_uuid))
+
+        if device_uuid is not None:
+            stmt = stmt.where(Camera.device_uuid == _as_uuid(device_uuid))
+
+        if device_uuids is not None:
+            clean_d = [_as_uuid(d) for d in device_uuids if d is not None]
+            if not clean_d:
+                return []
+            stmt = stmt.where(Camera.device_uuid.in_(clean_d))
+
+        if only_enabled is True:
+            stmt = stmt.where(Camera.is_enabled.is_(True))
+        elif only_enabled is False:
+            stmt = stmt.where(Camera.is_enabled.is_(False))
+
+        if only_detection_enabled is True:
+            stmt = stmt.where(Camera.is_detection_enabled.is_(True))
+        elif only_detection_enabled is False:
+            stmt = stmt.where(Camera.is_detection_enabled.is_(False))
+
+        opts = []
+        if include_config:
+            opts.append(selectinload(Camera.channel_configuration))
+        if include_device:
+            opts.append(selectinload(Camera.device))
+        if opts:
+            stmt = stmt.options(*opts)
+
+        if order_by_created:
+            stmt = stmt.order_by(Camera.created_at.asc())
+
+        return (await db.execute(stmt)).scalars().all()
+
+    async def list_cameras_with_device_details(
+        self,
+        db: AsyncSession,
+        *,
+        site_uuid: uuid.UUID,
+        user_id: int,
+        only_enabled: Optional[bool] = None,
+    ) -> List[dict]:
+        """Return camera rows joined with their device, as flat dicts."""
+        stmt = (
+            select(Camera, Device)
+            .join(Device, Device.device_uuid == Camera.device_uuid, isouter=True)
+            .where(
+                Camera.site_uuid == _as_uuid(site_uuid),
+                Camera.user_id == int(user_id),
+            )
+            .order_by(Camera.created_at.asc())
+        )
+
+        if only_enabled is True:
+            stmt = stmt.where(Camera.is_enabled.is_(True))
+        elif only_enabled is False:
+            stmt = stmt.where(Camera.is_enabled.is_(False))
+
+        rows = (await db.execute(stmt)).all()
+
+        return [
+            {
+                "camera_uuid": cam.camera_uuid,
+                "camera_code": cam.camera_code,
+                "site_uuid": cam.site_uuid,
+                "rtsp_url": cam.rtsp_url,
+                "webrtc_url": cam.webrtc_url,
+                "is_enabled": cam.is_enabled,
+                "is_detection_enabled": cam.is_detection_enabled,
+                "is_notification_enabled": cam.is_notification_enabled,
+                "roi": cam.roi,
+                "device_uuid": getattr(dev, "device_uuid", None),
+                "device_url": getattr(dev, "device_url", None),
+            }
+            for cam, dev in rows
+        ]
+
+    async def get_camera_roi(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> Any:
+        """Return just the roi JSON for one camera (None if camera missing)."""
+        return (
+            await db.execute(
+                select(Camera.roi).where(Camera.camera_uuid == _as_uuid(camera_uuid))
+            )
+        ).scalar_one_or_none()
+
+    async def cameras_exist(
+        self,
+        db: AsyncSession,
+        *,
+        camera_uuids: List[uuid.UUID],
+        user_id: Optional[int] = None,
+    ) -> set:
+        """Return the subset of camera_uuids that exist (optionally scoped to user)."""
+        clean = [_as_uuid(c) for c in (camera_uuids or []) if c is not None]
+        if not clean:
+            return set()
+        stmt = select(Camera.camera_uuid).where(Camera.camera_uuid.in_(clean))
+        if user_id is not None:
+            stmt = stmt.where(Camera.user_id == int(user_id))
+        rows = (await db.execute(stmt)).scalars().all()
+        return set(rows)
+
+    async def list_detection_enabled_user_ids(self, db: AsyncSession) -> List[int]:
+        """Return distinct user ids that own at least one detection-enabled camera."""
+        rows = (
+            await db.execute(
+                select(Camera.user_id)
+                .where(Camera.is_detection_enabled.is_(True))
+                .distinct()
+                .order_by(Camera.user_id.asc())
+            )
+        ).scalars().all()
+        return [int(uid) for uid in rows]
+
+    # ------------------------------------------------------------------
+    # Writes
+    # ------------------------------------------------------------------
+    async def update_camera(
+        self,
+        db: AsyncSession,
+        *,
+        camera_uuid: uuid.UUID,
+        dto: CameraUpdateDTO,
+    ) -> int:
+        """Update the Camera columns set on `dto`. Returns affected row count."""
+        values: Dict[str, Any] = dto.model_dump(exclude_unset=True)
+        if not values:
+            return 0
+        result = await db.execute(
+            update(Camera)
+            .where(Camera.camera_uuid == _as_uuid(camera_uuid))
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    async def disable_cameras(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: Optional[int] = None,
+        site_uuid: Optional[uuid.UUID] = None,
+        device_uuid: Optional[uuid.UUID] = None,
+        camera_uuids: Optional[List[uuid.UUID]] = None,
+    ) -> int:
+        """
+        Bulk-disable cameras (is_enabled + is_detection_enabled = False) matching
+        any combination of filters. Returns affected row count.
+        """
+        conds = []
+        if user_id is not None:
+            conds.append(Camera.user_id == int(user_id))
+        if site_uuid is not None:
+            conds.append(Camera.site_uuid == _as_uuid(site_uuid))
+        if device_uuid is not None:
+            conds.append(Camera.device_uuid == _as_uuid(device_uuid))
+        if camera_uuids is not None:
+            clean = [_as_uuid(c) for c in (camera_uuids or []) if c is not None]
+            if not clean:
+                return 0
+            conds.append(Camera.camera_uuid.in_(clean))
+        if not conds:
+            raise ValueError("disable_cameras requires at least one filter")
+
+        result = await db.execute(
+            update(Camera)
+            .where(*conds)
+            .values(is_enabled=False, is_detection_enabled=False)
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    async def set_camera_device(
+        self,
+        db: AsyncSession,
+        *,
+        camera_uuid: uuid.UUID,
+        device_uuid: uuid.UUID,
+    ) -> None:
+        """Assign a device to a camera (the single device each camera must have)."""
+        clean = _as_uuid(device_uuid)
+        await self._ensure_device_exists(db, clean)
+        await db.execute(
+            update(Camera)
+            .where(Camera.camera_uuid == _as_uuid(camera_uuid))
+            .values(device_uuid=clean)
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+
+    async def delete_camera(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> None:
+        """Delete a camera and its dependent pipeline-membership + channel config."""
+        cam_uuid = _as_uuid(camera_uuid)
+        await db.execute(delete(PipelineCamera).where(PipelineCamera.camera_uuid == cam_uuid))
+        await db.execute(
+            delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == cam_uuid)
+        )
+        await db.execute(delete(Camera).where(Camera.camera_uuid == cam_uuid))
+        await db.flush()
 
     async def upsert_camera_from_channel_config(
         self,
         db: AsyncSession,
         *,
-        pipeline_id: uuid.UUID,
-        channel_config: ChannelConfigLike,
-        user_id: Optional[int] = None,
-        cam_uuid: Optional[uuid.UUID] = None,
-        camera_code: Optional[str] = None,
-        site_uuid: Optional[uuid.UUID] = None,
-        webrtc_url: Optional[str] = None,
-        rtsp_url: Optional[str] = None,
-        device_uuid: Optional[uuid.UUID] = None,
-        name: Optional[str] = None,
-        location: Optional[str] = None,
-        timezone: Optional[str] = None,
-        day_of_week: Optional[List[int]] = None,
-        start_time: Optional[time] = None,
-        end_time: Optional[time] = None,
-        is_enabled: bool = True,
+        dto: CameraUpsertDTO,
     ) -> Tuple[Camera, Dict[str, Any], Optional[str]]:
+        """
+        Create or update a Camera (+ ChannelConfiguration + pipeline membership)
+        from a `CameraUpsertDTO`.
+        """
+        # Unpack the DTO into the local names the body works with.
+        pipeline_id = dto.pipeline_id
+        channel_config = dto.channel_config
+        user_id = dto.user_id
+        cam_uuid = dto.cam_uuid
+        camera_code = dto.camera_code
+        site_uuid = dto.site_uuid
+        webrtc_url = dto.webrtc_url
+        rtsp_url = dto.rtsp_url
+        device_uuid = dto.device_uuid
+        name = dto.name
+        location = dto.location
+        timezone = dto.timezone
+        day_of_week = dto.day_of_week
+        start_time = dto.start_time
+        end_time = dto.end_time
+        is_enabled = dto.is_enabled
 
         await self._ensure_pipeline_exists(db, pipeline_id)
 
@@ -176,11 +488,6 @@ class ChannelRepository:
 
             await db.flush()
 
-            if device_uuid is not None:
-                await self._set_camera_device(db, camera_uuid=cam.camera_uuid, device_uuid=device_uuid)
-            else:
-                if cam.is_detection_enabled:
-                    await self._ensure_camera_has_exactly_one_device(db, camera_uuid=cam.camera_uuid)
 
         else:
             if user_id is None:
@@ -193,8 +500,6 @@ class ChannelRepository:
                 raise ValueError("device_uuid is required to create a new camera (each camera must have a device).")
 
             await self._ensure_site_exists(db, site_uuid)
-            await self._ensure_device_exists(db, device_uuid)
-
             cam = Camera(
                 user_id=user_id,
                 site_uuid=site_uuid,
@@ -221,8 +526,12 @@ class ChannelRepository:
                 raise ValueError(
                     f"Camera already exists for user_id={user_id} camera_code={camera_code}"
                 ) from e
-
-            await self._set_camera_device(db, camera_uuid=cam.camera_uuid, device_uuid=device_uuid)
+                
+        if device_uuid is not None:
+            await self.set_camera_device(db, camera_uuid=cam.camera_uuid, device_uuid=device_uuid)
+        else:
+            if cam.is_detection_enabled:
+                await self._ensure_camera_has_exactly_one_device(db, camera_uuid=cam.camera_uuid)
 
         cfg_json = self._build_channel_configuration_json(d)
         tz = d.get("timezone") or timezone
@@ -257,165 +566,22 @@ class ChannelRepository:
 
         return cam, cfg_json, tz
 
-    async def upsert_site_settings(
-        self,
-        db: AsyncSession,
-        *,
-        user_id: int,
-        site_uuid: uuid.UUID,
-        config: Optional[Dict[str, Any]] = None,
-        day_of_week: Optional[List[int]] = None,
-        start_time: Optional[time] = None,
-        end_time: Optional[time] = None,
-        is_enabled: bool = True,
-    ) -> SiteSettings:
-        await self._ensure_site_exists(db, site_uuid)
-
-        incoming_config = jsonable_encoder(config or {}, exclude_none=True)
-
-        schedule = self._resolve_schedule(
-            raw_schedule=incoming_config.get("schedule"),
-            day_of_week=day_of_week,
-            start_time=start_time,
-            end_time=end_time,
-            is_enabled=is_enabled,
-        )
-        incoming_config["schedule"] = schedule
-
-        scalar_day, scalar_start, scalar_end = self._scalar_schedule_window(schedule)
-
-        row = (
-            await db.execute(select(SiteSettings).where(SiteSettings.site_uuid == site_uuid))
-        ).scalar_one_or_none()
-
-        if row is None:
-            row = SiteSettings(
-                user_id=user_id,
-                site_uuid=site_uuid,
-                config=incoming_config,
-                day_of_week=scalar_day,
-                start_time=scalar_start,
-                end_time=scalar_end,
-                is_enabled=bool(is_enabled),
-            )
-            db.add(row)
-            await db.flush()
-            return row
-
-        merged = dict(row.config or {})
-        merged.update(incoming_config)
-        merged["schedule"] = incoming_config.get("schedule", merged.get("schedule", self._default_weekly_schedule()))
-
-
-        row.config = merged
-        row.day_of_week = scalar_day
-        row.start_time = scalar_start
-        row.end_time = scalar_end
-        row.is_enabled = bool(is_enabled)
-
-        await db.flush()
-        return row
-
-    async def get_camera_full(
-        self,
-        db: AsyncSession,
-        *,
-        camera_uuid: uuid.UUID,
-    ) -> Optional[Tuple[Camera, Optional[ChannelConfiguration], Optional[uuid.UUID]]]:
-        cam = (
-            await db.execute(
-                select(Camera)
-                .where(Camera.camera_uuid == camera_uuid)
-                .options(
-                    selectinload(Camera.channel_configuration),
-                    selectinload(Camera.devices),
-                )
-            )
-        ).scalar_one_or_none()
-
-        if cam is None:
-            return None
-
-        pipeline_id = (
-            await db.execute(select(PipelineCamera.pipeline_id).where(PipelineCamera.camera_uuid == cam.camera_uuid))
-        ).scalar_one_or_none()
-
-        return cam, cam.channel_configuration, pipeline_id
-
-    async def get_device(
-        self,
-        db: AsyncSession,
-        *,
-        camera_uuid: uuid.UUID,
-        required: bool = False,
-        relaxed: bool = False,
-    ) -> Optional[Device]:
-        devices = await self.list_devices(db, camera_uuid=camera_uuid)
-
-        if len(devices) == 1:
-            return devices[0]
-        if len(devices) == 0 and not required:
-            return None
-        if relaxed and devices:
-            chosen = devices[0]
-            logger.warning(
-                "Camera %s has %s linked devices; using most recent device %s for legacy compatibility",
-                camera_uuid,
-                len(devices),
-                getattr(chosen, "device_uuid", None),
-            )
-            return chosen
-
-        raise ValueError(f"Camera {camera_uuid} must have exactly 1 device, found {len(devices)}")
-
-    async def list_devices(
-        self,
-        db: AsyncSession,
-        *,
-        camera_uuid: uuid.UUID,
-    ) -> List[Device]:
-        q = (
-            select(Device)
-            .join(CameraDevice, CameraDevice.device_uuid == Device.device_uuid)
-            .where(CameraDevice.camera_uuid == camera_uuid)
-            .order_by(CameraDevice.created_at.desc(), CameraDevice.id.desc())
-        )
-        return (await db.execute(q)).scalars().all()
-
-    async def delete_camera(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> None:
-        await db.execute(delete(PipelineCamera).where(PipelineCamera.camera_uuid == camera_uuid))
-        await db.execute(delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
-        await db.execute(delete(CameraDevice).where(CameraDevice.camera_uuid == camera_uuid))
-        await db.execute(delete(Camera).where(Camera.camera_uuid == camera_uuid))
-        await db.flush()
-
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
     async def _ensure_device_exists(self, db: AsyncSession, device_uuid: uuid.UUID) -> None:
         exists = (await db.execute(select(Device.device_uuid).where(Device.device_uuid == device_uuid))).scalar_one_or_none()
         if exists is None:
             raise ValueError(f"Device not found: {device_uuid}")
 
     async def _ensure_camera_has_exactly_one_device(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> None:
-        cnt = (
+        assigned = (
             await db.execute(
-                select(func.count(CameraDevice.id)).where(CameraDevice.camera_uuid == camera_uuid)
+                select(Camera.device_uuid).where(Camera.camera_uuid == camera_uuid)
             )
-        ).scalar_one()
-        if int(cnt) != 1:
-            raise ValueError(f"Camera {camera_uuid} must have exactly 1 device assigned, found {cnt}")
-
-    async def _set_camera_device(
-        self,
-        db: AsyncSession,
-        *,
-        camera_uuid: uuid.UUID,
-        device_uuid: uuid.UUID,
-    ) -> None:
-        clean = device_uuid if isinstance(device_uuid, uuid.UUID) else uuid.UUID(str(device_uuid))
-        await self._ensure_device_exists(db, clean)
-
-        await db.execute(delete(CameraDevice).where(CameraDevice.camera_uuid == camera_uuid))
-        db.add(CameraDevice(camera_uuid=camera_uuid, device_uuid=clean))
-        await db.flush()
+        ).scalar_one_or_none()
+        if assigned is None:
+            raise ValueError(f"Camera {camera_uuid} must have exactly 1 device assigned, found 0")
 
     async def _ensure_pipeline_exists(self, db: AsyncSession, pipeline_id: uuid.UUID) -> None:
         exists = (await db.execute(select(Pipeline.id).where(Pipeline.id == pipeline_id))).scalar_one_or_none()

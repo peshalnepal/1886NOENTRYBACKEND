@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 import numpy as np
 import cv2
 from pydantic import BaseModel, Field
-from dto import VisionModelConfig, VisionTask
+from application.models.vision_config import VisionModelConfig, VisionTask
 
 class YoloModelConfig(VisionModelConfig):
     """

@@ -2,22 +2,16 @@ import asyncio
 import json
 import httpx
 import logging
-import os
 from typing import Any, AsyncGenerator, Dict, Optional, List, Tuple
 from urllib.parse import urljoin
 from application.channels.channel_config import VideoChannelConfig
+from core.env import env_bool
 
 logger = logging.getLogger(__name__)
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-_EDGE_HTTP_TRUST_ENV = _env_bool(
+_EDGE_HTTP_TRUST_ENV = env_bool(
     "EDGE_CHANNEL_HTTP_TRUST_ENV",
-    _env_bool("EDGE_HTTP_TRUST_ENV", False),
+    env_bool("EDGE_HTTP_TRUST_ENV", False),
 )
 
 _http = httpx.AsyncClient(

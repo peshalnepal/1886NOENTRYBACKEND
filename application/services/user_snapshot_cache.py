@@ -5,10 +5,9 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.database_orm import User
+from application.repositories.user_repository import UserRepository
 
 
 @dataclass(frozen=True)
@@ -115,11 +114,7 @@ class UserSnapshotCache:
         try:
             async with self._lookup_limit:
                 async with session_factory() as db:
-                    row = (
-                        await db.execute(
-                            select(User).where(User.id == uid).limit(1)
-                        )
-                    ).scalar_one_or_none()
+                    row = await UserRepository(db).get_by_id(uid)
 
                 if row is not None:
                     snapshot = CachedUserSnapshot(

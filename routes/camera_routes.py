@@ -14,34 +14,32 @@ from application.services.user_snapshot_cache import (
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
-from sqlalchemy import delete as sql_delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dependencies import get_async_db, get_current_user, get_manager
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
+from application.repositories.video_repository import VideoRepository
+from application.repositories.notification_repository import NotificationRepository
 from domain.events import ChannelCreateEvent, ChannelEditEvent
-from core.database_orm import (
-    Camera,
-    CameraDevice,
-    ChannelConfiguration,
-    Device,
-    Notification,
-    PipelineCamera,
-    User,
-    VideoRecord,
-)
+from core.database_orm import Notification, User
 from core.database import AsyncSessionLocal, db_manager
 from application.services.alert_image_storage import AlertImageStorageService, extract_image_storage_key
-from application.services.clip_storage import EventClipService
+from application.services.clip_storage import (
+    EventClipService,
+    extract_notification_clip_storage_keys as _extract_notification_clip_storage_keys,
+)
 from application.services.webrtcgateway import resolve_camera_webrtc_url, WebRTCGatewayClient
 from core.security.tokens import decode_access_token
 from core.schemas import (
+    BoxNorm,
+    BoxPx,
     CameraSchema,
     CameraCreateSchema,
     CameraEditSchema,
     CameraWithConfigSchema,
+    DetectionItemOut,
+    DetectionOut,
 )  # type: ignore
 from application.services.manager import Manager
 
@@ -175,46 +173,6 @@ async def _fetch_device_snapshot(*, device_url: str, camera_uuid: uuid.UUID) -> 
         detail=last_error or "Jetson snapshot request failed.",
     )
 
-# -------------------------
-# Detection Schemas
-# -------------------------
-class BoxPx(BaseModel):
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-
-
-class BoxNorm(BaseModel):
-    x: float  # 0..1 left
-    y: float  # 0..1 top
-    w: float  # 0..1 width
-    h: float  # 0..1 height
-
-
-class DetectionItemOut(BaseModel):
-    box: BoxPx
-    cls_name: str
-    conf: float
-    box_norm: Optional[BoxNorm] = None
-
-
-class DetectionOut(BaseModel):
-    camera_uuid: str
-    frame_ts_ms: int
-    frame_seq: int
-    event_type: Optional[str] = None
-    reason: Optional[str] = None
-    inference_ms: Optional[int] = None
-    model_id: Optional[str] = None
-
-    frame_w: Optional[int] = None
-    frame_h: Optional[int] = None
-
-    detections: List[DetectionItemOut] = Field(default_factory=list)
-    pose: Optional[Any] = None
-
-
 def _normalize_box_px(box: Dict[str, Any], frame_w: Optional[int], frame_h: Optional[int]) -> Optional[BoxNorm]:
     if not frame_w or not frame_h:
         return None
@@ -281,16 +239,17 @@ async def list_cameras(
         raise HTTPException(status_code=422, detail="site_uuid query param is required")
 
     repo = ChannelRepository()
-    site_repo=SiteRepository()
-    if site_uuid is None:
-        raise HTTPException(status_code=400, detail="site_uuid is required")
 
-    cams = await site_repo.list_cameras_by_site(db, site_uuid=site_uuid,user_id=int(user.id))
+    cams = await repo.list_cameras(
+        db,
+        site_uuid=site_uuid,
+        user_id=int(user.id),
+        include_device=True,
+    )
 
     out: List[CameraSchema] = []
     for cam in cams:
-        loaded_devices = list(getattr(cam, "devices", None) or [])
-        dev = loaded_devices[0] if loaded_devices else None
+        dev = cam.device if getattr(cam, "device", None) else None
 
         out.append(
             CameraSchema(
@@ -329,7 +288,7 @@ async def get_camera(
     cam, cfg, _pid = full
     _ensure_user_owns_camera(cam, user.id)
 
-    dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=False, relaxed=True)
+    dev = cam.device if getattr(cam, "device", None) else None
 
     return CameraWithConfigSchema(
         camera_uuid=cam.camera_uuid,
@@ -557,11 +516,10 @@ async def latest_detections_for_site(
     user: User = Depends(get_current_user),
 ):
     repo = ChannelRepository()
-    site_repo=SiteRepository()
     if site_uuid is None:
         raise HTTPException(status_code=400, detail="site_uuid is required")
 
-    cams = await site_repo.list_cameras_by_site(db, site_uuid=site_uuid,user_id=int(user.id))
+    cams = await repo.list_cameras(db, site_uuid=site_uuid, user_id=int(user.id))
 
     pipeline = await manager.get_activepipeline(user_id=user.id)
 
@@ -737,80 +695,7 @@ async def edit_camera(
     )
 
 
-def _spawn_bg_task(coro, *, name: str) -> None:
-    """Spawn a background task with proper error handling and completion logging."""
-    task = asyncio.create_task(coro, name=name)
-
-    def _on_done(done_task: asyncio.Task) -> None:
-        try:
-            done_task.result()
-            logger.info(f"[Background Task] {name}: SUCCESS")
-        except asyncio.CancelledError:
-            logger.info(f"[Background Task] {name}: CANCELLED")
-        except Exception as e:
-            logger.exception(f"[Background Task] {name}: FAILED with error: {e}")
-
-    task.add_done_callback(_on_done)
-
-
-async def _delete_blobs_background(keys: List[str], *, service_cls: type, label: str) -> None:
-    """Delete blobs in parallel batches of 10."""
-    unique = list(dict.fromkeys(k for k in keys if k))
-    if not unique:
-        return
-
-    logger.info(f"[Blob Cleanup] Starting deletion of {len(unique)} {label} blobs")
-    svc = service_cls()
-    deleted = 0
-    failed = 0
-    batch_size = 10
-    try:
-        for i in range(0, len(unique), batch_size):
-            batch = unique[i: i + batch_size]
-            results = await asyncio.gather(
-                *[svc.delete_blob(blob_name=k) for k in batch],
-                return_exceptions=True,
-            )
-            for key, result in zip(batch, results):
-                if isinstance(result, Exception):
-                    failed += 1
-                    logger.warning(f"[Blob Cleanup] Failed to delete {label} blob {key}: {result}")
-                else:
-                    deleted += 1
-    finally:
-        try:
-            await svc.close()
-        except Exception:
-            pass
-    logger.info(f"[Blob Cleanup] COMPLETE: deleted {deleted} {label} blobs, {failed} failed")
-
-
-def _extract_notification_clip_storage_keys(payload: Any) -> List[str]:
-    if not isinstance(payload, dict):
-        return []
-    keys: List[str] = []
-
-    def _append_from_clip_dict(raw_clip: Any) -> None:
-        if not isinstance(raw_clip, dict):
-            return
-        key = str(raw_clip.get("storage_key") or "").strip()
-        if key:
-            keys.append(key)
-
-    msg = payload.get("msg")
-    if isinstance(msg, dict):
-        _append_from_clip_dict(msg)
-        _append_from_clip_dict(msg.get("clip"))
-
-    extra = payload.get("extra")
-    if isinstance(extra, dict):
-        _append_from_clip_dict(extra)
-        _append_from_clip_dict(extra.get("clip"))
-        for raw_clip in list(extra.get("multi_camera_prerecordings") or []):
-            _append_from_clip_dict(raw_clip)
-
-    _append_from_clip_dict(payload.get("clip"))
-    return list(dict.fromkeys(keys))
+from routes._background import _delete_blobs_background, _spawn_bg_task  # noqa: E402
 
 
 async def _cleanup_camera_runtime(
@@ -912,14 +797,12 @@ async def delete_camera(
     cam_code: Optional[str] = getattr(cam, "camera_code", None)
     site_uuid = cam.site_uuid
 
-    device_url_rows = (
-        await db.execute(
-            select(CameraDevice.camera_uuid, Device.device_url)
-            .join(Device, Device.device_uuid == CameraDevice.device_uuid)
-            .where(CameraDevice.camera_uuid == camera_uuid)
-        )
-    ).all()
-    device_urls = [str(row[1]).strip() for row in device_url_rows if str(row[1] or "").strip()]
+    cam_device = cam.device if getattr(cam, "device", None) else None
+    device_urls = (
+        [str(cam_device.device_url).strip()]
+        if cam_device is not None and str(getattr(cam_device, "device_url", "") or "").strip()
+        else []
+    )
 
     # ========================================
     # PHASE 1b: Disable camera in DB BEFORE edge/MediaMTX cleanup.
@@ -927,12 +810,7 @@ async def delete_camera(
     # between our edge cleanup and DB deletion it re-adds the camera.
     # ========================================
     logger.info(f"[Camera Delete] Phase 1b: Disabling camera in DB to prevent reconcile re-adds")
-    await db.execute(
-        update(Camera)
-        .where(Camera.camera_uuid == camera_uuid, Camera.user_id == int(user.id))
-        .values(is_enabled=False, is_detection_enabled=False)
-        .execution_options(synchronize_session=False)
-    )
+    await repo.disable_cameras(db, camera_uuids=[camera_uuid], user_id=int(user.id))
     await db.commit()
 
     # ========================================
@@ -982,13 +860,9 @@ async def delete_camera(
     # Camera deletion CASCADE-deletes VideoRecords, losing storage_key.
     # ========================================
     video_clip_keys: List[str] = []
+    video_repo = VideoRepository()
     async with AsyncSessionLocal() as vr_session:
-        vr_rows = (
-            await vr_session.execute(
-                select(VideoRecord.storage_key)
-                .where(VideoRecord.camera_uuid == camera_uuid)
-            )
-        ).scalars().all()
+        vr_rows = await video_repo.list_storage_keys(vr_session, camera_uuid=camera_uuid)
         video_clip_keys = [k.strip() for k in vr_rows if k and k.strip()]
     logger.info(f"[Camera Delete] Phase 3a: Extracted {len(video_clip_keys)} video record blob keys")
 
@@ -1001,14 +875,11 @@ async def delete_camera(
     # large, but IDs are just integers so memory is bounded.
     # ========================================
     notification_ids: List[int] = []
+    notification_repo = NotificationRepository()
     async with AsyncSessionLocal() as nid_session:
-        nid_rows = (
-            await nid_session.execute(
-                select(Notification.id)
-                .where(Notification.camera_uuid == camera_uuid)
-            )
-        ).scalars().all()
-        notification_ids = list(nid_rows)
+        notification_ids = await notification_repo.list_notification_ids(
+            nid_session, camera_uuid=camera_uuid
+        )
     logger.info(f"[Camera Delete] Phase 3b: Snapshotted {len(notification_ids)} notification IDs")
 
     # ========================================
@@ -1017,10 +888,7 @@ async def delete_camera(
     logger.info(f"[Camera Delete] Phase 3c: Deleting camera from DB (Foreground)")
 
     async with AsyncSessionLocal() as del_db:
-        await del_db.execute(sql_delete(PipelineCamera).where(PipelineCamera.camera_uuid == camera_uuid))
-        await del_db.execute(sql_delete(CameraDevice).where(CameraDevice.camera_uuid == camera_uuid))
-        await del_db.execute(sql_delete(ChannelConfiguration).where(ChannelConfiguration.camera_uuid == camera_uuid))
-        await del_db.execute(sql_delete(Camera).where(Camera.camera_uuid == camera_uuid))
+        await repo.delete_camera(del_db, camera_uuid=camera_uuid)
         await del_db.commit()
 
     logger.info(f"[Camera Delete] Camera row deleted")
@@ -1118,7 +986,7 @@ async def snapshot_jpg(
     cam, _cfg, _pid = full
     _ensure_user_owns_camera(cam, user.id)
 
-    dev = await repo.get_device(db, camera_uuid=cam.camera_uuid, required=False, relaxed=True)
+    dev = cam.device if getattr(cam, "device", None) else None
     device_url = str(getattr(dev, "device_url", "") or "").strip() if dev is not None else ""
     if not device_url:
         logger.warning(f"Camera {camera_uuid} has no device assigned or device_url missing")

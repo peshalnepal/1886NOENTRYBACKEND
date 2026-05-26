@@ -2,22 +2,33 @@
 
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, delete, func, literal_column, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from application.dtos import (
+    CameraContextDTO,
+    NotificationCreateDTO,
+    NotificationEmailCreateDTO,
+    SitePrerecordSettingsDTO,
+)
 from core.database_orm import (
     Camera,
     Site,
-    CameraDevice,
     Device,
     Notification,
     NotificationEmail,
     SiteSettings,
+    utc_now,
 )
+
+# Inter-function value objects live in application.dtos now; these aliases keep
+# the historical import paths (`from ...notification_repository import CameraContext`)
+# working for existing callers.
+CameraContext = CameraContextDTO
+SitePrerecordSettings = SitePrerecordSettingsDTO
 
 
 def dt_from_ts_ms(ts_ms: int) -> datetime:
@@ -30,26 +41,6 @@ def _as_uuid(v: Any) -> Optional[uuid.UUID]:
     if isinstance(v, uuid.UUID):
         return v
     return uuid.UUID(str(v))
-
-
-@dataclass(frozen=True)
-class CameraContext:
-    user_id: int
-    site_uuid: uuid.UUID
-    site_name: str
-    camera_code: Optional[str]
-    camera_name: Optional[str]
-    device_uuid: Optional[uuid.UUID]
-    device_name: Optional[str]
-    notification_trigger_mode: str = "inherit"
-    camera_playback_enabled: str = "inherit"
-
-
-@dataclass(frozen=True)
-class SitePrerecordSettings:
-    enabled: bool
-    camera_uuids: List[uuid.UUID]
-    trigger_mode: str = "roi_enter"
 
 
 def _normalize_trigger_mode(raw: Any) -> str:
@@ -128,8 +119,7 @@ class NotificationRepository:
             )
             .select_from(Camera)
             .join(Site, Site.site_uuid == Camera.site_uuid)
-            .outerjoin(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
-            .outerjoin(Device, Device.device_uuid == CameraDevice.device_uuid)
+            .outerjoin(Device, Device.device_uuid == Camera.device_uuid)
             .where(Camera.camera_uuid == cam_uuid)
         )
 
@@ -182,8 +172,7 @@ class NotificationRepository:
             )
             .select_from(Camera)
             .join(Site, Site.site_uuid == Camera.site_uuid)
-            .outerjoin(CameraDevice, CameraDevice.camera_uuid == Camera.camera_uuid)
-            .outerjoin(Device, Device.device_uuid == CameraDevice.device_uuid)
+            .outerjoin(Device, Device.device_uuid == Camera.device_uuid)
             .where(
                 Camera.user_id == int(user_id),
                 Camera.camera_uuid.in_(camera_uuid_values),
@@ -288,35 +277,30 @@ class NotificationRepository:
 
         return {site_uuid: emails for site_uuid, emails in grouped.items()}
 
+    @staticmethod
+    def _notification_from_dto(dto: NotificationCreateDTO) -> Notification:
+        return Notification(
+            user_id=int(dto.user_id),
+            site_uuid=_as_uuid(dto.site_uuid),
+            camera_uuid=_as_uuid(dto.camera_uuid),
+            device_uuid=_as_uuid(dto.device_uuid),
+            event_type=dto.event_type,
+            title=dto.title,
+            message=dto.message,
+            payload=dto.payload,
+            detected_at=dto.detected_at or utc_now(),
+            status=dto.status,
+            sent_at=dto.sent_at,
+        )
+
     async def create_notification(
         self,
         db: AsyncSession,
         *,
-        user_id: int,
-        site_uuid: uuid.UUID,
-        camera_uuid: Optional[uuid.UUID],
-        device_uuid: Optional[uuid.UUID],
-        event_type: str,
-        title: Optional[str],
-        message: Optional[str],
-        payload: Optional[Dict[str, Any]],
-        detected_at: datetime,
-        status: str = "created",
-        sent_at: Optional[datetime] = None,
+        dto: NotificationCreateDTO,
     ) -> Notification:
-        row = Notification(
-            user_id=int(user_id),
-            site_uuid=_as_uuid(site_uuid),
-            camera_uuid=_as_uuid(camera_uuid),
-            device_uuid=_as_uuid(device_uuid),
-            event_type=event_type,
-            title=title,
-            message=message,
-            payload=payload,
-            detected_at=detected_at,
-            status=status,
-            sent_at=sent_at,
-        )
+        """Insert one Notification from a `NotificationCreateDTO`."""
+        row = self._notification_from_dto(dto)
         db.add(row)
         await db.flush()  # makes row.id available
         return row
@@ -325,30 +309,38 @@ class NotificationRepository:
         self,
         db: AsyncSession,
         *,
-        rows: List[Dict[str, Any]],
+        dtos: List[NotificationCreateDTO],
     ) -> List[Notification]:
-        notifications: List[Notification] = []
-        for item in rows or []:
-            row = Notification(
-                user_id=int(item["user_id"]),
-                site_uuid=_as_uuid(item["site_uuid"]),
-                camera_uuid=_as_uuid(item.get("camera_uuid")),
-                device_uuid=_as_uuid(item.get("device_uuid")),
-                event_type=item["event_type"],
-                title=item.get("title"),
-                message=item.get("message"),
-                payload=item.get("payload"),
-                detected_at=item["detected_at"],
-                status=item.get("status", "created"),
-                sent_at=item.get("sent_at"),
-            )
-            notifications.append(row)
-
+        """Batch-insert Notifications from a list of `NotificationCreateDTO`."""
+        notifications = [self._notification_from_dto(dto) for dto in (dtos or [])]
         if notifications:
             db.add_all(notifications)
             await db.flush()
-
         return notifications
+
+    async def update_notification_payload(
+        self,
+        db: AsyncSession,
+        *,
+        notification_id: int,
+        payload: Dict[str, Any],
+    ) -> None:
+        """Overwrite the JSON payload column for a single notification row.
+
+        Used after a clip is captured asynchronously: the row is created up
+        front with clip_status=loading, then this updates it with the resolved
+        recording_url and clip_status=ready.
+        """
+        nid = int(notification_id)
+        if nid <= 0:
+            return
+        stmt = (
+            update(Notification)
+            .where(Notification.id == nid)
+            .values(payload=payload)
+        )
+        await db.execute(stmt)
+        await db.flush()
 
     async def mark_notification_sent(
         self,
@@ -425,3 +417,473 @@ class NotificationRepository:
         )
         await db.execute(stmt)
         await db.flush()
+
+    # ------------------------------------------------------------------
+    # Notification reads / lifecycle
+    # ------------------------------------------------------------------
+    def _notification_conditions(
+        self,
+        *,
+        user_id: Optional[int] = None,
+        site_uuid: Optional[uuid.UUID] = None,
+        camera_uuid: Optional[uuid.UUID] = None,
+        ids: Optional[List[int]] = None,
+        event_types: Optional[List[str]] = None,
+        only_visible: Optional[bool] = None,
+        only_unread: Optional[bool] = None,
+        detected_before: Optional[datetime] = None,
+        before_id: Optional[int] = None,
+    ) -> list:
+        conds: list = []
+        if user_id is not None:
+            conds.append(Notification.user_id == int(user_id))
+        if site_uuid is not None:
+            conds.append(Notification.site_uuid == _as_uuid(site_uuid))
+        if camera_uuid is not None:
+            conds.append(Notification.camera_uuid == _as_uuid(camera_uuid))
+        if ids is not None:
+            conds.append(Notification.id.in_([int(i) for i in ids]))
+        if event_types is not None:
+            conds.append(Notification.event_type.in_(list(event_types)))
+        if only_visible is True:
+            conds.append(Notification.visible.is_(True))
+        elif only_visible is False:
+            conds.append(Notification.visible.is_(False))
+        if only_unread is True:
+            conds.append(Notification.read_at.is_(None))
+        elif only_unread is False:
+            conds.append(Notification.read_at.isnot(None))
+        if detected_before is not None:
+            conds.append(Notification.detected_at < detected_before)
+        if before_id is not None:
+            conds.append(Notification.id < int(before_id))
+        return conds
+
+    async def list_notifications(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: Optional[int] = None,
+        site_uuid: Optional[uuid.UUID] = None,
+        camera_uuid: Optional[uuid.UUID] = None,
+        ids: Optional[List[int]] = None,
+        event_types: Optional[List[str]] = None,
+        only_visible: Optional[bool] = None,
+        only_unread: Optional[bool] = None,
+        detected_before: Optional[datetime] = None,
+        before_id: Optional[int] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        order_desc: bool = True,
+    ) -> List[Notification]:
+        """Return Notification rows matching any combination of filters."""
+        conds = self._notification_conditions(
+            user_id=user_id, site_uuid=site_uuid, camera_uuid=camera_uuid, ids=ids,
+            event_types=event_types, only_visible=only_visible, only_unread=only_unread,
+            detected_before=detected_before, before_id=before_id,
+        )
+        stmt = select(Notification)
+        if conds:
+            stmt = stmt.where(and_(*conds))
+        stmt = stmt.order_by(Notification.id.desc() if order_desc else Notification.id.asc())
+        if offset is not None:
+            stmt = stmt.offset(int(offset))
+        if limit is not None:
+            stmt = stmt.limit(int(limit))
+        return (await db.execute(stmt)).scalars().all()
+
+    async def list_notification_ids(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: Optional[int] = None,
+        site_uuid: Optional[uuid.UUID] = None,
+        camera_uuid: Optional[uuid.UUID] = None,
+        order_desc: bool = True,
+    ) -> List[int]:
+        """Return just the Notification ids matching the given filters.
+
+        Lighter than list_notifications when only ids are needed (e.g. snapshotting
+        ids before a camera delete SET NULLs camera_uuid).
+        """
+        conds = self._notification_conditions(
+            user_id=user_id, site_uuid=site_uuid, camera_uuid=camera_uuid,
+        )
+        stmt = select(Notification.id)
+        if conds:
+            stmt = stmt.where(and_(*conds))
+        stmt = stmt.order_by(Notification.id.desc() if order_desc else Notification.id.asc())
+        rows = (await db.execute(stmt)).scalars().all()
+        return [int(r) for r in rows]
+
+    async def count_notifications(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: Optional[int] = None,
+        site_uuid: Optional[uuid.UUID] = None,
+        camera_uuid: Optional[uuid.UUID] = None,
+        only_visible: Optional[bool] = None,
+        only_unread: Optional[bool] = None,
+    ) -> int:
+        """Count Notification rows matching any combination of filters."""
+        conds = self._notification_conditions(
+            user_id=user_id, site_uuid=site_uuid, camera_uuid=camera_uuid,
+            only_visible=only_visible, only_unread=only_unread,
+        )
+        stmt = select(func.count(Notification.id))
+        if conds:
+            stmt = stmt.where(and_(*conds))
+        return int((await db.execute(stmt)).scalar_one() or 0)
+
+    async def mark_notifications_read(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        ids: Optional[List[int]] = None,
+        read_at: Optional[datetime] = None,
+    ) -> int:
+        """Set read_at on a user's notifications. ids=None marks all. Returns count."""
+        conds = self._notification_conditions(user_id=user_id, ids=ids, only_unread=True)
+        result = await db.execute(
+            update(Notification)
+            .where(and_(*conds))
+            .values(read_at=read_at or utc_now())
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    async def set_notifications_visibility(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        ids: List[int],
+        visible: bool,
+    ) -> int:
+        """Show/hide a user's notifications by id. Returns affected row count."""
+        if not ids:
+            return 0
+        conds = self._notification_conditions(user_id=user_id, ids=ids)
+        if visible:
+            conds.append(Notification.visible.is_(False))
+        else:
+            conds.append(Notification.visible.is_(True))
+        result = await db.execute(
+            update(Notification)
+            .where(and_(*conds))
+            .values(visible=bool(visible))
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    async def delete_notifications(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: Optional[int] = None,
+        ids: Optional[List[int]] = None,
+        site_uuid: Optional[uuid.UUID] = None,
+        detected_before: Optional[datetime] = None,
+    ) -> int:
+        """Hard-delete Notification rows matching the given filters. Returns count."""
+        conds = self._notification_conditions(
+            user_id=user_id, ids=ids, site_uuid=site_uuid, detected_before=detected_before,
+        )
+        if not conds:
+            raise ValueError("delete_notifications requires at least one filter")
+        result = await db.execute(
+            delete(Notification)
+            .where(and_(*conds))
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    async def hide_notifications_by_filter(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        site_uuid: Optional[uuid.UUID] = None,
+        camera_uuid: Optional[uuid.UUID] = None,
+        visible_supported: bool = True,
+    ) -> int:
+        filters = [Notification.user_id == user_id]
+        if site_uuid is not None:
+            filters.append(Notification.site_uuid == site_uuid)
+        if camera_uuid is not None:
+            filters.append(Notification.camera_uuid == camera_uuid)
+            
+        if visible_supported:
+            filters.append(Notification.visible == True)
+            stmt = update(Notification).where(*filters).values(visible=False)
+        else:
+            stmt = delete(Notification).where(*filters)
+            
+        result = await db.execute(stmt)
+        return result.rowcount
+
+    async def iter_storage_keys_by_filter(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        site_uuid: Optional[uuid.UUID] = None,
+        camera_uuid: Optional[uuid.UUID] = None,
+        batch_size: int = 5000,
+        visible_supported: bool = True,
+    ):
+        filters = [Notification.user_id == user_id]
+        if site_uuid is not None:
+            filters.append(Notification.site_uuid == site_uuid)
+        if camera_uuid is not None:
+            filters.append(Notification.camera_uuid == camera_uuid)
+            
+        if visible_supported:
+            filters.append(Notification.visible == True)
+            
+        stmt = select(Notification.payload).where(*filters)
+        result = await db.stream(stmt.execution_options(yield_per=batch_size))
+        
+        async for row in result:
+            payload = row[0]
+            if not isinstance(payload, dict):
+                continue
+            key = str(payload.get("image_storage_key") or "").strip()
+            if key:
+                yield key
+
+
+    async def aggregate_detections_over_time(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        start: datetime,
+        bucket_minutes: int,
+        bucket_ms: int,
+        site_uuid: Optional[uuid.UUID] = None,
+        visible_supported: bool = False,
+        needs_payload_filter: bool = False,
+        roi_only: bool = False,
+        class_filter: Optional[str] = None,
+        as_utc_fn=None,
+        is_roi_fn=None,
+        extract_classes_fn=None,
+    ) -> Dict[int, int]:
+        """
+        Bucket a user's detections by time. Returns a dict of
+        {bucket_start_ms: count}.
+
+        When needs_payload_filter is False a pure-SQL time-bucket aggregation is
+        used. Otherwise rows are streamed in batches and filtered in Python via
+        the supplied is_roi_fn / extract_classes_fn callbacks.
+        """
+        su = _as_uuid(site_uuid)
+
+        if not needs_payload_filter:
+            # ── Fast path: pure SQL aggregation, no payload scanning ──
+            bucket_seconds = bucket_minutes * 60
+            bucket_expr = literal_column(
+                f"FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(detected_at) / {bucket_seconds}) * {bucket_seconds})"
+            )
+            stmt = (
+                select(bucket_expr.label("bucket_start"), func.count().label("cnt"))
+                .select_from(Notification.__table__)
+                .where(
+                    Notification.user_id == int(user_id),
+                    Notification.detected_at >= start,
+                )
+            )
+            if visible_supported:
+                stmt = stmt.where(Notification.visible.is_(True))
+            if su:
+                stmt = stmt.where(Notification.site_uuid == su)
+            stmt = stmt.group_by(literal_column("bucket_start"))
+
+            rows = (await db.execute(stmt)).all()
+            counts: Dict[int, int] = {}
+            for bucket_start_dt, cnt in rows:
+                dt = as_utc_fn(bucket_start_dt)
+                ts_ms_val = int(dt.timestamp() * 1000)
+                counts[ts_ms_val] = int(cnt)
+            return counts
+
+        # ── Filtered path: stream rows in batches to avoid OOM ──
+        stmt = select(
+            Notification.detected_at,
+            Notification.event_type,
+            Notification.title,
+            Notification.message,
+            Notification.payload,
+        ).where(
+            Notification.user_id == int(user_id),
+            Notification.detected_at >= start,
+        )
+        if visible_supported:
+            stmt = stmt.where(Notification.visible.is_(True))
+        if su:
+            stmt = stmt.where(Notification.site_uuid == su)
+
+        # Hint for ROI: most ROI notifications have "roi" in event_type or title
+        if roi_only and not class_filter:
+            stmt = stmt.where(
+                Notification.event_type.contains("roi")
+                | Notification.title.contains("roi")
+                | Notification.title.contains("ROI")
+            )
+
+        BATCH_SIZE = 5000
+        counts = {}
+        offset = 0
+        while True:
+            batch_stmt = stmt.order_by(Notification.id).offset(offset).limit(BATCH_SIZE)
+            rows = (await db.execute(batch_stmt)).all()
+            if not rows:
+                break
+
+            for raw_dt, event_type, title, message, payload in rows:
+                if roi_only and not is_roi_fn(event_type, title, message, payload):
+                    continue
+                if class_filter:
+                    classes = extract_classes_fn(event_type, title, message, payload)
+                    if class_filter not in classes:
+                        continue
+
+                dt = as_utc_fn(raw_dt)
+                ts_ms_val = int(dt.timestamp() * 1000)
+                bucket = ts_ms_val - (ts_ms_val % bucket_ms)
+                counts[bucket] = counts.get(bucket, 0) + 1
+
+            offset += BATCH_SIZE
+            if len(rows) < BATCH_SIZE:
+                break
+
+        return counts
+
+    async def get_camera_mode_row(
+        self, db: AsyncSession, *, camera_uuid: uuid.UUID
+    ):
+        """
+        Return the camera/site mode row used by the notifications camera-mode
+        cache: (is_enabled, is_detection_enabled, is_notification_enabled,
+        use_site_schedule, roi, SiteSettings.config, SiteSettings.id,
+        Site.timezone). Returns None when the camera does not exist.
+        """
+        return (
+            await db.execute(
+                select(
+                    Camera.is_enabled,
+                    Camera.is_detection_enabled,
+                    Camera.is_notification_enabled,
+                    Camera.use_site_schedule,
+                    Camera.roi,
+                    SiteSettings.config,
+                    SiteSettings.id,
+                    Site.timezone,
+                )
+                .join(Site, Site.site_uuid == Camera.site_uuid)
+                .outerjoin(SiteSettings, SiteSettings.site_uuid == Camera.site_uuid)
+                .where(Camera.camera_uuid == _as_uuid(camera_uuid))
+            )
+        ).first()
+
+    # ------------------------------------------------------------------
+    # NotificationEmail CRUD
+    # ------------------------------------------------------------------
+    async def list_notification_email_rows(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        site_uuid: Optional[uuid.UUID] = None,
+        only_enabled: Optional[bool] = None,
+    ) -> List[NotificationEmail]:
+        """Return NotificationEmail rows for a user (optionally one site)."""
+        stmt = select(NotificationEmail).where(NotificationEmail.user_id == int(user_id))
+        if site_uuid is not None:
+            stmt = stmt.where(NotificationEmail.site_uuid == _as_uuid(site_uuid))
+        if only_enabled is True:
+            stmt = stmt.where(NotificationEmail.is_enabled.is_(True))
+        elif only_enabled is False:
+            stmt = stmt.where(NotificationEmail.is_enabled.is_(False))
+        stmt = stmt.order_by(NotificationEmail.created_at.desc())
+        return (await db.execute(stmt)).scalars().all()
+
+    async def get_notification_email(
+        self,
+        db: AsyncSession,
+        *,
+        email_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        site_uuid: Optional[uuid.UUID] = None,
+        email: Optional[str] = None,
+    ) -> Optional[NotificationEmail]:
+        stmt = select(NotificationEmail)
+        if email_id is not None:
+            stmt = stmt.where(NotificationEmail.id == int(email_id))
+        if user_id is not None:
+            stmt = stmt.where(NotificationEmail.user_id == int(user_id))
+        if site_uuid is not None:
+            stmt = stmt.where(NotificationEmail.site_uuid == _as_uuid(site_uuid))
+        if email is not None:
+            stmt = stmt.where(NotificationEmail.email == email)
+        return (await db.execute(stmt)).scalars().first()
+
+    async def notification_email_exists(
+        self, db: AsyncSession, *, user_id: int, site_uuid: uuid.UUID, email: str
+    ) -> bool:
+        row = await self.get_notification_email(
+            db, user_id=user_id, site_uuid=site_uuid, email=email
+        )
+        return row is not None
+
+    async def create_notification_email(
+        self,
+        db: AsyncSession,
+        *,
+        dto: NotificationEmailCreateDTO,
+    ) -> NotificationEmail:
+        """Insert a site-scoped recipient email from a DTO. Flush only; caller commits."""
+        row = NotificationEmail(
+            user_id=int(dto.user_id),
+            site_uuid=_as_uuid(dto.site_uuid),
+            email=dto.email,
+            is_enabled=bool(dto.is_enabled),
+        )
+        db.add(row)
+        await db.flush()
+        return row
+
+    async def delete_notification_email(
+        self,
+        db: AsyncSession,
+        *,
+        email_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        site_uuid: Optional[uuid.UUID] = None,
+        email: Optional[str] = None,
+    ) -> int:
+        """Delete recipient email(s) by id or by (user, site, email). Returns count."""
+        conds = []
+        if email_id is not None:
+            conds.append(NotificationEmail.id == int(email_id))
+        if user_id is not None:
+            conds.append(NotificationEmail.user_id == int(user_id))
+        if site_uuid is not None:
+            conds.append(NotificationEmail.site_uuid == _as_uuid(site_uuid))
+        if email is not None:
+            conds.append(NotificationEmail.email == email)
+        if not conds:
+            raise ValueError("delete_notification_email requires at least one filter")
+        result = await db.execute(
+            delete(NotificationEmail)
+            .where(and_(*conds))
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0

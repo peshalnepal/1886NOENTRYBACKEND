@@ -63,136 +63,32 @@ def _truncate_message(raw: Any, limit: int = 240) -> str:
     return f"{text[: max(0, limit - 3)]}..."
 
 
-def _coerce_int(value: Any) -> Optional[int]:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+from application.services.overlay_normalize import (
+    _append_overlay_detection,
+)
 
 
 def _coerce_positive_int(value: Any) -> Optional[int]:
-    parsed = _coerce_int(value)
-    if parsed is None or parsed <= 0:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
         return None
     return parsed
-
-
-def _normalize_track_id(value: Any) -> Optional[int]:
-    return _coerce_int(value)
-
-
-def _normalize_overlay_box(raw_box: Any) -> Optional[Dict[str, int]]:
-    if isinstance(raw_box, dict):
-        keys = ("x1", "y1", "x2", "y2")
-        if not all(key in raw_box for key in keys):
-            return None
-        values = tuple(_coerce_int(raw_box.get(key)) for key in keys)
-    elif isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
-        values = tuple(_coerce_int(raw_box[idx]) for idx in range(4))
-    else:
-        return None
-
-    if any(value is None for value in values):
-        return None
-
-    x1, y1, x2, y2 = values
-    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
-
-
-def _normalize_box_norm(raw: Any) -> Optional[Dict[str, float]]:
-    if not isinstance(raw, dict):
-        return None
-    try:
-        x = float(raw["x"])
-        y = float(raw["y"])
-        w = float(raw["w"])
-        h = float(raw["h"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    return {"x": x, "y": y, "w": w, "h": h}
-
-
-def _normalize_overlay_detection(raw_detection: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(raw_detection, dict):
-        return None
-
-    box = _normalize_overlay_box(raw_detection.get("box") or raw_detection.get("bbox"))
-    if box is None:
-        return None
-
-    try:
-        conf = float(raw_detection.get("conf", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        conf = 0.0
-
-    result: Dict[str, Any] = {
-        "cls_name": str(raw_detection.get("cls_name") or raw_detection.get("class") or "obj"),
-        "conf": conf,
-        "box": box,
-    }
-    box_norm = _normalize_box_norm(raw_detection.get("box_norm"))
-    if box_norm is not None:
-        result["box_norm"] = box_norm
-    track_id = _normalize_track_id(raw_detection.get("track_id"))
-    if track_id is not None:
-        result["track_id"] = track_id
-    return result
-
-
-def _overlay_detection_base_key(normalized: Dict[str, Any]) -> Tuple[Any, ...]:
-    box = normalized["box"]
-    return (
-        normalized["cls_name"],
-        normalized["conf"],
-        box["x1"],
-        box["y1"],
-        box["x2"],
-        box["y2"],
-    )
-
-
-def _append_overlay_detection(
-    detections: List[Dict[str, Any]],
-    raw_detection: Any,
-    *,
-    seen_exact: set[Tuple[Any, ...]],
-    tracked_bases: set[Tuple[Any, ...]],
-    untracked_indexes: Dict[Tuple[Any, ...], int],
-) -> None:
-    normalized = _normalize_overlay_detection(raw_detection)
-    if normalized is None:
-        return
-
-    base_key = _overlay_detection_base_key(normalized)
-    track_id = normalized.get("track_id")
-    exact_key = base_key + (track_id,)
-    if exact_key in seen_exact:
-        return
-
-    if track_id is None:
-        if base_key in tracked_bases:
-            return
-        untracked_indexes.setdefault(base_key, len(detections))
-        detections.append(normalized)
-        seen_exact.add(exact_key)
-        return
-
-    untracked_index = untracked_indexes.pop(base_key, None)
-    if untracked_index is not None:
-        detections[untracked_index] = normalized
-    else:
-        detections.append(normalized)
-    tracked_bases.add(base_key)
-    seen_exact.add(exact_key)
 
 
 def _normalize_overlay_frame(raw_frame: Any, *, default_camera_uuid: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not isinstance(raw_frame, dict):
         return None
 
-    frame_ts_ms = _coerce_int(raw_frame.get("frame_ts_ms"))
-    frame_seq = _coerce_int(raw_frame.get("frame_seq"))
-    if frame_ts_ms is None or frame_seq is None:
+    try:
+        frame_ts_ms = int(raw_frame.get("frame_ts_ms"))
+    except (TypeError, ValueError):
+        return None
+    try:
+        frame_seq = int(raw_frame.get("frame_seq"))
+    except (TypeError, ValueError):
         return None
 
     detections: List[Dict[str, Any]] = []
@@ -385,8 +281,40 @@ class ClipCaptureResult:
         }
 
 
+def extract_notification_clip_storage_keys(payload: Any) -> List[str]:
+    """Extract clip storage_key values embedded in a notification payload."""
+    if not isinstance(payload, dict):
+        return []
+    keys: List[str] = []
+
+    def _collect(raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        key = str(raw.get("storage_key") or "").strip()
+        if key:
+            keys.append(key)
+
+    msg = payload.get("msg")
+    if isinstance(msg, dict):
+        _collect(msg)
+        _collect(msg.get("clip"))
+
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        _collect(extra)
+        _collect(extra.get("clip"))
+        for item in list(extra.get("multi_camera_prerecordings") or []):
+            _collect(item)
+
+    _collect(payload.get("clip"))
+    return list(dict.fromkeys(keys))
+
+
 class EventClipService:
-    CLIP_DURATION_S = 120
+    # Clip layout: PRE_EVENT_S before the event + POST_EVENT_S after = CLIP_DURATION_S total.
+    PRE_EVENT_S = 100
+    POST_EVENT_S = 20
+    CLIP_DURATION_S = PRE_EVENT_S + POST_EVENT_S
     COOLDOWN_S = 120.0
     MINIMUM_DURATION_S = 10
     SAS_TTL_HOURS = 168
@@ -468,28 +396,25 @@ class EventClipService:
         now = datetime.now(timezone.utc)
 
         if event_ts_ms is None:
-            start_time = now
+            event_time = now
         else:
             try:
                 event_time = datetime.fromtimestamp(float(event_ts_ms) / 1000.0, tz=timezone.utc)
             except (TypeError, ValueError, OSError, OverflowError):
                 event_time = now
 
-            # Capture POST-event footage: from event time onwards (with 5-second pre-buffer for context)
-            # This ensures we capture the object's actions in the ROI, not stale pre-event footage
-            start_time = event_time - timedelta(seconds=5)  # 5s pre-buffer for context
+        # Anchor the window on the event itself: PRE_EVENT_S of context before the
+        # trigger frame, then POST_EVENT_S after so viewers see what happened next.
+        start_time = event_time - timedelta(seconds=self.PRE_EVENT_S)
+        end_time = event_time + timedelta(seconds=self.POST_EVENT_S)
 
-        # Ensure start_time is not in the future
-        if start_time > now:
-            start_time = now - timedelta(seconds=self.CLIP_DURATION_S)
-
-        # End time should be CLIP_DURATION_S after start_time
-        end_time = start_time + timedelta(seconds=self.CLIP_DURATION_S)
-
-        # If calculated end_time is in the future, adjust both times to capture available footage
+        # If the post-event tail hasn't been recorded yet, clamp to "now" so we
+        # still return a valid window; the caller waits before invoking, so this
+        # path should be rare.
         if end_time > now:
             end_time = now
-            start_time = end_time - timedelta(seconds=self.CLIP_DURATION_S)
+            if start_time > end_time:
+                start_time = end_time - timedelta(seconds=self.CLIP_DURATION_S)
 
         return start_time, end_time
 
@@ -711,6 +636,7 @@ class EventClipService:
             )
             db.add(row)
             await db.commit()
+            await db.refresh(row)
 
     async def update_overlay_payload(
         self,
@@ -781,13 +707,18 @@ class EventClipService:
             start_time, end_time = self._get_capture_window(event_ts_ms)
             external_id = f"{camera_key}-{int(end_time.timestamp())}-{uuid.uuid4().hex[:10]}"
 
-            # ENHANCEMENT: Wait briefly to allow MediaMTX to buffer post-event segments
-            # This ensures the playback endpoint has segments available before we request them
-            # For ROI events, the event_ts_ms is when the object enters the ROI, and we capture
-            # POST-event footage (T to T+120s), so a 1-2 second delay is reasonable to ensure
-            # availability of the first few seconds of the recording window.
+            # Wait long enough for MediaMTX to flush the POST_EVENT_S tail of the
+            # recording (segments are written on a fixed cadence — see
+            # recordSegmentDuration in main-prod.bicep). The +2s slack covers the
+            # segment-boundary rounding so /list reports the full tail before we
+            # call /get. This wait now runs inside the background finalize task,
+            # so it does not block notification persistence / web / email.
             if event_ts_ms is not None:
-                await asyncio.sleep(1.5)
+                event_time = datetime.fromtimestamp(float(event_ts_ms) / 1000.0, tz=timezone.utc)
+                tail_ready_at = event_time + timedelta(seconds=self.POST_EVENT_S + 2)
+                wait_s = (tail_ready_at - datetime.now(timezone.utc)).total_seconds()
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
 
             try:
                 spans = await self._fetch_recording_spans(

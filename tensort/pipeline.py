@@ -638,7 +638,7 @@ class SimpleInferencePipeline(object):
 
     async def _pump_channel(self, camera_key, ch):
         try:
-            async for ev in ch.stream(event_queue=None):
+            async for ev in ch.stream():
                 if self._closing:
                     break
                 if isinstance(ev, RTSPEvent):

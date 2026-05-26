@@ -1,10 +1,28 @@
+from abc import ABC
 from datetime import datetime, time as dt_time, timezone as dt_timezone
 from typing import Optional, Literal, Tuple, Any, Dict, List
 import uuid
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from zoneinfo import ZoneInfo
 
-from dto import ChannelConfig
+
+class ChannelConfig(ABC):
+    """
+    Abstract base class for channel-specific configurations. This serves as a
+    marker interface for all concrete channel config implementations.
+    """
+
+    channel_id: str
+    camera_uuid: Optional[uuid.UUID]
+    rtsp_url: str
+    enabled: bool
+    sample_fps: float
+    decode_backend: Literal["gstreamer", "opencv"]
+    resize: Optional[Tuple[int, int]]
+    reconnect_base_ms: int
+    reconnect_max_ms: int
+    emit_format: Literal["raw", "jpeg"]
+    jpeg_quality: int
 
 DAY_NAME_BY_VALUE = {
     0: "Monday",

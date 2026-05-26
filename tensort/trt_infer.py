@@ -216,8 +216,6 @@ class TRTEngine(object):
             self.input_index = None
             self.output_indices = []
             self.output_shapes = {}
-
-            # Temporary: gather shapes/dtypes first pass
             _shapes = []
             _dtypes = []
             for i in range(self.engine.num_bindings):
