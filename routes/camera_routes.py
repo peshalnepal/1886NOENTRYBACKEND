@@ -42,6 +42,7 @@ from core.schemas import (
     DetectionOut,
 )  # type: ignore
 from application.services.manager import Manager
+from application.services.pipeline import _overlay_payload_from_resp
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/cameras", tags=["cameras"])
@@ -191,19 +192,26 @@ def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
     fw = getattr(resp, "frame_w", None)
     fh = getattr(resp, "frame_h", None)
 
+    merged = _overlay_payload_from_resp(
+        resp,
+        fallback_detections=list(getattr(resp, "tracks", ()) or ()),
+    ).get("detections") or []
+
     items: List[DetectionItemOut] = []
-    for d in (list(resp.detections) if getattr(resp, "detections", None) else []):
+    for d in merged:
         box = d.get("box") or {}
         if not all(k in box for k in ("x1", "y1", "x2", "y2")):
             continue
 
         box_px = BoxPx(x1=box["x1"], y1=box["y1"], x2=box["x2"], y2=box["y2"])
+        tid = d.get("track_id")
         items.append(
             DetectionItemOut(
                 box=box_px,
                 cls_name=str(d.get("cls_name") or ""),
                 conf=float(d.get("conf") or 0.0),
                 box_norm=_normalize_box_px(box, fw, fh) if normalize else None,
+                track_id=int(tid) if tid is not None else None,
             )
         )
 

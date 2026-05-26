@@ -587,6 +587,7 @@ class DetectionItemOut(BaseModel):
     cls_name: str
     conf: float
     box_norm: Optional[BoxNorm] = None
+    track_id: Optional[int] = None
 
 
 class DetectionOut(BaseModel):
