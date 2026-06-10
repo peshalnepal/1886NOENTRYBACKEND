@@ -511,7 +511,11 @@ class ModelPipeline:
         svc = self._notification_service
         if svc is None:
             return
-        await svc.hub.publish(msg)
+        # If the site's org has an operator, hold the alert for approval: persist
+        # it (the flusher marks it pending/invisible) but do NOT push it to the
+        # end user's realtime stream. With no operator, publish immediately.
+        if not await svc.requires_operator_approval(ctx.site_uuid):
+            await svc.hub.publish(msg)
         persist_payload = {**overlay_payload, **(extra_payload or {}), **(persist_extra or {})}
         self._task_spawner(
             svc.enqueue_notification(msg, ctx, extra_payload=persist_payload),

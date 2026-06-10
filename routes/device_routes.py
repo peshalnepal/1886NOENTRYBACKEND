@@ -19,7 +19,15 @@ from core.schemas import (
     EdgeCameraListOut,
     EdgeReconcileOut,
 )
-from dependencies import get_db, get_async_db, get_current_user, get_manager
+from dependencies import (
+    get_db,
+    get_async_db,
+    get_current_user,
+    get_manager,
+    RequirePermission,
+    OrgContext,
+)
+from core.security.roles import Permission
 from application.services.manager import EdgeDeviceUnavailableError, Manager
 
 router = APIRouter(prefix="/devices", tags=["devices"])
@@ -34,11 +42,17 @@ def _is_blank(s: Optional[str]) -> bool:
 def _gen_code(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:6]}"
 
-async def _get_device_or_404(db: AsyncSession, user_id: int, device_uuid: uuid.UUID) -> Device:
-    device = await device_repo.get_device(db, device_uuid=device_uuid, user_id=user_id)
+async def _get_device_or_404(db: AsyncSession, org_id: int, device_uuid: uuid.UUID) -> Device:
+    device = await device_repo.get_device(db, device_uuid=device_uuid, org_id=org_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     return device
+
+
+def _device_owner_id(device: Device, ctx: OrgContext) -> int:
+    """Runtime pipelines key off a user id; prefer the device creator,
+    falling back to the acting admin."""
+    return int(device.user_id) if device.user_id is not None else int(ctx.user.id)
 
 # -----------------------
 # Routes
@@ -46,25 +60,34 @@ async def _get_device_or_404(db: AsyncSession, user_id: int, device_uuid: uuid.U
 @router.get("", response_model=List[DeviceOut])
 async def list_devices(
     db: AsyncSession = Depends(get_async_db),
-    user=Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
-    return await device_repo.list_devices(db, user_id=user.id, order_by_recent=True)
+    return await device_repo.list_devices(db, org_id=ctx.org_id, order_by_recent=True)
 
 
 @router.post("", response_model=DeviceOut, status_code=status.HTTP_201_CREATED)
 async def create_device(
     payload: DeviceCreate,
     db: AsyncSession = Depends(get_async_db),
-    user=Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_DEVICES)),
 ):
     device_code = payload.device_code
     if _is_blank(device_code):
         device_code = _gen_code("dev")
 
+    target_org_id = ctx.org_id if ctx.org_id is not None else payload.org_id
+    if target_org_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="org_id is required when creating a device as a platform admin.",
+        )
+
     device = await device_repo.create_device(
         db,
         dto=DeviceCreateDTO(
-            user_id=user.id,
+            org_id=int(target_org_id),
+            user_id=ctx.user.id,
+            created_by=ctx.user.id,
             device_url=payload.device_url,
             name=payload.name,
             device_code=device_code,
@@ -80,9 +103,9 @@ async def create_device(
 async def get_device(
     device_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
-    user=Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
-    return await _get_device_or_404(db, user.id, device_uuid)
+    return await _get_device_or_404(db, ctx.org_id, device_uuid)
 
 
 @router.patch("/{device_uuid}", response_model=DeviceOut)
@@ -90,9 +113,9 @@ async def update_device(
     device_uuid: uuid.UUID,
     payload: DeviceUpdate,
     db: AsyncSession = Depends(get_async_db),
-    user=Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_DEVICES)),
 ):
-    device = await _get_device_or_404(db, user.id, device_uuid)
+    device = await _get_device_or_404(db, ctx.org_id, device_uuid)
 
     data = payload.model_dump(exclude_unset=True)
 
@@ -116,16 +139,17 @@ async def update_device(
 async def delete_device(
     device_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
-    user=Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_DEVICES)),
     manager: Optional[Manager] = Depends(get_manager),
 ):
-    device = await _get_device_or_404(db, user.id, device_uuid)
+    device = await _get_device_or_404(db, ctx.org_id, device_uuid)
+    owner_id = _device_owner_id(device, ctx)
 
     # Best-effort cleanup — DB delete must succeed even if manager/edge is down.
     if manager is not None:
         try:
             active_pipeline = await asyncio.wait_for(
-                manager.get_activepipeline(user_id=user.id), timeout=5.0,
+                manager.get_activepipeline(user_id=owner_id), timeout=5.0,
             )
             await asyncio.wait_for(
                 manager.cleanup_device_resources(
@@ -149,15 +173,16 @@ async def reconcile_edge_cameras(
     dry_run: bool = False,
     delete_unknown: bool = True,
     db: AsyncSession = Depends(get_async_db),
-    user=Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_DEVICES)),
     manager: Manager = Depends(get_manager),
 ):
-    device = await _get_device_or_404(db, user.id, device_uuid)
+    device = await _get_device_or_404(db, ctx.org_id, device_uuid)
+    owner_id = _device_owner_id(device, ctx)
 
     try:
         result = await manager.reconcile_device_edge_simple(
             device_uuid=device_uuid,
-            user_id=user.id,
+            user_id=owner_id,
             dry_run=dry_run,
             delete_unknown=delete_unknown,
         )

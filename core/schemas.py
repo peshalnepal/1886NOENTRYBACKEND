@@ -286,6 +286,9 @@ class SiteCreate(BaseModel):
     site_code: Optional[str] = Field(default=None, max_length=64)
     address: Optional[str] = Field(default=None, max_length=255)
     timezone: Optional[str] = Field(default="UTC", max_length=50)
+    # Required only when the caller is a platform admin acting cross-tenant
+    # (no implicit org). Ignored for normal callers.
+    org_id: Optional[int] = None
 
 
 class SiteUpdate(BaseModel):
@@ -302,6 +305,11 @@ class SiteOut(BaseModel):
     site_code: Optional[str] = None
     address: Optional[str] = None
     timezone: Optional[str] = "UTC"
+    # Caller's effective role on this site: "admin" | "arm_disarm" | "read_only".
+    # Org admins and platform admins always see "admin"; plain org members
+    # get the role from their site-scoped access grant (or "read_only" as a
+    # safe default).
+    viewer_role: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -421,6 +429,8 @@ class DeviceCreate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=255)
     device_code: Optional[str] = Field(default=None, max_length=64)
     is_enabled: bool = True
+    # Required only for platform admins in cross-tenant context (no implicit org).
+    org_id: Optional[int] = None
 
 
 class DeviceUpdate(BaseModel):
@@ -638,10 +648,30 @@ class BulkClipDeleteResponse(BaseModel):
 
 
 # --- Auth schemas ---
+class AuthOrgMembershipOut(BaseModel):
+    """One row from the user's org_memberships, used by the frontend
+    to decide which Admin / Platform Admin tabs to render."""
+
+    org_id: int
+    org_name: str
+    org_slug: str
+    role: str
+
+
 class AuthUserOut(BaseModel):
+    """Identity payload returned by /auth/me, /auth/login and signup.
+
+    `is_platform_admin` unlocks the Platform Admin section in the UI.
+    `organizations` carries every org the user belongs to plus the
+    role they hold there, so the frontend can show the Org Admin UI
+    whenever any membership has `role == "admin"`.
+    """
+
     id: int
     user_name: str
     user_email: EmailStr
+    is_platform_admin: bool = False
+    organizations: list[AuthOrgMembershipOut] = []
 
 
 class AuthTokenOut(BaseModel):

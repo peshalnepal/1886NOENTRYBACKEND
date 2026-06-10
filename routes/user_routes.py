@@ -1,15 +1,6 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    EmailStr,
-    Field,
-    SecretStr,
-    field_validator,
-    model_validator,
-)
 import uuid
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +10,12 @@ from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
 from application.repositories.user_repository import UserRepository
 from application.dtos import UserProfileUpdateDTO
+from core.schemas import (
+    ChangePasswordRequest,
+    DeleteAccountRequest,
+    UserOut,
+    UserProfileUpdateRequest,
+)
 from core.database_orm import Notification, User
 from core.database import AsyncSessionLocal
 from core.security.hashing import get_password_hash, verify_password
@@ -44,51 +41,6 @@ def _invalidate_user_snapshot_cache(request: Request, user_id: int) -> None:
     if cache is None:
         return
     cache.invalidate(int(user_id))
-    
-class UserOut(BaseModel):
-    id: int
-    user_name: str
-    user_email: EmailStr
-
-
-class UserProfileUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    user_name: str | None = Field(default=None, min_length=1, max_length=255)
-    user_email: EmailStr | None = None
-
-    @field_validator("user_email")
-    @classmethod
-    def normalize_email(cls, value: EmailStr | None) -> str | None:
-        if value is None:
-            return None
-        return str(value).lower().strip()
-
-    @model_validator(mode="after")
-    def validate_has_fields(self):
-        if self.user_name is None and self.user_email is None:
-            raise ValueError("Provide at least one field to update")
-        return self
-
-
-class ChangePasswordRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    current_password: SecretStr
-    new_password: SecretStr
-
-    @field_validator("new_password")
-    @classmethod
-    def validate_new_password(cls, value: SecretStr) -> SecretStr:
-        if len(value.get_secret_value()) < 8:
-            raise ValueError("New password must be at least 8 characters long")
-        return value
-
-
-class DeleteAccountRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    password: SecretStr
 
 
 def _to_user_out(user: User) -> UserOut:
@@ -189,30 +141,21 @@ async def change_my_password(
 from routes._background import _delete_blobs_background, _spawn_bg_task
 
 
-@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_my_account(
-    payload: DeleteAccountRequest,
+async def perform_user_deletion(
+    *,
+    user_id: int,
     request: Request,
-    db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
-    manager: Manager = Depends(get_manager),
-):
-    """
-    Full account deletion:
-    1. Snapshot camera/site info, disable cameras in DB
-    2. Stop cameras on edge/WebRTC/pipeline + purge notification service state
-    3a. Extract video record blob keys (foreground)
-    3b. Delete camera rows + relationships (foreground, makes UI clean)
-    4. Invalidate caches
-    5. Background: batch-delete notifications (extract blob keys),
-       schedule blob deletion, delete sites, delete user row
+    db: AsyncSession,
+    manager: Optional[Manager],
+) -> None:
+    """Run the full account-deletion pipeline for ``user_id``.
+
+    Shared by ``DELETE /users/me`` (self-service) and
+    ``DELETE /platform/users/{id}`` (platform-admin god mode). Password
+    verification is the caller's responsibility.
     """
     from routes.notifications_routes import invalidate_camera_mode_cache
 
-    if not verify_password(payload.password.get_secret_value(), current_user.hashed_password):
-        raise HTTPException(status_code=400, detail="Password is incorrect")
-
-    user_id = int(current_user.id)
     logger.info(f"[User Delete] Starting deletion of user={user_id}")
 
     # ========================================
@@ -387,4 +330,24 @@ async def delete_my_account(
     )
 
     logger.info(f"[User Delete] HTTP response ready: user={user_id} effectively deleted from UI")
+
+
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_my_account(
+    payload: DeleteAccountRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+    manager: Manager = Depends(get_manager),
+):
+    """Self-service account deletion. See :func:`perform_user_deletion`."""
+    if not verify_password(payload.password.get_secret_value(), current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Password is incorrect")
+
+    await perform_user_deletion(
+        user_id=int(current_user.id),
+        request=request,
+        db=db,
+        manager=manager,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

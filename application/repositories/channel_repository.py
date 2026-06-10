@@ -118,7 +118,9 @@ class ChannelRepository:
         *,
         camera_uuids: Optional[List[uuid.UUID]] = None,
         user_id: Optional[int] = None,
+        org_id: Optional[int] = None,
         site_uuid: Optional[uuid.UUID] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
         device_uuid: Optional[uuid.UUID] = None,
         device_uuids: Optional[List[uuid.UUID]] = None,
         pipeline_id: Optional[uuid.UUID] = None,
@@ -151,6 +153,15 @@ class ChannelRepository:
 
         if user_id is not None:
             stmt = stmt.where(Camera.user_id == int(user_id))
+
+        if org_id is not None:
+            stmt = stmt.where(Camera.org_id == int(org_id))
+
+        if site_uuids is not None:
+            clean_sites = [_as_uuid(s) for s in (site_uuids or []) if s is not None]
+            if not clean_sites:
+                return []
+            stmt = stmt.where(Camera.site_uuid.in_(clean_sites))
 
         if site_uuid is not None:
             stmt = stmt.where(Camera.site_uuid == _as_uuid(site_uuid))
@@ -192,17 +203,24 @@ class ChannelRepository:
         db: AsyncSession,
         *,
         site_uuid: uuid.UUID,
-        user_id: int,
+        user_id: Optional[int] = None,
+        org_id: Optional[int] = None,
         only_enabled: Optional[bool] = None,
     ) -> List[dict]:
-        """Return camera rows joined with their device, as flat dicts."""
+        """Return camera rows joined with their device, as flat dicts.
+
+        Cameras are scoped by `site_uuid` (which already pins the org). The
+        optional `user_id`/`org_id` filters narrow further when provided.
+        """
+        conds = [Camera.site_uuid == _as_uuid(site_uuid)]
+        if user_id is not None:
+            conds.append(Camera.user_id == int(user_id))
+        if org_id is not None:
+            conds.append(Camera.org_id == int(org_id))
         stmt = (
             select(Camera, Device)
             .join(Device, Device.device_uuid == Camera.device_uuid, isouter=True)
-            .where(
-                Camera.site_uuid == _as_uuid(site_uuid),
-                Camera.user_id == int(user_id),
-            )
+            .where(*conds)
             .order_by(Camera.created_at.asc())
         )
 
@@ -322,6 +340,43 @@ class ChannelRepository:
             update(Camera)
             .where(*conds)
             .values(is_enabled=False, is_detection_enabled=False)
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    async def list_enabled_camera_uuids_for_site(
+        self, db: AsyncSession, *, site_uuid: uuid.UUID
+    ) -> List[uuid.UUID]:
+        """Camera uuids currently enabled on a site (used to snapshot arm state)."""
+        rows = (
+            await db.execute(
+                select(Camera.camera_uuid).where(
+                    Camera.site_uuid == _as_uuid(site_uuid),
+                    Camera.is_enabled.is_(True),
+                )
+            )
+        ).scalars().all()
+        return list(rows)
+
+    async def set_cameras_enabled(
+        self,
+        db: AsyncSession,
+        *,
+        camera_uuids: List[uuid.UUID],
+        enabled: bool,
+    ) -> int:
+        """Bulk set is_enabled (+ is_detection_enabled) on specific cameras.
+
+        Used by the site arm/disarm cascade. Returns affected row count.
+        """
+        clean = [_as_uuid(c) for c in (camera_uuids or []) if c is not None]
+        if not clean:
+            return 0
+        result = await db.execute(
+            update(Camera)
+            .where(Camera.camera_uuid.in_(clean))
+            .values(is_enabled=bool(enabled), is_detection_enabled=bool(enabled))
             .execution_options(synchronize_session=False)
         )
         await db.flush()
@@ -499,9 +554,13 @@ class ChannelRepository:
             if device_uuid is None:
                 raise ValueError("device_uuid is required to create a new camera (each camera must have a device).")
 
-            await self._ensure_site_exists(db, site_uuid)
+            site_org_id = await self._ensure_site_exists(db, site_uuid)
+            # Org ownership always follows the site the camera lives on.
+            cam_org_id = site_org_id if site_org_id is not None else dto.org_id
             cam = Camera(
                 user_id=user_id,
+                created_by=dto.created_by if dto.created_by is not None else user_id,
+                org_id=cam_org_id,
                 site_uuid=site_uuid,
                 camera_code=camera_code,
                 rtsp_url=rtsp_url,
@@ -588,10 +647,16 @@ class ChannelRepository:
         if exists is None:
             raise ValueError(f"Pipeline not found: {pipeline_id}")
 
-    async def _ensure_site_exists(self, db: AsyncSession, site_uuid: uuid.UUID) -> None:
-        exists = (await db.execute(select(Site).where(Site.site_uuid == site_uuid, Site.is_deleted == False))).scalar_one_or_none()
-        if exists is None:
+    async def _ensure_site_exists(self, db: AsyncSession, site_uuid: uuid.UUID) -> Optional[int]:
+        """Validate the site exists and return its owning `org_id` (or None)."""
+        row = (
+            await db.execute(
+                select(Site.org_id).where(Site.site_uuid == site_uuid, Site.is_deleted == False)
+            )
+        ).first()
+        if row is None:
             raise ValueError(f"Site not found: {site_uuid}")
+        return int(row[0]) if row[0] is not None else None
 
     async def _get_camera_by_uuid(self, db: AsyncSession, camera_uuid: uuid.UUID) -> Optional[Camera]:
         stmt = (

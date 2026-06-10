@@ -13,14 +13,25 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import StreamingResponse
 
 from application.services.notification import WebNotificationHub
+from application.services.notification.types import NotificationMessage
 from application.repositories.notification_repository import NotificationRepository
+from application.repositories.site_repository import SiteRepository
 from application.repositories.notification_visibility import notification_visible_supported
+from application.services.authz_service import AuthzService
+from core.security.roles import OrgRole
 from application.services.user_snapshot_cache import (
     CachedUserSnapshot,
     UserSnapshotCache,
     UserSnapshotLookupError,
 )
 from core.database_orm import Notification, User
+from core.schemas import (
+    ChartPoint,
+    ClearNotificationsRequest,
+    DeleteNotificationsRequest,
+    DetectionsOverTimeOut,
+    NotificationOut,
+)
 from core.security.tokens import decode_access_token
 from dependencies import (
     get_async_db,
@@ -29,13 +40,33 @@ from dependencies import (
     get_notification_service,
     get_session_factory,
     get_user_snapshot_cache,
+    RequirePermission,
+    OrgContext,
 )
+from core.security.roles import Permission
 from application.services.notification import NotificationService
 
 router = APIRouter(prefix="/notifications")
 logger = logging.getLogger(__name__)
 
 notif_repo = NotificationRepository()
+site_repo = SiteRepository()
+def _is_operator(ctx: OrgContext) -> bool:
+    """Operators (and platform admins) may view pending alerts."""
+    return ctx.role == OrgRole.OPERATOR.value or bool(
+        getattr(ctx.user, "is_platform_admin", False)
+    )
+
+async def _notif_site_scope(db: AsyncSession, ctx: OrgContext) -> List[uuid.UUID]:
+    """Site UUIDs whose notifications the caller may read: all org sites for
+    admins/operators, only granted sites for plain members."""
+    org_sites = await site_repo.list_site_uuids(db, org_id=ctx.org_id)
+    accessible = await AuthzService.accessible_site_uuids(
+        db, user=ctx.user, org_id=ctx.org_id, role=ctx.role
+    )
+    if accessible is None:
+        return org_sites
+    return [s for s in org_sites if s in accessible]
 
 
 # -------------------------------------------------------------------
@@ -96,61 +127,6 @@ async def _resolve_stream_user(
 # -------------------------------------------------------------------
 # response / request models
 # -------------------------------------------------------------------
-class NotificationOut(BaseModel):
-    id: int
-    user_id: int
-    site_uuid: str
-    camera_uuid: Optional[str] = None
-    site_name: Optional[str] = None
-    camera_name: Optional[str] = None
-    device_uuid: Optional[str] = None
-    event_type: str
-    title: Optional[str] = None
-    message: Optional[str] = None
-    payload: Optional[Dict[str, Any]] = None
-    image_url: Optional[str] = None
-    image_storage_key: Optional[str] = None
-    clip_url: Optional[str] = None
-    clip_status: Optional[str] = None
-    detected_at: datetime
-    created_at: datetime
-    read_at: Optional[datetime] = None
-    sent_at: Optional[datetime] = None
-    status: str
-
-
-class ChartPoint(BaseModel):
-    bucket_start: datetime
-    count: int
-
-
-class DetectionsOverTimeOut(BaseModel):
-    user_id: int
-    site_uuid: Optional[str] = None
-    hours: int
-    object_class: Optional[str] = None
-    roi_only: bool
-    bucket_minutes: int
-    from_time: datetime = Field(alias="from")
-    to: datetime
-    total: int
-    points: List[ChartPoint]
-
-    class Config:
-        populate_by_name = True
-
-
-class ClearNotificationsRequest(BaseModel):
-    site_uuid: Optional[str] = None
-    camera_uuid: Optional[str] = None
-
-
-class DeleteNotificationsRequest(BaseModel):
-    site_uuid: Optional[str] = None
-    camera_uuid: Optional[str] = None
-    notification_ids: Optional[List[int]] = None
-
-
 # -------------------------------------------------------------------
 # shared helpers
 # -------------------------------------------------------------------
@@ -538,19 +514,22 @@ async def list_notifications(
     limit: int = 100,
     offset: int = 0,
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     limit, offset = _validate_pagination(limit, offset)
     su = _parse_optional_uuid(site_uuid, "site_uuid")
     cu = _parse_optional_uuid(camera_uuid, "camera_uuid")
     visible_supported = await notification_visible_supported(db)
+    target_sites = await _notif_site_scope(db, ctx)
+    if su is not None:
+        target_sites = [su] if su in target_sites else []
+    only_visible = None if _is_operator(ctx) else (True if visible_supported else None)
 
     rows = await notif_repo.list_notifications(
         db,
-        user_id=int(current_user.id),
-        site_uuid=su,
+        site_uuids=target_sites,
         camera_uuid=cu,
-        only_visible=True if visible_supported else None,
+        only_visible=only_visible,
         only_unread=True if unread_only else None,
         limit=limit,
         offset=offset,
@@ -558,16 +537,175 @@ async def list_notifications(
     )
     return [_to_out(r) for r in rows]
 
+@router.get("/pending", response_model=List[NotificationOut])
+async def list_pending_notifications(
+    site_uuid: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
+):
+    """Operator queue: alerts awaiting approval for the operator's org."""
+    limit, offset = _validate_pagination(limit, offset)
+    su = _parse_optional_uuid(site_uuid, "site_uuid")
+    target_sites = await _notif_site_scope(db, ctx)
+    if su is not None:
+        target_sites = [su] if su in target_sites else []
+
+    rows = await notif_repo.list_notifications(
+        db,
+        site_uuids=target_sites,
+        approval_status="pending",
+        limit=limit,
+        offset=offset,
+        order_desc=True,
+    )
+    return [_to_out(r) for r in rows]
+
+
+class ApprovalRequest(BaseModel):
+    notification_ids: List[int] = Field(default_factory=list)
+    # When true, an approved alert also emails the site's configured recipients
+    # (the operator's "important" opt-in). Ignored on reject.
+    email: bool = False
+
+
+async def _publish_approved_to_owner(
+    *, hub: WebNotificationHub, db: AsyncSession, ids: List[int], target_sites: List[uuid.UUID]
+) -> None:
+    """Push freshly-approved alerts to the end user's realtime stream.
+
+    The held alert was routed to operators only; on approval the owner
+    (``Notification.user_id``) must finally receive it live. We rebuild the
+    message from the persisted payload so the user sees the exact alert.
+    """
+    rows = await notif_repo.list_notifications(
+        db, ids=ids, site_uuids=target_sites, approval_status="approved"
+    )
+    for r in rows:
+        payload = r.payload if isinstance(r.payload, dict) else {}
+        msg_payload = payload.get("msg")
+        if not isinstance(msg_payload, dict):
+            continue
+        try:
+            msg = NotificationMessage.model_validate({**msg_payload, "db_id": int(r.id)})
+        except Exception:
+            logger.warning("Could not rebuild approved notification for publish id=%s", r.id, exc_info=True)
+            continue
+        await hub.publish(msg)
+
+
+async def _decide_notifications(
+    *,
+    db: AsyncSession,
+    ctx: OrgContext,
+    ids: List[int],
+    approve: bool,
+    hub: Optional[WebNotificationHub] = None,
+    notification_service: Optional[NotificationService] = None,
+    email_owner: bool = False,
+) -> int:
+    # Authorization is enforced by RequirePermission(ALERTS_APPROVE) on the
+    # calling routes; this helper only performs the state change.
+    if not ids:
+        raise HTTPException(status_code=422, detail="notification_ids required")
+    target_sites = await _notif_site_scope(db, ctx)
+    affected = await notif_repo.set_approval(
+        db,
+        ids=ids,
+        approval_status="approved" if approve else "rejected",
+        visible=approve,
+        approved_by=int(ctx.user.id),
+        site_uuids=target_sites,
+    )
+    await db.commit()
+    if not affected:
+        raise HTTPException(status_code=404, detail="No matching pending notifications")
+    # On approval the alert leaves the operator-only feed and goes live to the
+    # end user. Rejection stays hidden, so nothing is published.
+    if approve and hub is not None:
+        try:
+            await _publish_approved_to_owner(hub=hub, db=db, ids=ids, target_sites=target_sites)
+        except Exception:
+            logger.exception("Failed to publish approved notifications to owner ids=%s", ids)
+    # When the operator marks the alert important, also email the site's
+    # configured recipients. Fire-and-forget so the request doesn't block on SMTP.
+    if approve and email_owner and notification_service is not None:
+        try:
+            notification_service.queue_approved_emails(notification_ids=ids, site_uuids=target_sites)
+        except Exception:
+            logger.exception("Failed to queue approval emails ids=%s", ids)
+    return affected
+
+
+@router.post("/{notification_id}/approve")
+async def approve_notification(
+    notification_id: int,
+    email: bool = False,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
+    hub: WebNotificationHub = Depends(get_notification_hub),
+    notification_service: NotificationService = Depends(get_notification_service),
+):
+    """Operator approves a held alert; it becomes visible to admins/members.
+
+    Pass `?email=true` to also email the site's configured recipients (the
+    operator's "important" opt-in).
+    """
+    affected = await _decide_notifications(
+        db=db, ctx=ctx, ids=[notification_id], approve=True, hub=hub,
+        notification_service=notification_service, email_owner=email,
+    )
+    return {"approved": affected}
+
+
+@router.post("/{notification_id}/reject")
+async def reject_notification(
+    notification_id: int,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
+):
+    """Operator rejects a held alert; it stays hidden from admins/members."""
+    affected = await _decide_notifications(db=db, ctx=ctx, ids=[notification_id], approve=False)
+    return {"rejected": affected}
+
+
+@router.post("/approve")
+async def approve_notifications_bulk(
+    payload: ApprovalRequest,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
+    hub: WebNotificationHub = Depends(get_notification_hub),
+    notification_service: NotificationService = Depends(get_notification_service),
+):
+    affected = await _decide_notifications(
+        db=db, ctx=ctx, ids=payload.notification_ids, approve=True, hub=hub,
+        notification_service=notification_service, email_owner=payload.email,
+    )
+    return {"approved": affected}
+
+
+@router.post("/reject")
+async def reject_notifications_bulk(
+    payload: ApprovalRequest,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
+):
+    affected = await _decide_notifications(
+        db=db, ctx=ctx, ids=payload.notification_ids, approve=False
+    )
+    return {"rejected": affected}
+
 
 @router.post("/delete")
 async def delete_notifications_post(
     payload: DeleteNotificationsRequest,
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SETTINGS)),
     notification_service: NotificationService = Depends(get_notification_service),
 ):
     return await notification_service.handle_deletion_event(
-        user_id=int(current_user.id),
+        user_id=int(ctx.user.id),
         notification_ids=payload.notification_ids,
         site_uuid=payload.site_uuid,
         camera_uuid=payload.camera_uuid,
@@ -577,11 +715,11 @@ async def delete_notifications_post(
 async def delete_notifications(
     payload: DeleteNotificationsRequest,
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SETTINGS)),
     notification_service: NotificationService = Depends(get_notification_service),
 ):
     return await notification_service.handle_deletion_event(
-        user_id=int(current_user.id),
+        user_id=int(ctx.user.id),
         notification_ids=payload.notification_ids,
         site_uuid=payload.site_uuid,
         camera_uuid=payload.camera_uuid,
@@ -594,11 +732,15 @@ async def detections_over_time(
     object_class: Optional[str] = None,
     roi_only: bool = False,
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     su = _parse_optional_uuid(site_uuid, "site_uuid")
     class_filter = _normalize_object_class(object_class)
     visible_supported = await notification_visible_supported(db)
+
+    target_sites = await _notif_site_scope(db, ctx)
+    if su is not None:
+        target_sites = [su] if su in target_sites else []
 
     hours_i = max(1, min(int(hours), 24 * 7))
     bucket_minutes = 60 if hours_i <= 24 else 24 * 60
@@ -614,7 +756,7 @@ async def detections_over_time(
 
     counts: Dict[int, int] = await notif_repo.aggregate_detections_over_time(
         db,
-        user_id=int(current_user.id),
+        site_uuids=target_sites,
         start=start,
         bucket_minutes=bucket_minutes,
         bucket_ms=bucket_ms,
@@ -642,7 +784,7 @@ async def detections_over_time(
     total = sum(p.count for p in points)
 
     return DetectionsOverTimeOut(
-        user_id=int(current_user.id),
+        user_id=int(ctx.user.id),
         site_uuid=str(su) if su else None,
         hours=hours_i,
         object_class=class_filter,
@@ -659,21 +801,26 @@ async def detections_over_time(
 async def unread_count(
     site_uuid: Optional[str] = None,
     db: AsyncSession = Depends(get_async_db),
-    current_user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     su = _parse_optional_uuid(site_uuid, "site_uuid")
     visible_supported = await notification_visible_supported(db)
 
+    target_sites = await _notif_site_scope(db, ctx)
+    if su is not None:
+        target_sites = [su] if su in target_sites else []
+
+    only_visible = None if _is_operator(ctx) else (True if visible_supported else None)
+
     count = await notif_repo.count_notifications(
         db,
-        user_id=int(current_user.id),
-        site_uuid=su,
+        site_uuids=target_sites,
         only_unread=True,
-        only_visible=True if visible_supported else None,
+        only_visible=only_visible,
     )
 
     return {
-        "user_id": int(current_user.id),
+        "user_id": int(ctx.user.id),
         "site_uuid": str(su) if su else None,
         "unread": int(count),
     }

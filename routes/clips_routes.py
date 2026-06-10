@@ -5,48 +5,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel, Field, PositiveInt
 from sqlalchemy import delete, desc, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.services.clip_storage import EventClipService
 from core.database import AsyncSessionLocal
 from core.database_orm import Camera, Notification, Site, VideoRecord, User
+from core.schemas import BulkClipDeleteRequest, BulkClipDeleteResponse, ClipOut
 from dependencies import get_async_db, get_current_user
 
 
 router = APIRouter(prefix="/clips", tags=["clips"])
 logger = logging.getLogger(__name__)
-
-
-class ClipOut(BaseModel):
-    id: int
-    camera_uuid: str
-    camera_name: Optional[str] = None
-    camera_code: Optional[str] = None
-    site_uuid: Optional[str] = None
-    site_name: Optional[str] = None
-    site_code: Optional[str] = None
-    external_id: str
-    start_time: Optional[datetime] = None
-    end_time: Optional[datetime] = None
-    duration: Optional[int] = None
-    status: str
-    recording_url: Optional[str] = None
-    overlay_payload: Optional[Dict[str, Any]] = None
-    storage_key: Optional[str] = None
-    error: Optional[str] = None
-    created_at: datetime
-
-
-class BulkClipDeleteRequest(BaseModel):
-    clip_ids: List[PositiveInt] = Field(..., min_length=1)
-
-
-class BulkClipDeleteResponse(BaseModel):
-    requested: int
-    deleted: int
-    deleted_ids: List[int] = Field(default_factory=list)
 
 
 def _normalize_clip_ids(raw_ids: List[int]) -> List[int]:
@@ -68,19 +38,21 @@ async def _fetch_owned_clips(
     db: AsyncSession,
     user_id: int,
     clip_ids: List[int],
+    is_platform_admin: bool = False,
 ) -> List[VideoRecord]:
     ordered_ids = _normalize_clip_ids(clip_ids)
     if not ordered_ids:
         return []
 
+    conds = [VideoRecord.id.in_(ordered_ids)]
+    if not is_platform_admin:
+        conds.append(Camera.user_id == int(user_id))
+
     rows = (
         await db.execute(
             select(VideoRecord)
             .join(Camera, Camera.camera_uuid == VideoRecord.camera_uuid)
-            .where(
-                VideoRecord.id.in_(ordered_ids),
-                Camera.user_id == int(user_id),
-            )
+            .where(*conds)
         )
     ).scalars().all()
 
@@ -462,11 +434,14 @@ async def list_clips(
         )
         .join(Camera, Camera.camera_uuid == VideoRecord.camera_uuid)
         .join(Site, Site.site_uuid == Camera.site_uuid)
-        .where(Camera.user_id == int(user.id))
         .order_by(desc(VideoRecord.created_at), desc(VideoRecord.id))
         .offset(int(offset))
         .limit(min(int(limit), 200))
     )
+
+    # Platform admins see every clip; regular users see only their own.
+    if not bool(getattr(user, "is_platform_admin", False)):
+        stmt = stmt.where(Camera.user_id == int(user.id))
 
     if site_uuid is not None:
         stmt = stmt.where(Camera.site_uuid == site_uuid)
@@ -559,7 +534,12 @@ async def delete_clips(
     if not clip_ids:
         raise HTTPException(status_code=422, detail="Select at least one clip to delete")
 
-    clips = await _fetch_owned_clips(db=db, user_id=int(user.id), clip_ids=clip_ids)
+    clips = await _fetch_owned_clips(
+        db=db,
+        user_id=int(user.id),
+        clip_ids=clip_ids,
+        is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
+    )
     deleted = await _delete_clip_records(db=db, clips=clips)
     return BulkClipDeleteResponse(
         requested=len(clip_ids),

@@ -5,6 +5,7 @@ This is the top-level delivery facade. It replaces the old mixin-based God Objec
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, Dict, List, Optional
@@ -71,6 +72,7 @@ class NotificationService:
             image_service=self._image_service,
             buffer_poll_s=env_float("NOTIFICATION_BUFFER_POLL_S", 1.0, minimum=0.2),
         )
+        self._bg_tasks: set[asyncio.Task] = set()
         self._started = False
 
     def start(self) -> None:
@@ -111,6 +113,31 @@ class NotificationService:
     
     async def enqueue_notification(self, msg: NotificationMessage, ctx: CameraContext, extra_payload: Optional[Dict[str, Any]] = None) -> None:
         await self.flusher.enqueue(msg, ctx, extra_payload)
+
+    async def requires_operator_approval(self, site_uuid: Any) -> bool:
+        """True when the site's org has an operator, meaning realtime alerts
+        must be withheld from the end user until the operator approves them."""
+        return await self.flusher.requires_operator_approval(site_uuid)
+
+    def queue_approved_emails(
+        self, *, notification_ids: List[int], site_uuids: List[uuid.UUID]
+    ) -> None:
+        """Fire-and-forget the approval email for the given notifications.
+
+        Spawned from the approve route after the approval is committed, so the
+        operator's request returns without waiting on SMTP. The task is tracked
+        to keep a strong reference (asyncio only holds weak ones to live tasks).
+        """
+        if not notification_ids:
+            return
+        task = asyncio.create_task(
+            self.flusher.email_approved_notifications(
+                notification_ids=notification_ids, site_uuids=site_uuids
+            ),
+            name="email_approved_notifications",
+        )
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def record_detection_overlay_frame(self, *, camera_uuid: str, frame_ts_ms: Any, frame_seq: Any, frame_w: Any = None, frame_h: Any = None, detections: Any = None) -> None:
         await self.clip_manager.record_detection_overlay_frame(

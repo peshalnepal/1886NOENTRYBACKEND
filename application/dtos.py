@@ -51,6 +51,8 @@ class CameraUpsertDTO(_DTO):
     channel_config: Any = Field(..., description="dict or VideoChannelConfig-like object")
 
     user_id: Optional[int] = None
+    org_id: Optional[int] = None
+    created_by: Optional[int] = None
     cam_uuid: Optional[uuid.UUID] = None
     camera_code: Optional[str] = None
     site_uuid: Optional[uuid.UUID] = None
@@ -89,7 +91,9 @@ class CameraUpdateDTO(_DTO):
 # =====================================================================
 class DeviceCreateDTO(_DTO):
     """Input for `DeviceRepository.create_device`."""
-    user_id: int
+    org_id: int
+    user_id: Optional[int] = None  # legacy owner (runtime keying)
+    created_by: Optional[int] = None  # user who created the row
     device_url: str
     name: Optional[str] = None
     device_code: Optional[str] = None
@@ -109,7 +113,9 @@ class DeviceUpdateDTO(_DTO):
 # =====================================================================
 class SiteCreateDTO(_DTO):
     """Input for `SiteRepository.create_site`."""
-    user_id: int
+    org_id: int
+    user_id: Optional[int] = None  # legacy owner (runtime keying)
+    created_by: Optional[int] = None  # user who created the row
     name: str
     address: Optional[str] = None
     timezone: str = "UTC"
@@ -151,6 +157,7 @@ class NotificationCreateDTO(_DTO):
     detected_at: Optional[datetime] = None
     status: str = "created"
     sent_at: Optional[datetime] = None
+    approval_status: str = "approved"
 
 
 class NotificationEmailCreateDTO(_DTO):
@@ -179,6 +186,54 @@ class UserProfileUpdateDTO(_DTO):
     user_name: Optional[str] = None
     contact_phone: Optional[str] = None
     email: Optional[str] = None
+
+
+# =====================================================================
+# Organization / Membership
+# =====================================================================
+class OrganizationCreateDTO(_DTO):
+    """Input for `OrganizationRepository.create_organization`.
+
+    `owner_user_id` is the user that will be flagged as the initial
+    Org Admin. The repository creates the matching `OrgMembership`
+    row in the same transaction.
+    """
+
+    name: str
+    slug: str
+    owner_user_id: Optional[int] = None
+
+
+class OrganizationUpdateDTO(_DTO):
+    """Patch payload for `OrganizationRepository.update_organization`."""
+
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class OrgMembershipUpsertDTO(_DTO):
+    """Input for adding/updating an organization member.
+
+    The repository validates that `role` is a valid `OrgRole` value
+    before insert.
+    """
+
+    user_id: int
+    org_id: int
+    role: str
+
+
+class SiteMembershipUpsertDTO(_DTO):
+    """Input for adding/updating a site member.
+
+    Invariant: the user must already have an `OrgMembership` for the
+    organization that owns `site_uuid` (validated by the repository).
+    """
+
+    user_id: int
+    site_uuid: uuid.UUID
+    role: str
 
 
 # =====================================================================

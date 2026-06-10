@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Table,
     Text,
     Time,
     TypeDecorator,
@@ -164,9 +165,15 @@ class User(Base):
     email_verified = Column(Boolean, default=False, nullable=False)
     verified_at = Column(DateTime(timezone=True), nullable=True)
     last_login_at = Column(DateTime(timezone=True), nullable=True)
-    sites = relationship("Site", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
-    devices = relationship("Device", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
-    cameras = relationship("Camera", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
+    is_platform_admin = Column(
+        Boolean, default=False, nullable=False, server_default="0"
+    )
+    # RBAC grants are queried explicitly via AuthzService (lazy="raise"); the
+    # cascade is declared on AccessGrant.user instead of a collection here.
+
+    sites = relationship("Site", back_populates="user", foreign_keys="Site.user_id", cascade="all, delete-orphan", passive_deletes=True)
+    devices = relationship("Device", back_populates="user", foreign_keys="Device.user_id", cascade="all, delete-orphan", passive_deletes=True)
+    cameras = relationship("Camera", back_populates="user", foreign_keys="Camera.user_id", cascade="all, delete-orphan", passive_deletes=True)
 
     # site-scoped email recipients
     notification_emails = relationship(
@@ -180,6 +187,7 @@ class User(Base):
     notifications = relationship(
         "Notification",
         back_populates="user",
+        foreign_keys="Notification.user_id",
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
@@ -192,7 +200,14 @@ class Site(Base):
     __tablename__ = "sites"
 
     site_uuid = Column(GUID, primary_key=True, default=uuid.uuid4, unique=True, nullable=False, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    org_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     site_code = Column(String(64), nullable=True, index=True)
     name = Column(String(255), nullable=False)
@@ -200,11 +215,14 @@ class Site(Base):
     timezone = Column(String(50), nullable=True, default="UTC")
 
     is_deleted = Column(Boolean, default=False, nullable=False, server_default="0")
+    is_armed = Column(Boolean, default=True, nullable=False, server_default="1")
+    disarm_state = Column(JSONList, nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
-    user = relationship("User", back_populates="sites")
+    user = relationship("User", back_populates="sites", foreign_keys=[user_id])
+    creator = relationship("User", foreign_keys=[created_by])
 
     cameras = relationship(
         "Camera",
@@ -242,7 +260,7 @@ class Site(Base):
         uselist=False,
     )
 
-
+    organization = relationship("Organization", back_populates="sites")
     __table_args__ = (
         UniqueConstraint("user_id", "site_code", name="uq_site_user_site_code"),
     )
@@ -263,7 +281,14 @@ class Device(Base):
     __tablename__ = "devices"
 
     device_uuid = Column(GUID, primary_key=True, default=uuid.uuid4, unique=True, nullable=False, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    org_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     device_code = Column(String(64), nullable=True, index=True)
     name = Column(String(255), nullable=True)
@@ -274,8 +299,9 @@ class Device(Base):
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
-    user = relationship("User", back_populates="devices")
-
+    user = relationship("User", back_populates="devices", foreign_keys=[user_id])
+    creator = relationship("User", foreign_keys=[created_by])
+    organization = relationship("Organization",secondary="org_devices", back_populates="devices",passive_deletes=True)
     # Device <-> Sites (M:N)
     sites = relationship(
         "Site",
@@ -296,7 +322,29 @@ class Device(Base):
         UniqueConstraint("user_id", "device_code", name="uq_device_user_device_code"),
     )
 
+# =========================
+# ORGANIZATION <-> DEVICE association
+# =========================
 
+class OrganizationDevice(Base):
+    """
+    Link table: orgs <-> devices (M:N)
+
+    Deleting an org removes these rows (CASCADE) but does NOT delete devices.
+    Deleting a device removes these rows (CASCADE).
+    """
+    __tablename__ = "org_devices"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    org_id = Column(Integer, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    device_uuid = Column(GUID, ForeignKey("devices.device_uuid", ondelete="CASCADE"), nullable=False, index=True)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "device_uuid", name="uq_org_device_pair"),
+    )
 # =========================
 # SITE <-> DEVICE association
 # =========================
@@ -363,7 +411,14 @@ class Camera(Base):
     __tablename__ = "camera"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    org_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     site_uuid = Column(GUID, ForeignKey("sites.site_uuid", ondelete="CASCADE"), nullable=False, index=True)
 
     # Each camera runs on at most one device; a device may host many cameras.
@@ -390,7 +445,9 @@ class Camera(Base):
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
     use_site_schedule = Column(Boolean, nullable=False, default=True)
 
-    user = relationship("User", back_populates="cameras")
+    user = relationship("User", back_populates="cameras", foreign_keys=[user_id])
+    creator = relationship("User", foreign_keys=[created_by])
+    organization = relationship("Organization")
     site = relationship("Site", back_populates="cameras")
 
     device = relationship("Device", back_populates="cameras")
@@ -545,6 +602,7 @@ class Notification(Base):
         Index("ix_notif_user_camera_visible", "user_id", "camera_uuid", "visible", "detected_at"),
         Index("ix_notif_user_visible_unread", "user_id", "visible", "read_at"),
         Index("ix_notif_user_camera_detected", "user_id", "camera_uuid", "detected_at"),
+        Index("ix_notif_site_approval_visible_detected", "site_uuid", "approval_status", "visible", "detected_at"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -567,8 +625,15 @@ class Notification(Base):
     sent_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(String(32), nullable=False, default="created")
     visible=Column(Boolean,default=True)
+    approval_status = Column(
+        String(16), nullable=False, default="approved", server_default="approved"
+    )
+    approved_by = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_at = Column(DateTime(timezone=True), nullable=True)
 
-    user = relationship("User", back_populates="notifications")
+    user = relationship("User", back_populates="notifications", foreign_keys=[user_id])
     site = relationship("Site", back_populates="notifications")
     camera = relationship("Camera")
     device = relationship("Device")
@@ -647,3 +712,181 @@ class SignupTempData(Base):
     created_at = Column(DateTime(timezone=True), default=utc_now)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used = Column(Boolean, default=False)
+class Organization(Base):
+    """
+    Top-level tenant container.
+
+    Everything that belongs to an organization (sites, devices,
+    cameras, users) is reachable from this row. A Platform Admin
+    is the only actor permitted to create or delete organizations.
+
+    `owner_user_id` points at the first Org Admin that was created
+    together with the organization. It is informational only; an
+    organization can have many Org Admins via org-scoped `access_grants`.
+    """
+
+    __tablename__ = "organizations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    slug = Column(String(64), nullable=False, unique=True, index=True)
+
+    # Optional pointer to the user that was bootstrapped as the
+    # initial Org Admin. Set NULL if that user is later deleted.
+    owner_user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    is_active = Column(Boolean, default=True, nullable=False, server_default="1")
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    sites = relationship("Site", back_populates="organization", passive_deletes=True)
+    devices = relationship(
+        "Device",
+        secondary="org_devices",
+        back_populates="organization",
+        passive_deletes=True,
+    )
+    # Org-scoped RBAC grants live in `access_grants` and are queried
+    # explicitly (lazy="raise"); cascade is declared on AccessGrant.organization.
+
+
+# =========================================================================
+# RBAC: ROLES / PERMISSIONS / ACCESS GRANTS
+# =========================================================================
+# These three tables replace the old `org_memberships` and
+# `site_memberships` tables with a single ACL-style model:
+#
+#   "User X holds Role Y in Context Z (an org or a site)."
+#
+# A Role carries a set of Permissions (via `role_permissions`). The role
+# catalog and the role->permission mapping are seeded from
+# `core.security.roles.ROLE_PERMISSIONS` during DB initialization.
+#
+# All relationships use lazy="raise" so authorization code must resolve
+# them with explicit JOINs (no implicit lazy loading under async).
+
+# Many-to-many: roles <-> permissions
+role_permissions = Table(
+    "role_permissions",
+    Base.metadata,
+    Column(
+        "role_id",
+        Integer,
+        ForeignKey("roles.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "permission_id",
+        Integer,
+        ForeignKey("permissions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
+class Role(Base):
+    """A named role within a scope (``org`` or ``site``).
+
+    The same name (e.g. ``admin``) can exist in both scopes with different
+    powers, hence the composite uniqueness on ``(name, scope)``.
+    """
+
+    __tablename__ = "roles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(64), nullable=False)  # OrgRole/SiteRole value
+    scope = Column(String(16), nullable=False)  # "org" | "site"
+    description = Column(String(255), nullable=True)
+
+    permissions = relationship(
+        "Permission",
+        secondary=role_permissions,
+        lazy="raise",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("name", "scope", name="uq_role_name_scope"),
+    )
+
+
+class Permission(Base):
+    """An atomic, checkable privilege (e.g. ``site:arm_disarm``)."""
+
+    __tablename__ = "permissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(64), unique=True, nullable=False, index=True)
+    description = Column(String(255), nullable=True)
+
+
+class AccessGrant(Base):
+    """Unified membership/ACL row: a user holds a role on a context.
+
+    Exactly one of ``org_id`` / ``site_uuid`` is set (an org grant or a
+    site grant); both NULL is reserved for a future platform-wide grant.
+    Today platform scope is still carried by ``users.is_platform_admin``.
+
+    Replaces the former ``org_memberships`` and ``site_memberships`` tables.
+    """
+
+    __tablename__ = "access_grants"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role_id = Column(
+        Integer,
+        ForeignKey("roles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Context: an org grant OR a site grant (see CheckConstraint below).
+    org_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    site_uuid = Column(
+        GUID,
+        ForeignKey("sites.site_uuid", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    user = relationship("User", lazy="raise")
+    role = relationship("Role", lazy="raise")
+    organization = relationship("Organization", lazy="raise")
+    site = relationship("Site", lazy="raise")
+
+    __table_args__ = (
+        CheckConstraint(
+            "(org_id IS NOT NULL AND site_uuid IS NULL) OR "
+            "(org_id IS NULL AND site_uuid IS NOT NULL) OR "
+            "(org_id IS NULL AND site_uuid IS NULL)",
+            name="ck_access_grant_single_context",
+        ),
+        UniqueConstraint(
+            "user_id", "role_id", "org_id", "site_uuid",
+            name="uq_access_grant_user_role_context",
+        ),
+    )

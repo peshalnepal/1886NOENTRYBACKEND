@@ -6,7 +6,7 @@ Extracted verbatim from the former monolithic application/services/notification.
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, Set
+from typing import Dict, Iterable, List, Set
 
 from application.services.notification.types import NotificationMessage
 
@@ -39,9 +39,23 @@ class WebNotificationHub:
                 self._subs_by_user.pop(uid, None)
 
     async def publish(self, msg: NotificationMessage) -> None:
-        uid = int(msg.user_id)
+        """Deliver to the message's owner (`msg.user_id`)."""
+        await self.publish_to_users([int(msg.user_id)], msg)
+
+    async def publish_to_users(self, user_ids: Iterable[int], msg: NotificationMessage) -> None:
+        """Deliver to an explicit set of users.
+
+        Used to route operator-gated alerts to the org's operators (whose ids
+        differ from `msg.user_id`) instead of the end user.
+        """
+        ids = {int(uid) for uid in (user_ids or [])}
+        if not ids:
+            return
+
         async with self._lock:
-            subs = list(self._subs_by_user.get(uid, set()))
+            subs: List[asyncio.Queue[NotificationMessage]] = []
+            for uid in ids:
+                subs.extend(self._subs_by_user.get(uid, set()))
 
         for q in subs:
             try:

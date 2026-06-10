@@ -14,6 +14,8 @@ from routes.notification_email_routes import router as notification_emails_route
 from routes.clips_routes import router as clips_router
 from routes.auth import router as auth_router
 from routes.user_routes import router as users_router
+from routes.platform_admin_routes import router as platform_admin_router
+from routes.admin_routes import router as admin_router
 
 from core.config import DEBUG
 from core.database import db_manager, async_engine
@@ -250,6 +252,8 @@ app.include_router(notifications_router, prefix="/api")
 app.include_router(notification_emails_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
+app.include_router(platform_admin_router, prefix="/api")
+app.include_router(admin_router, prefix="/api")
 
 @app.get("/")
 async def root():

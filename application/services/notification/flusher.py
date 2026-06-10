@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy.exc import OperationalError
+from application.repositories.organization_repository import OrganizationRepository
+from core.database_orm import Site
+from sqlalchemy import select
 
 from application.dtos import NotificationCreateDTO
 from application.repositories.notification_repository import (
@@ -57,6 +60,10 @@ class NotificationFlusher:
         self._recipient_ttl_s = recipient_ttl_s
         
         self._recipient_cache: Dict[Tuple[int, str], Tuple[float, List[str]]] = {}
+        # Per-site cache of the owning org's operator user-ids. A non-empty list
+        # means new alerts are held for approval and routed live to those
+        # operators. Keyed by site_uuid str -> (expiry_monotonic, operator_ids).
+        self._approval_cache: Dict[str, Tuple[float, List[int]]] = {}
         
         self._buffer_lock = asyncio.Lock()
         self._flush_event = asyncio.Event()
@@ -257,7 +264,62 @@ class NotificationFlusher:
                 out[site_uuid] = list(emails)
 
         return out
+    
+    async def _operator_ids_for_sites(
+        self, site_uuids: List[uuid.UUID]
+    ) -> Dict[uuid.UUID, List[int]]:
+        """For each site, the owning org's operator user-ids. An empty list means
+        no operator, so alerts go straight to the end user. A non-empty list means
+        alerts are held `pending` and routed live to those operators. Cached
+        per-site with the recipient TTL."""
+        now = time.monotonic()
+        out: Dict[uuid.UUID, List[int]] = {}
+        missing: List[uuid.UUID] = []
+        for su in site_uuids:
+            hit = self._approval_cache.get(str(su))
+            if hit and hit[0] > now:
+                out[su] = list(hit[1])
+            else:
+                missing.append(su)
 
+        if missing and self._session_factory:
+
+            org_repo = OrganizationRepository()
+            async with self._session_factory() as db:
+                for su in missing:
+                    operator_ids: List[int] = []
+                    try:
+                        org_id = (
+                            await db.execute(
+                                select(Site.org_id).where(Site.site_uuid == su).limit(1)
+                            )
+                        ).scalar_one_or_none()
+                        if org_id is not None:
+                            operator_ids = await org_repo.list_operator_user_ids(db, org_id=int(org_id))
+                    except Exception:
+                        logger.warning("Operator-gate lookup failed for site=%s", su, exc_info=True)
+                        operator_ids = []
+                    self._approval_cache[str(su)] = (now + self._recipient_ttl_s, list(operator_ids))
+                    out[su] = list(operator_ids)
+
+        return out
+
+    async def operator_user_ids_for_site(self, site_uuid: Any) -> List[int]:
+        """Org operator user-ids for a single site (empty => no operator gate)."""
+        if site_uuid is None:
+            return []
+        try:
+            su = site_uuid if isinstance(site_uuid, uuid.UUID) else uuid.UUID(str(site_uuid))
+        except Exception:
+            return []
+        result = await self._operator_ids_for_sites([su])
+        return list(result.get(su, []))
+
+    async def requires_operator_approval(self, site_uuid: Any) -> bool:
+        """Whether a single site's org has an operator (so realtime alerts must
+        be withheld from the end user until approved). Uses the cached lookup."""
+        return bool(await self.operator_user_ids_for_site(site_uuid))
+    
     async def _run_with_session(self, db: Optional[Any], fn: Callable[[Any], Any], retry: bool = False) -> Any:
         if db is not None:
             return await fn(db)
@@ -286,6 +348,12 @@ class NotificationFlusher:
 
         site_groups: Dict[uuid.UUID, List[int]] = defaultdict(list)
         create_rows: List[Dict[str, Any]] = []
+
+        # Operator approval gate: when a site's org has an operator, new alerts
+
+        distinct_sites = list({item.ctx.site_uuid for item in items})
+        operator_ids_by_site = await self._operator_ids_for_sites(distinct_sites)
+        requires_approval_by_site = {su: bool(ids) for su, ids in operator_ids_by_site.items()}
 
         IMAGE_UPLOAD_CONCURRENCY = 10
         materialized: List[Tuple[Dict[str, Any], Optional[str], Optional[str]]] = []
@@ -318,6 +386,9 @@ class NotificationFlusher:
             if stored_image_key:
                 msg_payload["image_storage_key"] = stored_image_key
             site_groups[item.ctx.site_uuid].append(idx)
+            approval_status = (
+                "pending" if requires_approval_by_site.get(item.ctx.site_uuid, False) else "approved"
+            )
             create_rows.append(
                 NotificationCreateDTO(
                     user_id=int(item.ctx.user_id),
@@ -331,6 +402,7 @@ class NotificationFlusher:
                     detected_at=dt_from_ts_ms(item.msg.ts_ms),
                     status="created",
                     sent_at=None,
+                    approval_status=approval_status,
                 )
             )
 
@@ -361,7 +433,15 @@ class NotificationFlusher:
             if row_id is None:
                 continue
             item = items[idx]
-            await self.hub.publish(item.msg.model_copy(update={"db_id": int(row_id)}))
+            published_msg = item.msg.model_copy(update={"db_id": int(row_id)})
+            # Operator-gated: held alerts go live only to the org's operators
+            # (so they can approve from the realtime feed); the end user gets
+            # nothing until approval. With no operator, publish to the user.
+            operator_ids = operator_ids_by_site.get(item.ctx.site_uuid) or []
+            if operator_ids:
+                await self.hub.publish_to_users(operator_ids, published_msg)
+            else:
+                await self.hub.publish(published_msg)
             if str(item.msg.clip_status or "") == "loading":
                 clip_finalize_targets.append((int(row_id), item))
 
@@ -384,6 +464,10 @@ class NotificationFlusher:
         sent_at = datetime.now(timezone.utc)
 
         for site_uuid, indices in site_groups.items():
+            # Held-for-approval alerts must not email recipients until an
+            # operator approves them (email-on-approval is a follow-on).
+            if requires_approval_by_site.get(site_uuid, False):
+                continue
             recipients = recipients_by_site.get(site_uuid, [])
             if not recipients:
                 continue
@@ -412,6 +496,95 @@ class NotificationFlusher:
             return True
 
         return True
+
+    async def email_approved_notifications(
+        self,
+        *,
+        notification_ids: List[int],
+        site_uuids: List[uuid.UUID],
+    ) -> None:
+        """Email the site recipients for operator-approved notifications.
+
+        Mirrors the email step of the normal flush path, but driven from the
+        approval route: it re-reads the approved rows, groups them per owner and
+        site, sends each site's configured recipients a digest, then marks the
+        rows sent/failed. Runs on its own session, so it is safe to fire and
+        forget after the approval has been committed.
+        """
+        if not self.email or not notification_ids or not self._session_factory:
+            return
+
+        site_scope = [s for s in (site_uuids or []) if s is not None]
+
+        async with self._session_factory() as db:
+            rows = await self._repo.list_notifications(
+                db,
+                ids=[int(i) for i in notification_ids],
+                site_uuids=site_scope or None,
+                approval_status="approved",
+            )
+
+        # Recipients are scoped per (owner user_id, site), so group both ways.
+        by_user_site: Dict[int, Dict[uuid.UUID, List[Any]]] = defaultdict(lambda: defaultdict(list))
+        for r in rows:
+            by_user_site[int(r.user_id)][r.site_uuid].append(r)
+
+        sent_ids: List[int] = []
+        failed_ids: List[int] = []
+        sent_at = datetime.now(timezone.utc)
+
+        for owner_id, sites in by_user_site.items():
+            recipients_by_site = await self._get_recipients_for_sites_cached(
+                user_id=owner_id, site_uuids=list(sites.keys())
+            )
+            for site_uuid, site_rows in sites.items():
+                recipients = recipients_by_site.get(site_uuid, [])
+                if not recipients:
+                    continue
+
+                messages: List[NotificationMessage] = []
+                ids_for_site: List[int] = []
+                for r in site_rows:
+                    payload = r.payload if isinstance(r.payload, dict) else {}
+                    msg_payload = payload.get("msg")
+                    if not isinstance(msg_payload, dict):
+                        continue
+                    try:
+                        messages.append(
+                            NotificationMessage.model_validate({**msg_payload, "db_id": int(r.id)})
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not rebuild approved notification for email id=%s", r.id, exc_info=True
+                        )
+                        continue
+                    ids_for_site.append(int(r.id))
+
+                if not messages:
+                    continue
+
+                try:
+                    await self.email.send_digest(messages, to_emails=recipients)
+                    sent_ids.extend(ids_for_site)
+                except Exception:
+                    logger.exception(
+                        "Approval email send failed owner=%s site=%s count=%s",
+                        owner_id, site_uuid, len(messages),
+                    )
+                    failed_ids.extend(ids_for_site)
+
+        if not sent_ids and not failed_ids:
+            return
+
+        try:
+            async with self._session_factory() as db:
+                if sent_ids:
+                    await self._repo.mark_notifications_sent(db, notification_ids=sent_ids, sent_at=sent_at)
+                if failed_ids:
+                    await self._repo.mark_notifications_failed(db, notification_ids=failed_ids)
+                await db.commit()
+        except Exception:
+            logger.exception("Failed to update approved notification email statuses ids=%s", notification_ids)
 
     async def _prepare_notification_item(self, msg: NotificationMessage, ctx: CameraContext, extra_payload: Optional[Dict[str, Any]] = None) -> BufferedNotification:
         # Clip capture is decoupled from notification persistence: we mark
@@ -469,6 +642,12 @@ class NotificationFlusher:
                 logger.exception("Failed to persist resolved clip notif_id=%s", notification_id)
 
         try:
-            await self.hub.publish(updated_msg)
+            # Route the clip-ready republish the same way as the original alert:
+            # to operators while it's awaiting approval, to the end user otherwise.
+            operator_ids = await self.operator_user_ids_for_site(ctx.site_uuid)
+            if operator_ids:
+                await self.hub.publish_to_users(operator_ids, updated_msg)
+            else:
+                await self.hub.publish(updated_msg)
         except Exception:
             logger.exception("Failed to republish clip-ready notification notif_id=%s", notification_id)

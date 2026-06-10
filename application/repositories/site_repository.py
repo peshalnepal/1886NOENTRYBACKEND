@@ -57,35 +57,77 @@ class SiteRepository:
         *,
         site_uuid: uuid.UUID,
         user_id: Optional[int] = None,
+        org_id: Optional[int] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
         raise_if_missing: bool = True,
     ) -> Optional[Site]:
-        stmt = select(Site).where(Site.site_uuid == _as_uuid(site_uuid), Site.is_deleted == False)
-        if user_id is not None:
-            stmt = stmt.where(Site.user_id == int(user_id))
-        site = (await db.execute(stmt)).scalar_one_or_none()
+        """Fetch a single active site.
+
+        Scoping precedence (any combination may be supplied):
+          * `org_id`     - restrict to the owning organization.
+          * `site_uuids` - a member's allow-list of accessible sites
+            (None = no restriction; empty list = no access).
+          * `user_id`    - legacy creator/owner filter (internal callers).
+        """
+        if site_uuids is not None and not site_uuids:
+            site = None
+        else:
+            stmt = select(Site).where(
+                Site.site_uuid == _as_uuid(site_uuid), Site.is_deleted == False
+            )
+            if user_id is not None:
+                stmt = stmt.where(Site.user_id == int(user_id))
+            if org_id is not None:
+                stmt = stmt.where(Site.org_id == int(org_id))
+            if site_uuids is not None:
+                stmt = stmt.where(Site.site_uuid.in_([_as_uuid(s) for s in site_uuids]))
+            site = (await db.execute(stmt)).scalar_one_or_none()
         if site is None and raise_if_missing:
             raise HTTPException(status_code=404, detail="Site not found")
         return site
 
-    async def get_sites(self, db: AsyncSession, *, user_id: int) -> List[Site]:
-        if user_id is None:
-            raise HTTPException(status_code=400, detail="user_id is required")
-        stmt = (
-            select(Site)
-            .where(Site.user_id == int(user_id), Site.is_deleted == False)
-            .order_by(Site.created_at.desc())
-        )
+    async def get_sites(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: Optional[int] = None,
+        org_id: Optional[int] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
+        allow_unscoped: bool = False,
+    ) -> List[Site]:
+        if not allow_unscoped and user_id is None and org_id is None and site_uuids is None:
+            raise HTTPException(status_code=400, detail="A scoping filter is required")
+        if site_uuids is not None and not site_uuids:
+            return []
+        stmt = select(Site).where(Site.is_deleted == False)
+        if user_id is not None:
+            stmt = stmt.where(Site.user_id == int(user_id))
+        if org_id is not None:
+            stmt = stmt.where(Site.org_id == int(org_id))
+        if site_uuids is not None:
+            stmt = stmt.where(Site.site_uuid.in_([_as_uuid(s) for s in site_uuids]))
+        stmt = stmt.order_by(Site.created_at.desc())
         return (await db.execute(stmt)).scalars().all()
 
-    async def list_site_uuids(self, db: AsyncSession, *, user_id: int) -> List[uuid.UUID]:
-        """Return just the site uuids owned by a user (active sites only)."""
-        rows = (
-            await db.execute(
-                select(Site.site_uuid).where(
-                    Site.user_id == int(user_id), Site.is_deleted == False
-                )
-            )
-        ).scalars().all()
+    async def list_site_uuids(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: Optional[int] = None,
+        org_id: Optional[int] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
+    ) -> List[uuid.UUID]:
+        """Return just the site uuids in scope (active sites only)."""
+        if site_uuids is not None and not site_uuids:
+            return []
+        stmt = select(Site.site_uuid).where(Site.is_deleted == False)
+        if user_id is not None:
+            stmt = stmt.where(Site.user_id == int(user_id))
+        if org_id is not None:
+            stmt = stmt.where(Site.org_id == int(org_id))
+        if site_uuids is not None:
+            stmt = stmt.where(Site.site_uuid.in_([_as_uuid(s) for s in site_uuids]))
+        rows = (await db.execute(stmt)).scalars().all()
         return list(rows)
 
     # ------------------------------------------------------------------
@@ -94,7 +136,9 @@ class SiteRepository:
     async def create_site(self, db: AsyncSession, *, dto: SiteCreateDTO) -> Site:
         """Insert a new Site from a `SiteCreateDTO`. Flush only; caller commits."""
         site = Site(
-            user_id=int(dto.user_id),
+            org_id=int(dto.org_id),
+            user_id=int(dto.user_id) if dto.user_id is not None else None,
+            created_by=int(dto.created_by) if dto.created_by is not None else None,
             name=dto.name,
             address=dto.address,
             timezone=dto.timezone or "UTC",

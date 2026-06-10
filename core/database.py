@@ -598,7 +598,383 @@ class DatabaseManager:
                 except Exception as exc:
                     logger.warning("Skipping camera.device_uuid migration: %s", exc)
 
-        # Seed a dev user if DB is empty.
+            # ------------------------------------------------------------------
+            # Multi-tenant RBAC migration (MySQL).
+            #
+            # create_all already creates the new tables on fresh DBs. For
+            # existing databases we:
+            #   * add `users.is_platform_admin` if missing
+            #   * add `sites.org_id` if missing
+            # The RBAC tables `organizations`, `roles`, `permissions`,
+            # `role_permissions` and `access_grants` are created by
+            # create_all; the legacy `org_memberships`/`site_memberships`
+            # tables are migrated into `access_grants` and dropped further
+            # down in this method.
+            # ------------------------------------------------------------------
+            if dialect_name.startswith("mysql"):
+                try:
+                    has_platform_admin = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'users' "
+                                "  AND COLUMN_NAME = 'is_platform_admin' "
+                                "LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if not has_platform_admin:
+                        await conn.execute(
+                            text(
+                                "ALTER TABLE users ADD COLUMN is_platform_admin "
+                                "TINYINT(1) NOT NULL DEFAULT 0"
+                            )
+                        )
+                        logger.info("Added users.is_platform_admin column.")
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping users.is_platform_admin migration: %s", exc
+                    )
+
+                try:
+                    has_is_armed = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'sites' "
+                                "  AND COLUMN_NAME = 'is_armed' "
+                                "LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if not has_is_armed:
+                        await conn.execute(
+                            text(
+                                "ALTER TABLE sites ADD COLUMN is_armed "
+                                "TINYINT(1) NOT NULL DEFAULT 1"
+                            )
+                        )
+                        logger.info("Added sites.is_armed column.")
+                except Exception as exc:
+                    logger.warning("Skipping sites.is_armed migration: %s", exc)
+
+                try:
+                    has_org_id = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'sites' "
+                                "  AND COLUMN_NAME = 'org_id' "
+                                "LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if not has_org_id:
+                        await conn.execute(
+                            text("ALTER TABLE sites ADD COLUMN org_id INT NULL")
+                        )
+                        await conn.execute(
+                            text(
+                                "ALTER TABLE sites ADD INDEX ix_sites_org_id (org_id)"
+                            )
+                        )
+                        logger.info("Added sites.org_id column.")
+                except Exception as exc:
+                    logger.warning("Skipping sites.org_id migration: %s", exc)
+
+                # --- org_id on camera / devices -----------------------------
+                for tbl in ("camera", "devices"):
+                    try:
+                        has_col = (
+                            await conn.execute(
+                                text(
+                                    "SELECT 1 FROM information_schema.COLUMNS "
+                                    "WHERE TABLE_SCHEMA = DATABASE() "
+                                    f"  AND TABLE_NAME = '{tbl}' "
+                                    "  AND COLUMN_NAME = 'org_id' "
+                                    "LIMIT 1"
+                                )
+                            )
+                        ).fetchone()
+                        if not has_col:
+                            await conn.execute(
+                                text(f"ALTER TABLE `{tbl}` ADD COLUMN org_id INT NULL")
+                            )
+                            await conn.execute(
+                                text(
+                                    f"ALTER TABLE `{tbl}` ADD INDEX ix_{tbl}_org_id (org_id)"
+                                )
+                            )
+                            logger.info("Added %s.org_id column.", tbl)
+                    except Exception as exc:
+                        logger.warning("Skipping %s.org_id migration: %s", tbl, exc)
+
+                # --- relax legacy user_id to nullable (now "created_by") -----
+                for tbl in ("sites", "camera", "devices"):
+                    try:
+                        is_nullable = (
+                            await conn.execute(
+                                text(
+                                    "SELECT IS_NULLABLE FROM information_schema.COLUMNS "
+                                    "WHERE TABLE_SCHEMA = DATABASE() "
+                                    f"  AND TABLE_NAME = '{tbl}' "
+                                    "  AND COLUMN_NAME = 'user_id' "
+                                    "LIMIT 1"
+                                )
+                            )
+                        ).scalar_one_or_none()
+                        if is_nullable == "NO":
+                            await conn.execute(
+                                text(f"ALTER TABLE `{tbl}` MODIFY COLUMN user_id INT NULL")
+                            )
+                            logger.info("Relaxed %s.user_id to NULL.", tbl)
+                    except Exception as exc:
+                        logger.warning("Skipping %s.user_id nullable migration: %s", tbl, exc)
+
+                # --- sites.disarm_state -------------------------------------
+                try:
+                    has_disarm = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'sites' "
+                                "  AND COLUMN_NAME = 'disarm_state' "
+                                "LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if not has_disarm:
+                        await conn.execute(
+                            text("ALTER TABLE sites ADD COLUMN disarm_state JSON NULL")
+                        )
+                        logger.info("Added sites.disarm_state column.")
+                except Exception as exc:
+                    logger.warning("Skipping sites.disarm_state migration: %s", exc)
+
+                # --- created_by on sites / camera / devices -----------------
+                # Records who created the row. Backfilled from the legacy
+                # user_id so existing rows keep an accurate creator.
+                for tbl in ("sites", "camera", "devices"):
+                    try:
+                        has_created_by = (
+                            await conn.execute(
+                                text(
+                                    "SELECT 1 FROM information_schema.COLUMNS "
+                                    "WHERE TABLE_SCHEMA = DATABASE() "
+                                    f"  AND TABLE_NAME = '{tbl}' "
+                                    "  AND COLUMN_NAME = 'created_by' "
+                                    "LIMIT 1"
+                                )
+                            )
+                        ).fetchone()
+                        if not has_created_by:
+                            await conn.execute(
+                                text(f"ALTER TABLE `{tbl}` ADD COLUMN created_by INT NULL")
+                            )
+                            await conn.execute(
+                                text(
+                                    f"ALTER TABLE `{tbl}` ADD INDEX ix_{tbl}_created_by (created_by)"
+                                )
+                            )
+                            await conn.execute(
+                                text(
+                                    f"UPDATE `{tbl}` SET created_by = user_id "
+                                    "WHERE created_by IS NULL"
+                                )
+                            )
+                            logger.info("Added %s.created_by column (backfilled from user_id).", tbl)
+                    except Exception as exc:
+                        logger.warning("Skipping %s.created_by migration: %s", tbl, exc)
+
+                # --- notification approval workflow columns ------------------
+                try:
+                    has_approval = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'notification' "
+                                "  AND COLUMN_NAME = 'approval_status' "
+                                "LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if not has_approval:
+                        await conn.execute(
+                            text(
+                                "ALTER TABLE notification "
+                                "ADD COLUMN approval_status VARCHAR(16) NOT NULL DEFAULT 'approved', "
+                                "ADD COLUMN approved_by INT NULL, "
+                                "ADD COLUMN approved_at DATETIME NULL"
+                            )
+                        )
+                        await conn.execute(
+                            text(
+                                "ALTER TABLE notification "
+                                "ADD INDEX ix_notif_site_approval_visible_detected "
+                                "(site_uuid, approval_status, visible, detected_at)"
+                            )
+                        )
+                        logger.info("Added notification.approval_status workflow columns.")
+                except Exception as exc:
+                    logger.warning("Skipping notification.approval_status migration: %s", exc)
+
+                # --- unified RBAC: seed catalog + migrate memberships --------
+                # create_all builds `roles`/`permissions`/`role_permissions`/
+                # `access_grants` on fresh DBs. Here we idempotently seed the
+                # role+permission catalog, then migrate any legacy
+                # `org_memberships`/`site_memberships` rows into `access_grants`
+                # and drop those tables.
+                try:
+                    from core.security.roles import (
+                        PERMISSION_DESCRIPTIONS,
+                        ROLE_PERMISSIONS,
+                    )
+
+                    # 1. permissions
+                    for perm_name, perm_desc in PERMISSION_DESCRIPTIONS.items():
+                        await conn.execute(
+                            text(
+                                "INSERT INTO permissions (name, description) "
+                                "SELECT :n, :d FROM DUAL "
+                                "WHERE NOT EXISTS "
+                                "(SELECT 1 FROM permissions WHERE name = :n)"
+                            ),
+                            {"n": perm_name, "d": perm_desc},
+                        )
+
+                    # 2. roles (one row per distinct (name, scope))
+                    for (role_name, scope) in {k for k in ROLE_PERMISSIONS.keys()}:
+                        await conn.execute(
+                            text(
+                                "INSERT INTO roles (name, scope, description) "
+                                "SELECT :n, :s, :d FROM DUAL "
+                                "WHERE NOT EXISTS "
+                                "(SELECT 1 FROM roles WHERE name = :n AND scope = :s)"
+                            ),
+                            {"n": role_name, "s": scope, "d": f"{scope} role: {role_name}"},
+                        )
+
+                    # 3. role -> permission links
+                    for (role_name, scope), perms in ROLE_PERMISSIONS.items():
+                        for perm in perms:
+                            await conn.execute(
+                                text(
+                                    "INSERT INTO role_permissions (role_id, permission_id) "
+                                    "SELECT r.id, p.id FROM roles r, permissions p "
+                                    "WHERE r.name = :rn AND r.scope = :rs "
+                                    "  AND p.name = :pn "
+                                    "  AND NOT EXISTS (SELECT 1 FROM role_permissions rp "
+                                    "    WHERE rp.role_id = r.id AND rp.permission_id = p.id)"
+                                ),
+                                {"rn": role_name, "rs": scope, "pn": perm.value},
+                            )
+                    logger.info("Seeded RBAC role/permission catalog.")
+                except Exception as exc:
+                    logger.warning("Skipping RBAC catalog seed: %s", exc)
+
+                # Migrate legacy org_memberships -> access_grants, then drop.
+                try:
+                    has_org_mem = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.TABLES "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'org_memberships' LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if has_org_mem:
+                        await conn.execute(
+                            text(
+                                "INSERT INTO access_grants "
+                                "  (user_id, role_id, org_id, site_uuid, created_at, updated_at) "
+                                "SELECT m.user_id, r.id, m.org_id, NULL, m.created_at, m.updated_at "
+                                "FROM org_memberships m "
+                                "JOIN roles r ON r.name = m.role AND r.scope = 'org' "
+                                "WHERE NOT EXISTS (SELECT 1 FROM access_grants g "
+                                "  WHERE g.user_id = m.user_id AND g.role_id = r.id "
+                                "    AND g.org_id = m.org_id AND g.site_uuid IS NULL)"
+                            )
+                        )
+                        await conn.execute(text("DROP TABLE org_memberships"))
+                        logger.info(
+                            "Migrated org_memberships -> access_grants and dropped legacy table."
+                        )
+                except Exception as exc:
+                    logger.warning("Skipping org_memberships migration: %s", exc)
+
+                # Migrate legacy site_memberships -> access_grants, then drop.
+                try:
+                    has_site_mem = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.TABLES "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'site_memberships' LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if has_site_mem:
+                        await conn.execute(
+                            text(
+                                "INSERT INTO access_grants "
+                                "  (user_id, role_id, org_id, site_uuid, created_at, updated_at) "
+                                "SELECT m.user_id, r.id, NULL, m.site_uuid, m.created_at, m.updated_at "
+                                "FROM site_memberships m "
+                                "JOIN roles r ON r.name = m.role AND r.scope = 'site' "
+                                "WHERE NOT EXISTS (SELECT 1 FROM access_grants g "
+                                "  WHERE g.user_id = m.user_id AND g.role_id = r.id "
+                                "    AND g.site_uuid = m.site_uuid AND g.org_id IS NULL)"
+                            )
+                        )
+                        await conn.execute(text("DROP TABLE site_memberships"))
+                        logger.info(
+                            "Migrated site_memberships -> access_grants and dropped legacy table."
+                        )
+                except Exception as exc:
+                    logger.warning("Skipping site_memberships migration: %s", exc)
+
+                # --- backfill org_id from access grants ----------------------
+                # Idempotent: only touches rows where org_id is still NULL.
+                try:
+                    await conn.execute(
+                        text(
+                            "UPDATE sites s "
+                            "JOIN access_grants g "
+                            "  ON g.user_id = s.user_id AND g.org_id IS NOT NULL "
+                            "SET s.org_id = g.org_id "
+                            "WHERE s.org_id IS NULL"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            "UPDATE camera c "
+                            "JOIN sites s ON s.site_uuid = c.site_uuid "
+                            "SET c.org_id = s.org_id "
+                            "WHERE c.org_id IS NULL AND s.org_id IS NOT NULL"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            "UPDATE devices d "
+                            "JOIN access_grants g "
+                            "  ON g.user_id = d.user_id AND g.org_id IS NOT NULL "
+                            "SET d.org_id = g.org_id "
+                            "WHERE d.org_id IS NULL"
+                        )
+                    )
+                    logger.info("Backfilled org_id on sites/camera/devices.")
+                except Exception as exc:
+                    logger.warning("Skipping org_id backfill: %s", exc)
+
+        # Seed a dev user if DB is empty. The dev user is also flagged as
+        # the platform admin so the new `/api/platform/...` endpoints are
+        # usable out of the box.
         async with self.AsyncSessionLocal() as db:
             existing = (await db.execute(select(User.id).limit(1))).scalar_one_or_none()
             if existing is None:
@@ -608,6 +984,7 @@ class DatabaseManager:
                         email="dev@example.com",
                         hashed_password=get_password_hash("DevPass123!"),
                         email_verified=True,
+                        is_platform_admin=True,
                     )
                 )
                 await db.commit()

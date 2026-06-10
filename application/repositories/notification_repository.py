@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import and_, delete, func, literal_column, select, update
+from sqlalchemy import and_, delete, false, func, literal_column, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.dtos import (
@@ -291,6 +291,8 @@ class NotificationRepository:
             detected_at=dto.detected_at or utc_now(),
             status=dto.status,
             sent_at=dto.sent_at,
+            approval_status=dto.approval_status,
+            visible=(dto.approval_status == "approved"),
         )
 
     async def create_notification(
@@ -426,9 +428,11 @@ class NotificationRepository:
         *,
         user_id: Optional[int] = None,
         site_uuid: Optional[uuid.UUID] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
         camera_uuid: Optional[uuid.UUID] = None,
         ids: Optional[List[int]] = None,
         event_types: Optional[List[str]] = None,
+        approval_status: Optional[str] = None,
         only_visible: Optional[bool] = None,
         only_unread: Optional[bool] = None,
         detected_before: Optional[datetime] = None,
@@ -439,6 +443,14 @@ class NotificationRepository:
             conds.append(Notification.user_id == int(user_id))
         if site_uuid is not None:
             conds.append(Notification.site_uuid == _as_uuid(site_uuid))
+        if site_uuids is not None:
+            clean_sites = [_as_uuid(s) for s in site_uuids if s is not None]
+            # Empty allow-list -> match nothing (always-false predicate).
+            conds.append(
+                Notification.site_uuid.in_(clean_sites) if clean_sites else false()
+            )
+        if approval_status is not None:
+            conds.append(Notification.approval_status == str(approval_status))
         if camera_uuid is not None:
             conds.append(Notification.camera_uuid == _as_uuid(camera_uuid))
         if ids is not None:
@@ -465,9 +477,11 @@ class NotificationRepository:
         *,
         user_id: Optional[int] = None,
         site_uuid: Optional[uuid.UUID] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
         camera_uuid: Optional[uuid.UUID] = None,
         ids: Optional[List[int]] = None,
         event_types: Optional[List[str]] = None,
+        approval_status: Optional[str] = None,
         only_visible: Optional[bool] = None,
         only_unread: Optional[bool] = None,
         detected_before: Optional[datetime] = None,
@@ -478,8 +492,10 @@ class NotificationRepository:
     ) -> List[Notification]:
         """Return Notification rows matching any combination of filters."""
         conds = self._notification_conditions(
-            user_id=user_id, site_uuid=site_uuid, camera_uuid=camera_uuid, ids=ids,
-            event_types=event_types, only_visible=only_visible, only_unread=only_unread,
+            user_id=user_id, site_uuid=site_uuid, site_uuids=site_uuids,
+            camera_uuid=camera_uuid, ids=ids,
+            event_types=event_types, approval_status=approval_status,
+            only_visible=only_visible, only_unread=only_unread,
             detected_before=detected_before, before_id=before_id,
         )
         stmt = select(Notification)
@@ -522,13 +538,16 @@ class NotificationRepository:
         *,
         user_id: Optional[int] = None,
         site_uuid: Optional[uuid.UUID] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
         camera_uuid: Optional[uuid.UUID] = None,
+        approval_status: Optional[str] = None,
         only_visible: Optional[bool] = None,
         only_unread: Optional[bool] = None,
     ) -> int:
         """Count Notification rows matching any combination of filters."""
         conds = self._notification_conditions(
-            user_id=user_id, site_uuid=site_uuid, camera_uuid=camera_uuid,
+            user_id=user_id, site_uuid=site_uuid, site_uuids=site_uuids,
+            camera_uuid=camera_uuid, approval_status=approval_status,
             only_visible=only_visible, only_unread=only_unread,
         )
         stmt = select(func.count(Notification.id))
@@ -575,6 +594,45 @@ class NotificationRepository:
             update(Notification)
             .where(and_(*conds))
             .values(visible=bool(visible))
+            .execution_options(synchronize_session=False)
+        )
+        await db.flush()
+        return result.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # Operator approval workflow
+    # ------------------------------------------------------------------
+    async def set_approval(
+        self,
+        db: AsyncSession,
+        *,
+        ids: List[int],
+        approval_status: str,
+        visible: bool,
+        approved_by: Optional[int] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
+        only_pending: bool = True,
+    ) -> int:
+        """Approve or reject pending notifications by id.
+
+        Scoped to `site_uuids` (the operator's org sites) so an operator
+        cannot act on another tenant's alerts. By default only rows still
+        `pending` are affected. Returns the number of rows updated.
+        """
+        if not ids:
+            return 0
+        conds = self._notification_conditions(ids=ids, site_uuids=site_uuids)
+        if only_pending:
+            conds.append(Notification.approval_status == "pending")
+        result = await db.execute(
+            update(Notification)
+            .where(and_(*conds))
+            .values(
+                approval_status=str(approval_status),
+                visible=bool(visible),
+                approved_by=approved_by,
+                approved_at=utc_now(),
+            )
             .execution_options(synchronize_session=False)
         )
         await db.flush()
@@ -662,7 +720,7 @@ class NotificationRepository:
         self,
         db: AsyncSession,
         *,
-        user_id: int,
+        site_uuids: List[uuid.UUID],
         start: datetime,
         bucket_minutes: int,
         bucket_ms: int,
@@ -684,6 +742,8 @@ class NotificationRepository:
         the supplied is_roi_fn / extract_classes_fn callbacks.
         """
         su = _as_uuid(site_uuid)
+        clean_sites = [_as_uuid(s) for s in (site_uuids or []) if s is not None]
+        site_scope = Notification.site_uuid.in_(clean_sites) if clean_sites else false()
 
         if not needs_payload_filter:
             # ── Fast path: pure SQL aggregation, no payload scanning ──
@@ -695,7 +755,7 @@ class NotificationRepository:
                 select(bucket_expr.label("bucket_start"), func.count().label("cnt"))
                 .select_from(Notification.__table__)
                 .where(
-                    Notification.user_id == int(user_id),
+                    site_scope,
                     Notification.detected_at >= start,
                 )
             )
@@ -721,7 +781,7 @@ class NotificationRepository:
             Notification.message,
             Notification.payload,
         ).where(
-            Notification.user_id == int(user_id),
+            site_scope,
             Notification.detected_at >= start,
         )
         if visible_supported:
@@ -799,12 +859,20 @@ class NotificationRepository:
         self,
         db: AsyncSession,
         *,
-        user_id: int,
+        user_id: Optional[int] = None,
         site_uuid: Optional[uuid.UUID] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
         only_enabled: Optional[bool] = None,
     ) -> List[NotificationEmail]:
-        """Return NotificationEmail rows for a user (optionally one site)."""
-        stmt = select(NotificationEmail).where(NotificationEmail.user_id == int(user_id))
+        """Return NotificationEmail rows, scoped by user and/or site(s)."""
+        stmt = select(NotificationEmail)
+        if user_id is not None:
+            stmt = stmt.where(NotificationEmail.user_id == int(user_id))
+        if site_uuids is not None:
+            clean = [_as_uuid(s) for s in site_uuids if s is not None]
+            stmt = stmt.where(
+                NotificationEmail.site_uuid.in_(clean) if clean else false()
+            )
         if site_uuid is not None:
             stmt = stmt.where(NotificationEmail.site_uuid == _as_uuid(site_uuid))
         if only_enabled is True:

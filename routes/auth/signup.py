@@ -9,14 +9,25 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from application.dtos import OrganizationCreateDTO, OrgMembershipUpsertDTO
+from application.repositories.organization_repository import OrganizationRepository
 from application.repositories.verify_repository import EmailVerificationRepository
 from core.database_orm import SignupTempData, User,EmailVerification, utc_now
+from core.security.roles import OrgRole
 from core.env import env_bool, env_int
+from core.schemas import (
+    AuthOrgMembershipOut,
+    AuthTokenOut,
+    AuthUserOut,
+    LoginRequest,
+    SignupCodeOut,
+    SignupRequestCode,
+    SignupVerifyRequest,
+)
 from core.security.hashing import get_password_hash, verify_password
 from core.security.tokens import create_access_token
 from dependencies import get_async_db, get_current_user
@@ -50,85 +61,98 @@ SMTP_FROM = (os.getenv("FROM_EMAIL") or os.getenv("SMTP_FROM") or SMTP_USERNAME)
 SMTP_USE_TLS = env_bool("SMTP_USE_TLS", True)
 
 
-class AuthUserOut(BaseModel):
-    id: int
-    user_name: str
-    user_email: EmailStr
+def _slug_from_email(email: str) -> str:
+    """Build a URL-safe organization slug from the signup email.
+
+    Example: "Jane.Doe@Example.com" -> "jane-doe-example-com". A short
+    random suffix is appended at the caller to guarantee uniqueness.
+    """
+    local = email.split("@", 1)[0]
+    cleaned = "".join(
+        ch.lower() if ch.isalnum() else "-" for ch in email.replace("@", "-")
+    )
+    cleaned = "-".join(part for part in cleaned.split("-") if part) or local.lower()
+    return cleaned[:48] or "org"
 
 
-class AuthTokenOut(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    user: AuthUserOut
+async def _bootstrap_personal_organization(
+    db: AsyncSession, *, user: User
+) -> None:
+    """Create an Organization owned by `user` and grant them Org Admin.
 
+    Called immediately after a signup verification succeeds. The new
+    organization is named after the user (`<name>'s Organization`) and
+    given a slug derived from their email. If the derived slug is
+    already taken (e.g. they signed up before, the org was deleted,
+    and someone else grabbed the slug) a 6-char hex suffix is appended.
 
-class SignupRequestCode(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    Does NOT commit; the caller owns the transaction.
+    """
+    org_repo = OrganizationRepository()
 
-    user_name: str = Field(..., min_length=1, max_length=255)
-    user_email: EmailStr
-    password: SecretStr
+    base_slug = _slug_from_email(user.email)
+    slug = base_slug
+    # Try a handful of suffixes to avoid an infinite loop in the rare
+    # case of repeated collisions.
+    for attempt in range(5):
+        existing = await org_repo.get_by_slug(db, slug)
+        if existing is None:
+            break
+        slug = f"{base_slug}-{secrets.token_hex(3)}"
 
-    @field_validator("user_email")
-    @classmethod
-    def normalize_email(cls, value: EmailStr) -> str:
-        return str(value).lower().strip()
-
-    @field_validator("password")
-    @classmethod
-    def validate_password(cls, value: SecretStr) -> SecretStr:
-        if len(value.get_secret_value()) < 8:
-            raise ValueError("Password must be at least 8 characters long")
-        return value
-
-
-class SignupVerifyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    signup_token: str = Field(..., min_length=16, max_length=255)
-    code: str = Field(..., min_length=6, max_length=10)
-
-    @field_validator("signup_token")
-    @classmethod
-    def normalize_token(cls, value: str) -> str:
-        token = value.strip()
-        if not token:
-            raise ValueError("signup_token is required")
-        return token
-
-    @field_validator("code")
-    @classmethod
-    def normalize_code(cls, value: str) -> str:
-        code = value.strip()
-        if not code.isdigit():
-            raise ValueError("Verification code must contain digits only")
-        return code
-
-
-class SignupCodeOut(BaseModel):
-    message: str
-    signup_token: str
-    expires_at: datetime
-    debug_code: str | None = None
-
-
-class LoginRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    user_email: EmailStr
-    password: SecretStr
-
-    @field_validator("user_email")
-    @classmethod
-    def normalize_email(cls, value: EmailStr) -> str:
-        return str(value).lower().strip()
+    org = await org_repo.create_organization(
+        db,
+        OrganizationCreateDTO(
+            name=f"{user.user_name}'s Organization",
+            slug=slug,
+            owner_user_id=int(user.id),
+        ),
+    )
+    await org_repo.upsert_org_membership(
+        db,
+        OrgMembershipUpsertDTO(
+            user_id=int(user.id),
+            org_id=int(org.id),
+            role=OrgRole.ADMIN.value,
+        ),
+    )
+    await db.commit()
+    await db.refresh(org)
 
 
 def _to_user_out(user: User) -> AuthUserOut:
+    """Project a User row to the auth payload (no org info)."""
     return AuthUserOut(
         id=int(user.id),
         user_name=user.user_name,
         user_email=user.email,
+        is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
+        organizations=[],
+    )
+
+
+async def _to_user_out_with_orgs(db: AsyncSession, user: User) -> AuthUserOut:
+    """Project a User row, additionally hydrating their organizations.
+
+    Used by login/signup/me so the client receives the full role
+    picture in one round-trip and can pick which dashboard to land
+    the user on.
+    """
+    rows = await OrganizationRepository().list_user_orgs(db, user_id=int(user.id))
+    return AuthUserOut(
+        id=int(user.id),
+        user_name=user.user_name,
+        user_email=user.email,
+        is_platform_admin=bool(getattr(user, "is_platform_admin", False)),
+        organizations=[
+            AuthOrgMembershipOut(
+                org_id=int(o.id),
+                org_name=o.name,
+                org_slug=o.slug,
+                role=role_name,
+            )
+            for (role_name, o) in rows
+        ],
     )
 
 
@@ -351,6 +375,8 @@ async def signup_verify(
         )
         db.add(user)
         user.last_login_at = utc_now()
+        await db.flush()
+        await _bootstrap_personal_organization(db, user=user)
         await db.commit()
         await db.refresh(user)
     except IntegrityError:
@@ -360,7 +386,9 @@ async def signup_verify(
         await db.rollback()
         raise
     token = _build_access_token(user)
-    return AuthTokenOut(access_token=token, user=_to_user_out(user))
+    return AuthTokenOut(
+        access_token=token, user=await _to_user_out_with_orgs(db, user)
+    )
 
 
 @router.post("/login", response_model=AuthTokenOut)
@@ -389,9 +417,14 @@ async def login(
     await db.refresh(user)
 
     token = _build_access_token(user)
-    return AuthTokenOut(access_token=token, user=_to_user_out(user))
+    return AuthTokenOut(
+        access_token=token, user=await _to_user_out_with_orgs(db, user)
+    )
 
 
 @router.get("/me", response_model=AuthUserOut)
-async def me(current_user: User = Depends(get_current_user)):
-    return _to_user_out(current_user)
+async def me(
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await _to_user_out_with_orgs(db, current_user)

@@ -16,7 +16,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dependencies import get_async_db, get_current_user, get_manager
+from dependencies import (
+    get_async_db,
+    get_current_user,
+    get_manager,
+    RequirePermission,
+    OrgContext,
+)
+from core.security.roles import Permission
+from application.services.authz_service import AuthzService
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.site_repository import SiteRepository
 from application.repositories.video_repository import VideoRepository
@@ -53,6 +61,61 @@ _SNAPSHOT_HTTP = httpx.AsyncClient(
 
 def _ensure_user_owns_camera(cam: Any, user_id: int) -> None:
     if int(getattr(cam, "user_id", -1)) != int(user_id):
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+
+def _camera_owner_id(cam: Any, fallback_user_id: int) -> int:
+    """Detection pipelines are keyed by a user id; use the camera's creator
+    so viewers (members) read the owner's pipeline, not their own."""
+    owner = getattr(cam, "user_id", None)
+    return int(owner) if owner is not None else int(fallback_user_id)
+
+
+def _owner_id_for_site(site: Any, ctx: OrgContext) -> int:
+    """Pipeline owner for a site: its creator, falling back to the actor."""
+    owner = getattr(site, "user_id", None)
+    return int(owner) if owner is not None else int(ctx.user.id)
+
+
+async def _ensure_stream_camera_access(db: AsyncSession, cam: Any, user: User) -> int:
+    """Access check for SSE handlers that resolve the user from a token
+    (no `OrgContext` dependency available). Returns the owner user id."""
+    if cam is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    if bool(getattr(user, "is_platform_admin", False)):
+        return _camera_owner_id(cam, int(user.id))
+    resolved = await AuthzService.resolve_user_org(db, user=user)
+    if resolved is None:
+        raise HTTPException(status_code=403, detail="You do not belong to any organization.")
+    org_id, role = resolved
+    cam_org = getattr(cam, "org_id", None)
+    if cam_org is not None and int(cam_org) != int(org_id):
+        raise HTTPException(status_code=404, detail="Camera not found")
+    accessible = await AuthzService.accessible_site_uuids(
+        db, user=user, org_id=org_id, role=role
+    )
+    if accessible is not None and getattr(cam, "site_uuid", None) not in accessible:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return _camera_owner_id(cam, int(user.id))
+
+
+async def _ensure_camera_access(db: AsyncSession, cam: Any, ctx: OrgContext) -> None:
+    """404 unless the camera is in the caller's org and (for plain members)
+    on a site they have been granted access to.
+
+    Platform admins in super context (ctx.org_id is None) skip both checks.
+    """
+    if cam is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    if ctx.org_id is None:
+        return
+    cam_org = getattr(cam, "org_id", None)
+    if cam_org is not None and int(cam_org) != int(ctx.org_id):
+        raise HTTPException(status_code=404, detail="Camera not found")
+    accessible = await AuthzService.accessible_site_uuids(
+        db, user=ctx.user, org_id=ctx.org_id, role=ctx.role
+    )
+    if accessible is not None and getattr(cam, "site_uuid", None) not in accessible:
         raise HTTPException(status_code=404, detail="Camera not found")
 
 
@@ -236,7 +299,7 @@ def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
 @router.get("", response_model=List[CameraSchema])
 async def list_cameras(
     db: AsyncSession = Depends(get_async_db),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
     site_uuid: uuid.UUID = None,  # keep query param; if None -> 422 below
 ):
     """
@@ -246,12 +309,21 @@ async def list_cameras(
     if site_uuid is None:
         raise HTTPException(status_code=422, detail="site_uuid query param is required")
 
+    # Enforce org + (for members) site-level access. Platform admins in super
+    # context (org_id is None) bypass the org scoping check entirely.
+    if ctx.org_id is not None:
+        accessible = await AuthzService.accessible_site_uuids(
+            db, user=ctx.user, org_id=ctx.org_id, role=ctx.role
+        )
+        if accessible is not None and site_uuid not in accessible:
+            raise HTTPException(status_code=404, detail="Site not found")
+
     repo = ChannelRepository()
 
     cams = await repo.list_cameras(
         db,
         site_uuid=site_uuid,
-        user_id=int(user.id),
+        org_id=ctx.org_id,
         include_device=True,
     )
 
@@ -286,7 +358,7 @@ async def list_cameras(
 async def get_camera(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
@@ -294,7 +366,7 @@ async def get_camera(
         raise HTTPException(status_code=404, detail="Camera not found")
 
     cam, cfg, _pid = full
-    _ensure_user_owns_camera(cam, user.id)
+    await _ensure_camera_access(db, cam, ctx)
 
     dev = cam.device if getattr(cam, "device", None) else None
 
@@ -325,7 +397,7 @@ async def get_camera(
 async def get_camera_playback(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     """
     Returns the WebRTC playback URL for this camera.
@@ -337,8 +409,8 @@ async def get_camera_playback(
         raise HTTPException(status_code=404, detail="Camera not found")
 
     cam, _cfg, _pid = full
-    _ensure_user_owns_camera(cam, user.id)
-    
+    await _ensure_camera_access(db, cam, ctx)
+
     # Validate camera has required fields
     rtsp_url = getattr(cam, "rtsp_url", None)
     camera_code = getattr(cam, "camera_code", None)
@@ -396,7 +468,7 @@ async def get_latest_detection(
     normalize: bool = False,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
@@ -404,9 +476,9 @@ async def get_latest_detection(
         raise HTTPException(status_code=404, detail="Camera not found")
 
     cam, _cfg, _pid = full
-    _ensure_user_owns_camera(cam, user.id)
+    await _ensure_camera_access(db, cam, ctx)
 
-    pipeline = await manager.get_activepipeline(user_id=user.id)
+    pipeline = await manager.get_activepipeline(user_id=_camera_owner_id(cam, ctx.user.id))
 
     resp = await pipeline.get_latest_detection(str(camera_uuid))
     if resp is None and refresh:
@@ -439,9 +511,9 @@ async def stream_detections_sse(
         if not full:
             raise HTTPException(status_code=404, detail="Camera not found")
         cam, _cfg, _pid = full
-        _ensure_user_owns_camera(cam, user.id)
+        owner_id = await _ensure_stream_camera_access(db, cam, user)
 
-    pipeline = await manager.get_activepipeline(user_id=user.id)
+    pipeline = await manager.get_activepipeline(user_id=owner_id)
     cam_key = str(camera_uuid)
 
     async def gen():
@@ -521,15 +593,23 @@ async def latest_detections_for_site(
     site_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     repo = ChannelRepository()
     if site_uuid is None:
         raise HTTPException(status_code=400, detail="site_uuid is required")
 
-    cams = await repo.list_cameras(db, site_uuid=site_uuid, user_id=int(user.id))
+    if ctx.org_id is not None:
+        accessible = await AuthzService.accessible_site_uuids(
+            db, user=ctx.user, org_id=ctx.org_id, role=ctx.role
+        )
+        if accessible is not None and site_uuid not in accessible:
+            raise HTTPException(status_code=404, detail="Site not found")
 
-    pipeline = await manager.get_activepipeline(user_id=user.id)
+    cams = await repo.list_cameras(db, site_uuid=site_uuid, org_id=ctx.org_id)
+
+    owner_id = _camera_owner_id(cams[0], ctx.user.id) if cams else int(ctx.user.id)
+    pipeline = await manager.get_activepipeline(user_id=owner_id)
 
     out: Dict[str, Optional[Dict[str, Any]]] = {}
     for cam in cams:
@@ -545,14 +625,23 @@ async def create_camera(
     payload: CameraCreateSchema,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_CAMERAS)),
 ):
     try:
         data = payload.model_dump(exclude_none=True)
 
-        # Trust JWT context, not client-provided user_id.
-        data["user_id"] = int(user.id)
-        pipeline = await manager.get_activepipeline(user_id=user.id)
+        # The target site must belong to the caller's org; the camera's
+        # org ownership is then derived from the site in the repository.
+        site_uuid = data.get("site_uuid")
+        if site_uuid is None:
+            raise HTTPException(status_code=422, detail="site_uuid is required")
+        site = await SiteRepository().get_site(
+            db, org_id=ctx.org_id, site_uuid=site_uuid
+        )
+        owner_id = _owner_id_for_site(site, ctx)
+
+        data["user_id"] = owner_id
+        pipeline = await manager.get_activepipeline(user_id=owner_id)
 
         ev = ChannelCreateEvent(
             channel_id=None,
@@ -563,7 +652,7 @@ async def create_camera(
         result = await manager.update_pipeline(
             pipeline.pipeline_id,
             [ev],
-            user_id=user.id,
+            user_id=owner_id,
             camera_code_prefix="cam",
         )
 
@@ -647,16 +736,17 @@ async def edit_camera(
     payload: CameraEditSchema,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_CAMERAS)),
 ):
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
         raise HTTPException(status_code=404, detail="Camera not found")
     cam, _cfg, _pid = full
-    _ensure_user_owns_camera(cam, user.id)
+    await _ensure_camera_access(db, cam, ctx)
+    owner_id = _camera_owner_id(cam, ctx.user.id)
 
-    pipeline = await manager.get_activepipeline(user_id=user.id)
+    pipeline = await manager.get_activepipeline(user_id=owner_id)
     patch_payload = payload.model_dump(exclude_unset=True)
     patch_payload.pop("user_id", None)
 
@@ -667,7 +757,7 @@ async def edit_camera(
     )
 
     try:
-        result = await manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=user.id)
+        result = await manager.update_pipeline(pipeline.pipeline_id, [ev], user_id=owner_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not result or not result.cameras:
@@ -777,7 +867,7 @@ async def delete_camera(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     manager: Manager = Depends(get_manager),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_CAMERAS)),
 ):
     """
     Full camera deletion:
@@ -800,7 +890,8 @@ async def delete_camera(
     if not full:
         raise HTTPException(status_code=404, detail="Camera not found")
     cam, _cfg, _pid = full
-    _ensure_user_owns_camera(cam, user.id)
+    await _ensure_camera_access(db, cam, ctx)
+    owner_id = _camera_owner_id(cam, ctx.user.id)
 
     cam_code: Optional[str] = getattr(cam, "camera_code", None)
     site_uuid = cam.site_uuid
@@ -818,7 +909,7 @@ async def delete_camera(
     # between our edge cleanup and DB deletion it re-adds the camera.
     # ========================================
     logger.info(f"[Camera Delete] Phase 1b: Disabling camera in DB to prevent reconcile re-adds")
-    await repo.disable_cameras(db, camera_uuids=[camera_uuid], user_id=int(user.id))
+    await repo.disable_cameras(db, camera_uuids=[camera_uuid], user_id=owner_id)
     await db.commit()
 
     # ========================================
@@ -834,7 +925,7 @@ async def delete_camera(
             purge_fn = getattr(notif_svc, "purge_deleted_site_runtime_state", None)
             if callable(purge_fn):
                 await purge_fn(
-                    user_id=int(user.id),
+                    user_id=owner_id,
                     site_uuid=site_uuid,
                     camera_uuids=[camera_uuid],
                 )
@@ -849,7 +940,7 @@ async def delete_camera(
             await asyncio.wait_for(
                 _cleanup_camera_runtime(
                     manager,
-                    user_id=int(user.id),
+                    user_id=owner_id,
                     camera_uuid=camera_uuid,
                     camera_code=cam_code,
                     device_urls=device_urls,
@@ -992,7 +1083,7 @@ async def snapshot_jpg(
         raise HTTPException(status_code=404, detail="Camera not found")
 
     cam, _cfg, _pid = full
-    _ensure_user_owns_camera(cam, user.id)
+    await _ensure_stream_camera_access(db, cam, user)
 
     dev = cam.device if getattr(cam, "device", None) else None
     device_url = str(getattr(dev, "device_url", "") or "").strip() if dev is not None else ""

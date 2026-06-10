@@ -6,14 +6,31 @@ import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.notification_repository import NotificationRepository
 from application.repositories.site_repository import SiteRepository
 from application.dtos import NotificationEmailCreateDTO
-from dependencies import get_async_db, get_current_user
+from core.schemas import (
+    NotificationEmailCreate,
+    NotificationEmailCreateResult,
+    NotificationEmailOut,
+)
+from application.services.authz_service import AuthzService
+from dependencies import (
+    get_async_db,
+    RequirePermission,
+    OrgContext,
+)
+from core.security.roles import Permission
 from core.database_orm import User
+
+
+def _email_owner_id(site, ctx: OrgContext) -> int:
+    """Recipient emails are keyed by the site owner so the notification
+    flusher (which resolves recipients by the camera/site owner) finds them."""
+    owner = getattr(site, "user_id", None)
+    return int(owner) if owner is not None else int(ctx.user.id)
 
 router = APIRouter(prefix="/notification-emails", tags=["notification-emails"])
 
@@ -51,45 +68,31 @@ def _invalidate_notification_email_cache(
     svc.invalidate_recipient_cache(user_id=int(user_id), site_uuid=site_uuid)
 
 # -------------------------
-# Schemas
-# -------------------------
-class NotificationEmailCreate(BaseModel):
-    email: EmailStr
-    # If omitted, email is applied to all sites owned by the user.
-    site_uuid: Optional[uuid.UUID] = None
-
-
-class NotificationEmailOut(BaseModel):
-    id: int
-    user_id: int
-    site_uuid: uuid.UUID
-    email: str
-    is_enabled: bool
-
-
-class NotificationEmailCreateResult(BaseModel):
-    created: List[NotificationEmailOut]
-    created_count: int
-    skipped_count: int
-    target_site_count: int
-
-
-# -------------------------
 # Endpoints
 # -------------------------
 @router.get("", response_model=List[NotificationEmailOut])
 async def list_notification_emails(
     site_uuid: Optional[uuid.UUID] = None,
     db: AsyncSession = Depends(get_async_db),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     """
-    List notification emails for a user.
+    List notification emails for the caller's organization.
     Optional site_uuid filter narrows results to one site.
+    Members are limited to sites they can access.
     """
-    rows = await notif_repo.list_notification_email_rows(
-        db, user_id=int(user.id), site_uuid=site_uuid
+    accessible = await AuthzService.accessible_site_uuids(
+        db, user=ctx.user, org_id=ctx.org_id, role=ctx.role
     )
+    if site_uuid is not None:
+        if accessible is not None and site_uuid not in accessible:
+            raise HTTPException(status_code=404, detail="Site not found")
+        target = [site_uuid]
+    else:
+        org_sites = await site_repo.list_site_uuids(db, org_id=ctx.org_id)
+        target = org_sites if accessible is None else [s for s in org_sites if s in accessible]
+
+    rows = await notif_repo.list_notification_email_rows(db, site_uuids=target)
     return [
         NotificationEmailOut(
             id=row.id,
@@ -107,27 +110,27 @@ async def add_notification_email(
     payload: NotificationEmailCreate,
     request: Request,
     db: AsyncSession = Depends(get_async_db),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SETTINGS)),
 ):
     """
-    Add a notification email.
-    If site_uuid is missing, apply it to all sites for the user.
+    Add a notification email (org admin only).
+    If site_uuid is missing, apply it to all sites in the organization.
     """
     normalized_email = payload.email.lower().strip()
 
     if payload.site_uuid is not None:
         site = await site_repo.get_site(
-            db, site_uuid=payload.site_uuid, user_id=int(user.id), raise_if_missing=False
+            db, site_uuid=payload.site_uuid, org_id=ctx.org_id, raise_if_missing=False
         )
-        target_site_uuids = [site.site_uuid] if site is not None else []
+        target_sites = [site] if site is not None else []
     else:
-        target_site_uuids = await site_repo.list_site_uuids(db, user_id=int(user.id))
+        target_sites = await site_repo.get_sites(db, org_id=ctx.org_id)
 
-    if not target_site_uuids:
+    if not target_sites:
         if payload.site_uuid is not None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Site not found for this user",
+                detail="Site not found for this organization",
             )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -135,17 +138,18 @@ async def add_notification_email(
         )
 
     created_rows = []
-    for target_site_uuid in target_site_uuids:
+    for target_site in target_sites:
+        owner_id = _email_owner_id(target_site, ctx)
         if await notif_repo.notification_email_exists(
-            db, user_id=int(user.id), site_uuid=target_site_uuid, email=normalized_email
+            db, user_id=owner_id, site_uuid=target_site.site_uuid, email=normalized_email
         ):
             continue
 
         row = await notif_repo.create_notification_email(
             db,
             dto=NotificationEmailCreateDTO(
-                user_id=int(user.id),
-                site_uuid=target_site_uuid,
+                user_id=owner_id,
+                site_uuid=target_site.site_uuid,
                 email=normalized_email,
                 is_enabled=True,
             ),
@@ -176,8 +180,8 @@ async def add_notification_email(
             for row in created_rows
         ],
         created_count=len(created_rows),
-        skipped_count=len(target_site_uuids) - len(created_rows),
-        target_site_count=len(target_site_uuids),
+        skipped_count=len(target_sites) - len(created_rows),
+        target_site_count=len(target_sites),
     )
 
 
@@ -187,16 +191,24 @@ async def delete_notification_email(
     all_sites: bool = False,
     request: Request = None,
     db: AsyncSession = Depends(get_async_db),
-    user: User = Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SETTINGS)),
 ):
     """
-    Delete one notification email entry by ID.
+    Delete one notification email entry by ID (org admin only).
     If all_sites=true, remove the same user/email pair from all sites.
     """
-    email = await notif_repo.get_notification_email(
-        db, email_id=email_id, user_id=int(user.id)
-    )
+    email = await notif_repo.get_notification_email(db, email_id=email_id)
     if not email:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Notification email not found",
+        )
+
+    # Confirm the recipient's site belongs to the caller's organization.
+    owning_site = await site_repo.get_site(
+        db, site_uuid=email.site_uuid, org_id=ctx.org_id, raise_if_missing=False
+    )
+    if owning_site is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Notification email not found",

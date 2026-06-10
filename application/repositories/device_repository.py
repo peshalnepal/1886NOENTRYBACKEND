@@ -37,6 +37,7 @@ class DeviceRepository:
         device_uuids: Optional[List[uuid.UUID]] = None,
         site_uuid: Optional[uuid.UUID] = None,
         user_id: Optional[int] = None,
+        org_id: Optional[int] = None,
         camera_uuid: Optional[uuid.UUID] = None,
         device_url: Optional[str] = None,
         only_enabled: Optional[bool] = None,
@@ -68,6 +69,9 @@ class DeviceRepository:
         if user_id is not None:
             stmt = stmt.where(Device.user_id == int(user_id))
 
+        if org_id is not None:
+            stmt = stmt.where(Device.org_id == int(org_id))
+
         if device_url:
             stmt = stmt.where(Device.device_url == device_url)
 
@@ -95,6 +99,7 @@ class DeviceRepository:
         device_uuid: Optional[uuid.UUID] = None,
         site_uuid: Optional[uuid.UUID] = None,
         user_id: Optional[int] = None,
+        org_id: Optional[int] = None,
         camera_uuid: Optional[uuid.UUID] = None,
         device_url: Optional[str] = None,
         only_enabled: Optional[bool] = None,
@@ -104,6 +109,7 @@ class DeviceRepository:
             device_uuid=device_uuid,
             site_uuid=site_uuid,
             user_id=user_id,
+            org_id=org_id,
             camera_uuid=camera_uuid,
             device_url=device_url,
             only_enabled=only_enabled,
@@ -119,6 +125,7 @@ class DeviceRepository:
         device_uuids: Optional[List[uuid.UUID]] = None,
         site_uuid: Optional[uuid.UUID] = None,
         user_id: Optional[int] = None,
+        org_id: Optional[int] = None,
         camera_uuid: Optional[uuid.UUID] = None,
         device_url: Optional[str] = None,
         only_enabled: Optional[bool] = None,
@@ -129,6 +136,7 @@ class DeviceRepository:
             device_uuids=device_uuids,
             site_uuid=site_uuid,
             user_id=user_id,
+            org_id=org_id,
             camera_uuid=camera_uuid,
             device_url=device_url,
             only_enabled=only_enabled,
@@ -152,8 +160,11 @@ class DeviceRepository:
 
     async def create_device(self, db: AsyncSession, *, dto: DeviceCreateDTO) -> Device:
         """Insert a new Device from a `DeviceCreateDTO`. Flush only; caller commits."""
+        user_id=int(dto.user_id) if dto.user_id is not None else None
         device = Device(
-            user_id=int(dto.user_id),
+            org_id=int(dto.org_id),
+            user_id=user_id,
+            created_by=user_id,
             device_url=dto.device_url,
             name=dto.name,
             device_code=dto.device_code,
