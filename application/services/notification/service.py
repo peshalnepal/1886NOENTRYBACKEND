@@ -139,6 +139,36 @@ class NotificationService:
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
+    async def set_clips_approval_for_notifications(
+        self, *, notification_ids: List[int], site_uuids: List[uuid.UUID], approved: bool
+    ) -> int:
+        """Flip captured clips visible/hidden to match an operator's decision.
+
+        Clips are matched to alerts by the external_id(s) embedded in each
+        notification payload (there is no FK). Approval reveals the playback to
+        the end user; rejection keeps it hidden. Returns rows updated.
+        """
+        from application.services.clip_storage import extract_notification_clip_external_ids
+
+        if not notification_ids or self._session_factory is None:
+            return 0
+
+        async with self._session_factory() as db:
+            rows = await self._repo.list_notifications(
+                db, ids=[int(i) for i in notification_ids], site_uuids=site_uuids or None
+            )
+
+        external_ids: List[str] = []
+        for row in rows:
+            external_ids.extend(
+                extract_notification_clip_external_ids(getattr(row, "payload", None))
+            )
+        external_ids = list(dict.fromkeys(external_ids))
+        if not external_ids:
+            return 0
+
+        return await self.clip_manager.set_clips_approval(external_ids=external_ids, approved=approved)
+
     async def record_detection_overlay_frame(self, *, camera_uuid: str, frame_ts_ms: Any, frame_seq: Any, frame_w: Any = None, frame_h: Any = None, detections: Any = None) -> None:
         await self.clip_manager.record_detection_overlay_frame(
             camera_uuid=camera_uuid,

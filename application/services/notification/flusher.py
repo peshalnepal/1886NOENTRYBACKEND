@@ -24,6 +24,7 @@ from application.repositories.notification_repository import (
     NotificationRepository,
     dt_from_ts_ms,
 )
+from application.services.clip_storage import extract_notification_clip_external_ids
 from application.services.notification.overlay_helpers import _json_safe
 from application.services.notification.types import (
     BufferedNotification,
@@ -611,9 +612,16 @@ class NotificationFlusher:
         republishes the message with `clip_status="ready"` so the web UI can
         swap the spinner for the player.
         """
+        # When the site's org has an operator, the captured playback must be
+        # held invisible (like the alert itself) until the operator approves it,
+        # so the end user never sees the clip before review.
+        operator_ids = await self.operator_user_ids_for_site(ctx.site_uuid)
+        requires_approval = bool(operator_ids)
+
         try:
             merged_extra = await self._clip_manager.attach_clip_payload(
                 msg=msg, ctx=ctx, extra_payload=extra_payload,
+                requires_approval=requires_approval,
             )
         except Exception:
             logger.exception("Background clip capture failed notif_id=%s camera=%s", notification_id, msg.camera_uuid)
@@ -641,10 +649,30 @@ class NotificationFlusher:
             except Exception:
                 logger.exception("Failed to persist resolved clip notif_id=%s", notification_id)
 
+        # Settle the approve-during-capture race: clips are captured ~tens of
+        # seconds after the alert is persisted, so the operator may have already
+        # decided the alert before the clip rows existed (the approve/reject
+        # route's clip flip would have matched nothing). Re-read the current
+        # approval state and reconcile the just-captured clips with it.
+        if requires_approval and self._session_factory is not None:
+            try:
+                external_ids = extract_notification_clip_external_ids(
+                    {"extra": merged_extra} if isinstance(merged_extra, dict) else None
+                )
+                if external_ids:
+                    async with self._session_factory() as db:
+                        rows = await self._repo.list_notifications(db, ids=[int(notification_id)])
+                    current_status = str(getattr(rows[0], "approval_status", "pending")) if rows else "pending"
+                    if current_status == "approved":
+                        await self._clip_manager.set_clips_approval(external_ids=external_ids, approved=True)
+                    elif current_status == "rejected":
+                        await self._clip_manager.set_clips_approval(external_ids=external_ids, approved=False)
+            except Exception:
+                logger.exception("Failed to reconcile captured clip approval notif_id=%s", notification_id)
+
         try:
             # Route the clip-ready republish the same way as the original alert:
             # to operators while it's awaiting approval, to the end user otherwise.
-            operator_ids = await self.operator_user_ids_for_site(ctx.site_uuid)
             if operator_ids:
                 await self.hub.publish_to_users(operator_ids, updated_msg)
             else:

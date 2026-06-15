@@ -584,6 +584,14 @@ class VideoRecord(Base):
     notification_sent = Column(Boolean, default=False)
     usage_processed = Column(Boolean, default=False)
 
+    # Operator-approval gate (mirrors Notification): when the site's org has an
+    # operator, a freshly captured clip is held invisible until the operator
+    # approves the matching alert, so end users never see the playback first.
+    visible = Column(Boolean, default=True)
+    approval_status = Column(
+        String(16), nullable=False, default="approved", server_default="approved"
+    )
+
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 

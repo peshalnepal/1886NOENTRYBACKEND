@@ -364,7 +364,21 @@ class ClipManager:
             contexts_by_camera=contexts_by_camera,
         )
 
-    async def _capture_site_prerecord_clips(self, *, msg: NotificationMessage, ctx: CameraContext, plan: SitePrerecordPlan, trigger_clip: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    async def set_clips_approval(self, *, external_ids: List[str], approved: bool) -> int:
+        """Flip captured clips' visibility when an operator decides an alert."""
+        clip_service = self._clip_service
+        if clip_service is None:
+            return 0
+        setter = getattr(clip_service, "set_clips_approval", None)
+        if not callable(setter):
+            return 0
+        try:
+            return await setter(external_ids=external_ids, approved=approved)
+        except Exception:
+            logger.exception("Failed to set clip approval external_ids=%s approved=%s", external_ids, approved)
+            return 0
+
+    async def _capture_site_prerecord_clips(self, *, msg: NotificationMessage, ctx: CameraContext, plan: SitePrerecordPlan, trigger_clip: Optional[Dict[str, Any]] = None, requires_approval: bool = False) -> List[Dict[str, Any]]:
         clip_service = self._clip_service
         if clip_service is None:
             return []
@@ -393,6 +407,7 @@ class ClipManager:
                     event_ts_ms=msg.ts_ms,
                     trigger=f"site_prerecord:{msg.camera_uuid}:{plan.settings.trigger_mode}:{msg.alert_type}",
                     overlay_payload=(trigger_overlay_payload if camera_uuid_str == trigger_camera_uuid_str else None),
+                    requires_approval=requires_approval,
                 )
             )
 
@@ -427,7 +442,7 @@ class ClipManager:
 
         return out
 
-    async def attach_clip_payload(self, *, msg: NotificationMessage, ctx: CameraContext, extra_payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    async def attach_clip_payload(self, *, msg: NotificationMessage, ctx: CameraContext, extra_payload: Optional[Dict[str, Any]], requires_approval: bool = False) -> Optional[Dict[str, Any]]:
         clip_service = self._clip_service
         if clip_service is None:
             return extra_payload
@@ -456,6 +471,7 @@ class ClipManager:
                     event_ts_ms=msg.ts_ms,
                     trigger=f"site_prerecord:{msg.camera_uuid}:{trigger_mode}:{msg.alert_type}",
                     overlay_payload=overlay_payload,
+                    requires_approval=requires_approval,
                 ),
                 timeout=self._trigger_camera_timeout_s,
             )
@@ -476,7 +492,7 @@ class ClipManager:
         if plan is None:
             return merged or extra_payload
 
-        multi_clips = await self._capture_site_prerecord_clips(msg=msg, ctx=ctx, plan=plan, trigger_clip=clip)
+        multi_clips = await self._capture_site_prerecord_clips(msg=msg, ctx=ctx, plan=plan, trigger_clip=clip, requires_approval=requires_approval)
         if multi_clips:
             merged["multi_camera_prerecordings"] = multi_clips
 

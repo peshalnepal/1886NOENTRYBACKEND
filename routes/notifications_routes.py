@@ -570,6 +570,13 @@ async def _decide_notifications(
             await _publish_approved_to_owner(hub=hub, db=db, ids=ids, target_sites=target_sites)
         except Exception:
             logger.exception("Failed to publish approved notifications to owner ids=%s", ids)
+    if notification_service is not None:
+        try:
+            await notification_service.set_clips_approval_for_notifications(
+                notification_ids=ids, site_uuids=target_sites, approved=approve,
+            )
+        except Exception:
+            logger.exception("Failed to reconcile clip approval for notifications ids=%s", ids)
     # When the operator marks the alert important, also email the site's
     # configured recipients. Fire-and-forget so the request doesn't block on SMTP.
     if approve and email_owner and notification_service is not None:
@@ -606,9 +613,13 @@ async def reject_notification(
     notification_id: int,
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
+    notification_service: NotificationService = Depends(get_notification_service),
 ):
     """Operator rejects a held alert; it stays hidden from admins/members."""
-    affected = await _decide_notifications(db=db, ctx=ctx, ids=[notification_id], approve=False)
+    affected = await _decide_notifications(
+        db=db, ctx=ctx, ids=[notification_id], approve=False,
+        notification_service=notification_service,
+    )
     return {"rejected": affected}
 
 
@@ -632,9 +643,11 @@ async def reject_notifications_bulk(
     payload: ApprovalRequest,
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
+    notification_service: NotificationService = Depends(get_notification_service),
 ):
     affected = await _decide_notifications(
-        db=db, ctx=ctx, ids=payload.notification_ids, approve=False
+        db=db, ctx=ctx, ids=payload.notification_ids, approve=False,
+        notification_service=notification_service,
     )
     return {"rejected": affected}
 

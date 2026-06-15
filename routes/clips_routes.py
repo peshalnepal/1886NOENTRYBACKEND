@@ -439,9 +439,13 @@ async def list_clips(
         .limit(min(int(limit), 200))
     )
 
-    # Platform admins see every clip; regular users see only their own.
+    # Platform admins see every clip; regular users see only their own, and only
+    # once they're visible. When the site's org has an operator, freshly captured
+    # clips are held invisible until the operator approves the matching alert, so
+    # end users never get the playback before review.
     if not bool(getattr(user, "is_platform_admin", False)):
         stmt = stmt.where(Camera.user_id == int(user.id))
+        stmt = stmt.where(VideoRecord.visible.is_(True))
 
     if site_uuid is not None:
         stmt = stmt.where(Camera.site_uuid == site_uuid)

@@ -12,7 +12,7 @@ import httpx
 from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobSasPermissions, ContentSettings, generate_blob_sas
 from azure.storage.blob.aio import BlobServiceClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.notification_repository import CameraContext
@@ -308,6 +308,23 @@ def extract_notification_clip_storage_keys(payload: Any) -> List[str]:
 
     _collect(payload.get("clip"))
     return list(dict.fromkeys(keys))
+
+
+def extract_notification_clip_external_ids(payload: Any) -> List[str]:
+    """Extract clip external_id values embedded in a notification payload.
+
+    Used to flip the captured VideoRecord(s) for an alert visible/hidden when an
+    operator approves or rejects it (clips are matched to alerts by external_id,
+    since there is no FK between them).
+    """
+    if not isinstance(payload, dict):
+        return []
+    ids: List[str] = []
+    clips=payload.get("clip")
+    ext = str(clips.get("external_id") or "").strip()
+    if ext:
+        ids.append(ext)
+    return list(dict.fromkeys(ids))
 
 
 class EventClipService:
@@ -612,6 +629,7 @@ class EventClipService:
         recording_url: Optional[str] = None,
         overlay_payload: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
+        requires_approval: bool = False,
     ) -> None:
         if self._session_factory is None:
             return
@@ -633,10 +651,39 @@ class EventClipService:
                 recording_url=recording_url,
                 overlay_payload=overlay_payload,
                 error=error,
+                visible=not requires_approval,
+                approval_status="pending" if requires_approval else "approved",
             )
             db.add(row)
             await db.commit()
             await db.refresh(row)
+
+    async def set_clips_approval(self, *, external_ids: List[str], approved: bool) -> int:
+        """Flip stored clips' operator-approval state, matched by external_id.
+
+        Called when an operator approves/rejects an alert: approval makes the
+        captured playback visible to the end user; rejection keeps it hidden.
+        Returns the number of rows updated.
+        """
+        if self._session_factory is None:
+            return 0
+
+        clean_ids = [str(e).strip() for e in (external_ids or []) if str(e or "").strip()]
+        if not clean_ids:
+            return 0
+
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(VideoRecord)
+                .where(VideoRecord.external_id.in_(clean_ids))
+                .values(
+                    visible=bool(approved),
+                    approval_status="approved" if approved else "rejected",
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await db.commit()
+            return int(result.rowcount or 0)
 
     async def update_overlay_payload(
         self,
@@ -685,6 +732,7 @@ class EventClipService:
         event_ts_ms: Optional[int] = None,
         trigger: Optional[str] = None,
         overlay_payload: Optional[Dict[str, Any]] = None,
+        requires_approval: bool = False,
     ) -> Optional[Dict[str, Any]]:
         if not self.enabled:
             return None
@@ -768,6 +816,7 @@ class EventClipService:
                             storage_key="",
                             recording_url=recording_url,
                             overlay_payload=overlay_payload,
+                            requires_approval=requires_approval,
                         )
                     except Exception:
                         logger.exception(
@@ -833,6 +882,7 @@ class EventClipService:
                         storage_key=storage_key,
                         recording_url=recording_url,
                         overlay_payload=overlay_payload,
+                        requires_approval=requires_approval,
                     )
                 except Exception:
                     logger.exception(
