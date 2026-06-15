@@ -316,6 +316,57 @@ class NotificationRepository:
         await db.execute(stmt)
         await db.flush()
 
+    async def append_note(
+        self,
+        db: AsyncSession,
+        *,
+        notification_id: int,
+        text: str,
+        author_id: int,
+        author_name: Optional[str] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
+    ) -> Optional[Notification]:
+        """Append an operator note to a notification's payload.
+
+        Notes accumulate as a list under ``payload["notes"]`` so they can later
+        be rolled up into the per-organization end-of-day report. Scoped to
+        ``site_uuids`` (the caller's readable sites) so an operator cannot annotate
+        notifications outside their organization. Returns the updated row, or
+        ``None`` when no in-scope notification matches.
+        """
+        nid = int(notification_id)
+        if nid <= 0:
+            return None
+
+        note_text = str(text or "").strip()
+        if not note_text:
+            return None
+
+        conds = self._notification_conditions(ids=[nid], site_uuids=site_uuids)
+        stmt = select(Notification)
+        if conds:
+            stmt = stmt.where(and_(*conds))
+        row = (await db.execute(stmt)).scalar_one_or_none()
+        if row is None:
+            return None
+
+        payload = dict(row.payload) if isinstance(row.payload, dict) else {}
+        existing = payload.get("notes")
+        notes = list(existing) if isinstance(existing, list) else []
+        notes.append(
+            {
+                "text": note_text,
+                "author_id": int(author_id),
+                "author_name": str(author_name or "") or None,
+                "created_at": utc_now().isoformat(),
+            }
+        )
+        payload["notes"] = notes
+        # Reassign (rather than mutate in place) so SQLAlchemy detects the JSON change.
+        row.payload = payload
+        await db.flush()
+        return row
+
     async def mark_notification_sent(
         self,
         db: AsyncSession,

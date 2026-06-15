@@ -453,6 +453,13 @@ class DeviceOut(BaseModel):
 
 
 # --- Notification schemas ---
+class NotificationNote(BaseModel):
+    text: str
+    author_id: Optional[int] = None
+    author_name: Optional[str] = None
+    created_at: Optional[str] = None
+
+
 class NotificationOut(BaseModel):
     id: int
     user_id: int
@@ -469,6 +476,7 @@ class NotificationOut(BaseModel):
     image_storage_key: Optional[str] = None
     clip_url: Optional[str] = None
     clip_status: Optional[str] = None
+    notes: List[NotificationNote] = Field(default_factory=list)
     detected_at: datetime
     created_at: datetime
     read_at: Optional[datetime] = None

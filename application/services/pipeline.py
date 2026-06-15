@@ -67,6 +67,51 @@ from application.services.overlay_normalize import (
 )
 
 
+def _humanize_roi_alert(cls_name: Any, ctx: CameraContext) -> Tuple[str, str]:
+    """Build a human-readable title/body for an ROI-enter alert.
+
+    Replaces the old debug-style ``"car entered ROI <uuid>-roi (track 112809)"``
+    with operator-friendly copy like ``"Car entered the restricted zone at
+    Front Gate · Main Site"``. The class word is preserved in the body so the
+    downstream object-name inference (regex over the body) still works, and the
+    location is drawn from the resolved camera/site names rather than raw UUIDs.
+    The timestamp is rendered by the client from ``ts_ms``, so it is not
+    duplicated in the text.
+    """
+    label = (str(cls_name or "object").strip() or "object")
+    label = label[:1].upper() + label[1:]
+
+    loc_parts = [p for p in (getattr(ctx, "camera_name", None), getattr(ctx, "site_name", None)) if p]
+    location = ", ".join(loc_parts) if loc_parts else "the monitored area"
+
+    title = f"{label} entered restricted zone"
+    body = f"{label} entered the restricted zone at {location}"
+    return title, body
+
+
+def _humanize_item_detected(cls_name: Any, conf: float, ctx: CameraContext) -> Tuple[str, str]:
+    """Build a human-readable title/body for a confirmed-detection alert.
+
+    Replaces the old ``"car confirmed (track_id=112809, conf=0.87)"`` debug
+    string with operator-friendly copy. Keeps the class word in the body so the
+    downstream object-name inference still works.
+    """
+    label = (str(cls_name or "object").strip() or "object")
+    label = label[:1].upper() + label[1:]
+
+    loc_parts = [p for p in (getattr(ctx, "camera_name", None), getattr(ctx, "site_name", None)) if p]
+    location = ", ".join(loc_parts) if loc_parts else "the monitored area"
+
+    try:
+        pct = max(0, min(100, int(round(float(conf) * 100))))
+    except (TypeError, ValueError):
+        pct = 0
+
+    title = f"{label} detected"
+    body = f"{label} detected at {location} ({pct}% confidence)"
+    return title, body
+
+
 def _live_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Filter raw tracker output down to the tracks that should actually be drawn
@@ -979,6 +1024,8 @@ class ModelPipeline:
             raw_track_id = a.get("track_id")
             track_id = int(raw_track_id) if raw_track_id is not None else None
 
+            roi_title, roi_body = _humanize_roi_alert(a.get("cls_name"), ctx)
+
             msg = NotificationMessage(
                 user_id=int(ctx.user_id),
                 id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-{a.get('roi_id')}-{a.get('track_id')}",
@@ -986,8 +1033,8 @@ class ModelPipeline:
                 camera_uuid=cam_uuid,
                 site_uuid=str(ctx.site_uuid),
                 site_name=ctx.site_name,
-                title=f"ROI Alert ({a.get('type','roi')})",
-                body=f"{a.get('cls_name','object')} entered ROI {a.get('roi_id')} (track {a.get('track_id')})",
+                title=roi_title,
+                body=roi_body,
                 alert_type="roi_enter",
                 cls_names=[str(a.get("cls_name", "object"))],
                 max_conf=float(a.get("conf", 0.0) or 0.0),
@@ -1054,6 +1101,8 @@ class ModelPipeline:
             cls_name = str(tr.get("cls_name") or "object")
             conf = float(tr.get("conf", 0.0) or 0.0)
 
+            item_title, item_body = _humanize_item_detected(cls_name, conf, ctx)
+
             msg = NotificationMessage(
                 user_id=int(ctx.user_id),
                 id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-track-{track_id}",
@@ -1061,8 +1110,8 @@ class ModelPipeline:
                 camera_uuid=cam_uuid,
                 site_uuid=str(ctx.site_uuid),
                 site_name=ctx.site_name,
-                title=f"Item Detected: {cls_name}",
-                body=f"{cls_name} confirmed (track_id={track_id}, conf={conf:.2f})",
+                title=item_title,
+                body=item_body,
                 alert_type="item_detected",
                 cls_names=[cls_name],
                 max_conf=conf,

@@ -158,6 +158,15 @@ def _payload_msg(payload: Any) -> Dict[str, Any]:
     return payload
 
 
+def _payload_notes(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("notes")
+    if not isinstance(raw, list):
+        return []
+    return [n for n in raw if isinstance(n, dict)]
+
+
 def _to_out(n: Notification) -> NotificationOut:
     msg = _payload_msg(n.payload)
     extra = n.payload.get("extra") if isinstance(n.payload, dict) else None
@@ -201,6 +210,7 @@ def _to_out(n: Notification) -> NotificationOut:
         image_storage_key=image_storage_key or None,
         clip_url=clip_url or None,
         clip_status=clip_status or None,
+        notes=_payload_notes(n.payload),
         detected_at=n.detected_at,
         created_at=n.created_at,
         read_at=n.read_at,
@@ -650,6 +660,38 @@ async def reject_notifications_bulk(
         notification_service=notification_service,
     )
     return {"rejected": affected}
+
+
+class AddNoteRequest(BaseModel):
+    note: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/{notification_id}/note", response_model=NotificationOut)
+async def add_notification_note(
+    notification_id: int,
+    payload: AddNoteRequest,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
+):
+    """Attach an operator note to a notification.
+
+    Notes accumulate on the notification so they can be rolled up into the
+    organization's end-of-day report. Scoped to the operator's readable sites.
+    """
+    target_sites = await _notif_site_scope(db, ctx)
+    author_name = getattr(ctx.user, "user_name", None) or getattr(ctx.user, "email", None)
+    row = await notif_repo.append_note(
+        db,
+        notification_id=notification_id,
+        text=payload.note,
+        author_id=int(ctx.user.id),
+        author_name=author_name,
+        site_uuids=target_sites,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    await db.commit()
+    return _to_out(row)
 
 
 @router.post("/delete")
