@@ -50,7 +50,7 @@ from core.schemas import (
     DetectionOut,
 )  # type: ignore
 from application.services.manager import Manager
-from application.services.pipeline import _overlay_payload_from_resp
+from application.services.pipeline import _overlay_payload_from_resp, _live_tracks
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/cameras", tags=["cameras"])
@@ -257,7 +257,7 @@ def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
 
     merged = _overlay_payload_from_resp(
         resp,
-        fallback_detections=list(getattr(resp, "tracks", ()) or ()),
+        fallback_detections=_live_tracks(list(getattr(resp, "tracks", ()) or ())),
     ).get("detections") or []
 
     items: List[DetectionItemOut] = []

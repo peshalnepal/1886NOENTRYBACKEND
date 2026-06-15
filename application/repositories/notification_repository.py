@@ -14,6 +14,7 @@ from application.dtos import (
     NotificationEmailCreateDTO,
     SitePrerecordSettingsDTO,
 )
+from application.repositories._helpers import as_uuid as _as_uuid, normalize_uuid_list
 from core.database_orm import (
     Camera,
     Site,
@@ -33,14 +34,6 @@ SitePrerecordSettings = SitePrerecordSettingsDTO
 
 def dt_from_ts_ms(ts_ms: int) -> datetime:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
-
-
-def _as_uuid(v: Any) -> Optional[uuid.UUID]:
-    if v is None:
-        return None
-    if isinstance(v, uuid.UUID):
-        return v
-    return uuid.UUID(str(v))
 
 
 def _normalize_trigger_mode(raw: Any) -> str:
@@ -66,27 +59,6 @@ def _coerce_playback_mode(raw: Any) -> str:
     if value in ("always", "never", "inherit"):
         return value
     return "inherit"
-
-
-def _normalize_uuid_list(raw: Any) -> List[uuid.UUID]:
-    if not isinstance(raw, (list, tuple, set)):
-        return []
-
-    seen = set()
-    out: List[uuid.UUID] = []
-    for item in raw:
-        try:
-            parsed = _as_uuid(item)
-        except Exception:
-            parsed = None
-        if parsed is None:
-            continue
-        key = str(parsed)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(parsed)
-    return out
 
 
 class NotificationRepository:
@@ -153,7 +125,7 @@ class NotificationRepository:
         user_id: int,
         camera_uuids: List[uuid.UUID],
     ) -> Dict[uuid.UUID, CameraContext]:
-        camera_uuid_values = _normalize_uuid_list(camera_uuids or [])
+        camera_uuid_values = normalize_uuid_list(camera_uuids or [])
         if not camera_uuid_values:
             return {}
 
@@ -228,7 +200,7 @@ class NotificationRepository:
 
         return SitePrerecordSettings(
             enabled=bool(block.get("enabled")),
-            camera_uuids=_normalize_uuid_list(block.get("camera_uuids")),
+            camera_uuids=normalize_uuid_list(block.get("camera_uuids")),
             trigger_mode=_normalize_trigger_mode(block.get("trigger_mode")),
         )
 
@@ -668,20 +640,14 @@ class NotificationRepository:
         user_id: int,
         site_uuid: Optional[uuid.UUID] = None,
         camera_uuid: Optional[uuid.UUID] = None,
-        visible_supported: bool = True,
     ) -> int:
-        filters = [Notification.user_id == user_id]
+        filters = [Notification.user_id == user_id, Notification.visible == True]
         if site_uuid is not None:
             filters.append(Notification.site_uuid == site_uuid)
         if camera_uuid is not None:
             filters.append(Notification.camera_uuid == camera_uuid)
-            
-        if visible_supported:
-            filters.append(Notification.visible == True)
-            stmt = update(Notification).where(*filters).values(visible=False)
-        else:
-            stmt = delete(Notification).where(*filters)
-            
+
+        stmt = update(Notification).where(*filters).values(visible=False)
         result = await db.execute(stmt)
         return result.rowcount
 
@@ -693,17 +659,13 @@ class NotificationRepository:
         site_uuid: Optional[uuid.UUID] = None,
         camera_uuid: Optional[uuid.UUID] = None,
         batch_size: int = 5000,
-        visible_supported: bool = True,
     ):
-        filters = [Notification.user_id == user_id]
+        filters = [Notification.user_id == user_id, Notification.visible == True]
         if site_uuid is not None:
             filters.append(Notification.site_uuid == site_uuid)
         if camera_uuid is not None:
             filters.append(Notification.camera_uuid == camera_uuid)
-            
-        if visible_supported:
-            filters.append(Notification.visible == True)
-            
+
         stmt = select(Notification.payload).where(*filters)
         result = await db.stream(stmt.execution_options(yield_per=batch_size))
         
@@ -725,7 +687,6 @@ class NotificationRepository:
         bucket_minutes: int,
         bucket_ms: int,
         site_uuid: Optional[uuid.UUID] = None,
-        visible_supported: bool = False,
         needs_payload_filter: bool = False,
         roi_only: bool = False,
         class_filter: Optional[str] = None,
@@ -757,10 +718,9 @@ class NotificationRepository:
                 .where(
                     site_scope,
                     Notification.detected_at >= start,
+                    Notification.visible.is_(True),
                 )
             )
-            if visible_supported:
-                stmt = stmt.where(Notification.visible.is_(True))
             if su:
                 stmt = stmt.where(Notification.site_uuid == su)
             stmt = stmt.group_by(literal_column("bucket_start"))
@@ -783,9 +743,8 @@ class NotificationRepository:
         ).where(
             site_scope,
             Notification.detected_at >= start,
+            Notification.visible.is_(True),
         )
-        if visible_supported:
-            stmt = stmt.where(Notification.visible.is_(True))
         if su:
             stmt = stmt.where(Notification.site_uuid == su)
 

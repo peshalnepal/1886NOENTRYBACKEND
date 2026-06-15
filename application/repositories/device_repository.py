@@ -16,15 +16,8 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.dtos import DeviceCreateDTO, DeviceUpdateDTO
+from application.repositories._helpers import as_uuid as _as_uuid
 from core.database_orm import Camera, Device, SiteDevice
-
-
-def _as_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    if isinstance(value, uuid.UUID):
-        return value
-    return uuid.UUID(str(value))
 
 
 class DeviceRepository:

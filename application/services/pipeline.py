@@ -67,6 +67,40 @@ from application.services.overlay_normalize import (
 )
 
 
+def _live_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filter raw tracker output down to the tracks that should actually be drawn
+    on the live overlay (and recorded for playback).
+
+    The tracker keeps "coasting" tracks alive for several frames after they stop
+    matching a detection (occlusion / flicker tolerance). Those tracks have no
+    real detection backing them on the current frame — their bbox is pure
+    velocity extrapolation that, for fast objects, freezes in place and leaves a
+    trail of stale ghost boxes behind the moving object.
+
+    For rendering we only want tracks that:
+      - were updated by a detection THIS frame (``misses == 0``), and
+      - are confirmed (survived ``min_hits``), so a single spurious detection
+        does not flash an ID'd box for one frame.
+
+    The raw Jetson detections are still drawn separately, so a real object is
+    never hidden by this filter — it only suppresses the ID'd ghost boxes.
+    """
+    out: List[Dict[str, Any]] = []
+    for t in tracks:
+        if not isinstance(t, dict):
+            continue
+        if not t.get("confirmed", False):
+            continue
+        try:
+            if int(t.get("misses", 0) or 0) > 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        out.append(t)
+    return out
+
+
 def _overlay_payload_from_resp(
     resp: ObjDetectResponse,
     *,
@@ -660,7 +694,7 @@ class ModelPipeline:
                         or await svc.is_camera_prerecord_eligible(cam_uuid)
                     )
                     if _prerecord_ok:
-                        base_overlay = _overlay_payload_from_resp(resp2, fallback_detections=resp2.tracks)
+                        base_overlay = _overlay_payload_from_resp(resp2, fallback_detections=_live_tracks(list(resp2.tracks)))
                         await svc.record_detection_overlay_frame(
                             camera_uuid=cam_uuid,
                             frame_ts_ms=base_overlay.get("frame_ts_ms"),

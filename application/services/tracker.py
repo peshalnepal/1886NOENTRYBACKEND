@@ -87,16 +87,21 @@ class Track:
     # velocity is now 3D: [vcx, vcy, vh]. Aspect ratio is held constant — see predict().
     vel: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
 
-    def predict(self, now_ts: float) -> BBox:
-        dt = min(max(1e-3, now_ts - self.last_ts), 0.15)
+    def predict(self, now_ts: float, max_dt: float = 0.5) -> BBox:
+        # dt is clamped so a noisy velocity estimate can't fling the predicted
+        # box across the frame. ``max_dt`` is supplied by the tracker and scales
+        # with the observed frame interval: at 0.1-0.25 FPS we still extrapolate
+        # ~one frame ahead instead of the old fixed 0.15s, which made prediction
+        # a no-op for slow/irregular streams.
+        dt = min(max(1e-3, now_ts - self.last_ts), max(1e-3, max_dt))
         state = _xyxy_to_cxcyah(self.bbox)                 # convert current bbox into (cx, cy, a, h)
         state[0] += self.vel[0] * dt                       # advance center x by vcx*dt
         state[1] += self.vel[1] * dt                       # advance center y by vcy*dt
         state[3] += self.vel[2] * dt                       # advance height by vh*dt (aspect 'a' is untouched)
         return _cxcyah_to_xyxy(state)                      # convert back to xyxy for IoU computation
 
-    def update(self, det_bbox: BBox, det_score: float, now_ts: float, alpha: float = 0.65) -> None:
-        dt = max(1e-3, now_ts - self.last_ts)              # time since last observation
+    def update(self, det_bbox: BBox, det_score: float, now_ts: float, alpha: float = 0.4, max_dt: float = 0.5) -> None:
+        dt = min(max(1e-3, now_ts - self.last_ts), max(1e-3, max_dt))           # time since last observation
         old = _xyxy_to_cxcyah(self.bbox)                   # previous state in cxcyah
         new = _xyxy_to_cxcyah(det_bbox)                    # new detection in cxcyah
         new_vel = np.array([
@@ -125,6 +130,25 @@ class ByteTrackLite:
       - stage2: match remaining tracks with low-conf dets (helps with flicker)
       - create new tracks from unmatched high-conf dets
       - confirm after min_hits
+
+    Low / irregular FPS robustness
+    ------------------------------
+    This tracker is designed to run on streams where a single Jetson cycles
+    through ~20 cameras, so each camera may only deliver one frame every 4-10s
+    (0.1-0.25 FPS), and the interval jitters. To cope:
+
+      * Every time-based threshold self-tunes to the *observed* inter-frame
+        interval (an EMA of dt), instead of assuming ~30 FPS. A fixed 0.1s
+        staleness budget used to purge every track on the very next frame, so
+        nothing ever survived long enough to confirm.
+      * Velocity prediction is allowed to extrapolate ~one frame ahead rather
+        than a fixed 0.15s.
+
+    Association stays IoU-only (overlap-based). By default the public output is
+    realtime-only: tracks that did not match a detection on the current frame
+    are kept only inside the tracker, never emitted as drawable boxes. This
+    prevents old bboxes from trailing fast-moving objects while still allowing
+    callers to raise ``max_misses`` for short internal occlusion tolerance.
     """
     def __init__(
         self,
@@ -133,46 +157,95 @@ class ByteTrackLite:
         min_iou_high: float = 0.30,
         min_iou_low: float = 0.20,
         min_hits: int = 2,
-        max_misses: int = 15,
-        max_stale_s: float = 3.0,
+        max_misses: int = 0,
+        max_stale_s: Optional[float] = None,
+        stale_frames: float = 2.0,
+        predict_horizon_frames: float = 1.5,
         match_same_class: bool = True,
+        emit_coasting_tracks: bool = False,
     ) -> None:
         self.high_th = float(high_th)
         self.low_th = float(low_th)
         self.min_iou_high = float(min_iou_high)
         self.min_iou_low = float(min_iou_low)
         self.min_hits = int(min_hits)
+        # max_misses = 0: drop a track as soon as it misses a frame. Raise it
+        # only if you want short internal occlusion tolerance. Public output
+        # still suppresses missed tracks unless emit_coasting_tracks=True.
         self.max_misses = int(max_misses)
-        self.max_stale_s = float(max_stale_s)
+        # max_stale_s: absolute-time staleness budget. Leave as None (default) to
+        # derive it from the observed frame interval so the tracker self-tunes to
+        # whatever (possibly very low / irregular) FPS each camera delivers. Set
+        # an explicit value only to hard-override that behaviour.
+        self.max_stale_s = float(max_stale_s) if max_stale_s is not None else None
+        # How many frames a track may coast (when deriving max_stale_s) and how
+        # far ahead predict() may extrapolate, both measured in frame intervals.
+        self.stale_frames = float(stale_frames)
+        self.predict_horizon_frames = float(predict_horizon_frames)
         self.match_same_class = bool(match_same_class)
+        self.emit_coasting_tracks = bool(emit_coasting_tracks)
 
         self._next_id = 1
         self._tracks: List[Track] = []
 
+        # Observed inter-frame interval (EMA, seconds) and the timestamp of the
+        # previous update(), used to make all thresholds frame-rate adaptive.
+        self._dt_ema: Optional[float] = None
+        self._last_now_ts: Optional[float] = None
+
+    def _frame_interval(self) -> float:
+        """Best estimate of the current inter-frame interval (seconds)."""
+        return float(self._dt_ema) if self._dt_ema is not None else 0.0
+
     def _purge(self, now_ts: float) -> None:
+        interval = self._frame_interval()
+        if self.max_stale_s is not None:
+            stale_budget = self.max_stale_s
+        else:
+            # Allow ~stale_frames frames of coasting, with a 1.5x jitter margin
+            # and a small floor so high-FPS streams still behave sensibly. This
+            # is the key low-FPS fix: a fixed 0.1s budget purged every track on
+            # the next frame (5-10s later) before it could ever confirm.
+            stale_budget = max(0.5, interval * self.stale_frames * 1.5)
         kept: List[Track] = []
         for t in self._tracks:
             stale_s = now_ts - t.last_update_ts
-            if stale_s > self.max_stale_s:
+            if stale_s > stale_budget:
                 continue
             if t.misses > self.max_misses:
                 continue
             kept.append(t)
         self._tracks = kept
-        
+
     def update(self, detections: List[Dict[str, Any]], ts_s: Optional[float] = None) -> Dict[str, Any]:
         now_ts = float(ts_s if ts_s is not None else time.time())
+
+        # Track the observed inter-frame interval so every time-based threshold
+        # self-tunes to the actual delivery rate (which for a Jetson cycling
+        # through ~20 cameras can be one frame every 4-10s). The pipeline only
+        # forwards forward-progressing frames, so dt is normally positive; guard
+        # anyway against the rare Jetson-restart timestamp regression.
+        if self._last_now_ts is not None:
+            raw_dt = now_ts - self._last_now_ts
+            if raw_dt > 0:
+                self._dt_ema = raw_dt if self._dt_ema is None else (0.7 * self._dt_ema + 0.3 * raw_dt)
+        self._last_now_ts = now_ts
+
         self._purge(now_ts)
         hi = [d for d in detections if float(d["conf"]) >= self.high_th]                 # high-conf dets
         lo = [d for d in detections if self.low_th <= float(d["conf"]) < self.high_th]   # low-conf dets
 
         events: List[Tuple[str, int]] = []
-        pred = [t.predict(now_ts) for t in self._tracks]                                 # predicted bbox per track
+        # Extrapolate/update up to ~predict_horizon_frames of motion (bounded by
+        # the observed interval) rather than a fixed sub-second window.
+        max_track_dt = max(0.15, self._frame_interval() * self.predict_horizon_frames)
+        pred = [t.predict(now_ts, max_track_dt) for t in self._tracks]                   # predicted bbox per track
 
         # split tracks: confirmed get priority access to high-conf detections
         confirmed_idxs = [i for i, t in enumerate(self._tracks) if t.confirmed]
         tentative_idxs = [i for i, t in enumerate(self._tracks) if not t.confirmed]
         matched_track_idxs: set = set()                                                  # tracks that got a det this frame
+        live_track_ids: set[int] = set()                                                  # track IDs updated/created this frame
 
         def _match(track_idxs, det_idxs, det_list, min_iou):
             """Hungarian match between a subset of tracks and a subset of detections."""
@@ -202,7 +275,8 @@ class ByteTrackLite:
         for ti, dj in _match(confirmed_idxs, unmatched_hi, hi, self.min_iou_high):
             matched_track_idxs.add(ti)
             unmatched_hi.discard(dj)                                                      # this det is taken
-            self._tracks[ti].update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts)
+            self._tracks[ti].update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts, max_dt=max_track_dt)
+            live_track_ids.add(self._tracks[ti].track_id)
             # no confirmation event needed — track was already confirmed
 
         # ─── Stage 1b: tentative tracks ↔ remaining high-conf detections ───
@@ -210,7 +284,8 @@ class ByteTrackLite:
             matched_track_idxs.add(ti)
             unmatched_hi.discard(dj)
             t = self._tracks[ti]
-            t.update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts)
+            t.update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts, max_dt=max_track_dt)
+            live_track_ids.add(t.track_id)
             if t.hits >= self.min_hits:                                                   # graduate to confirmed if enough hits
                 t.confirmed = True
                 events.append(("track_confirmed", t.track_id))
@@ -223,7 +298,8 @@ class ByteTrackLite:
             unmatched_lo.discard(dj)
             t = self._tracks[ti]
             was_confirmed = t.confirmed
-            t.update(lo[dj]["bbox"], float(lo[dj]["conf"]), now_ts)
+            t.update(lo[dj]["bbox"], float(lo[dj]["conf"]), now_ts, max_dt=max_track_dt)
+            live_track_ids.add(t.track_id)
             if (not was_confirmed) and t.hits >= self.min_hits:
                 t.confirmed = True
                 events.append(("track_confirmed", t.track_id))
@@ -247,11 +323,21 @@ class ByteTrackLite:
                 last_ts=now_ts,
                 last_update_ts=now_ts,
             ))
+            live_track_ids.add(tid)
             events.append(("track_created", tid))
 
-        # Output (unchanged)
+        # Apply the miss/stale budget before returning. Without this, a track
+        # that just missed is emitted for one extra frame and can be drawn
+        # beside the newly-created track for a fast object that jumped ahead.
+        self._purge(now_ts)
+
+        # Output only tracks backed by a detection on this update. Coasting
+        # tracks keep their previous bbox, so emitting them is the visible stale
+        # box bug for fast objects that jumped to a new location.
         out_tracks = []
         for t in self._tracks:
+            if not self.emit_coasting_tracks and t.track_id not in live_track_ids:
+                continue
             out_tracks.append({
                 "track_id": t.track_id,
                 "cls_name": t.cls_name,

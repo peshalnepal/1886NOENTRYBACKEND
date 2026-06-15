@@ -14,15 +14,8 @@ from typing import Any, List, Optional
 from sqlalchemy import and_, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from application.repositories._helpers import as_uuid as _as_uuid
 from core.database_orm import VideoRecord
-
-
-def _as_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    if isinstance(value, uuid.UUID):
-        return value
-    return uuid.UUID(str(value))
 
 
 class VideoRepository:

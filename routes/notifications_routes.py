@@ -16,7 +16,7 @@ from application.services.notification import WebNotificationHub
 from application.services.notification.types import NotificationMessage
 from application.repositories.notification_repository import NotificationRepository
 from application.repositories.site_repository import SiteRepository
-from application.repositories.notification_visibility import notification_visible_supported
+from application.repositories._helpers import as_uuid as _as_uuid
 from application.services.authz_service import AuthzService
 from core.security.roles import OrgRole
 from application.services.user_snapshot_cache import (
@@ -67,6 +67,18 @@ async def _notif_site_scope(db: AsyncSession, ctx: OrgContext) -> List[uuid.UUID
     if accessible is None:
         return org_sites
     return [s for s in org_sites if s in accessible]
+
+
+async def _resolve_target_sites(
+    db: AsyncSession, ctx: OrgContext, site_uuid: Optional[str]
+) -> Tuple[Optional[uuid.UUID], List[uuid.UUID]]:
+    """Parse the requested site filter and intersect it with the caller's
+    readable sites. Returns ``(parsed_uuid, target_sites)``."""
+    su = _as_uuid(site_uuid)
+    target_sites = await _notif_site_scope(db, ctx)
+    if su is not None:
+        target_sites = [su] if su in target_sites else []
+    return su, target_sites
 
 
 # -------------------------------------------------------------------
@@ -125,18 +137,8 @@ async def _resolve_stream_user(
 
 
 # -------------------------------------------------------------------
-# response / request models
-# -------------------------------------------------------------------
-# -------------------------------------------------------------------
 # shared helpers
 # -------------------------------------------------------------------
-def _parse_optional_uuid(value: Optional[str], field_name: str) -> Optional[uuid.UUID]:
-    if not value:
-        return None
-    try:
-        return uuid.UUID(value)
-    except Exception:
-        raise HTTPException(status_code=422, detail=f"Invalid {field_name}")
 
 
 def _validate_pagination(limit: int, offset: int) -> Tuple[int, int]:
@@ -204,59 +206,6 @@ def _to_out(n: Notification) -> NotificationOut:
         read_at=n.read_at,
         sent_at=n.sent_at,
         status=str(n.status),
-    )
-
-
-def _to_out_row(r) -> NotificationOut:
-    """Build NotificationOut from a column-level select Row (not a full ORM object)."""
-    payload = r.payload
-    msg = _payload_msg(payload)
-    extra = payload.get("extra") if isinstance(payload, dict) else None
-
-    image_url = ""
-    image_storage_key = ""
-    clip_url = ""
-    clip_status = ""
-
-    if isinstance(extra, dict):
-        image_url = str(extra.get("image_url") or "").strip()
-        image_storage_key = str(extra.get("image_storage_key") or "").strip()
-
-    if not image_url:
-        image_url = str(msg.get("image_url") or "").strip()
-    if not image_storage_key:
-        image_storage_key = str(msg.get("image_storage_key") or "").strip()
-
-    clip_url = str(msg.get("clip_url") or "").strip()
-    clip_status = str(msg.get("clip_status") or "").strip()
-
-    if isinstance(extra, dict) and not clip_url:
-        clip_payload = extra.get("clip")
-        if isinstance(clip_payload, dict):
-            clip_url = str(clip_payload.get("recording_url") or "").strip()
-            clip_status = str(clip_payload.get("status") or "").strip()
-
-    return NotificationOut(
-        id=int(r.id),
-        user_id=int(r.user_id),
-        site_uuid=str(r.site_uuid),
-        camera_uuid=str(r.camera_uuid) if r.camera_uuid else None,
-        site_name=str(msg.get("site_name") or "") or None,
-        camera_name=str(msg.get("camera_name") or "") or None,
-        device_uuid=str(r.device_uuid) if r.device_uuid else None,
-        event_type=str(r.event_type),
-        title=r.title,
-        message=r.message,
-        payload=payload,
-        image_url=image_url or None,
-        image_storage_key=image_storage_key or None,
-        clip_url=clip_url or None,
-        clip_status=clip_status or None,
-        detected_at=r.detected_at,
-        created_at=r.created_at,
-        read_at=r.read_at,
-        sent_at=r.sent_at,
-        status=str(r.status),
     )
 
 
@@ -517,13 +466,9 @@ async def list_notifications(
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     limit, offset = _validate_pagination(limit, offset)
-    su = _parse_optional_uuid(site_uuid, "site_uuid")
-    cu = _parse_optional_uuid(camera_uuid, "camera_uuid")
-    visible_supported = await notification_visible_supported(db)
-    target_sites = await _notif_site_scope(db, ctx)
-    if su is not None:
-        target_sites = [su] if su in target_sites else []
-    only_visible = None if _is_operator(ctx) else (True if visible_supported else None)
+    cu = _as_uuid(camera_uuid)
+    _, target_sites = await _resolve_target_sites(db, ctx, site_uuid)
+    only_visible = None if _is_operator(ctx) else True
 
     rows = await notif_repo.list_notifications(
         db,
@@ -547,10 +492,7 @@ async def list_pending_notifications(
 ):
     """Operator queue: alerts awaiting approval for the operator's org."""
     limit, offset = _validate_pagination(limit, offset)
-    su = _parse_optional_uuid(site_uuid, "site_uuid")
-    target_sites = await _notif_site_scope(db, ctx)
-    if su is not None:
-        target_sites = [su] if su in target_sites else []
+    _, target_sites = await _resolve_target_sites(db, ctx, site_uuid)
 
     rows = await notif_repo.list_notifications(
         db,
@@ -734,13 +676,8 @@ async def detections_over_time(
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
-    su = _parse_optional_uuid(site_uuid, "site_uuid")
     class_filter = _normalize_object_class(object_class)
-    visible_supported = await notification_visible_supported(db)
-
-    target_sites = await _notif_site_scope(db, ctx)
-    if su is not None:
-        target_sites = [su] if su in target_sites else []
+    su, target_sites = await _resolve_target_sites(db, ctx, site_uuid)
 
     hours_i = max(1, min(int(hours), 24 * 7))
     bucket_minutes = 60 if hours_i <= 24 else 24 * 60
@@ -761,7 +698,6 @@ async def detections_over_time(
         bucket_minutes=bucket_minutes,
         bucket_ms=bucket_ms,
         site_uuid=su,
-        visible_supported=visible_supported,
         needs_payload_filter=needs_payload_filter,
         roi_only=bool(roi_only),
         class_filter=class_filter,
@@ -803,14 +739,8 @@ async def unread_count(
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
-    su = _parse_optional_uuid(site_uuid, "site_uuid")
-    visible_supported = await notification_visible_supported(db)
-
-    target_sites = await _notif_site_scope(db, ctx)
-    if su is not None:
-        target_sites = [su] if su in target_sites else []
-
-    only_visible = None if _is_operator(ctx) else (True if visible_supported else None)
+    su, target_sites = await _resolve_target_sites(db, ctx, site_uuid)
+    only_visible = None if _is_operator(ctx) else True
 
     count = await notif_repo.count_notifications(
         db,

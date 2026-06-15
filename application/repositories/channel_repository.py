@@ -22,6 +22,8 @@ from sqlalchemy.orm import selectinload
 
 from application.channels.channel_config import VideoChannelConfig
 from application.dtos import CameraUpdateDTO, CameraUpsertDTO
+from application.repositories._helpers import as_uuid as _as_uuid
+from application.repositories.device_repository import DeviceRepository
 from core.database_orm import (
     Camera,
     ChannelConfiguration,
@@ -50,14 +52,6 @@ SUNDAY_TO_SATURDAY = [6, 0, 1, 2, 3, 4, 5]
 
 DEFAULT_START_TIME = time(0, 0, 0)
 DEFAULT_END_TIME = time(23, 59, 59)
-
-
-def _as_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    if isinstance(value, uuid.UUID):
-        return value
-    return uuid.UUID(str(value))
 
 
 class ChannelRepository:
@@ -391,7 +385,7 @@ class ChannelRepository:
     ) -> None:
         """Assign a device to a camera (the single device each camera must have)."""
         clean = _as_uuid(device_uuid)
-        await self._ensure_device_exists(db, clean)
+        await DeviceRepository().ensure_device_exists(db, clean)
         await db.execute(
             update(Camera)
             .where(Camera.camera_uuid == _as_uuid(camera_uuid))
@@ -628,11 +622,6 @@ class ChannelRepository:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    async def _ensure_device_exists(self, db: AsyncSession, device_uuid: uuid.UUID) -> None:
-        exists = (await db.execute(select(Device.device_uuid).where(Device.device_uuid == device_uuid))).scalar_one_or_none()
-        if exists is None:
-            raise ValueError(f"Device not found: {device_uuid}")
-
     async def _ensure_camera_has_exactly_one_device(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> None:
         assigned = (
             await db.execute(

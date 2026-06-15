@@ -96,6 +96,3 @@ class PipelineRepository:
             selectinload(Pipeline.cameras).selectinload(Camera.device),
         ).order_by(Pipeline.created_at.asc())
         return self._attach_channel_configs((await db.execute(stmt)).scalars().first())
-    
-    async def get_default_pipeline_for_user(self, db: AsyncSession, user_id: int) -> Optional[Pipeline]:
-        return await self.get_pipeline_by_userid(db, user_id)

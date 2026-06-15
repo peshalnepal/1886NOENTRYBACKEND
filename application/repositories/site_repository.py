@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.channels.channel_config import VideoChannelConfig
 from application.dtos import SiteCreateDTO, SiteSettingsUpsertDTO, SiteUpdateDTO
+from application.repositories._helpers import as_uuid as _as_uuid, normalize_uuid_list
 from core.database_orm import (
     Camera,
     ChannelConfiguration,
@@ -35,14 +36,6 @@ from core.database_orm import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _as_uuid(value: Any) -> Optional[uuid.UUID]:
-    if value is None:
-        return None
-    if isinstance(value, uuid.UUID):
-        return value
-    return uuid.UUID(str(value))
 
 
 class SiteRepository:
@@ -329,7 +322,7 @@ class SiteRepository:
         Use delete_site_graph_batched() for large sites — this variant is kept
         for small sites and tests. Flush only; caller commits.
         """
-        normalized = self._normalize_uuid_list(camera_uuids)
+        normalized = normalize_uuid_list(camera_uuids)
         sid = _as_uuid(site_uuid)
 
         await db.execute(delete(Notification).where(Notification.site_uuid == sid))
@@ -373,7 +366,7 @@ class SiteRepository:
 
         Returns: (stats_dict, alert_blob_keys, clip_blob_keys)
         """
-        normalized = self._normalize_uuid_list(camera_uuids)
+        normalized = normalize_uuid_list(camera_uuids)
         sid = _as_uuid(site_uuid)
 
         stats = {"notifications": 0, "videos": 0, "cameras": len(normalized)}
@@ -419,21 +412,6 @@ class SiteRepository:
     # ------------------------------------------------------------------
     # Deletion internals
     # ------------------------------------------------------------------
-    @staticmethod
-    def _normalize_uuid_list(values: Optional[List[uuid.UUID]]) -> List[uuid.UUID]:
-        out: List[uuid.UUID] = []
-        seen = set()
-        for value in values or []:
-            parsed = _as_uuid(value)
-            if parsed is None:
-                continue
-            key = str(parsed)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(parsed)
-        return out
-
     async def _batch_delete(
         self,
         session_factory,
@@ -524,7 +502,7 @@ class SiteRepository:
         camera_uuids: List[uuid.UUID],
     ) -> List[str]:
         """Return non-blank VideoRecord.storage_key values for the given cameras."""
-        normalized = self._normalize_uuid_list(camera_uuids)
+        normalized = normalize_uuid_list(camera_uuids)
         if not normalized:
             return []
         async with session_factory() as session:
@@ -548,7 +526,7 @@ class SiteRepository:
         Foreground delete of a user's camera rows and their relationship rows
         (pipeline membership + channel configs). Each in its own transaction.
         """
-        normalized = self._normalize_uuid_list(camera_uuids)
+        normalized = normalize_uuid_list(camera_uuids)
         if not normalized:
             return
         async with session_factory() as session:

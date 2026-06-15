@@ -11,7 +11,6 @@ import uuid
 from typing import Any, Dict, List, Optional, Set
 
 from application.repositories.notification_repository import NotificationRepository
-from application.repositories.notification_visibility import notification_visible_supported
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +89,11 @@ class NotificationDeleter:
             batch_ids = sorted_ids[i : i + batch_size]
             try:
                 async with self._session_factory() as db:
-                    visible_supported = await notification_visible_supported(db)
                     rows = await self._repo.list_notifications(
                         db,
                         user_id=int(user_id),
                         ids=batch_ids,
-                        only_visible=True if visible_supported else None,
+                        only_visible=True,
                     )
 
                     matched_ids: List[int] = []
@@ -117,10 +115,7 @@ class NotificationDeleter:
                     if not matched_ids:
                         continue
 
-                    if visible_supported:
-                        hidden_count = await self._repo.set_notifications_visibility(db, user_id=int(user_id), ids=matched_ids, visible=False)
-                    else:
-                        hidden_count = await self._repo.delete_notifications(db, user_id=int(user_id), ids=matched_ids)
+                    hidden_count = await self._repo.set_notifications_visibility(db, user_id=int(user_id), ids=matched_ids, visible=False)
                     await db.commit()
 
                     hidden_count = hidden_count or len(matched_ids)
@@ -135,13 +130,11 @@ class NotificationDeleter:
         """Hide notifications via a single bulk SQL statement, and clean up blobs via a streaming query."""
         try:
             async with self._session_factory() as db:
-                visible_supported = await notification_visible_supported(db)
                 affected_count = await self._repo.hide_notifications_by_filter(
                     db,
                     user_id=user_id,
                     site_uuid=site_uuid,
                     camera_uuid=camera_uuid,
-                    visible_supported=visible_supported,
                 )
                 await db.commit()
                 logger.info("Bulk hid %s notifications for user=%s site=%s camera=%s", affected_count, user_id, site_uuid, camera_uuid)
@@ -158,14 +151,12 @@ class NotificationDeleter:
         try:
             batch = []
             async with self._session_factory() as db:
-                visible_supported = await notification_visible_supported(db)
                 async for key in self._repo.iter_storage_keys_by_filter(
                     db,
                     user_id=user_id,
                     site_uuid=site_uuid,
                     camera_uuid=camera_uuid,
                     batch_size=5000,
-                    visible_supported=visible_supported,
                 ):
                     batch.append(key)
                     if len(batch) >= 1000:
