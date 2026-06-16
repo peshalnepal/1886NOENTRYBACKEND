@@ -321,8 +321,18 @@ class ModelPipeline:
         self.pipeline_id = pipeline_id
         self.detect_store = detect_store or InMemoryObjDetectStore()
         self.detection_hub = DetectionHub()
-        self._last_seen: Dict[str, Tuple[int, int]] = {}     
+        self._last_seen: Dict[str, Tuple[int, int]] = {}
         self._last_ok_s: Dict[str, float] = {}
+        # Clock-skew monitor: the Jetson stamps frame_ts_ms with its own wall
+        # clock, and the clip window is sliced out of MediaMTX recordings stamped
+        # with the Azure clock. If the Jetson clock drifts from UTC, every clip is
+        # shifted and the event falls outside the captured window. We can't fix the
+        # Jetson clock from here, but we CAN detect the drift: the Azure clock ≈ the
+        # MediaMTX clock (both Azure/NTP), so (azure_now - frame_ts_ms) on arrival
+        # is the one-way lag; its rolling floor approximates the clock offset.
+        self._clock_skew_floor_ms: Dict[str, float] = {}
+        self._clock_skew_floor_reset_s: Dict[str, float] = {}
+        self._clock_skew_last_warn_s: Dict[str, float] = {}
         self._channels: Dict[str, VideoChannel] = {}
         self._poll_tasks: Dict[str, asyncio.Task] = {}
         self._last_seq: Dict[str, int] = {}
@@ -366,6 +376,21 @@ class ModelPipeline:
         self._startup_jitter_ms = max(
             0,
             int(os.getenv("DETECTION_STARTUP_JITTER_MS", "100")),
+        )
+        # Warn when the estimated Jetson↔Azure clock offset exceeds this many ms.
+        # The clip window absorbs sub-second offsets; multi-second skew shifts the
+        # event out of the PRE/POST window, so default to 3s. Set 0 to disable.
+        self._clock_skew_warn_ms = max(
+            0,
+            int(os.getenv("DETECTION_CLOCK_SKEW_WARN_MS", "3000")),
+        )
+        self._clock_skew_floor_window_s = max(
+            30.0,
+            float(os.getenv("DETECTION_CLOCK_SKEW_FLOOR_WINDOW_S", "300.0")),
+        )
+        self._clock_skew_warn_interval_s = max(
+            5.0,
+            float(os.getenv("DETECTION_CLOCK_SKEW_WARN_INTERVAL_S", "120.0")),
         )
         self._lock = asyncio.Lock()
         self._started = False
@@ -442,6 +467,56 @@ class ModelPipeline:
             return True
 
         return False
+
+    def _monitor_clock_skew(self, key: str, frame_ts_ms: int) -> None:
+        """Estimate and warn on Jetson↔Azure clock drift (warn-only, no behavior change).
+
+        ``lag = azure_now_ms - frame_ts_ms`` is the one-way delay between the
+        Jetson stamping a frame and Azure receiving the detection. Real lag is
+        always positive and bounded below by the network/processing latency, so
+        the *minimum* lag over a window is a good estimate of the constant clock
+        offset: a near-zero/positive floor means the clocks agree; a large
+        positive floor means the Jetson clock is BEHIND Azure (and the clip window
+        will land in the past); a negative floor means the Jetson clock is AHEAD
+        (the frame is stamped in the "future", which is physically impossible
+        without skew, so it is a definitive signal). The floor is reset on a slow
+        window so a corrected clock recovers instead of latching forever.
+        """
+        if self._clock_skew_warn_ms <= 0:
+            return
+
+        now_s = time.time()
+        lag_ms = (now_s * 1000.0) - float(frame_ts_ms)
+
+        reset_at = self._clock_skew_floor_reset_s.get(key, 0.0)
+        floor = self._clock_skew_floor_ms.get(key)
+        if floor is None or now_s >= reset_at:
+            self._clock_skew_floor_ms[key] = lag_ms
+            self._clock_skew_floor_reset_s[key] = now_s + self._clock_skew_floor_window_s
+            floor = lag_ms
+        elif lag_ms < floor:
+            self._clock_skew_floor_ms[key] = lag_ms
+            floor = lag_ms
+
+        # A healthy floor is a small positive number (one-way latency). Flag only
+        # when it drifts beyond the threshold in either direction.
+        if -self._clock_skew_warn_ms <= floor <= self._clock_skew_warn_ms:
+            return
+
+        last_warn = self._clock_skew_last_warn_s.get(key, 0.0)
+        if (now_s - last_warn) < self._clock_skew_warn_interval_s:
+            return
+        self._clock_skew_last_warn_s[key] = now_s
+
+        direction = "AHEAD of" if floor < 0 else "BEHIND"
+        logger.warning(
+            "Jetson clock appears skewed camera=%s estimated_offset_ms=%d (Jetson clock is %s Azure/MediaMTX). "
+            "Clip windows are anchored on the Jetson wall clock; multi-second skew shifts the event out of the "
+            "captured PRE/POST window. Verify NTP/time sync on the Jetson host.",
+            key,
+            int(floor),
+            direction,
+        )
 
     def set_notification_service(self, svc: NotificationService) -> None:
         self._notification_service = svc
@@ -521,6 +596,9 @@ class ModelPipeline:
             self._last_seen.pop(key, None)
             self._last_ok_s.pop(key, None)
             self._last_detection_summary_s.pop(key, None)
+            self._clock_skew_floor_ms.pop(key, None)
+            self._clock_skew_floor_reset_s.pop(key, None)
+            self._clock_skew_last_warn_s.pop(key, None)
         if isinstance(self.detect_store, InMemoryObjDetectStore):
             await self.detect_store.forget(key)
         self._ctx_resolver.invalidate(key)
@@ -647,6 +725,8 @@ class ModelPipeline:
 
         if not self._is_new_detection(key, resp):
             return False
+
+        self._monitor_clock_skew(key, int(resp.frame_ts_ms))
 
         tracker_payload = dict(payload or {})
         tracker_payload["camera_uuid"] = str(resp.camera_uuid)

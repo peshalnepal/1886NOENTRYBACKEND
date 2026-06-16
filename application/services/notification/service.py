@@ -49,8 +49,12 @@ class NotificationService:
             clip_overlay_history_ttl_s=env_float("CLIP_OVERLAY_HISTORY_TTL_S", 180.0, minimum=30.0),
             clip_overlay_history_max_frames=env_int("CLIP_OVERLAY_HISTORY_MAX_FRAMES_PER_CAMERA", 10800, minimum=1),
             prerecord_eligible_ttl_s=env_float("PRERECORD_ELIGIBLE_CACHE_TTL_S", 30.0, minimum=5.0),
-            site_prerecord_timeout_s=env_float("SITE_PRERECORD_TIMEOUT_S", 30.0, minimum=1.0),
-            trigger_camera_timeout_s=env_float("TRIGGER_CAMERA_TIMEOUT_S", 15.0, minimum=1.0),
+            # These timeouts MUST exceed the clip service's post-event tail wait
+            # (POST_EVENT_S + 2s, ~32s by default) plus download/upload time, or
+            # capture_pre_event_clip is cancelled mid-sleep and no clip is produced.
+            # Capture runs on a background finalize task, so generous values are safe.
+            site_prerecord_timeout_s=env_float("SITE_PRERECORD_TIMEOUT_S", 90.0, minimum=1.0),
+            trigger_camera_timeout_s=env_float("TRIGGER_CAMERA_TIMEOUT_S", 90.0, minimum=1.0),
         )
         
         self.flusher = NotificationFlusher(

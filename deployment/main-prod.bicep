@@ -318,6 +318,9 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
 
             // Video clip capture (pre-record on detection)
             { name: 'VIDEO_CLIP_CAPTURE_ENABLED', value: 'true' }
+            // Clip layout: 90s pre-roll + 30s post-roll = 120s total, event anchored at 90s.
+            { name: 'VIDEO_CLIP_PRE_EVENT_S', value: '90' }
+            { name: 'VIDEO_CLIP_POST_EVENT_S', value: '30' }
             { name: 'VIDEO_CLIP_DURATION_S', value: '120' }
             { name: 'VIDEO_CLIP_COOLDOWN_S', value: '120' }
             { name: 'VIDEO_CLIP_MIN_DURATION_S', value: '10' }

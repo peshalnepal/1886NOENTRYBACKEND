@@ -329,8 +329,9 @@ def extract_notification_clip_external_ids(payload: Any) -> List[str]:
 
 class EventClipService:
     # Clip layout: PRE_EVENT_S before the event + POST_EVENT_S after = CLIP_DURATION_S total.
-    PRE_EVENT_S = 100
-    POST_EVENT_S = 20
+    # Default: 1 min 30 sec of pre-roll + 30 sec of post-roll = 2 min total.
+    PRE_EVENT_S = 90
+    POST_EVENT_S = 30
     CLIP_DURATION_S = PRE_EVENT_S + POST_EVENT_S
     COOLDOWN_S = 120.0
     MINIMUM_DURATION_S = 10
@@ -351,10 +352,19 @@ class EventClipService:
         self.storage_enabled = bool(self.connection_string)
         self.enabled = bool(capture_enabled and self.playback_base_url)
 
+        # Pre/post-roll are the source of truth for the clip layout; the total
+        # duration is always derived from them so the event stays anchored at the
+        # PRE_EVENT_S mark. (A standalone VIDEO_CLIP_DURATION_S is still accepted
+        # for backward compatibility but only used when PRE/POST are not given.)
         try:
-            self.CLIP_DURATION_S = int(os.getenv("VIDEO_CLIP_DURATION_S") or self.CLIP_DURATION_S)
+            self.PRE_EVENT_S = int(os.getenv("VIDEO_CLIP_PRE_EVENT_S") or self.PRE_EVENT_S)
         except (ValueError, TypeError):
             pass
+        try:
+            self.POST_EVENT_S = int(os.getenv("VIDEO_CLIP_POST_EVENT_S") or self.POST_EVENT_S)
+        except (ValueError, TypeError):
+            pass
+        self.CLIP_DURATION_S = self.PRE_EVENT_S + self.POST_EVENT_S
         try:
             self.COOLDOWN_S = float(os.getenv("VIDEO_CLIP_COOLDOWN_S") or self.COOLDOWN_S)
         except (ValueError, TypeError):
@@ -752,21 +762,28 @@ class EventClipService:
             if cached and (time.monotonic() - cached[0]) <= self.COOLDOWN_S:
                 return cached[1].to_payload()
 
-            start_time, end_time = self._get_capture_window(event_ts_ms)
-            external_id = f"{camera_key}-{int(end_time.timestamp())}-{uuid.uuid4().hex[:10]}"
-
             # Wait long enough for MediaMTX to flush the POST_EVENT_S tail of the
             # recording (segments are written on a fixed cadence — see
             # recordSegmentDuration in main-prod.bicep). The +2s slack covers the
             # segment-boundary rounding so /list reports the full tail before we
             # call /get. This wait now runs inside the background finalize task,
             # so it does not block notification persistence / web / email.
+            #
+            # IMPORTANT: the wait MUST happen before _get_capture_window(), because
+            # that method clamps end_time to "now". The capture is kicked off right
+            # after the event, so if we computed the window first, end_time would be
+            # clamped from event+POST_EVENT_S back to ~event (no post-roll), leaving
+            # the event jammed against the very end of the clip. Sleeping first lets
+            # "now" advance past event+POST_EVENT_S so the full tail survives.
             if event_ts_ms is not None:
                 event_time = datetime.fromtimestamp(float(event_ts_ms) / 1000.0, tz=timezone.utc)
                 tail_ready_at = event_time + timedelta(seconds=self.POST_EVENT_S + 2)
                 wait_s = (tail_ready_at - datetime.now(timezone.utc)).total_seconds()
                 if wait_s > 0:
                     await asyncio.sleep(wait_s)
+
+            start_time, end_time = self._get_capture_window(event_ts_ms)
+            external_id = f"{camera_key}-{int(end_time.timestamp())}-{uuid.uuid4().hex[:10]}"
 
             try:
                 spans = await self._fetch_recording_spans(
