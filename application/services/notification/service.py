@@ -46,8 +46,12 @@ class NotificationService:
             repo=self._repo,
             session_factory=self._session_factory,
             image_service=self._image_service,
-            clip_overlay_history_ttl_s=env_float("CLIP_OVERLAY_HISTORY_TTL_S", 180.0, minimum=30.0),
-            clip_overlay_history_max_frames=env_int("CLIP_OVERLAY_HISTORY_MAX_FRAMES_PER_CAMERA", 10800, minimum=1),
+            # Per-camera overlay history is a fixed-size FIFO ring buffer (latest
+            # in, oldest out) — retention is bounded by COUNT, not wall-clock time,
+            # so a clip's PRE/POST window is always reconstructable regardless of
+            # the variable per-camera detection cadence. Default and floor are
+            # 10800 = 60*60*3 frames per camera.
+            clip_overlay_history_max_frames=env_int("CLIP_OVERLAY_HISTORY_MAX_FRAMES_PER_CAMERA", 10800, minimum=10800),
             prerecord_eligible_ttl_s=env_float("PRERECORD_ELIGIBLE_CACHE_TTL_S", 30.0, minimum=5.0),
             # These timeouts MUST exceed the clip service's post-event tail wait
             # (POST_EVENT_S + 2s, ~32s by default) plus download/upload time, or
@@ -172,6 +176,51 @@ class NotificationService:
             return 0
 
         return await self.clip_manager.set_clips_approval(external_ids=external_ids, approved=approved)
+
+    async def purge_alert_media_for_notifications(
+        self, *, notification_ids: List[int], site_uuids: List[uuid.UUID]
+    ) -> None:
+        """Delete the image + clip blobs linked to alerts (operator rejection).
+
+        Reuses the same payload-driven media extraction/deletion the retention
+        service uses for expired alerts: the image and clip storage keys are
+        pulled straight from each notification payload and the blobs deleted via
+        the existing ``delete_blob`` services. The (now hidden) notification and
+        its VideoRecord rows are left in place and reaped later by retention.
+        """
+        from application.services.clip_storage import extract_notification_clip_storage_keys
+        from application.services.alert_image_storage import extract_image_storage_key
+
+        if not notification_ids or self._session_factory is None:
+            return
+
+        async with self._session_factory() as db:
+            rows = await self._repo.list_notifications(
+                db, ids=[int(i) for i in notification_ids], site_uuids=site_uuids or None
+            )
+
+        image_keys: List[str] = []
+        clip_keys: List[str] = []
+        for row in rows:
+            payload = getattr(row, "payload", None)
+            key = extract_image_storage_key(payload)
+            if key:
+                image_keys.append(key)
+            clip_keys.extend(extract_notification_clip_storage_keys(payload))
+
+        if self._image_service is not None:
+            for key in dict.fromkeys(image_keys):
+                try:
+                    await self._image_service.delete_blob(blob_name=key)
+                except Exception:
+                    logger.warning("Failed deleting rejected alert image blob %s", key, exc_info=True)
+
+        if self._clip_service is not None:
+            for key in dict.fromkeys(clip_keys):
+                try:
+                    await self._clip_service.delete_blob(blob_name=key)
+                except Exception:
+                    logger.warning("Failed deleting rejected alert clip blob %s", key, exc_info=True)
 
     async def record_detection_overlay_frame(self, *, camera_uuid: str, frame_ts_ms: Any, frame_seq: Any, frame_w: Any = None, frame_h: Any = None, detections: Any = None) -> None:
         await self.clip_manager.record_detection_overlay_frame(

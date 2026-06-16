@@ -585,6 +585,12 @@ async def _decide_notifications(
             await notification_service.set_clips_approval_for_notifications(
                 notification_ids=ids, site_uuids=target_sites, approved=approve,
             )
+            # On rejection, also delete the image + clip blobs linked to the
+            # alert (the hidden notification/clip rows are reaped by retention).
+            if not approve:
+                await notification_service.purge_alert_media_for_notifications(
+                    notification_ids=ids, site_uuids=target_sites,
+                )
         except Exception:
             logger.exception("Failed to reconcile clip approval for notifications ids=%s", ids)
     # When the operator marks the alert important, also email the site's

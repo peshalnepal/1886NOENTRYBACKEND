@@ -32,7 +32,6 @@ class ClipManager:
         repo: NotificationRepository,
         session_factory,
         image_service,
-        clip_overlay_history_ttl_s: float = 180.0,
         clip_overlay_history_max_frames: int = 10800,
         prerecord_eligible_ttl_s: float = 30.0,
         site_prerecord_timeout_s: float = 30.0,
@@ -43,7 +42,6 @@ class ClipManager:
         self._session_factory = session_factory
         self._image_service = image_service
         
-        self._clip_overlay_history_ttl_s = clip_overlay_history_ttl_s
         self._clip_overlay_history_max_frames = clip_overlay_history_max_frames
         self._prerecord_eligible_ttl_s = prerecord_eligible_ttl_s
         self._site_prerecord_timeout_s = site_prerecord_timeout_s
@@ -148,15 +146,19 @@ class ClipManager:
         if frame is None:
             return
 
-        history_cutoff_ms = int(frame["frame_ts_ms"]) - int(self._clip_overlay_history_ttl_s * 1000.0)
+        # Per-camera FIFO ring buffer of the most recent detection frames. The
+        # deque's `maxlen` (CLIP_OVERLAY_HISTORY_MAX_FRAMES_PER_CAMERA, default
+        # 10800 = 60*60*3) evicts the OLDEST frame automatically when a new one is
+        # appended, so retention is bounded by COUNT, not wall-clock time. A
+        # count-based buffer is robust to the low, variable per-camera detection
+        # cadence (a single Jetson round-robins many cameras), guaranteeing a
+        # clip's PRE/POST window can always be reconstructed from history. Boxes
+        # are extracted from this buffer in _clip_overlay_frames_for_window.
         async with self._overlay_history_lock:
             bucket = self._overlay_history_by_camera.get(str(camera_uuid))
             if bucket is None:
                 bucket = deque(maxlen=int(self._clip_overlay_history_max_frames))
                 self._overlay_history_by_camera[str(camera_uuid)] = bucket
-
-            while bucket and int(bucket[0].get("frame_ts_ms", 0)) < history_cutoff_ms:
-                bucket.popleft()
 
             if bucket:
                 last = bucket[-1]
@@ -222,22 +224,6 @@ class ClipManager:
             if start_ts_ms <= int(frame.get("frame_ts_ms", -1)) <= end_ts_ms
         ]
 
-    async def _trim_clip_overlay_history(self, *, camera_uuid: str, through_time: Optional[datetime]) -> None:
-        if through_time is None:
-            return
-
-        through_ts_ms = int(through_time.astimezone(timezone.utc).timestamp() * 1000.0)
-        async with self._overlay_history_lock:
-            bucket = self._overlay_history_by_camera.get(str(camera_uuid))
-            if not bucket:
-                return
-
-            while bucket and int(bucket[0].get("frame_ts_ms", 0)) <= through_ts_ms:
-                bucket.popleft()
-
-            if not bucket:
-                self._overlay_history_by_camera.pop(str(camera_uuid), None)
-
     async def _finalize_captured_clip(
         self,
         *,
@@ -297,7 +283,14 @@ class ClipManager:
             except Exception:
                 logger.exception("Failed finalizing clip overlay camera=%s external_id=%s", camera_uuid, external_id)
 
-        await self._trim_clip_overlay_history(camera_uuid=str(camera_uuid), through_time=end_time)
+        # NOTE: intentionally do NOT prune the overlay history here. Multiple
+        # alerts can fire on the same camera with overlapping clip windows, and a
+        # later clip's PRE_EVENT portion overlaps this clip's window. Trimming
+        # through `end_time` would delete the box history that the overlapping
+        # clip still needs, leaving it with only its post-event tail (or a single
+        # trigger-frame box). The per-camera deque already self-bounds on append
+        # via the TTL cutoff and `maxlen` (see record_detection_overlay_frame),
+        # so memory stays bounded without destroying frames in-flight clips need.
 
         finalized = dict(clip)
         finalized["overlay_payload"] = overlay_payload

@@ -320,10 +320,11 @@ def extract_notification_clip_external_ids(payload: Any) -> List[str]:
     if not isinstance(payload, dict):
         return []
     ids: List[str] = []
-    clips=payload.get("clip")
-    ext = str(clips.get("external_id") or "").strip()
-    if ext:
-        ids.append(ext)
+    clips = payload.get("clip")
+    if isinstance(clips, dict):
+        ext = str(clips.get("external_id") or "").strip()
+        if ext:
+            ids.append(ext)
     return list(dict.fromkeys(ids))
 
 
