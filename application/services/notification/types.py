@@ -51,6 +51,7 @@ class NotificationMessage(BaseModel):
     clip_url: Optional[str] = None
     clip_status: Optional[str] = None
     db_id: Optional[int] = None  # Set after DB persistence so the frontend can delete by ID
+    approval_status: Optional[str] = None
 
 
 @dataclass(frozen=True)

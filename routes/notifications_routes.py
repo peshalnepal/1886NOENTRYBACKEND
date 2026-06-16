@@ -18,7 +18,6 @@ from application.repositories.notification_repository import NotificationReposit
 from application.repositories.site_repository import SiteRepository
 from application.repositories._helpers import as_uuid as _as_uuid
 from application.services.authz_service import AuthzService
-from core.security.roles import OrgRole
 from application.services.user_snapshot_cache import (
     CachedUserSnapshot,
     UserSnapshotCache,
@@ -51,12 +50,6 @@ logger = logging.getLogger(__name__)
 
 notif_repo = NotificationRepository()
 site_repo = SiteRepository()
-def _is_operator(ctx: OrgContext) -> bool:
-    """Operators (and platform admins) may view pending alerts."""
-    return ctx.role == OrgRole.OPERATOR.value or bool(
-        getattr(ctx.user, "is_platform_admin", False)
-    )
-
 async def _notif_site_scope(db: AsyncSession, ctx: OrgContext) -> List[uuid.UUID]:
     """Site UUIDs whose notifications the caller may read: all org sites for
     admins/operators, only granted sites for plain members."""
@@ -478,13 +471,11 @@ async def list_notifications(
     limit, offset = _validate_pagination(limit, offset)
     cu = _as_uuid(camera_uuid)
     _, target_sites = await _resolve_target_sites(db, ctx, site_uuid)
-    only_visible = None if _is_operator(ctx) else True
-
     rows = await notif_repo.list_notifications(
         db,
         site_uuids=target_sites,
         camera_uuid=cu,
-        only_visible=only_visible,
+        only_visible=True,
         only_unread=True if unread_only else None,
         limit=limit,
         offset=offset,
@@ -540,7 +531,9 @@ async def _publish_approved_to_owner(
         if not isinstance(msg_payload, dict):
             continue
         try:
-            msg = NotificationMessage.model_validate({**msg_payload, "db_id": int(r.id)})
+            msg = NotificationMessage.model_validate(
+                {**msg_payload, "db_id": int(r.id), "approval_status": "approved"}
+            )
         except Exception:
             logger.warning("Could not rebuild approved notification for publish id=%s", r.id, exc_info=True)
             continue
@@ -801,13 +794,11 @@ async def unread_count(
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
     su, target_sites = await _resolve_target_sites(db, ctx, site_uuid)
-    only_visible = None if _is_operator(ctx) else True
-
     count = await notif_repo.count_notifications(
         db,
         site_uuids=target_sites,
         only_unread=True,
-        only_visible=only_visible,
+        only_visible=True,
     )
 
     return {

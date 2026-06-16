@@ -440,9 +440,12 @@ class NotificationFlusher:
             # nothing until approval. With no operator, publish to the user.
             operator_ids = operator_ids_by_site.get(item.ctx.site_uuid) or []
             if operator_ids:
-                await self.hub.publish_to_users(operator_ids, published_msg)
+                # Held for review: the client shows these only in the operator
+                # queue, never in any user's notification feed (incl. the operator).
+                held_msg = published_msg.model_copy(update={"approval_status": "pending"})
+                await self.hub.publish_to_users(operator_ids, held_msg)
             else:
-                await self.hub.publish(published_msg)
+                await self.hub.publish(published_msg.model_copy(update={"approval_status": "approved"}))
             if str(item.msg.clip_status or "") == "loading":
                 clip_finalize_targets.append((int(row_id), item))
 
@@ -674,8 +677,10 @@ class NotificationFlusher:
             # Route the clip-ready republish the same way as the original alert:
             # to operators while it's awaiting approval, to the end user otherwise.
             if operator_ids:
-                await self.hub.publish_to_users(operator_ids, updated_msg)
+                await self.hub.publish_to_users(
+                    operator_ids, updated_msg.model_copy(update={"approval_status": "pending"})
+                )
             else:
-                await self.hub.publish(updated_msg)
+                await self.hub.publish(updated_msg.model_copy(update={"approval_status": "approved"}))
         except Exception:
             logger.exception("Failed to republish clip-ready notification notif_id=%s", notification_id)
