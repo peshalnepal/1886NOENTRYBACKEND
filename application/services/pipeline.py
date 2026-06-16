@@ -782,19 +782,9 @@ class ModelPipeline:
             alerts = list(resp2.alerts or ())
             emitted_detail = False
 
-            if allow_broad_notifications and self.notify_on_confirmed and track_events:
-                try:
-                    emitted_detail = (
-                        await self._emit_item_detected_notifications(
-                            resp2,
-                            tracks,
-                            track_events,
-                            extra_payload=await _ensure_alert_extra_payload(),
-                        )
-                    ) or emitted_detail
-                except Exception:
-                    logger.exception("Failed to emit item-detected notifications camera=%s", cam_uuid)
-
+            # ROI entry is the most specific operator event. Emit it first and
+            # suppress broader same-frame detection notices so one event does
+            # not create two pending notifications for the operator.
             if self.notify_on_roi_enter and alerts:
                 try:
                     emitted_detail = (
@@ -806,6 +796,19 @@ class ModelPipeline:
                     ) or emitted_detail
                 except Exception:
                     logger.exception("Failed to emit ROI notifications camera=%s", cam_uuid)
+
+            if not emitted_detail and allow_broad_notifications and self.notify_on_confirmed and track_events:
+                try:
+                    emitted_detail = (
+                        await self._emit_item_detected_notifications(
+                            resp2,
+                            tracks,
+                            track_events,
+                            extra_payload=await _ensure_alert_extra_payload(),
+                        )
+                    ) or emitted_detail
+                except Exception:
+                    logger.exception("Failed to emit item-detected notifications camera=%s", cam_uuid)
 
             if not emitted_detail and allow_broad_notifications:
                 summary_classes = self._interesting_detection_classes(resp2)
