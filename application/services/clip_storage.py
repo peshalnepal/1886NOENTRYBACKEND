@@ -333,7 +333,6 @@ class EventClipService:
     PRE_EVENT_S = 90
     POST_EVENT_S = 30
     CLIP_DURATION_S = PRE_EVENT_S + POST_EVENT_S
-    COOLDOWN_S = 120.0
     MINIMUM_DURATION_S = 10
     SAS_TTL_HOURS = 168
     DOWNLOAD_FORMAT = "mp4"
@@ -366,10 +365,6 @@ class EventClipService:
             pass
         self.CLIP_DURATION_S = self.PRE_EVENT_S + self.POST_EVENT_S
         try:
-            self.COOLDOWN_S = float(os.getenv("VIDEO_CLIP_COOLDOWN_S") or self.COOLDOWN_S)
-        except (ValueError, TypeError):
-            pass
-        try:
             self.MINIMUM_DURATION_S = int(os.getenv("VIDEO_CLIP_MIN_DURATION_S") or self.MINIMUM_DURATION_S)
         except (ValueError, TypeError):
             pass
@@ -391,7 +386,6 @@ class EventClipService:
         self._blob_service: Optional[BlobServiceClient] = None
         self._session_factory: Optional[SessionFactory] = None
         self._camera_locks: Dict[str, asyncio.Lock] = {}
-        self._recent_by_camera: Dict[str, Tuple[float, ClipCaptureResult]] = {}
         self._playback_last_warn_at = 0.0
         self._playback_unavailable_until = 0.0
 
@@ -758,9 +752,6 @@ class EventClipService:
             if time.monotonic() < self._playback_unavailable_until:
                 return None
 
-            cached = self._recent_by_camera.get(camera_key)
-            if cached and (time.monotonic() - cached[0]) <= self.COOLDOWN_S:
-                return cached[1].to_payload()
 
             # Wait long enough for MediaMTX to flush the POST_EVENT_S tail of the
             # recording (segments are written on a fixed cadence — see
@@ -852,7 +843,6 @@ class EventClipService:
                         duration=duration_s,
                         path=path,
                     )
-                    self._recent_by_camera[camera_key] = (time.monotonic(), result)
                     return result.to_payload()
 
                 payload = await self._download_clip(
@@ -918,7 +908,6 @@ class EventClipService:
                     duration=duration_s,
                     path=path,
                 )
-                self._recent_by_camera[camera_key] = (time.monotonic(), result)
                 return result.to_payload()
 
             except PlaybackUnavailableError as exc:

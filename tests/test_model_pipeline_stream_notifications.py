@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -39,6 +40,7 @@ class _FakeNotificationService:
         self.is_camera_prerecord_eligible = AsyncMock(return_value=False)
         self.record_detection_overlay_frame = AsyncMock()
         self.enqueue_notification = AsyncMock()
+        self.requires_operator_approval = AsyncMock(return_value=False)
 
 
 class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
@@ -65,12 +67,21 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         config.notification_trigger_mode = trigger_mode
         channel = _FakeChannel(config)
         service = _FakeNotificationService()
+        spawned_tasks = []
+
+        def spawn(coro, name):
+            task = asyncio.create_task(coro, name=name)
+            spawned_tasks.append(task)
+            return task
+
         pipeline = ModelPipeline(
             pipeline_id=uuid.uuid4(),
             notify_on_confirmed=False,
             notify_on_roi_enter=False,
             interesting_classes={"person"},
+            task_spawner=spawn,
         )
+        pipeline._test_spawned_tasks = spawned_tasks
         pipeline.set_notification_service(service)
         pipeline._trigger_mode_resolver.resolve = AsyncMock(return_value="any_detection")
         pipeline._get_camera_ctx = AsyncMock(
@@ -87,6 +98,11 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         pipeline._persist_and_maybe_email = AsyncMock()
         return pipeline, channel, service
 
+    async def _drain_spawned_tasks(self, pipeline):
+        tasks = list(getattr(pipeline, "_test_spawned_tasks", []))
+        if tasks:
+            await asyncio.gather(*tasks)
+
     async def test_stream_payload_restores_summary_and_overlay_side_effects(self):
         pipeline, channel, service = await self._make_pipeline(scheduled=True, trigger_mode="any_detection")
         camera_uuid = channel.key()
@@ -97,6 +113,7 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         pipeline._emit_detection_summary_notification = AsyncMock(return_value=True)
 
         processed = await pipeline._process_detection_payload(camera_uuid, channel, self._make_payload(camera_uuid))
+        await self._drain_spawned_tasks(pipeline)
 
         self.assertTrue(processed)
         service.record_detection_overlay_frame.assert_awaited_once()
@@ -115,6 +132,7 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         pipeline._emit_detection_summary_notification = AsyncMock(return_value=True)
 
         processed = await pipeline._process_detection_payload(camera_uuid, channel, self._make_payload(camera_uuid))
+        await self._drain_spawned_tasks(pipeline)
 
         self.assertTrue(processed)
         pipeline._emit_detection_summary_notification.assert_not_awaited()
@@ -140,9 +158,53 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         pipeline._emit_detection_summary_notification = AsyncMock(return_value=True)
 
         processed = await pipeline._process_detection_payload(camera_uuid, channel, self._make_payload(camera_uuid))
+        await self._drain_spawned_tasks(pipeline)
 
         self.assertTrue(processed)
         pipeline._emit_item_detected_notifications.assert_awaited_once()
+        pipeline._emit_detection_summary_notification.assert_not_awaited()
+        pipeline._build_alert_extra_payload.assert_awaited_once()
+
+    async def test_stream_payload_prefers_roi_alert_over_confirmed_track_alert(self):
+        pipeline, channel, service = await self._make_pipeline(scheduled=True, trigger_mode="any_detection")
+        camera_uuid = channel.key()
+
+        track = {
+            "track_id": 11,
+            "cls_name": "person",
+            "conf": 0.88,
+            "bbox": [10, 20, 110, 220],
+            "confirmed": True,
+        }
+        roi_alert = {
+            "type": "roi_enter",
+            "ts_ms": 1234567890,
+            "camera_uuid": camera_uuid,
+            "roi_id": f"{camera_uuid}-roi",
+            "track_id": 11,
+            "cls_name": "person",
+            "conf": 0.88,
+            "bbox": [10, 20, 110, 220],
+        }
+
+        pipeline.notify_on_confirmed = True
+        pipeline.notify_on_roi_enter = True
+        pipeline._tracker.update_from_event = Mock(
+            return_value={"tracks": [track], "events": [("track_confirmed", 11)]}
+        )
+        pipeline._fetch_rois = AsyncMock(return_value=[object()])
+        pipeline._roi_engine.process = Mock(return_value=[roi_alert])
+        pipeline._build_alert_extra_payload = AsyncMock(return_value={"image_url": "https://example.com/frame.jpg"})
+        pipeline._emit_roi_alert_notifications = AsyncMock(return_value=True)
+        pipeline._emit_item_detected_notifications = AsyncMock(return_value=True)
+        pipeline._emit_detection_summary_notification = AsyncMock(return_value=True)
+
+        processed = await pipeline._process_detection_payload(camera_uuid, channel, self._make_payload(camera_uuid))
+        await self._drain_spawned_tasks(pipeline)
+
+        self.assertTrue(processed)
+        pipeline._emit_roi_alert_notifications.assert_awaited_once()
+        pipeline._emit_item_detected_notifications.assert_not_awaited()
         pipeline._emit_detection_summary_notification.assert_not_awaited()
         pipeline._build_alert_extra_payload.assert_awaited_once()
 
@@ -158,6 +220,7 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
             channel,
             self._make_payload(other_camera_uuid),
         )
+        await self._drain_spawned_tasks(pipeline)
 
         self.assertFalse(processed)
         pipeline._tracker.update_from_event.assert_not_called()
@@ -172,6 +235,7 @@ class ModelPipelineStreamNotificationTests(unittest.IsolatedAsyncioTestCase):
         await pipeline.add_channel(channel)
         payload = self._make_payload(camera_uuid)
         processed = await pipeline._process_detection_payload(camera_uuid, channel, payload)
+        await self._drain_spawned_tasks(pipeline)
 
         self.assertTrue(processed)
         self.assertIsNotNone(await pipeline.get_latest_detection(camera_uuid))
