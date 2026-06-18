@@ -31,7 +31,6 @@ param acrUsername string
 param caddyImageRepo string = 'caddy'
 param caddyImageTag string = '2.8.4'
 
-
 @secure()
 param acrPassword string
 
@@ -121,7 +120,9 @@ resource environment 'Microsoft.App/managedEnvironments@2023-05-01' = {
 var mysqlSuffix = toLower(substring(uniqueString(resourceGroup().id, namePrefix, environmentName, mysqlLocation), 0, 6))
 var mysqlServerName = toLower('${namePrefix}-mysql-${mysqlSuffix}')
 var mysqlFqdn = '${mysqlServerName}.mysql.database.azure.com'
-var clipStorageName = videoClipStorageAccountName != '' ? toLower(videoClipStorageAccountName) : toLower(substring(replace('${namePrefix}clips${suffix}', '-', ''), 0, 24))
+var clipStorageName = videoClipStorageAccountName != ''
+  ? toLower(videoClipStorageAccountName)
+  : toLower(substring(replace('${namePrefix}clips${suffix}', '-', ''), 0, 24))
 var clipStorageKey = clipStorage.listKeys().keys[0].value
 var clipStorageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${clipStorage.name};AccountKey=${clipStorageKey};EndpointSuffix=core.windows.net'
 
@@ -395,9 +396,9 @@ param mediamtxHostOverride string = ''
 param caddyEmail string = 'peshalnepal3@gmail.com'
 
 var mediamtxName = '${namePrefix}-mtx-${suffix}'
-var mediamtxDns  = '${namePrefix}mtx${suffix}'
+var mediamtxDns = '${namePrefix}mtx${suffix}'
 
-var regionForHost     = toLower(replace(location, ' ', ''))
+var regionForHost = toLower(replace(location, ' ', ''))
 var mediamtxPublicHost = '${mediamtxDns}.${regionForHost}.azurecontainer.io'
 
 var proxyHost = (mediamtxHostOverride != '') ? mediamtxHostOverride : mediamtxPublicHost
@@ -501,8 +502,10 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       type: 'Public'
       dnsNameLabel: mediamtxDns
       ports: [
-        { port: 80,  protocol: 'TCP' }
+        { port: 80, protocol: 'TCP' }
         { port: 443, protocol: 'TCP' }
+        { port: 8554, protocol: 'TCP' } // Add this for RTSP ingest
+        { port: 8554, protocol: 'UDP' } // Add this for RTSP ingest
         { port: 8189, protocol: 'UDP' }
       ]
     }
@@ -546,6 +549,8 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
         properties: {
           image: '${acr.properties.loginServer}/${mediamtxImageRepo}:${mediamtxImageTag}'
           ports: [
+            { port: 8554, protocol: 'TCP' } // Add this
+            { port: 8554, protocol: 'UDP' } // Add this
             { port: 9996, protocol: 'TCP' }
             { port: 8889, protocol: 'TCP' }
             { port: 9997, protocol: 'TCP' }
