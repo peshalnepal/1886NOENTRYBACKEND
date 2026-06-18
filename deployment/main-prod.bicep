@@ -504,8 +504,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
       ports: [
         { port: 80, protocol: 'TCP' }
         { port: 443, protocol: 'TCP' }
-        { port: 8554, protocol: 'TCP' } // Add this for RTSP ingest
-        { port: 8554, protocol: 'UDP' } // Add this for RTSP ingest
+        { port: 8554, protocol: 'TCP' } // RTSP ingest (TCP only — ACI dedupes by port number)
         { port: 8189, protocol: 'UDP' }
       ]
     }
@@ -549,8 +548,7 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
         properties: {
           image: '${acr.properties.loginServer}/${mediamtxImageRepo}:${mediamtxImageTag}'
           ports: [
-            { port: 8554, protocol: 'TCP' } // Add this
-            { port: 8554, protocol: 'UDP' } // Add this
+            { port: 8554, protocol: 'TCP' } // RTSP ingest (TCP only — ACI dedupes by port number)
             { port: 9996, protocol: 'TCP' }
             { port: 8889, protocol: 'TCP' }
             { port: 9997, protocol: 'TCP' }
