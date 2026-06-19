@@ -38,6 +38,12 @@ def _assign(cost: np.ndarray) -> List[Tuple[int, int]]:
     if cost.size == 0:
         return []
 
+    # Hungarian (and the greedy sort) break on NaN/inf, which can sneak in from
+    # a malformed IoU computation. Replace any non-finite cost with a large but
+    # finite "forbidden" value so the solver simply avoids that pairing.
+    if not np.all(np.isfinite(cost)):
+        cost = np.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)
+
     if _HAS_SCIPY:
         r, c = linear_sum_assignment(cost)
         return list(zip(r.tolist(), c.tolist()))
@@ -54,6 +60,48 @@ def _assign(cost: np.ndarray) -> List[Tuple[int, int]]:
         used_c.add(j)
         out.append((i, j))
     return out
+
+def _sanitize_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Defensively normalize raw detections before tracking.
+
+    Detections arrive from an external pipeline, so a single malformed entry
+    (missing key, wrong shape, NaN/inf coords, degenerate or inverted box)
+    should not crash the tracker for the whole frame. Bad entries are dropped;
+    good ones are returned with a guaranteed-valid float32 ``bbox`` (x1<=x2,
+    y1<=y2), a clamped ``conf`` and a string ``cls_name``.
+    """
+    if not detections:
+        return []
+    clean: List[Dict[str, Any]] = []
+    for d in detections:
+        if not isinstance(d, dict) or "bbox" not in d:
+            continue
+        try:
+            bbox = np.asarray(d["bbox"], dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            continue
+        if bbox.size != 4 or not np.all(np.isfinite(bbox)):
+            continue
+        x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        try:
+            conf = float(d.get("conf", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        if not np.isfinite(conf):
+            conf = 0.0
+        conf = max(0.0, min(1.0, conf))
+        clean.append({
+            "bbox": np.array([x1, y1, x2, y2], dtype=np.float32),
+            "cls_name": str(d.get("cls_name", "unknown")),
+            "conf": conf,
+        })
+    return clean
+
 
 def _xyxy_to_cxcyah(b: BBox) -> np.ndarray:
     w = b[2] - b[0]                                # box width  = x2 - x1
@@ -97,17 +145,27 @@ class Track:
         state = _xyxy_to_cxcyah(self.bbox)                 # convert current bbox into (cx, cy, a, h)
         state[0] += self.vel[0] * dt                       # advance center x by vcx*dt
         state[1] += self.vel[1] * dt                       # advance center y by vcy*dt
-        state[3] += self.vel[2] * dt                       # advance height by vh*dt (aspect 'a' is untouched)
+        # Advance height by vh*dt (aspect 'a' is held constant). Floor the height
+        # so a shrinking object over a long (up to ~2s) frame interval can't push
+        # the predicted box to zero/negative height — that would produce an
+        # inverted, degenerate box and a garbage IoU, dropping the track.
+        state[3] = max(1e-3, state[3] + self.vel[2] * dt)
         return _cxcyah_to_xyxy(state)                      # convert back to xyxy for IoU computation
 
     def update(self, det_bbox: BBox, det_score: float, now_ts: float, alpha: float = 0.4, max_dt: float = 0.5) -> None:
-        dt = min(max(1e-3, now_ts - self.last_ts), max(1e-3, max_dt))           # time since last observation
+        # Estimate velocity over the *actual* elapsed time, not the prediction
+        # clamp. When a track is re-matched after coasting through several misses,
+        # the real gap can far exceed max_dt; dividing the displacement by the
+        # clamped (smaller) dt used to inflate the velocity and fling the next
+        # prediction across the frame. For steady FPS (elapsed <= max_dt) this is
+        # identical to before. ``max_dt`` is kept for call-site compatibility.
+        elapsed = max(1e-3, now_ts - self.last_ts)         # true time since last observation
         old = _xyxy_to_cxcyah(self.bbox)                   # previous state in cxcyah
         new = _xyxy_to_cxcyah(det_bbox)                    # new detection in cxcyah
         new_vel = np.array([
-            (new[0] - old[0]) / dt,                        # vcx = Δcx / dt
-            (new[1] - old[1]) / dt,                        # vcy = Δcy / dt
-            (new[3] - old[3]) / dt,                        # vh  = Δh  / dt  (no va — aspect ignored)
+            (new[0] - old[0]) / elapsed,                   # vcx = Δcx / elapsed
+            (new[1] - old[1]) / elapsed,                   # vcy = Δcy / elapsed
+            (new[3] - old[3]) / elapsed,                   # vh  = Δh  / elapsed  (no va — aspect ignored)
         ], dtype=np.float32)
         self.vel = alpha * self.vel + (1.0 - alpha) * new_vel
         self.bbox = det_bbox
@@ -163,6 +221,9 @@ class ByteTrackLite:
         predict_horizon_frames: float = 1.5,
         match_same_class: bool = True,
         emit_coasting_tracks: bool = False,
+        assoc_center_dist: bool = True,
+        assoc_dist_scale: float = 2.5,
+        assoc_dist_min_interval: float = 0.25,
     ) -> None:
         self.high_th = float(high_th)
         self.low_th = float(low_th)
@@ -184,6 +245,19 @@ class ByteTrackLite:
         self.predict_horizon_frames = float(predict_horizon_frames)
         self.match_same_class = bool(match_same_class)
         self.emit_coasting_tracks = bool(emit_coasting_tracks)
+        # Center-distance association fallback for low / irregular FPS. Pure IoU
+        # association silently fails once an object moves more than its own size
+        # between frames: with velocity still zero on the first re-match, the
+        # predicted box equals the old box, IoU drops below min_iou, and a new ID
+        # is spawned every frame so velocity is never learned. When the observed
+        # interval is >= assoc_dist_min_interval (i.e. the stream is slow enough
+        # that IoU alone is unreliable) we additionally allow matching by center
+        # distance, gated to assoc_dist_scale * object-size. IoU matches always
+        # cost less than distance matches, so high-FPS behaviour is unchanged and
+        # association quality is preserved; this only rescues the slow-FPS case.
+        self.assoc_center_dist = bool(assoc_center_dist)
+        self.assoc_dist_scale = float(assoc_dist_scale)
+        self.assoc_dist_min_interval = float(assoc_dist_min_interval)
 
         self._next_id = 1
         self._tracks: List[Track] = []
@@ -219,6 +293,12 @@ class ByteTrackLite:
 
     def update(self, detections: List[Dict[str, Any]], ts_s: Optional[float] = None) -> Dict[str, Any]:
         now_ts = float(ts_s if ts_s is not None else time.time())
+        if not np.isfinite(now_ts):
+            now_ts = time.time()
+
+        # Drop malformed detections up front so a single bad entry can't crash
+        # the frame, and so downstream code can assume valid float32 bboxes.
+        detections = _sanitize_detections(detections)
 
         # Track the observed inter-frame interval so every time-based threshold
         # self-tunes to the actual delivery rate (which for a Jetson cycling
@@ -247,6 +327,15 @@ class ByteTrackLite:
         matched_track_idxs: set = set()                                                  # tracks that got a det this frame
         live_track_ids: set[int] = set()                                                  # track IDs updated/created this frame
 
+        # Enable the center-distance fallback only once the stream is slow enough
+        # that IoU alone is unreliable. Below this interval (fast streams) the
+        # behaviour is byte-for-byte the old pure-IoU association.
+        use_dist = self.assoc_center_dist and self._frame_interval() >= self.assoc_dist_min_interval
+        # cost layout:  IoU match  -> [0, 1-min_iou]  (< 1, always preferred)
+        #               dist match -> [1, 2)          (only when use_dist)
+        #               forbidden  -> 1e6
+        _ACCEPT = 2.0
+
         def _match(track_idxs, det_idxs, det_list, min_iou):
             """Hungarian match between a subset of tracks and a subset of detections."""
             if not track_idxs or not det_idxs:
@@ -257,14 +346,42 @@ class ByteTrackLite:
             cost = np.full((len(track_idxs), len(det_idxs)), 1e6, dtype=np.float32)
             for ii, ti in enumerate(track_idxs):
                 t = self._tracks[ti]
+                pb = pred[ti]
+                pcx = 0.5 * (float(pb[0]) + float(pb[2]))
+                pcy = 0.5 * (float(pb[1]) + float(pb[3]))
+                ph = float(pb[3]) - float(pb[1])
                 for jj, dj in enumerate(det_idxs):
                     d = det_list[dj]
                     if self.match_same_class and t.cls_name != d["cls_name"]:
                         continue                                                          # leave at 1e6 → effectively forbidden
-                    cost[ii, jj] = 1.0 - _iou(pred[ti], d["bbox"])                       # standard 1 - IoU cost
+                    iou = _iou(pb, d["bbox"])
+                    if iou >= min_iou:
+                        cost[ii, jj] = 1.0 - iou                                          # standard 1 - IoU cost (preferred)
+                        continue
+                    if not use_dist:
+                        continue                                                          # pure-IoU regime: reject
+                    # Low/zero overlap but the stream is slow: fall back to center
+                    # distance so a fast object (or a zero-velocity cold start) can
+                    # still be linked instead of spawning a fresh ID every frame.
+                    db = d["bbox"]
+                    dcx = 0.5 * (float(db[0]) + float(db[2]))
+                    dcy = 0.5 * (float(db[1]) + float(db[3]))
+                    dw = float(db[2]) - float(db[0])
+                    dh = float(db[3]) - float(db[1])
+                    if ph <= 0.0 or dh <= 0.0:
+                        continue
+                    ratio = dh / ph
+                    if ratio < 0.5 or ratio > 2.0:                                        # reject very different scales
+                        continue
+                    gate = 0.5 * (dw + dh) * self.assoc_dist_scale
+                    if gate <= 0.0:
+                        continue
+                    dist = float(np.hypot(dcx - pcx, dcy - pcy))
+                    if dist < gate:
+                        cost[ii, jj] = 1.0 + dist / gate                                  # [1, 2): always worse than any IoU match
             matches = []
             for ii, jj in _assign(cost):
-                if cost[ii, jj] > 1.0 - min_iou:                                          # IoU too low → reject this pairing
+                if cost[ii, jj] >= _ACCEPT:                                               # forbidden or out-of-gate → reject
                     continue
                 matches.append((track_idxs[ii], det_idxs[jj]))                            # remap to original indices
             return matches
@@ -627,13 +744,22 @@ class MultiCameraByteTrack:
 
     def update_from_event(self, ev: Dict[str, Any]) -> Dict[str, Any]:
         cam = str(ev["camera_uuid"])
-        ts_s = float(ev.get("frame_ts_ms", int(time.time() * 1000))) / 1000.0
+        try:
+            ts_s = float(ev.get("frame_ts_ms") or int(time.time() * 1000)) / 1000.0
+        except (TypeError, ValueError):
+            ts_s = time.time()
 
         dets: List[Dict[str, Any]] = []
-        for d in ev.get("detections", []):
-            b = d["box"]
+        for d in ev.get("detections", []) or []:
+            b = d.get("box") if isinstance(d, dict) else None
+            if not isinstance(b, dict):
+                continue
+            try:
+                bbox = np.array([b["x1"], b["y1"], b["x2"], b["y2"]], dtype=np.float32)
+            except (KeyError, TypeError, ValueError):
+                continue
             dets.append({
-                "bbox": np.array([b["x1"], b["y1"], b["x2"], b["y2"]], dtype=np.float32),
+                "bbox": bbox,
                 "cls_name": str(d.get("cls_name", "unknown")),
                 "conf": float(d.get("conf", 0.0)),
             })
