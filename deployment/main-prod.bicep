@@ -402,12 +402,14 @@ var regionForHost = toLower(replace(location, ' ', ''))
 var mediamtxPublicHost = '${mediamtxDns}.${regionForHost}.azurecontainer.io'
 
 var proxyHost = (mediamtxHostOverride != '') ? mediamtxHostOverride : mediamtxPublicHost
-
 var mediamtxYaml = $'''
 logLevel: info
 logDestinations: [stdout]
 writeQueueSize: 1024
 udpReadBufferSize: 0
+
+readTimeout: 60s
+writeTimeout: 60s
 
 authMethod: internal
 authInternalUsers:
@@ -429,21 +431,23 @@ authInternalUsers:
 
 api: yes
 apiAddress: :9997
-apiAllowOrigins: ['*']
+apiAllowOrigins: ["*"]
 
 playback: yes
 playbackAddress: :9996
-playbackAllowOrigins: ['*']
+playbackAllowOrigins: ["*"]
+
+rtsp: yes
+rtspTransports: [tcp]
+rtspAddress: :8554
 
 webrtc: yes
 webrtcAddress: :8889
-
 webrtcLocalUDPAddress: :8189
-webrtcLocalTCPAddress: ''
-webrtcAllowOrigins: ['*']
-
+webrtcLocalTCPAddress: ""
+webrtcAllowOrigins: ["*"]
 webrtcIPsFromInterfaces: no
-webrtcAdditionalHosts: ['${proxyHost}']
+webrtcAdditionalHosts: ["${proxyHost}"]
 
 webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
@@ -453,8 +457,8 @@ pathDefaults:
   recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
   recordFormat: fmp4
   recordPartDuration: 1s
-  recordSegmentDuration: 15s
-  recordDeleteAfter: 7m
+  recordSegmentDuration: 15m
+  recordDeleteAfter: 7d
 
 hls: false
 rtmp: false
