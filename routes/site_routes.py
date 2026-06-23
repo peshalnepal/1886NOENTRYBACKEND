@@ -1205,11 +1205,49 @@ async def unlink_device_from_site(
 class ArmStateOut(BaseModel):
     site_uuid: uuid.UUID
     is_armed: bool
+    # Whether a temporary user override is currently in force (vs. following the
+    # schedule), and when it auto-clears (next schedule boundary; null = no
+    # boundary, so the override is permanent until changed).
+    override_active: bool = False
+    override_until: Optional[datetime] = None
 
 
 class SetArmRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     is_armed: bool
+
+
+async def _resolve_site_schedule_for_arm(
+    db: AsyncSession, site: Site
+) -> tuple[List[Dict[str, Any]], str]:
+    """Return the (schedule, timezone) that governs a site's armed state.
+
+    Mirrors how the manager resolves the site schedule so the override boundary
+    computed here matches the one the reconcile loop / pipeline evaluate against.
+    """
+    settings_row = await SiteRepository().get_site_settings(db, site_uuid=site.site_uuid)
+    payload = _site_schedule_payload_from_row(settings_row, fallback_timezone=site.timezone)
+    return (payload.get("schedule") or [], str(payload.get("timezone") or "UTC"))
+
+
+def _effective_arm_state_out(
+    site: Site, schedule: List[Dict[str, Any]], tz: str, *, now: datetime
+) -> ArmStateOut:
+    override = VideoChannelConfig.effective_arm_override(
+        site.arm_override, site.arm_override_until, now_utc=now
+    )
+    if override is not None:
+        armed = bool(override)
+        override_active = True
+    else:
+        armed = VideoChannelConfig.schedule_is_active(schedule, tz, now_utc=now)
+        override_active = False
+    return ArmStateOut(
+        site_uuid=site.site_uuid,
+        is_armed=armed,
+        override_active=override_active,
+        override_until=site.arm_override_until if override_active else None,
+    )
 
 
 @router.get(
@@ -1233,30 +1271,40 @@ async def get_site_arm_state(
     ).scalar_one_or_none()
     if site is None or bool(site.is_deleted):
         raise HTTPException(status_code=404, detail="Site not found")
-    return ArmStateOut(site_uuid=site.site_uuid, is_armed=bool(site.is_armed))
+    schedule, tz = await _resolve_site_schedule_for_arm(db, site)
+    return _effective_arm_state_out(site, schedule, tz, now=datetime.now(timezone.utc))
 
 
 @router.patch(
     "/{site_uuid}/arm",
     response_model=ArmStateOut,
-    dependencies=[Depends(RequirePermission(Permission.SITE_ARM_DISARM))],
 )
 async def set_site_arm_state(
     site_uuid: uuid.UUID,
     payload: SetArmRequest,
     db: AsyncSession = Depends(get_async_db),
-    actor=Depends(get_current_user),
+    ctx: OrgContext = Depends(RequirePermission(Permission.SITE_ARM_DISARM)),
+    manager: Manager = Depends(get_manager),
 ):
-    """Arm or disarm a site.
+    """Arm or disarm a site, schedule-aware.
 
     Permission: requires `SiteRole.ADMIN` or `SiteRole.ARM_DISARM`
     (Org Admins satisfy this implicitly through `AuthzService`).
     Read-only members will get a 403 here.
 
-    Disarming a site disables every camera that is currently enabled on
-    it (`is_enabled=False`) and snapshots that set into `disarm_state` so
-    arming again re-enables exactly those cameras. The edge reconcile and
-    detection pipeline read `is_enabled`, so cameras actually stop.
+    The site's schedule is the default source of truth for whether it is armed.
+    Arming/disarming records a *temporary override* that lasts only until the
+    next schedule boundary, after which the schedule resumes control:
+
+      * Disarming during an active window keeps the site disarmed until that
+        window ends (the next time the schedule flips off).
+      * Arming while off-schedule keeps the site armed until the next window
+        begins (the next time the schedule flips on).
+
+    If the requested state already matches the schedule, any existing override is
+    simply cleared. The effective armed state gates BOTH edge detection (the
+    reconcile loop tears cameras down on the Jetson when disarmed) and
+    notifications (the pipeline suppresses alerts when disarmed).
     """
     site = (
         await db.execute(
@@ -1266,33 +1314,53 @@ async def set_site_arm_state(
     if site is None or bool(site.is_deleted):
         raise HTTPException(status_code=404, detail="Site not found")
 
-    channel_repo = ChannelRepository()
     want_armed = bool(payload.is_armed)
+    schedule, tz = await _resolve_site_schedule_for_arm(db, site)
 
-    if not want_armed:
-        # Disarm: snapshot the currently-enabled cameras, then disable them.
-        enabled_now = await channel_repo.list_enabled_camera_uuids_for_site(
-            db, site_uuid=site.site_uuid
-        )
-        await channel_repo.set_cameras_enabled(
-            db, camera_uuids=enabled_now, enabled=False
-        )
-        site.disarm_state = [str(c) for c in enabled_now]
-        site.is_armed = False
+    now = datetime.now(timezone.utc)
+    scheduled_now = VideoChannelConfig.schedule_is_active(schedule, tz, now_utc=now)
+
+    if want_armed == scheduled_now:
+        # Desired state already equals what the schedule dictates: drop any
+        # override so the schedule drives the site again.
+        site.arm_override = None
+        site.arm_override_until = None
     else:
-        # Arm: re-enable exactly the cameras captured at disarm time.
-        prev = [uuid.UUID(str(c)) for c in (site.disarm_state or [])]
-        await channel_repo.set_cameras_enabled(db, camera_uuids=prev, enabled=True)
-        site.disarm_state = None
-        site.is_armed = True
+        # Override the schedule until its next boundary. A None boundary (no
+        # schedule configured) means there is nothing to clear it, so it stays
+        # until changed.
+        site.arm_override = want_armed
+        site.arm_override_until = VideoChannelConfig.next_schedule_transition(
+            schedule, tz, now_utc=now
+        )
 
     await db.commit()
     await db.refresh(site)
 
-    # Best-effort: nudge the runtime so streams/detection stop or resume now
-    # instead of waiting for the next periodic reconcile.
+    owner_id = _owner_id(site, ctx)
+
+    # Collect every device backing the site's cameras: the override applies to
+    # all cameras regardless of per-camera schedules, so every device must be
+    # reconciled.
+    cams = await ChannelRepository().list_cameras(db, site_uuid=site.site_uuid)
+    device_uuids = sorted(
+        {
+            cam.device_uuid
+            for cam in cams
+            if getattr(cam, "device_uuid", None) is not None
+        },
+        key=str,
+    )
+
+    # Best-effort: nudge the runtime so notifications and edge detection react
+    # now instead of waiting for the next periodic reconcile / cache lapse.
     try:
-        await _refresh_site_arm_runtime(site=site)
+        await _refresh_site_arm_runtime(
+            manager=manager,
+            user_id=owner_id,
+            site_uuid=site.site_uuid,
+            device_uuids=device_uuids,
+        )
     except Exception:
         logger.warning(
             "Best-effort arm/disarm runtime refresh failed for site=%s",
@@ -1300,13 +1368,46 @@ async def set_site_arm_state(
         )
 
     logger.info(
-        "Site=%s armed=%s by user=%s", site_uuid, site.is_armed, int(actor.id)
+        "Site=%s want_armed=%s override=%s until=%s by user=%s",
+        site_uuid,
+        want_armed,
+        site.arm_override,
+        site.arm_override_until,
+        int(ctx.user.id),
     )
-    return ArmStateOut(site_uuid=site.site_uuid, is_armed=bool(site.is_armed))
+    return _effective_arm_state_out(site, schedule, tz, now=now)
 
 
-async def _refresh_site_arm_runtime(*, site: Site) -> None:
-    """Hook for pushing arm/disarm state to the live pipeline. The DB
-    (`is_enabled`) is authoritative and the edge reconcile picks it up; this
-    is where an immediate manager nudge would go. Kept as a no-op-safe seam."""
-    return None
+async def _refresh_site_arm_runtime(
+    *,
+    manager: Manager,
+    user_id: int,
+    site_uuid: uuid.UUID,
+    device_uuids: List[uuid.UUID],
+) -> None:
+    """Push a fresh arm/disarm decision to the live runtime.
+
+    1. Invalidate the pipeline's per-site arm cache so the notification gate
+       flips on the next frame instead of after the TTL.
+    2. Fire a best-effort edge reconcile for the site's devices so detection is
+       torn down (disarm) or brought back up (arm) on the Jetson immediately.
+
+    The DB (`arm_override` + schedule) remains authoritative; the periodic edge
+    reconcile loop will converge anyway, so any failure here is non-fatal.
+    """
+    try:
+        pipeline = manager.get_loaded_pipeline(user_id=int(user_id))
+        if pipeline is not None and hasattr(pipeline, "invalidate_site_arm_state"):
+            pipeline.invalidate_site_arm_state(str(site_uuid))
+    except Exception:
+        logger.warning(
+            "Failed to invalidate arm-state cache site=%s", site_uuid, exc_info=True
+        )
+
+    if device_uuids:
+        asyncio.create_task(
+            manager.reconcile_devices_best_effort(
+                user_id=int(user_id),
+                device_uuids=list(device_uuids),
+            )
+        )

@@ -1,5 +1,5 @@
 from abc import ABC
-from datetime import datetime, time as dt_time, timezone as dt_timezone
+from datetime import datetime, time as dt_time, timedelta, timezone as dt_timezone
 from typing import Optional, Literal, Tuple, Any, Dict, List
 import uuid
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -381,6 +381,169 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
 
     def is_scheduled_now(self, *, now_utc: Optional[datetime] = None) -> bool:
         return self.schedule_is_active(self.schedule, self.timezone, now_utc=now_utc)
+
+    @staticmethod
+    def next_schedule_transition(
+        raw_schedule: Any,
+        timezone_name: Optional[str] = None,
+        *,
+        now_utc: Optional[datetime] = None,
+    ) -> Optional[datetime]:
+        """Return the next UTC instant at which ``schedule_is_active`` flips value.
+
+        Used to stamp the expiry on a temporary arm/disarm override so it clears
+        exactly at the next schedule boundary: a disarm placed during an active
+        window expires when the window ends (active flips True->False); an arm
+        placed while off-schedule expires when the next window begins (active
+        flips False->True).
+
+        Inputs:
+          raw_schedule  : list of window dicts ({day_of_week, start_time,
+                          end_time, is_enabled}); normalized internally, so it may
+                          be raw/un-normalized or ``None``.
+          timezone_name : IANA tz the window local-times are interpreted in
+                          (defaults to UTC if missing/invalid).
+          now_utc       : reference instant (defaults to now); naive values are
+                          treated as UTC.
+
+        Returns:
+          A timezone-aware UTC ``datetime`` of the next flip, or ``None`` when
+          there is no schedule at all (the site is always "scheduled", so there is
+          no boundary and an override placed on it is effectively permanent).
+
+        Note: the result is a self-contained timestamp. Once stored, expiry is
+        decided purely by comparing ``now`` to it (see ``arm_override_is_active``),
+        so callers never need to re-derive the schedule to know when it clears.
+        """
+        schedule = VideoChannelConfig.normalize_schedule(raw_schedule)
+        if not schedule:
+            return None
+
+        now = now_utc or datetime.now(dt_timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=dt_timezone.utc)
+
+        try:
+            tz = ZoneInfo(str(timezone_name or "UTC"))
+        except Exception:
+            tz = dt_timezone.utc
+
+        current = VideoChannelConfig.schedule_is_active(schedule, timezone_name, now_utc=now)
+        local_now = now.astimezone(tz)
+
+        # Windows are normalized to same-day start<end (overnight windows are
+        # already split), so every window contributes a start and end edge on its
+        # weekday. Scan the next 8 local days so a weekly schedule always yields a
+        # boundary, evaluate the active state AT each candidate edge, and return
+        # the first edge whose state differs from the current one.
+        candidates: List[datetime] = []
+        for day_offset in range(0, 8):
+            day_date = (local_now + timedelta(days=day_offset)).date()
+            weekday = day_date.weekday()
+            for window in schedule:
+                if not bool(window.get("is_enabled", True)):
+                    continue
+                try:
+                    window_day = int(window.get("day_of_week", -1))
+                except (TypeError, ValueError):
+                    continue
+                if window_day != weekday:
+                    continue
+                for edge_key, default in (
+                    ("start_time", DEFAULT_START_TIME),
+                    ("end_time", DEFAULT_END_TIME),
+                ):
+                    try:
+                        edge_time = _coerce_schedule_time(window.get(edge_key), default)
+                    except ValueError:
+                        continue
+                    # Build the edge as a tz-aware local datetime, then convert to
+                    # UTC. (On DST spring-forward/fall-back days an edge time that
+                    # is skipped or doubled can be off by the DST hour; acceptable
+                    # for an arm window boundary.)
+                    edge_utc = datetime.combine(day_date, edge_time, tzinfo=tz).astimezone(
+                        dt_timezone.utc
+                    )
+                    if edge_utc > now:
+                        candidates.append(edge_utc)
+
+        # State is piecewise-constant and only changes at edges, so the earliest
+        # edge whose active-state differs from `current` is the true next flip.
+        # Re-evaluating the active function at the edge (rather than just taking
+        # the nearest edge) skips edges that don't actually change state, which is
+        # what makes overlapping windows correct.
+        for edge_utc in sorted(candidates):
+            if (
+                VideoChannelConfig.schedule_is_active(schedule, timezone_name, now_utc=edge_utc)
+                != current
+            ):
+                return edge_utc
+
+        return None
+
+    @staticmethod
+    def arm_override_is_active(
+        arm_override_until: Optional[datetime],
+        *,
+        now_utc: Optional[datetime] = None,
+    ) -> bool:
+        """Whether an override with the given expiry is still in effect.
+
+        Inputs:
+          arm_override_until : the stored boundary timestamp. ``None`` means the
+                               override has no schedule boundary to clear it (no
+                               schedule was configured) -> treated as permanent.
+                               Naive datetimes are read back from MySQL by aiomysql
+                               (tzinfo stripped), so naive is interpreted as UTC.
+          now_utc            : reference instant (defaults to now).
+
+        Returns: ``True`` while the override still applies (``now < until``, or
+        ``until is None``), ``False`` once it has lapsed.
+        """
+        if arm_override_until is None:
+            return True
+        now = now_utc or datetime.now(dt_timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=dt_timezone.utc)
+        # aiomysql returns DATETIME columns as naive UTC; treat naive as UTC.
+        until = arm_override_until
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=dt_timezone.utc)
+        return now < until
+
+    @staticmethod
+    def effective_arm_override(
+        arm_override: Optional[bool],
+        arm_override_until: Optional[datetime],
+        *,
+        now_utc: Optional[datetime] = None,
+    ) -> Optional[bool]:
+        """Resolve a stored arm override into an effective decision.
+
+        This is the SINGLE source of the arm/disarm rule. It is deliberately
+        called from three places that each hold the Site values in a different
+        runtime context, so they can never disagree:
+          * routes/site_routes.py        -> build the API response
+          * SiteArmStateResolver (pipeline) -> gate notifications per frame
+          * manager/controllers/schedule.py -> gate edge detection per reconcile
+        That repetition is intentional reuse of one rule, not duplicated logic.
+
+        Inputs:
+          arm_override       : stored override value -- ``None`` (no override),
+                               ``True`` (force-armed) or ``False`` (force-disarmed).
+          arm_override_until : the override's expiry (see ``arm_override_is_active``).
+          now_utc            : reference instant (defaults to now).
+
+        Returns:
+          ``True`` / ``False`` while a live override applies, or ``None`` meaning
+          "no override -- the caller should follow the schedule" (either nothing
+          was set, or it has expired at a schedule boundary).
+        """
+        if arm_override is None:
+            return None
+        if not VideoChannelConfig.arm_override_is_active(arm_override_until, now_utc=now_utc):
+            return None
+        return bool(arm_override)
 
     @model_validator(mode="after")
     def _validate_and_normalize(self):

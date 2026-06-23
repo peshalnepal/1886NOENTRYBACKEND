@@ -50,6 +50,11 @@ class ScheduleResolver:
         state = {
             "schedule": VideoChannelConfig.normalize_schedule(config.get("schedule")),
             "timezone": str(config.get("timezone") or site_timezone or "UTC"),
+            # Temporary arm/disarm override lives on the Site row; it wins over the
+            # schedule for every camera in the site until it clears at the next
+            # schedule boundary.
+            "arm_override": getattr(site, "arm_override", None) if site is not None else None,
+            "arm_override_until": getattr(site, "arm_override_until", None) if site is not None else None,
         }
         if cache is not None:
             cache[cache_key] = state
@@ -90,12 +95,16 @@ class ScheduleResolver:
             or "UTC"
         )
 
+        # The site row is always consulted (cached) so the site-level arm/disarm
+        # override applies to every camera, including those with their own
+        # schedule. The site schedule itself is only adopted when the camera
+        # inherits it.
+        site_state = await self._load_site_schedule_state(
+            db,
+            site_uuid=cam.site_uuid,
+            cache=site_cache,
+        )
         if use_site_schedule:
-            site_state = await self._load_site_schedule_state(
-                db,
-                site_uuid=cam.site_uuid,
-                cache=site_cache,
-            )
             if site_state.get("schedule"):
                 schedule = site_state["schedule"]
             timezone_name = str(site_state.get("timezone") or timezone_name or "UTC")
@@ -103,15 +112,27 @@ class ScheduleResolver:
         if not schedule:
             schedule = VideoChannelConfig.default_schedule()
 
+        now = datetime.now(timezone.utc)
+        active = VideoChannelConfig.schedule_is_active(
+            schedule,
+            timezone_name or "UTC",
+            now_utc=now,
+        )
+        override = VideoChannelConfig.effective_arm_override(
+            site_state.get("arm_override"),
+            site_state.get("arm_override_until"),
+            now_utc=now,
+        )
+        armed = bool(override) if override is not None else active
+
         return {
             "schedule": schedule,
             "timezone": timezone_name or "UTC",
             "use_site_schedule": use_site_schedule,
-            "active": VideoChannelConfig.schedule_is_active(
-                schedule,
-                timezone_name or "UTC",
-                now_utc=datetime.now(timezone.utc),
-            ),
+            "active": active,
+            # Effective armed state = override (if active) else schedule. Drives
+            # whether detection is provisioned on the edge for this camera.
+            "armed": armed,
         }
 
     async def sync_site_schedule_runtime(

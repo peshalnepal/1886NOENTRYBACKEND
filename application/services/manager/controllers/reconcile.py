@@ -213,8 +213,13 @@ class DeviceReconciler:
                     cfg_timezone=getattr(getattr(cam, "channel_configuration", None), "timezone", None),
                     site_cache=site_schedule_cache,
                 )
-                # Alert schedules should not tear down active detection runtimes.
-                if bool(cam.is_detection_enabled):
+                # Detection is provisioned on the edge only when the camera is
+                # detection-enabled AND the site is currently armed. "Armed" is the
+                # schedule's active state, optionally overridden by a temporary
+                # site arm/disarm that clears at the next schedule boundary. A
+                # disarmed / off-schedule site has its cameras torn down here, so
+                # the Jetson actually stops detecting.
+                if bool(cam.is_detection_enabled) and bool(schedule_state.get("armed", True)):
                     desired_set.add(str(cam.camera_uuid))
                 # Keep playback paths provisioned for enabled cameras regardless of
                 # alert schedule state so live view remains stable.

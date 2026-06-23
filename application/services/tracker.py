@@ -334,7 +334,7 @@ class ByteTrackLite:
         # cost layout:  IoU match  -> [0, 1-min_iou]  (< 1, always preferred)
         #               dist match -> [1, 2)          (only when use_dist)
         #               forbidden  -> 1e6
-        _ACCEPT = 2.0
+        _ACCEPT = 1.6
 
         def _match(track_idxs, det_idxs, det_list, min_iou):
             """Hungarian match between a subset of tracks and a subset of detections."""

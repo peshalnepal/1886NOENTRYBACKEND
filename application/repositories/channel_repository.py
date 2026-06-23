@@ -339,43 +339,6 @@ class ChannelRepository:
         await db.flush()
         return result.rowcount or 0
 
-    async def list_enabled_camera_uuids_for_site(
-        self, db: AsyncSession, *, site_uuid: uuid.UUID
-    ) -> List[uuid.UUID]:
-        """Camera uuids currently enabled on a site (used to snapshot arm state)."""
-        rows = (
-            await db.execute(
-                select(Camera.camera_uuid).where(
-                    Camera.site_uuid == _as_uuid(site_uuid),
-                    Camera.is_enabled.is_(True),
-                )
-            )
-        ).scalars().all()
-        return list(rows)
-
-    async def set_cameras_enabled(
-        self,
-        db: AsyncSession,
-        *,
-        camera_uuids: List[uuid.UUID],
-        enabled: bool,
-    ) -> int:
-        """Bulk set is_enabled (+ is_detection_enabled) on specific cameras.
-
-        Used by the site arm/disarm cascade. Returns affected row count.
-        """
-        clean = [_as_uuid(c) for c in (camera_uuids or []) if c is not None]
-        if not clean:
-            return 0
-        result = await db.execute(
-            update(Camera)
-            .where(Camera.camera_uuid.in_(clean))
-            .values(is_enabled=bool(enabled), is_detection_enabled=bool(enabled))
-            .execution_options(synchronize_session=False)
-        )
-        await db.flush()
-        return result.rowcount or 0
-
     async def set_camera_device(
         self,
         db: AsyncSession,

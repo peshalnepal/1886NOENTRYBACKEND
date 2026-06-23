@@ -28,6 +28,7 @@ from application.services.notification import NotificationMessage, NotificationS
 from application.repositories.notification_repository import CameraContext
 from application.services.common import (
     CameraContextResolver,
+    SiteArmStateResolver,
     SiteTriggerModeResolver,
 )
 
@@ -367,6 +368,9 @@ class ModelPipeline:
             default="roi_enter",
             ttl_s=float(os.getenv("SITE_TRIGGER_MODE_CACHE_TTL_S", "30.0")),
         )
+        self._arm_state_resolver = SiteArmStateResolver(
+            ttl_s=float(os.getenv("SITE_ARM_STATE_CACHE_TTL_S", "10.0")),
+        )
         self._session_factory: Optional[SessionFactory] = None
         self._device_fetch_limits: Dict[str, asyncio.Semaphore] = {}
         self._max_concurrent_fetch_per_device = max(
@@ -525,6 +529,7 @@ class ModelPipeline:
         self._session_factory = session_factory
         self._ctx_resolver.set_session_factory(session_factory)
         self._trigger_mode_resolver.set_session_factory(session_factory)
+        self._arm_state_resolver.set_session_factory(session_factory)
         if self._notification_service is not None:
             try:
                 self._notification_service.set_session_factory(session_factory)
@@ -542,6 +547,11 @@ class ModelPipeline:
     def invalidate_site_trigger_mode_cache(self, site_uuid: str) -> None:
         """Invalidate the cached trigger_mode for a site (after settings are saved)."""
         self._trigger_mode_resolver.invalidate(str(site_uuid))
+
+    def invalidate_site_arm_state(self, site_uuid: str) -> None:
+        """Invalidate the cached arm/disarm override for a site so a fresh
+        arm/disarm action gates notifications immediately instead of after TTL."""
+        self._arm_state_resolver.invalidate(str(site_uuid))
 
     async def add_channel(self, ch: VideoChannel) -> None:
         key = ch.key()
@@ -683,13 +693,23 @@ class ModelPipeline:
         cfg = getattr(ch, "config", None)
         return getattr(cfg, "enabled", True) is not False
 
-    def _notifications_allowed_now(self, ch: VideoChannel) -> bool:
+    async def _notifications_allowed_now(self, ch: VideoChannel) -> bool:
         cfg = getattr(ch, "config", None)
         if cfg is None:
             return True
 
         if getattr(cfg, "notification_enabled", True) is False:
             return False
+
+        # A site-level arm/disarm override wins over the schedule for every
+        # camera in the site (until it clears at the next schedule boundary). With
+        # no active override we fall back to the camera's own schedule.
+        site_uuid = getattr(cfg, "site_uuid", None)
+        override = await self._arm_state_resolver.resolve(
+            str(site_uuid) if site_uuid else None
+        )
+        if override is not None:
+            return bool(override)
 
         is_scheduled_now = getattr(cfg, "is_scheduled_now", None)
         if callable(is_scheduled_now):
@@ -831,7 +851,7 @@ class ModelPipeline:
                 except Exception:
                     logger.exception("Failed to record detection overlay frame camera=%s", cam_uuid)
 
-            if not self._notifications_allowed_now(ch):
+            if not await self._notifications_allowed_now(ch):
                 return
 
             _cam_trigger_mode = str(getattr(_cam_cfg, "notification_trigger_mode", "inherit") or "inherit")

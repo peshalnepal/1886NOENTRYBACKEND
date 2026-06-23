@@ -215,8 +215,12 @@ class Site(Base):
     timezone = Column(String(50), nullable=True, default="UTC")
 
     is_deleted = Column(Boolean, default=False, nullable=False, server_default="0")
-    is_armed = Column(Boolean, default=True, nullable=False, server_default="1")
-    disarm_state = Column(JSONList, nullable=True)
+    # Temporary, schedule-aware arm/disarm override. NULL arm_override means the
+    # site follows its schedule. A non-NULL value forces armed (True) or disarmed
+    # (False) until arm_override_until, the next schedule boundary, after which the
+    # schedule resumes control. arm_override_until NULL => no boundary (permanent).
+    arm_override = Column(Boolean, nullable=True)
+    arm_override_until = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)

@@ -637,28 +637,30 @@ class DatabaseManager:
                         "Skipping users.is_platform_admin migration: %s", exc
                     )
 
-                try:
-                    has_is_armed = (
-                        await conn.execute(
-                            text(
-                                "SELECT 1 FROM information_schema.COLUMNS "
-                                "WHERE TABLE_SCHEMA = DATABASE() "
-                                "  AND TABLE_NAME = 'sites' "
-                                "  AND COLUMN_NAME = 'is_armed' "
-                                "LIMIT 1"
+                # --- schedule-aware arm/disarm override on sites -------------
+                for col_name, col_def in (
+                    ("arm_override", "TINYINT(1) NULL"),
+                    ("arm_override_until", "DATETIME NULL"),
+                ):
+                    try:
+                        has_col = (
+                            await conn.execute(
+                                text(
+                                    "SELECT 1 FROM information_schema.COLUMNS "
+                                    "WHERE TABLE_SCHEMA = DATABASE() "
+                                    "  AND TABLE_NAME = 'sites' "
+                                    f"  AND COLUMN_NAME = '{col_name}' "
+                                    "LIMIT 1"
+                                )
                             )
-                        )
-                    ).fetchone()
-                    if not has_is_armed:
-                        await conn.execute(
-                            text(
-                                "ALTER TABLE sites ADD COLUMN is_armed "
-                                "TINYINT(1) NOT NULL DEFAULT 1"
+                        ).fetchone()
+                        if not has_col:
+                            await conn.execute(
+                                text(f"ALTER TABLE sites ADD COLUMN `{col_name}` {col_def}")
                             )
-                        )
-                        logger.info("Added sites.is_armed column.")
-                except Exception as exc:
-                    logger.warning("Skipping sites.is_armed migration: %s", exc)
+                            logger.info("Added sites.%s column.", col_name)
+                    except Exception as exc:
+                        logger.warning("Skipping sites.%s migration: %s", col_name, exc)
 
                 try:
                     has_org_id = (
@@ -733,27 +735,6 @@ class DatabaseManager:
                             logger.info("Relaxed %s.user_id to NULL.", tbl)
                     except Exception as exc:
                         logger.warning("Skipping %s.user_id nullable migration: %s", tbl, exc)
-
-                # --- sites.disarm_state -------------------------------------
-                try:
-                    has_disarm = (
-                        await conn.execute(
-                            text(
-                                "SELECT 1 FROM information_schema.COLUMNS "
-                                "WHERE TABLE_SCHEMA = DATABASE() "
-                                "  AND TABLE_NAME = 'sites' "
-                                "  AND COLUMN_NAME = 'disarm_state' "
-                                "LIMIT 1"
-                            )
-                        )
-                    ).fetchone()
-                    if not has_disarm:
-                        await conn.execute(
-                            text("ALTER TABLE sites ADD COLUMN disarm_state JSON NULL")
-                        )
-                        logger.info("Added sites.disarm_state column.")
-                except Exception as exc:
-                    logger.warning("Skipping sites.disarm_state migration: %s", exc)
 
                 # --- created_by on sites / camera / devices -----------------
                 # Records who created the row. Backfilled from the legacy

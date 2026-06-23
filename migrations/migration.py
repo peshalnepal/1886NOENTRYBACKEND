@@ -15,8 +15,8 @@ Schema bring-up (idempotent, checks existence first):
   - creates any missing tables from the ORM metadata (organizations, roles,
     permissions, role_permissions, access_grants, …)
   - adds any missing columns the new ORM introduced on existing tables
-    (users.is_platform_admin, sites.org_id, sites.created_by, sites.is_deleted,
-    sites.is_armed, sites.disarm_state) + the sites.org_id FK
+    (users.is_platform_admin, sites.org_id, sites.created_by, sites.is_deleted)
+    + the sites.org_id FK
 
 This script then runs a DATA backfill + fixup pass:
 
@@ -164,8 +164,6 @@ _NEW_COLUMNS = [
     ("sites", "org_id", "INT NULL"),
     ("sites", "created_by", "INT NULL"),
     ("sites", "is_deleted", "BOOLEAN NOT NULL DEFAULT 0"),
-    ("sites", "is_armed", "BOOLEAN NOT NULL DEFAULT 1"),
-    ("sites", "disarm_state", "JSON NULL"),
 ]
 
 
