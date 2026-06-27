@@ -16,6 +16,7 @@ from pydantic import (
 )
 
 from application.channels.channel_config import VideoChannelConfig
+from core.source_url import is_supported_source_url
 
 
 # -------------------------
@@ -106,7 +107,8 @@ class CameraCreateSchema(BaseModel):
 
     site_uuid: uuid.UUID
     device_uuid: Optional[uuid.UUID] = None
-    rtsp_url: str = Field(..., min_length=1)
+    # The single camera source URL: rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt.
+    source_url: str = Field(..., min_length=1)
     device_url: Optional[str] = Field(default=None, min_length=1)
     name: Optional[str] = None
     location: Optional[str] = None
@@ -144,12 +146,18 @@ class CameraCreateSchema(BaseModel):
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("rtsp_url", "device_url", "name", "location", "detection_path_template", "timezone"):
+        for attr in ("source_url", "device_url", "name", "location", "detection_path_template", "timezone"):
             v = getattr(self, attr, None)
             if isinstance(v, str) and not v.strip():
                 setattr(self, attr, None)
-        if not self.rtsp_url:
-            raise ValueError("rtsp_url is required.")
+        if not self.source_url:
+            raise ValueError("source_url is required.")
+        if not is_supported_source_url(self.source_url):
+            raise ValueError(
+                "Unsupported camera source URL. Expected one of: "
+                "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
+            )
+        self.source_url = self.source_url.strip()
         return _normalize_schedule_fields(self)
 
 
@@ -175,7 +183,7 @@ class CameraEditSchema(BaseModel):
     site_uuid: Optional[uuid.UUID] = None
     device_uuid: Optional[uuid.UUID] = None  # allow re-assign device if you want
 
-    rtsp_url: Optional[str] = Field(default=None, min_length=1)
+    source_url: Optional[str] = Field(default=None, min_length=1)
     device_url: Optional[str] = Field(default=None, min_length=1)
     webrtc_url: Optional[str] = Field(default=None, min_length=1)
     name: Optional[str] = None
@@ -213,10 +221,18 @@ class CameraEditSchema(BaseModel):
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("rtsp_url", "name", "location", "detection_path_template", "timezone"):
+        for attr in ("source_url", "name", "location", "detection_path_template", "timezone"):
             v = getattr(self, attr, None)
             if isinstance(v, str) and not v.strip():
                 setattr(self, attr, None)
+        # Patch semantics: only validate the source when the caller sent one.
+        if self.source_url is not None:
+            if not is_supported_source_url(self.source_url):
+                raise ValueError(
+                    "Unsupported camera source URL. Expected one of: "
+                    "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
+                )
+            self.source_url = self.source_url.strip()
         return _normalize_schedule_fields(self)
 
 
@@ -239,7 +255,7 @@ class CameraSchema(BaseModel):
     site_uuid: uuid.UUID
     device_uuid: Optional[uuid.UUID] = None
 
-    rtsp_url: str
+    source_url: str
     webrtc_url: Optional[str] = None
 
     is_enabled: bool
@@ -321,7 +337,8 @@ class LinkDeviceRequest(BaseModel):
 
 class SiteCameraCreate(BaseModel):
     device_uuid: uuid.UUID
-    rtsp_url: str = Field(..., min_length=1, max_length=2048)
+    # The single camera source URL: rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt.
+    source_url: str = Field(..., min_length=1, max_length=2048)
     name: Optional[str] = Field(default=None, max_length=255)
     location: Optional[str] = Field(default=None, max_length=255)
     is_enabled: bool = True
@@ -345,6 +362,14 @@ class SiteCameraCreate(BaseModel):
 
     @model_validator(mode="after")
     def _validate_schedule(self):
+        if not self.source_url:
+            raise ValueError("source_url is required.")
+        if not is_supported_source_url(self.source_url):
+            raise ValueError(
+                "Unsupported camera source URL. Expected one of: "
+                "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
+            )
+        self.source_url = self.source_url.strip()
         return _normalize_schedule_fields(self)
 
 

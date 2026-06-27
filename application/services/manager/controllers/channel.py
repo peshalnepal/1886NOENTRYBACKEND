@@ -80,8 +80,8 @@ class ChannelController:
         coro = self._state.edge.patch_camera(device_url=device_url, camera_uuid=camera_uuid, patch=patch)
         await self._safe_bg_call(coro, "Background edge patch succeeded camera_uuid=", "Background edge patch failed camera_uuid=", camera_uuid)
 
-    async def _bg_webrtc_update_stream(self, *, stream_key: str, rtsp_url: str) -> None:
-        coro = self._state.webrtc.update_stream(stream_key=stream_key, rtsp_url=rtsp_url)
+    async def _bg_webrtc_update_stream(self, *, stream_key: str, source_url: str) -> None:
+        coro = self._state.webrtc.update_stream(stream_key=stream_key, source_url=source_url)
         await self._safe_bg_call(coro, "Background WebRTC update succeeded stream_key=", "Background WebRTC update failed stream_key=", stream_key)
 
     async def _safe_bg_call(self, coro: asyncio.coroutine, success_msg: str, error_msg: str, identifier: str) -> None:
@@ -105,9 +105,9 @@ class ChannelController:
 
         patch = self._patch_to_dict(getattr(ev, "configs", None))
 
-        rtsp_url = patch.get("rtsp_url")
-        if not rtsp_url:
-            raise ValueError("Create_Channel requires rtsp_url")
+        source_url = patch.get("source_url")
+        if not source_url:
+            raise ValueError("Create_Channel requires source_url")
 
         site_uuid = patch.get("site_uuid")
         if not site_uuid:
@@ -155,7 +155,7 @@ class ChannelController:
         patch["device_uuid"] = device_uuid
 
         # 2. Create WebRTC stream NOW
-        webrtc_url = await self._state.webrtc.ensure_stream(stream_key=str(camera_code), rtsp_url=str(rtsp_url))
+        webrtc_url = await self._state.webrtc.ensure_stream(stream_key=str(camera_code), source_url=str(source_url))
 
         # 3. Upsert to DB, wrapped in try/except to rollback stream on failure
         try:
@@ -193,7 +193,7 @@ class ChannelController:
             "detection_enabled": det_enabled,
             "notification_enabled": bool(getattr(cam, "is_notification_enabled", True)),
             "camera_uuid": str(cam.camera_uuid),
-            "rtsp_url": cam.rtsp_url,
+            "source_url": cam.source_url,
         }
         
         if det_enabled:
@@ -225,7 +225,7 @@ class ChannelController:
                 name=getattr(cam, "name", None),
                 location=getattr(cam, "location", None),
                 site_uuid=cam.site_uuid,
-                rtsp_url=cam.rtsp_url,
+                source_url=cam.source_url,
                 webrtc_url=cam.webrtc_url,
                 enabled=bool(cam.is_enabled),
                 detection_enabled=bool(cam.is_detection_enabled),
@@ -254,7 +254,7 @@ class ChannelController:
                 "camera_uuid": str(cam.camera_uuid),
                 "site_uuid": str(cam.site_uuid),
                 "device_uuid": str(device_uuid),
-                "rtsp_url": cam.rtsp_url,
+                "source_url": cam.source_url,
                 "webrtc_url": cam.webrtc_url,
             }
         ]
@@ -286,7 +286,7 @@ class ChannelController:
         if existing_pid is not None and existing_pid != pid:
             raise ValueError("Camera does not belong to provided pipeline_id")
 
-        old_rtsp = cam_db.rtsp_url
+        old_rtsp = cam_db.source_url
         old_webrtc = cam_db.webrtc_url
         patch = self._patch_to_dict(getattr(ev, "configs", None))
         patch.pop("webrtc_url", None)
@@ -341,7 +341,7 @@ class ChannelController:
                     **merged_cfg,
                     "camera_uuid": cam_uuid,
                     "webrtc_url": old_webrtc,
-                    "rtsp_url": merged_cfg.get("rtsp_url", old_rtsp),
+                    "source_url": merged_cfg.get("source_url", old_rtsp),
                     "enabled": merged_cfg.get("enabled", cam_db.is_enabled),
                     "detection_enabled": merged_cfg.get("detection_enabled", cam_db.is_detection_enabled),
                     "notification_enabled": merged_cfg.get("notification_enabled", cam_db.is_notification_enabled),
@@ -364,9 +364,9 @@ class ChannelController:
         device_changed = old_dev is None or old_dev.device_uuid != new_device_uuid
         if len(old_devices) != 1 or device_changed:
             await self._state.channel_repo.set_camera_device(db, camera_uuid=cam_uuid, device_uuid=new_device_uuid)
-        if cam2.rtsp_url != old_rtsp and cam2.camera_code:
+        if cam2.source_url != old_rtsp and cam2.camera_code:
             self._state.spawn_bg(
-                self._bg_webrtc_update_stream(stream_key=str(cam2.camera_code), rtsp_url=cam2.rtsp_url),
+                self._bg_webrtc_update_stream(stream_key=str(cam2.camera_code), source_url=cam2.source_url),
                 name=f"webrtc_update_{cam_uuid}"
             )
 
@@ -386,7 +386,7 @@ class ChannelController:
                     "detection_enabled": det_enabled,
                     "notification_enabled": bool(cam2.is_notification_enabled),
                     "camera_uuid": str(cam_uuid),
-                    "rtsp_url": cam2.rtsp_url,
+                    "source_url": cam2.source_url,
                 }
                 self._state.spawn_bg(
                     self._bg_edge_upsert(device_url=new_dev.device_url, payload=edge_payload),
@@ -394,7 +394,7 @@ class ChannelController:
                 )
             else:
                 edge_patch = _only_jetson_config(patch)
-                edge_patch.setdefault("rtsp_url", cam2.rtsp_url)
+                edge_patch.setdefault("source_url", cam2.source_url)
                 edge_patch["enabled"] =bool(det_enabled)
                 edge_patch["detection_enabled"] = det_enabled
                 edge_patch["notification_enabled"] = bool(cam2.is_notification_enabled)
@@ -425,7 +425,7 @@ class ChannelController:
                 name=getattr(cam2, "name", None),
                 location=getattr(cam2, "location", None),
                 site_uuid=cam2.site_uuid,
-                rtsp_url=cam2.rtsp_url,
+                source_url=cam2.source_url,
                 webrtc_url=cam2.webrtc_url,
                 enabled=bool(cam2.is_enabled),
                 detection_enabled=bool(cam2.is_detection_enabled),
@@ -451,7 +451,7 @@ class ChannelController:
         events_out = [{
             "event_type": "Edit_Channel",
             "camera_uuid": str(cam2.camera_uuid),
-            "rtsp_url": cam2.rtsp_url,
+            "source_url": cam2.source_url,
             "webrtc_url": cam2.webrtc_url,
             "device_uuid": str(new_device_uuid),
             "patch": patch,

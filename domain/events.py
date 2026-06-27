@@ -80,7 +80,7 @@ class RTSPEvent(ChannelEvent):
 class ChannelConnectedEvent(ChannelEvent):
     event_type: str = "ChannelConnectedEvent"
     camera_uuid: str
-    rtsp_url: str
+    source_url: str
     device_url: Optional[str] = None
     webrtc_url: Optional[str] = None
 

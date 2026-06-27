@@ -5,6 +5,8 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from zoneinfo import ZoneInfo
 
+from core.source_url import is_supported_source_url
+
 
 class ChannelConfig(ABC):
     """
@@ -14,7 +16,7 @@ class ChannelConfig(ABC):
 
     channel_id: str
     camera_uuid: Optional[uuid.UUID]
-    rtsp_url: str
+    source_url: str
     enabled: bool
     sample_fps: float
     decode_backend: Literal["gstreamer", "opencv"]
@@ -70,7 +72,7 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
 
     Rules:
     - CREATE (camera_uuid is None):
-        requires rtsp_url, site_uuid, device_uuid
+        requires source_url, site_uuid, device_uuid
     - EDIT (camera_uuid is provided):
         all fields are optional; only provided ones should be applied.
     - webrtc_url and device_url:
@@ -97,8 +99,9 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
         description="Assigned device UUID (required on create)."
     )
 
-    rtsp_url: Optional[str] = Field(
+    source_url: Optional[str] = Field(
         default=None,
+        description="Camera source URL (rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt).",
     )
 
     webrtc_url: Optional[str] = Field(
@@ -549,7 +552,7 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
     def _validate_and_normalize(self):
         for attr in (
             "channel_id",
-            "rtsp_url",
+            "source_url",
             "webrtc_url",
             "device_url",
             "name",
@@ -561,6 +564,15 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
             if isinstance(v, str) and not v.strip():
                 setattr(self, attr, None)
 
+        # A non-empty source must use a supported scheme.
+        if self.source_url is not None:
+            if not is_supported_source_url(self.source_url):
+                raise ValueError(
+                    "Unsupported camera source URL. Expected one of: "
+                    "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
+                )
+            self.source_url = self.source_url.strip()
+
         if self.channel_id is None and self.camera_uuid is not None:
             self.channel_id = str(self.camera_uuid)
 
@@ -568,8 +580,8 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
             self.schedule = self.normalize_schedule(self.schedule) or None
 
         if self.camera_uuid is None:
-            if not self.rtsp_url:
-                raise ValueError("rtsp_url is required when creating a new camera (camera_uuid is None).")
+            if not self.source_url:
+                raise ValueError("source_url is required when creating a new camera (camera_uuid is None).")
             if self.site_uuid is None:
                 raise ValueError("site_uuid is required when creating a new camera.")
             if self.device_uuid is None:

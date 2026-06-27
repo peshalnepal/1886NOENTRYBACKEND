@@ -434,7 +434,7 @@ class Camera(Base):
     name = Column(String(255), nullable=True)
     location = Column(String(255), nullable=True)
 
-    rtsp_url = Column(String(2048), nullable=False)
+    source_url = Column(String(2048), nullable=False)
     webrtc_url = Column(String(2048), nullable=True)
 
     is_enabled = Column(Boolean, default=True)

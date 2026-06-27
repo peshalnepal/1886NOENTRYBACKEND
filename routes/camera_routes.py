@@ -296,6 +296,19 @@ def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
 # -------------------------
 # Cameras
 # -------------------------
+@router.get("/source-schemes")
+async def get_source_schemes(_user: User = Depends(get_current_user)):
+    """Camera source-URL schemes the platform accepts.
+
+    The single source of truth is ``core.source_url`` (same data drives
+    server-side validation), so the frontend can render exactly what users may
+    enter without hardcoding/drifting. Declared before ``/{camera_uuid}`` so the
+    static path matches first.
+    """
+    from core.source_url import supported_source_schemes
+    return supported_source_schemes()
+
+
 @router.get("", response_model=List[CameraSchema])
 async def list_cameras(
     db: AsyncSession = Depends(get_async_db),
@@ -339,7 +352,7 @@ async def list_cameras(
                 location=getattr(cam, "location", None),
                 site_uuid=cam.site_uuid,
                 device_uuid=(dev.device_uuid if dev else None),
-                rtsp_url=cam.rtsp_url,
+                source_url=cam.source_url,
                 webrtc_url=_camera_webrtc_url(cam),
                 is_enabled=cam.is_enabled,
                 is_detection_enabled=cam.is_detection_enabled,
@@ -377,7 +390,7 @@ async def get_camera(
         location=getattr(cam, "location", None),
         site_uuid=cam.site_uuid,
         device_uuid=(dev.device_uuid if dev else None),
-        rtsp_url=cam.rtsp_url,
+        source_url=cam.source_url,
         webrtc_url=_camera_webrtc_url(cam),
         is_enabled=cam.is_enabled,
         is_detection_enabled=cam.is_detection_enabled,
@@ -412,11 +425,11 @@ async def get_camera_playback(
     await _ensure_camera_access(db, cam, ctx)
 
     # Validate camera has required fields
-    rtsp_url = getattr(cam, "rtsp_url", None)
+    source_url = getattr(cam, "source_url", None)
     camera_code = getattr(cam, "camera_code", None)
     if not camera_code:
         raise HTTPException(status_code=409, detail="Camera code not set")
-    if not rtsp_url:
+    if not source_url:
         raise HTTPException(status_code=409, detail="RTSP URL not configured")
     
     # Provision stream in MediaMTX if not already done
@@ -424,7 +437,7 @@ async def get_camera_playback(
         webrtc_client = WebRTCGatewayClient()
         webrtc_url = await webrtc_client.ensure_stream(
             stream_key=camera_code,
-            rtsp_url=rtsp_url
+            source_url=source_url
         )
         await webrtc_client.close()
         
@@ -663,15 +676,15 @@ async def create_camera(
         
         # Provision WebRTC stream in MediaMTX after camera creation
         camera_code = getattr(cam_out, "camera_code", None)
-        rtsp_url = getattr(cam_out, "rtsp_url", None)
+        source_url = getattr(cam_out, "source_url", None)
         webrtc_url = None
         
-        if camera_code and rtsp_url:
+        if camera_code and source_url:
             try:
                 webrtc_client = WebRTCGatewayClient()
                 webrtc_url = await webrtc_client.ensure_stream(
                     stream_key=camera_code,
-                    rtsp_url=rtsp_url
+                    source_url=source_url
                 )
                 await webrtc_client.close()
                 logger.info(
@@ -707,7 +720,7 @@ async def create_camera(
             location=getattr(cam_out, "location", None),
             site_uuid=cam_out.site_uuid,
             device_uuid=cam_out.device_uuid,
-            rtsp_url=cam_out.rtsp_url,
+            source_url=cam_out.source_url,
             webrtc_url=webrtc_url,
             is_enabled=cam_out.enabled,
             is_detection_enabled=cam_out.detection_enabled,
@@ -774,7 +787,7 @@ async def edit_camera(
         location=getattr(cam_out, "location", None),
         site_uuid=cam_out.site_uuid,
         device_uuid=cam_out.device_uuid,
-        rtsp_url=cam_out.rtsp_url,
+        source_url=cam_out.source_url,
         webrtc_url=resolve_camera_webrtc_url(
             camera_code=getattr(cam_out, "camera_code", None),
             stored_url=getattr(cam_out, "webrtc_url", None),

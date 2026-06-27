@@ -460,9 +460,22 @@ pathDefaults:
   recordSegmentDuration: 15m
   recordDeleteAfter: 7d
 
-hls: false
-rtmp: false
-srt: false
+# Source/ingest protocols. A camera's source_url can be any scheme — MediaMTX
+# PULLS it (path "source" set via the admin API) and re-broadcasts to browsers
+# over WebRTC/WHEP. Enabling these makes the rtmp/srt/http(HLS) source readers
+# available (rtsp + webrtc were already on). The listeners bind internally only;
+# they are NOT exposed on the public ACI IP below, so this stays pull-only (no
+# anonymous push). To also accept PUSH ingest, publish ports 1935 (rtmp, TCP)
+# and 8890 (srt, UDP) on the container group ipAddress.
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigins: ["*"]
+
+rtmp: yes
+rtmpAddress: :1935
+
+srt: yes
+srtAddress: :8890
 
 paths:
   all_others: {}
@@ -557,6 +570,9 @@ resource mediamtx 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = if 
             { port: 8889, protocol: 'TCP' }
             { port: 9997, protocol: 'TCP' }
             { port: 8189, protocol: 'UDP' }
+            { port: 8888, protocol: 'TCP' } // HLS muxer (internal; source-reader support)
+            { port: 1935, protocol: 'TCP' } // RTMP server (internal; expose on ipAddress for push)
+            { port: 8890, protocol: 'UDP' } // SRT server (internal; expose on ipAddress for push)
           ]
           resources: {
             requests: {

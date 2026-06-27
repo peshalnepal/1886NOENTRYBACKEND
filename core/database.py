@@ -534,6 +534,45 @@ class DatabaseManager:
                 except Exception as exc:
                     logger.warning("Skipping camera.camera_playback_enabled migration: %s", exc)
 
+            # Rename camera.rtsp_url -> camera.source_url. The camera source is
+            # now a single generic field accepting rtsp/rtsps/webrtc/whep/http/
+            # https/rtmp/rtmps/srt. The column is renamed in place so stored
+            # values are preserved; create_all never renames existing columns.
+            if dialect_name.startswith("mysql"):
+                try:
+                    has_old = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'camera' "
+                                "  AND COLUMN_NAME = 'rtsp_url' "
+                                "LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    has_new = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "  AND TABLE_NAME = 'camera' "
+                                "  AND COLUMN_NAME = 'source_url' "
+                                "LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                    if has_old and not has_new:
+                        await conn.execute(
+                            text(
+                                "ALTER TABLE camera CHANGE COLUMN rtsp_url "
+                                "source_url VARCHAR(2048) NOT NULL"
+                            )
+                        )
+                        logger.info("Renamed camera.rtsp_url -> camera.source_url.")
+                except Exception as exc:
+                    logger.warning("Skipping camera.rtsp_url->source_url migration: %s", exc)
+
             # Migrate: the camera<->device M:N link table (camera_devices) is
             # replaced by a direct camera.device_uuid FK column. One device can
             # host many cameras; each camera has at most one device.

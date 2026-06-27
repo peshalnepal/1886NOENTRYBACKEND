@@ -58,7 +58,7 @@ class CameraUpsertDTO(_DTO):
     site_uuid: Optional[uuid.UUID] = None
 
     webrtc_url: Optional[str] = None
-    rtsp_url: Optional[str] = None
+    source_url: Optional[str] = None
     device_uuid: Optional[uuid.UUID] = None
 
     name: Optional[str] = None
@@ -75,7 +75,7 @@ class CameraUpdateDTO(_DTO):
     """Patch payload for `ChannelRepository.update_camera` (every field optional)."""
     name: Optional[str] = None
     location: Optional[str] = None
-    rtsp_url: Optional[str] = None
+    source_url: Optional[str] = None
     is_enabled: Optional[bool] = None
     is_detection_enabled: Optional[bool] = None
     is_notification_enabled: Optional[bool] = None

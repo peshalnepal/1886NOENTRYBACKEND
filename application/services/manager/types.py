@@ -19,7 +19,7 @@ class CameraOut(BaseModel):
     location: Optional[str] = None
     site_uuid: uuid.UUID
 
-    rtsp_url: str
+    source_url: str
     webrtc_url: Optional[str] = None
 
     enabled: bool

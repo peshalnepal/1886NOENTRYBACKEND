@@ -21,7 +21,7 @@ def _edge_health_ready(health: Optional[Dict[str, Any]]) -> bool:
 
 
 JETSON_PATCH_KEYS = {
-    "rtsp_url",
+    "source_url",
     "enabled",
     "detection_enabled",
     "notification_enabled",
@@ -47,7 +47,7 @@ RUNTIME_CONFIG_FORBIDDEN_KEYS = {
     "site_uuid",
     "device_uuid",
     "device_url",
-    "rtsp_url",
+    "source_url",
     "webrtc_url",
     "enabled",
     "detection_enabled",
@@ -146,7 +146,7 @@ def build_video_channel_config(
 
     return VideoChannelConfig(
         camera_uuid=cam.camera_uuid,
-        rtsp_url=cam.rtsp_url,
+        source_url=cam.source_url,
         webrtc_url=cam.webrtc_url or "",
         site_uuid=cam.site_uuid,
         device_uuid=device_uuid,

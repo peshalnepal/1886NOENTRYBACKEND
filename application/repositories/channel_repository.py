@@ -230,7 +230,7 @@ class ChannelRepository:
                 "camera_uuid": cam.camera_uuid,
                 "camera_code": cam.camera_code,
                 "site_uuid": cam.site_uuid,
-                "rtsp_url": cam.rtsp_url,
+                "source_url": cam.source_url,
                 "webrtc_url": cam.webrtc_url,
                 "is_enabled": cam.is_enabled,
                 "is_detection_enabled": cam.is_detection_enabled,
@@ -385,7 +385,7 @@ class ChannelRepository:
         camera_code = dto.camera_code
         site_uuid = dto.site_uuid
         webrtc_url = dto.webrtc_url
-        rtsp_url = dto.rtsp_url
+        source_url = dto.source_url
         device_uuid = dto.device_uuid
         name = dto.name
         location = dto.location
@@ -409,7 +409,7 @@ class ChannelRepository:
         if device_uuid is not None:
             device_uuid = device_uuid if isinstance(device_uuid, uuid.UUID) else uuid.UUID(str(device_uuid))
 
-        rtsp_url = rtsp_url or d.get("rtsp_url")
+        source_url = source_url or d.get("source_url")
         if name is None:
             name = d.get("name")
         if location is None:
@@ -452,15 +452,15 @@ class ChannelRepository:
         if camera_playback_enabled_val not in ("inherit", "always", "never"):
             camera_playback_enabled_val = "inherit"
 
-        if not rtsp_url:
-            raise ValueError("channel_config.rtsp_url is required")
+        if not source_url:
+            raise ValueError("channel_config.source_url is required")
 
         cam: Optional[Camera] = None
         if cam_uuid:
             cam = await self._get_camera_by_uuid(db, cam_uuid)
 
         if cam:
-            cam.rtsp_url = rtsp_url
+            cam.source_url = source_url
             cam.is_enabled = bool(enabled)
             cam.is_detection_enabled = bool(detection_enabled)
             cam.is_notification_enabled = bool(notification_enabled)
@@ -520,7 +520,7 @@ class ChannelRepository:
                 org_id=cam_org_id,
                 site_uuid=site_uuid,
                 camera_code=camera_code,
-                rtsp_url=rtsp_url,
+                source_url=source_url,
                 webrtc_url=webrtc_url,
                 name=name,
                 location=location,
@@ -629,7 +629,7 @@ class ChannelRepository:
         cfg = dict(d)
         for k in (
             "camera_uuid", "camera_id", "channel_id",
-            "rtsp_url", "webrtc_url",
+            "source_url", "webrtc_url",
             "device_url",
             "enabled", "detection_enabled", "notification_enabled",
             "site_uuid", "device_uuid", "user_id",

@@ -252,7 +252,7 @@ class DeviceReconciler:
                 webrtc_errors.append(f"Camera not found in DB during WebRTC reconcile: {cu}")
                 continue
             try:
-                await self._state.webrtc.ensure_stream(stream_key=cu, rtsp_url=cam.rtsp_url)
+                await self._state.webrtc.ensure_stream(stream_key=cu, source_url=cam.source_url)
                 webrtc_added.append(str(cam.camera_uuid))
             except Exception as e:
                 logger.warning("WebRTC ensure_stream failed during reconcile for %s: %s", cu, e)
@@ -338,7 +338,7 @@ class DeviceReconciler:
                 **_only_jetson_config(cfg),
                 # Explicit fields last so they always win over whatever is in channel config
                 "camera_uuid": cu,
-                "rtsp_url": cam.rtsp_url,
+                "source_url": cam.source_url,
                 "enabled":True,
                 "detection_enabled": True,
                 "notification_enabled": bool(cam.is_notification_enabled),

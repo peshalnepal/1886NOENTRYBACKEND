@@ -6,7 +6,22 @@ from typing import Optional, Tuple,Literal
 from urllib.parse import quote
 import logging
 import time
+
+from core.source_url import is_rtsp_source
+
 logger = logging.getLogger(__name__)
+
+
+def _mediamtx_source_payload(source: str) -> Dict[str, Any]:
+    """Build the MediaMTX path payload for a camera ``source``.
+
+    ``rtspTransport`` only applies to RTSP/RTSPS sources; sending it for a
+    WebRTC/HLS/RTMP/SRT source is meaningless, so it is only included for RTSP.
+    """
+    payload: Dict[str, Any] = {"source": source, "sourceOnDemand": True}
+    if is_rtsp_source(source):
+        payload["rtspTransport"] = "tcp"
+    return payload
 
 
 def get_public_webrtc_base() -> str:
@@ -35,7 +50,16 @@ def resolve_camera_webrtc_url(*, camera_code: Optional[str], stored_url: Optiona
 
 class WebRTCGatewayClient:
     """
-    Provisions (or updates) RTSP->WebRTC streams on a MediaMTX gateway using WHEP protocol.
+    Provisions (or updates) any-source -> WebRTC streams on a MediaMTX gateway
+    using the WHEP protocol.
+
+    The path ``source`` is the camera's ``source_url`` and may be any scheme
+    MediaMTX can pull: rtsp/rtsps, rtmp/rtmps, srt, http(s) (HLS), or webrtc/whep.
+    MediaMTX pulls it and re-broadcasts to the browser over WebRTC/WHEP — the
+    output protocol is always WebRTC regardless of the input scheme. (MediaMTX
+    does not transcode, so the source codec must be WebRTC-compatible — H264/
+    VP8/VP9/AV1; e.g. H265/MJPEG sources can be recorded but not live-viewed
+    over WebRTC.)
 
     WHEP (WebRTC HTTP Egress Protocol) Requirements:
       - MediaMTX must have WHEP protocol enabled
@@ -132,7 +156,7 @@ class WebRTCGatewayClient:
             return f"{action} returned HTTP {response.status_code}: {body}"
         return f"{action} returned HTTP {response.status_code}"
 
-    async def ensure_stream(self, *, stream_key: str, rtsp_url: str) -> Optional[str]:
+    async def ensure_stream(self, *, stream_key: str, source_url: str) -> Optional[str]:
         """
         Ensure stream exists in MediaMTX. Returns stable WHEP URL.
         
@@ -152,13 +176,13 @@ class WebRTCGatewayClient:
 
         safe_name = quote(stream_key, safe="")
         add_url = f"{self.admin_api_url}/v3/config/paths/add/{safe_name}"
-        payload = {"source": rtsp_url, "rtspTransport": "tcp", "sourceOnDemand": True}
+        payload = _mediamtx_source_payload(source_url)
         add_error: Optional[str] = None
 
         # 1. Try Add
         try:
-            logger.debug("Attempting to provision stream: add_url=%s, stream_key=%s, rtsp_url=%s", 
-                        add_url, stream_key, rtsp_url)
+            logger.debug("Attempting to provision stream: add_url=%s, stream_key=%s, source_url=%s", 
+                        add_url, stream_key, source_url)
             r = await self._client.post(add_url, json=payload, auth=self._auth())
             if r.status_code == 200:
                 logger.info("Stream provisioned successfully via add: stream_key=%s, whep_url=%s", 
@@ -218,14 +242,14 @@ class WebRTCGatewayClient:
             )
         )
 
-    async def update_stream(self, *, stream_key: str, rtsp_url: str) -> None:
+    async def update_stream(self, *, stream_key: str, source_url: str) -> None:
         if not self.admin_api_url:
             return
             
         safe_name = quote(stream_key, safe="")
         url = f"{self.admin_api_url}/v3/config/paths/patch/{safe_name}"
-        payload = {"source": rtsp_url, "rtspTransport": "tcp", "sourceOnDemand": True}
-        
+        payload = _mediamtx_source_payload(source_url)
+
         try:
             await self._client.patch(url, json=payload, auth=self._auth())
         except Exception as exc:
@@ -380,7 +404,7 @@ class WebRTCGatewayClient:
             out.append(
                 {
                     "stream_key": name,
-                    "rtsp_url": c.get("source"),                 # what you set in ensure_stream()
+                    "source_url": c.get("source"),                 # what you set in ensure_stream()
                     "webrtc_url": self._derive_public_webrtc_url(name),
                     "max_readers": c.get("maxReaders"),
                     "source_on_demand": c.get("sourceOnDemand"),

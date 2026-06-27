@@ -443,7 +443,7 @@ def _camera_out_to_response(cam_out) -> CameraWithConfigSchema:
         location=getattr(cam_out, "location", None),
         site_uuid=cam_out.site_uuid,
         device_uuid=cam_out.device_uuid,
-        rtsp_url=cam_out.rtsp_url,
+        source_url=cam_out.source_url,
         webrtc_url=resolve_camera_webrtc_url(
             camera_code=getattr(cam_out, "camera_code", None),
             stored_url=getattr(cam_out, "webrtc_url", None),
