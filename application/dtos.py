@@ -262,3 +262,20 @@ class SitePrerecordSettingsDTO(_DTO):
     enabled: bool = False
     camera_uuids: List[uuid.UUID] = Field(default_factory=list)
     trigger_mode: str = "roi_enter"
+
+
+# =====================================================================
+# Reports
+# =====================================================================
+class ReportCreateDTO(_DTO):
+    """Input for `ReportRepository.create` — one archived report PDF."""
+    org_id: int
+    report_type: str = "general"  # general | urgent
+    filename: str
+    generated_by: Optional[int] = None
+    generated_by_email: Optional[str] = None
+    site_uuids: List[str] = Field(default_factory=list)
+    period_start: Optional[datetime] = None
+    period_end: Optional[datetime] = None
+    alert_count: int = 0
+    pdf_data: bytes

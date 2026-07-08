@@ -9,6 +9,7 @@ import asyncio
 import html
 import smtplib
 from datetime import datetime, timezone
+from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import List, Optional
@@ -51,6 +52,82 @@ class EmailNotifier:
 
         await asyncio.to_thread(self._send_digest_sync, ordered, recipients)
 
+    async def send_report(
+        self,
+        *,
+        subject: str,
+        html_body: str,
+        text_body: str,
+        attachment_bytes: bytes,
+        attachment_filename: str,
+        to_emails: List[str],
+        attachment_subtype: str = "pdf",
+    ) -> bool:
+        """Send a one-off email with a binary attachment (e.g. a PDF report).
+
+        Returns True when the message was handed to SMTP, False when email is
+        disabled or there are no recipients. Runs the blocking SMTP exchange on
+        a worker thread so it never stalls the event loop.
+        """
+        if not self.cfg.enabled:
+            return False
+        recipients = [e for e in (to_emails or []) if e]
+        if not recipients:
+            return False
+
+        await asyncio.to_thread(
+            self._send_report_sync,
+            subject,
+            html_body,
+            text_body,
+            attachment_bytes,
+            attachment_filename,
+            recipients,
+            attachment_subtype,
+        )
+        return True
+
+    def _smtp_send(self, message: MIMEMultipart, to_emails: List[str], *, timeout: int = 10) -> None:
+        """Connect, optionally STARTTLS + login, and send one MIME message.
+
+        Single SMTP exchange shared by every sender (alert, digest, report) so
+        the connect/login/sendmail dance lives in exactly one place.
+        """
+        with smtplib.SMTP(self.cfg.smtp_host, self.cfg.smtp_port, timeout=timeout) as server:
+            if self.cfg.use_tls:
+                server.starttls()
+            if self.cfg.smtp_user and self.cfg.smtp_pass:
+                server.login(self.cfg.smtp_user, self.cfg.smtp_pass)
+            server.sendmail(self.cfg.from_email, to_emails, message.as_string())
+
+    def _send_report_sync(
+        self,
+        subject: str,
+        html_body: str,
+        text_body: str,
+        attachment_bytes: bytes,
+        attachment_filename: str,
+        to_emails: List[str],
+        attachment_subtype: str,
+    ) -> None:
+        outer = MIMEMultipart("mixed")
+        outer["Subject"] = subject
+        outer["From"] = self.cfg.from_email
+        outer["To"] = ", ".join(to_emails)
+
+        body = MIMEMultipart("alternative")
+        body.attach(MIMEText(text_body, "plain", "utf-8"))
+        body.attach(MIMEText(html_body, "html", "utf-8"))
+        outer.attach(body)
+
+        part = MIMEApplication(attachment_bytes, _subtype=attachment_subtype)
+        part.add_header(
+            "Content-Disposition", "attachment", filename=attachment_filename
+        )
+        outer.attach(part)
+
+        self._smtp_send(outer, to_emails, timeout=20)
+
     def _send_sync(self, msg: NotificationMessage, to_emails: List[str]) -> None:
         subject = f"{self.cfg.subject_prefix} {msg.site_name} — {msg.title}"
 
@@ -65,12 +142,7 @@ class EmailNotifier:
         m.attach(MIMEText(text_body, "plain", "utf-8"))
         m.attach(MIMEText(html_body, "html", "utf-8"))
 
-        with smtplib.SMTP(self.cfg.smtp_host, self.cfg.smtp_port, timeout=10) as server:
-            if self.cfg.use_tls:
-                server.starttls()
-            if self.cfg.smtp_user and self.cfg.smtp_pass:
-                server.login(self.cfg.smtp_user, self.cfg.smtp_pass)
-            server.sendmail(self.cfg.from_email, to_emails, m.as_string())
+        self._smtp_send(m, to_emails)
 
     def _send_digest_sync(self, messages: List[NotificationMessage], to_emails: List[str]) -> None:
         first = messages[0]
@@ -88,12 +160,7 @@ class EmailNotifier:
         m.attach(MIMEText(text_body, "plain", "utf-8"))
         m.attach(MIMEText(html_body, "html", "utf-8"))
 
-        with smtplib.SMTP(self.cfg.smtp_host, self.cfg.smtp_port, timeout=10) as server:
-            if self.cfg.use_tls:
-                server.starttls()
-            if self.cfg.smtp_user and self.cfg.smtp_pass:
-                server.login(self.cfg.smtp_user, self.cfg.smtp_pass)
-            server.sendmail(self.cfg.from_email, to_emails, m.as_string())
+        self._smtp_send(m, to_emails)
 
     def _render_text(self, msg: NotificationMessage) -> str:
         ts = self._fmt_ts(msg.ts_ms)

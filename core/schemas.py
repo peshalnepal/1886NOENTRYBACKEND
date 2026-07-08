@@ -477,9 +477,48 @@ class DeviceOut(BaseModel):
         from_attributes = True
 
 
+# --- Report archive schemas ---
+class ReportOut(BaseModel):
+    """One archived report PDF (metadata only — download via its endpoint)."""
+
+    id: int
+    org_id: int
+    report_type: str
+    filename: str
+    generated_by_email: Optional[str] = None
+    site_uuids: List[str] = Field(default_factory=list)
+    period_start: Optional[datetime] = None
+    period_end: Optional[datetime] = None
+    alert_count: int = 0
+    pdf_size: int = 0
+    created_at: datetime
+
+
 # --- Notification schemas ---
+class NoteAttributes(BaseModel):
+    """Structured, class-aware observations an operator records on an alert.
+
+    Vehicle alerts (car/truck/motorcycle) use ``model`` / ``color`` /
+    ``direction``; person alerts use ``gender`` / ``clothing_color`` /
+    ``direction``. All optional — the frontend surfaces the relevant subset per
+    detected class. ``object_type`` is "vehicle" | "person" | "other".
+    """
+
+    object_type: Optional[str] = None
+    # Vehicle
+    model: Optional[str] = None
+    color: Optional[str] = None
+    # Person
+    gender: Optional[str] = None
+    clothing_color: Optional[str] = None
+    # Shared
+    direction: Optional[str] = None
+
+
 class NotificationNote(BaseModel):
-    text: str
+    text: Optional[str] = None
+    action: Optional[str] = None
+    attributes: Optional[NoteAttributes] = None
     author_id: Optional[int] = None
     author_name: Optional[str] = None
     created_at: Optional[str] = None

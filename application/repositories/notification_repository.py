@@ -321,25 +321,42 @@ class NotificationRepository:
         db: AsyncSession,
         *,
         notification_id: int,
-        text: str,
+        text: Optional[str] = None,
+        action: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
         author_id: int,
         author_name: Optional[str] = None,
         site_uuids: Optional[List[uuid.UUID]] = None,
     ) -> Optional[Notification]:
         """Append an operator note to a notification's payload.
 
-        Notes accumulate as a list under ``payload["notes"]`` so they can later
-        be rolled up into the per-organization end-of-day report. Scoped to
-        ``site_uuids`` (the caller's readable sites) so an operator cannot annotate
-        notifications outside their organization. Returns the updated row, or
-        ``None`` when no in-scope notification matches.
+        A note now carries three optional operator-supplied parts: free-text
+        ``text``, the ``action`` taken (rendered in the report's ACTIONS column),
+        and structured, class-aware ``attributes`` (vehicle model/color/direction
+        or person gender/clothing/direction — rendered as bullets in the report's
+        Notes column). Notes accumulate under ``payload["notes"]`` for the
+        per-organization report. Scoped to ``site_uuids`` (the caller's readable
+        sites) so an operator cannot annotate other tenants' alerts.
+
+        Returns the updated row, ``None`` when no in-scope notification matches,
+        or ``None`` when the note is entirely empty.
         """
         nid = int(notification_id)
         if nid <= 0:
             return None
 
         note_text = str(text or "").strip()
-        if not note_text:
+        action_text = str(action or "").strip()
+        # Keep only the non-empty structured attributes.
+        clean_attrs: Dict[str, Any] = {}
+        if isinstance(attributes, dict):
+            for key, value in attributes.items():
+                sval = str(value or "").strip() if not isinstance(value, (int, float, bool)) else value
+                if sval not in ("", None):
+                    clean_attrs[str(key)] = sval
+
+        # A note must carry at least one piece of information.
+        if not note_text and not action_text and not clean_attrs:
             return None
 
         conds = self._notification_conditions(ids=[nid], site_uuids=site_uuids)
@@ -355,7 +372,9 @@ class NotificationRepository:
         notes = list(existing) if isinstance(existing, list) else []
         notes.append(
             {
-                "text": note_text,
+                "text": note_text or None,
+                "action": action_text or None,
+                "attributes": clean_attrs or None,
                 "author_id": int(author_id),
                 "author_name": str(author_name or "") or None,
                 "created_at": utc_now().isoformat(),
@@ -458,7 +477,9 @@ class NotificationRepository:
         approval_status: Optional[str] = None,
         only_visible: Optional[bool] = None,
         only_unread: Optional[bool] = None,
+        emailed: Optional[bool] = None,
         detected_before: Optional[datetime] = None,
+        detected_after: Optional[datetime] = None,
         before_id: Optional[int] = None,
     ) -> list:
         conds: list = []
@@ -488,8 +509,17 @@ class NotificationRepository:
             conds.append(Notification.read_at.is_(None))
         elif only_unread is False:
             conds.append(Notification.read_at.isnot(None))
+        # "Emailed" = the alert was mailed to recipients (sent_at stamped), i.e.
+        # an operator approved it with the email opt-in (urgent). Not-emailed
+        # approved alerts roll into the daily general report instead.
+        if emailed is True:
+            conds.append(Notification.sent_at.isnot(None))
+        elif emailed is False:
+            conds.append(Notification.sent_at.is_(None))
         if detected_before is not None:
             conds.append(Notification.detected_at < detected_before)
+        if detected_after is not None:
+            conds.append(Notification.detected_at >= detected_after)
         if before_id is not None:
             conds.append(Notification.id < int(before_id))
         return conds
@@ -508,6 +538,7 @@ class NotificationRepository:
         only_visible: Optional[bool] = None,
         only_unread: Optional[bool] = None,
         detected_before: Optional[datetime] = None,
+        detected_after: Optional[datetime] = None,
         before_id: Optional[int] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -519,7 +550,8 @@ class NotificationRepository:
             camera_uuid=camera_uuid, ids=ids,
             event_types=event_types, approval_status=approval_status,
             only_visible=only_visible, only_unread=only_unread,
-            detected_before=detected_before, before_id=before_id,
+            detected_before=detected_before, detected_after=detected_after,
+            before_id=before_id,
         )
         stmt = select(Notification)
         if conds:

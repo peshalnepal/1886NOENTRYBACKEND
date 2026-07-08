@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import StreamingResponse
 
@@ -29,6 +29,7 @@ from core.schemas import (
     ClearNotificationsRequest,
     DeleteNotificationsRequest,
     DetectionsOverTimeOut,
+    NoteAttributes,
     NotificationOut,
 )
 from core.security.tokens import decode_access_token
@@ -540,6 +541,47 @@ async def _publish_approved_to_owner(
         await hub.publish(msg)
 
 
+# Strong refs to fire-and-forget urgent-report tasks (asyncio keeps only weak
+# references to running tasks).
+_urgent_report_tasks: set = set()
+
+
+def _queue_urgent_report(
+    *,
+    ctx: OrgContext,
+    ids: List[int],
+    session_factory,
+) -> None:
+    """Archive an urgent report for alerts approved with the email opt-in.
+
+    The operator chose "approve + email", meaning the alerts went to users
+    immediately — that decision is captured as a downloadable urgent report in
+    the org archive. Fire-and-forget so approval never blocks on PDF work.
+    """
+    if ctx.org_id is None:
+        return  # platform-admin super context has no single org to file under
+
+    from application.services.report import PdfReportGenerator
+
+    generator = PdfReportGenerator(
+        session_factory=session_factory,
+        email=None,  # the alert email already went out; the report is archive-only
+    )
+    task = asyncio.create_task(
+        generator.build_report(
+            org_id=int(ctx.org_id),
+            report_type="urgent",
+            notification_ids=[int(i) for i in ids],
+            persist=True,
+            generated_by=int(ctx.user.id),
+            generated_by_email=str(getattr(ctx.user, "email", "") or "") or None,
+        ),
+        name=f"urgent_report:{ctx.org_id}",
+    )
+    _urgent_report_tasks.add(task)
+    task.add_done_callback(_urgent_report_tasks.discard)
+
+
 async def _decide_notifications(
     *,
     db: AsyncSession,
@@ -549,6 +591,7 @@ async def _decide_notifications(
     hub: Optional[WebNotificationHub] = None,
     notification_service: Optional[NotificationService] = None,
     email_owner: bool = False,
+    session_factory=None,
 ) -> int:
     # Authorization is enforced by RequirePermission(ALERTS_APPROVE) on the
     # calling routes; this helper only performs the state change.
@@ -593,6 +636,13 @@ async def _decide_notifications(
             notification_service.queue_approved_emails(notification_ids=ids, site_uuids=target_sites)
         except Exception:
             logger.exception("Failed to queue approval emails ids=%s", ids)
+        # Approve-with-email = urgent: archive a downloadable urgent report for
+        # exactly these alerts alongside the immediate email.
+        if session_factory is not None:
+            try:
+                _queue_urgent_report(ctx=ctx, ids=ids, session_factory=session_factory)
+            except Exception:
+                logger.exception("Failed to queue urgent report ids=%s", ids)
     return affected
 
 
@@ -604,15 +654,18 @@ async def approve_notification(
     ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
     hub: WebNotificationHub = Depends(get_notification_hub),
     notification_service: NotificationService = Depends(get_notification_service),
+    session_factory=Depends(get_session_factory),
 ):
     """Operator approves a held alert; it becomes visible to admins/members.
 
     Pass `?email=true` to also email the site's configured recipients (the
-    operator's "important" opt-in).
+    operator's "important" opt-in). Emailed approvals are archived as an
+    urgent report; plain approvals roll into the daily general report.
     """
     affected = await _decide_notifications(
         db=db, ctx=ctx, ids=[notification_id], approve=True, hub=hub,
         notification_service=notification_service, email_owner=email,
+        session_factory=session_factory,
     )
     return {"approved": affected}
 
@@ -639,10 +692,12 @@ async def approve_notifications_bulk(
     ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
     hub: WebNotificationHub = Depends(get_notification_hub),
     notification_service: NotificationService = Depends(get_notification_service),
+    session_factory=Depends(get_session_factory),
 ):
     affected = await _decide_notifications(
         db=db, ctx=ctx, ids=payload.notification_ids, approve=True, hub=hub,
         notification_service=notification_service, email_owner=payload.email,
+        session_factory=session_factory,
     )
     return {"approved": affected}
 
@@ -662,7 +717,22 @@ async def reject_notifications_bulk(
 
 
 class AddNoteRequest(BaseModel):
-    note: str = Field(min_length=1, max_length=2000)
+    # All parts optional; at least one must be present (see validator). A note
+    # carries free-text `note`, the operator `action` taken, and structured
+    # class-aware `attributes` (vehicle model/color/direction or person
+    # gender/clothing/direction) for the report's Notes column bullets.
+    note: Optional[str] = Field(default=None, max_length=2000)
+    action: Optional[str] = Field(default=None, max_length=2000)
+    attributes: Optional[NoteAttributes] = None
+
+    @model_validator(mode="after")
+    def _require_some_content(self) -> "AddNoteRequest":
+        has_attrs = self.attributes is not None and any(
+            str(v or "").strip() for v in self.attributes.model_dump().values()
+        )
+        if not (self.note or "").strip() and not (self.action or "").strip() and not has_attrs:
+            raise ValueError("Provide at least one of note, action, or attributes.")
+        return self
 
 
 @router.post("/{notification_id}/note", response_model=NotificationOut)
@@ -675,7 +745,7 @@ async def add_notification_note(
     """Attach an operator note to a notification.
 
     Notes accumulate on the notification so they can be rolled up into the
-    organization's end-of-day report. Scoped to the operator's readable sites.
+    organization's report. Scoped to the operator's readable sites.
     """
     target_sites = await _notif_site_scope(db, ctx)
     author_name = getattr(ctx.user, "user_name", None) or getattr(ctx.user, "email", None)
@@ -683,6 +753,8 @@ async def add_notification_note(
         db,
         notification_id=notification_id,
         text=payload.note,
+        action=payload.action,
+        attributes=payload.attributes.model_dump(exclude_none=True) if payload.attributes else None,
         author_id=int(ctx.user.id),
         author_name=author_name,
         site_uuids=target_sites,

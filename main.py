@@ -16,13 +16,15 @@ from routes.auth import router as auth_router
 from routes.user_routes import router as users_router
 from routes.platform_admin_routes import router as platform_admin_router
 from routes.admin_routes import router as admin_router
+from routes.report_routes import router as reports_router
 
 from core.config import DEBUG
 from core.database import db_manager, async_engine
-from core.env import env_bool
+from core.env import env_bool, env_float
 from application.services.manager import Manager
 from application.services.notification import WebNotificationHub, NotificationService, EmailNotifier, EmailConfig
 from application.services.retention import RetentionService
+from application.services.report import PdfReportGenerator, ReportScheduler
 from application.services.user_snapshot_cache import UserSnapshotCache
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -161,6 +163,23 @@ async def lifespan(app: FastAPI):
     app.state.retention_service = RetentionService(session_factory=SessionLocal)
     app.state.alert_blob_cleanup_tasks = set()
 
+    # Daily approved-alerts report scheduler (org-admin configured send time).
+    def _report_generator_factory() -> PdfReportGenerator:
+        return PdfReportGenerator(
+            session_factory=SessionLocal,
+            email=email_notifier,
+            dashboard_base_url=DASHBOARD_URL if DASHBOARD_URL else None,
+        )
+
+    report_scheduler = ReportScheduler(
+        session_factory=SessionLocal,
+        generator_factory=_report_generator_factory,
+        poll_s=env_float("REPORTS_SCHEDULER_POLL_S", 60.0, minimum=15.0),
+    )
+    app.state.report_scheduler = report_scheduler
+    if env_bool("REPORTS_SCHEDULER_ENABLED", True):
+        report_scheduler.start()
+
     logger.info("Application startup: starting background pipelines.")
     pipeline_startup = await app.state.manager.start_background_pipelines()
     app.state.pipeline_startup = pipeline_startup
@@ -206,6 +225,12 @@ async def lifespan(app: FastAPI):
         if blob_cleanup_tasks:
             await asyncio.gather(*blob_cleanup_tasks, return_exceptions=True)
     finally:
+        try:
+            report_scheduler = getattr(app.state, "report_scheduler", None)
+            if report_scheduler is not None:
+                await report_scheduler.shutdown()
+        except Exception:
+            logger.exception("Report scheduler shutdown failed")
         try:
             if hasattr(app.state, "manager") and app.state.manager:
                 await app.state.manager.shutdown()
@@ -254,6 +279,7 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(platform_admin_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
+app.include_router(reports_router, prefix="/api")
 
 @app.get("/")
 async def root():

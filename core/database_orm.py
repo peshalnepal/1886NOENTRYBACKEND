@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Table,
     Text,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.mysql import LONGBLOB
 from sqlalchemy.ext.mutable import Mutable, MutableDict, MutableList
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.types import CHAR
@@ -767,6 +769,105 @@ class Organization(Base):
     )
     # Org-scoped RBAC grants live in `access_grants` and are queried
     # explicitly (lazy="raise"); cascade is declared on AccessGrant.organization.
+
+
+# =========================================================================
+# ORGANIZATION REPORT ARCHIVE
+# =========================================================================
+class OrganizationReport(Base):
+    """A generated alert-report PDF, archived so members can browse/download.
+
+    ``report_type`` is ``"general"`` (the daily scheduled / manually generated
+    roll-up of approved-but-not-emailed alerts) or ``"urgent"`` (persisted when
+    an operator approves an alert with the email opt-in — the alert was pushed
+    to users immediately). The PDF bytes live in ``pdf_data`` (LONGBLOB) so the
+    archive is self-contained; list queries must avoid selecting the blob.
+    ``site_uuids`` records which sites' alerts appear in the report (drives the
+    site filter), and ``generated_by_email`` drives the operator filter.
+    """
+
+    __tablename__ = "organization_reports"
+    __table_args__ = (
+        Index("ix_org_report_org_type_created", "org_id", "report_type", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    report_type = Column(String(16), nullable=False, default="general")  # general | urgent
+    filename = Column(String(255), nullable=False)
+
+    generated_by = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    generated_by_email = Column(String(255), nullable=True, index=True)
+
+    site_uuids = Column(JSONList, nullable=True)
+
+    period_start = Column(DateTime(timezone=True), nullable=True)
+    period_end = Column(DateTime(timezone=True), nullable=True)
+    alert_count = Column(Integer, nullable=False, default=0)
+
+    pdf_data = Column(LargeBinary().with_variant(LONGBLOB, "mysql"), nullable=False)
+    pdf_size = Column(Integer, nullable=False, default=0)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+
+
+# =========================================================================
+# ORGANIZATION REPORT SCHEDULE
+# =========================================================================
+class OrganizationReportSchedule(Base):
+    """Per-organization daily schedule for the approved-alerts PDF report.
+
+    An org admin configures a local wall-clock time (``send_hour`` /
+    ``send_minute`` interpreted in ``timezone``) at which the background
+    ``ReportScheduler`` emails the report. ``last_sent_on`` records the last
+    date (``YYYY-MM-DD`` in the schedule's own timezone) a report went out, so a
+    given day fires exactly once even though the scheduler polls every minute.
+    """
+
+    __tablename__ = "organization_report_schedules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    is_enabled = Column(Boolean, default=False, nullable=False, server_default="0")
+    send_hour = Column(Integer, nullable=False, default=8)      # 0..23 local
+    send_minute = Column(Integer, nullable=False, default=0)    # 0..59 local
+    timezone = Column(String(64), nullable=False, default="UTC")
+
+    # Report scope each run: how many hours back to cover, and whether to count
+    # only operator-approved alerts (vs. auto-approved orgs without an operator).
+    window_hours = Column(Integer, nullable=False, default=24)
+    operator_approved_only = Column(
+        Boolean, default=True, nullable=False, server_default="1"
+    )
+
+    # Last date (YYYY-MM-DD in `timezone`) a report was sent; the once-per-day guard.
+    last_sent_on = Column(String(10), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("send_hour >= 0 AND send_hour <= 23", name="ck_report_send_hour"),
+        CheckConstraint("send_minute >= 0 AND send_minute <= 59", name="ck_report_send_minute"),
+        CheckConstraint("window_hours >= 1", name="ck_report_window_hours"),
+    )
 
 
 # =========================================================================
