@@ -21,6 +21,7 @@ from core.database_orm import OrganizationReport
 # Columns safe to return in list views (everything except the blob).
 _LIST_COLUMNS = (
     OrganizationReport.id,
+    OrganizationReport.report_uuid,
     OrganizationReport.org_id,
     OrganizationReport.report_type,
     OrganizationReport.filename,
@@ -40,6 +41,7 @@ class ReportRepository:
         """Insert one archived report. Flush only; caller commits."""
         row = OrganizationReport(
             org_id=int(dto.org_id),
+            report_uuid=str(dto.report_uuid),
             report_type=str(dto.report_type or "general"),
             filename=dto.filename,
             generated_by=dto.generated_by,
@@ -65,6 +67,7 @@ class ReportRepository:
         created_before: Optional[datetime] = None,
         generated_by_email: Optional[str] = None,
         site_uuid: Optional[str] = None,
+        report_uuid: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> List[Any]:
@@ -76,6 +79,8 @@ class ReportRepository:
         filtered page rather than as a dialect-specific JSON_CONTAINS.
         """
         stmt = select(*_LIST_COLUMNS).where(OrganizationReport.org_id == int(org_id))
+        if report_uuid:
+            stmt = stmt.where(OrganizationReport.report_uuid == str(report_uuid).strip())
         if report_type:
             stmt = stmt.where(OrganizationReport.report_type == str(report_type))
         if created_after is not None:

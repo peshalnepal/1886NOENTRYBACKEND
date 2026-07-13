@@ -86,6 +86,7 @@ class ReportResult:
 
     report_type: str
     report_id: Optional[int]
+    report_uuid: str
     org_id: int
     org_name: str
     alert_count: int
@@ -297,8 +298,12 @@ class PdfReportGenerator:
         await self._attach_images(entries)
         image_count = sum(1 for e in entries if e.image_jpeg is not None)
 
+        # One stable id shared by the rendered PDF and the archived row so the
+        # printed "Report ID" matches what members search for in the archive.
+        report_uuid = str(uuid.uuid4())
+
         pdf_bytes = self._render_pdf(
-            org_name=org_name,
+            report_uuid=report_uuid,
             report_type=report_type,
             prepared_for=prepared_for,
             entries=entries,
@@ -310,6 +315,7 @@ class PdfReportGenerator:
         result = ReportResult(
             report_type=report_type,
             report_id=None,
+            report_uuid=report_uuid,
             org_id=int(org_id),
             org_name=org_name,
             alert_count=len(entries),
@@ -319,7 +325,7 @@ class PdfReportGenerator:
             end=end,
             recipients=recipients,
             pdf_bytes=pdf_bytes,
-            filename=self._filename(org_name, report_type),
+            filename=self._filename(report_type, report_uuid),
         )
 
         if persist:
@@ -344,6 +350,7 @@ class PdfReportGenerator:
         try:
             dto = ReportCreateDTO(
                 org_id=result.org_id,
+                report_uuid=result.report_uuid,
                 report_type=result.report_type,
                 filename=result.filename,
                 generated_by=generated_by,
@@ -570,7 +577,7 @@ class PdfReportGenerator:
     def _render_pdf(
         self,
         *,
-        org_name: str,
+        report_uuid: str,
         report_type: str,
         prepared_for: str,
         entries: List[_AlertEntry],
@@ -581,14 +588,14 @@ class PdfReportGenerator:
         doc = PDFReport()
         type_label = _REPORT_TYPE_LABELS.get(report_type, "Alert Report")
 
-        # --- Branded header + centered title ---
+        # --- Branded header (logo + wordmark) + centered title ---
         doc.brand_header(right_text=self._fmt_dt(datetime.now(timezone.utc)) + " UTC")
         doc.title_center(type_label.upper())
 
-        # --- Report info block (label/value rows) ---
-        doc.field_row("Organization", org_name)
+        # --- Report info block (label/value rows). No organization name by
+        # request; the report is identified by its stable Report ID instead. ---
+        doc.field_row("Report ID", report_uuid)
         doc.field_row("Prepared for", prepared_for)
-        doc.field_row("Company", "1886NOENTRY")
         doc.field_row("Reporting window", self._fmt_window(start, end))
         doc.field_row("Sites covered", str(site_count))
         doc.field_row("Approved alerts", str(len(entries)))
@@ -618,8 +625,8 @@ class PdfReportGenerator:
         """One observation: stacked label/value rows + large event photo."""
         doc.section_band(
             "#%d \u2014 %s" % (idx, entry.title),
-            fill=(0.925, 0.945, 0.975),
-            text_color=(0.043, 0.071, 0.125),
+            fill=(0.949, 0.949, 0.953),
+            text_color=(0.090, 0.094, 0.102),
             size=9.5,
         )
 
@@ -819,10 +826,12 @@ class PdfReportGenerator:
         return f"{s} to {e} UTC"
 
     @staticmethod
-    def _filename(org_name: str, report_type: str = "general") -> str:
-        slug = re.sub(r"[^a-z0-9]+", "-", str(org_name or "org").lower()).strip("-") or "org"
+    def _filename(report_type: str = "general", report_uuid: str = "") -> str:
+        # Brand-based filename (no organization name), suffixed with a short slice
+        # of the report UUID so downloads stay distinguishable and traceable.
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
-        return f"{slug}-{report_type}-report-{stamp}.pdf"
+        short = str(report_uuid or "").split("-")[0] or "report"
+        return f"noentry-{report_type}-report-{stamp}-{short}.pdf"
 
 
 def _timedelta_hours(hours: int):

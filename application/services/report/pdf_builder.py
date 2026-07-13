@@ -20,7 +20,7 @@ from __future__ import annotations
 import io
 import zlib
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple,Dict
 
 # A4 in points.
 PAGE_W = 595.28
@@ -181,9 +181,14 @@ class _Page:
     links: List[Tuple[float, float, float, float, str]] = field(default_factory=list)
 
 
-# Brand palette shared by the layout helpers.
-NAVY: "Color" = (0.043, 0.071, 0.125)      # #0b1220
-ACCENT: "Color" = (0.055, 0.647, 0.914)    # #0ea5e9
+# Brand palette shared by the layout helpers — 1-866 NOENTRY colors.
+# The logo is a yellow warning-diamond with a black border + white "stop" hand
+# and a "1-866 NOENTRY" wordmark (NO in red). We lead with black ink and red as
+# the accent and use yellow sparingly (the emblem only), per brand guidance.
+BRAND_YELLOW: "Color" = (0.965, 0.773, 0.0)  # #F6C500 warning yellow
+BRAND_RED: "Color" = (0.851, 0.063, 0.051)   # #D9100D
+NAVY: "Color" = (0.090, 0.094, 0.102)        # near-black brand ink (section bands)
+ACCENT: "Color" = BRAND_RED                  # accent (titles, rules)
 MUTED: "Color" = (0.42, 0.47, 0.55)
 INK: "Color" = (0.10, 0.12, 0.16)
 HAIRLINE: "Color" = (0.88, 0.90, 0.93)
@@ -356,32 +361,73 @@ class PDFReport:
         self.y -= lead + 2.0
 
     # -- branded layout helpers ---------------------------------------------
-    def brand_header(self, *, company: str = "1886NOENTRY", tagline: str = "AI SECURITY MONITORING", right_text: str = "") -> None:
+    def _fill_round_rect(self, x: float, y: float, w: float, h: float, r: float, color: Color) -> None:
+        """Fill a rounded rectangle (used to compose the logo hand)."""
+        r = min(r, w / 2.0, h / 2.0)
+        k = 0.5523  # circle-to-bezier constant
+        rr, gg, bb = color
+        p = [
+            b"%.2f %.2f m" % (x + r, y),
+            b"%.2f %.2f l" % (x + w - r, y),
+            b"%.2f %.2f %.2f %.2f %.2f %.2f c" % (x + w - r + r * k, y, x + w, y + r - r * k, x + w, y + r),
+            b"%.2f %.2f l" % (x + w, y + h - r),
+            b"%.2f %.2f %.2f %.2f %.2f %.2f c" % (x + w, y + h - r + r * k, x + w - r + r * k, y + h, x + w - r, y + h),
+            b"%.2f %.2f l" % (x + r, y + h),
+            b"%.2f %.2f %.2f %.2f %.2f %.2f c" % (x + r - r * k, y + h, x, y + h - r + r * k, x, y + h - r),
+            b"%.2f %.2f l" % (x, y + r),
+            b"%.2f %.2f %.2f %.2f %.2f %.2f c" % (x, y + r - r * k, x + r - r * k, y, x + r, y),
+        ]
+        self._cur.ops.append(b"%.3f %.3f %.3f rg " % (rr, gg, bb) + b" ".join(p) + b" f\n")
+
+    def _draw_noentry_emblem(self, cx: float, cy: float, box: float) -> None:
+        """Draw the 1-866 NOENTRY warning-sign logo: a yellow diamond with a
+        black border and a white 'stop' hand, centered at (cx, cy)."""
+        d = box / 2.0 * 0.98  # half-diagonal
+        diamond = b"%.2f %.2f m %.2f %.2f l %.2f %.2f l %.2f %.2f l h" % (
+            cx, cy + d, cx + d, cy, cx, cy - d, cx - d, cy,
+        )
+        yr, yg, yb = BRAND_YELLOW
+        self._cur.ops.append(b"%.3f %.3f %.3f rg " % (yr, yg, yb) + diamond + b" f\n")
+        # Black border.
+        self._cur.ops.append(
+            b"0.05 0.05 0.06 RG %.2f w " % max(1.7, box * 0.055) + diamond + b" S\n"
+        )
+        # White hand: palm + thumb + four fingers.
+        s = box
+        white: Color = (1.0, 1.0, 1.0)
+        self._fill_round_rect(cx - 0.19 * s, cy - 0.26 * s, 0.38 * s, 0.36 * s, 0.06 * s, white)  # palm
+        self._fill_round_rect(cx - 0.30 * s, cy - 0.10 * s, 0.15 * s, 0.11 * s, 0.055 * s, white)  # thumb
+        fw, gap, fh = 0.070 * s, 0.021 * s, 0.20 * s
+        total = 4 * fw + 3 * gap
+        fx = cx - total / 2.0
+        fy = cy + 0.06 * s
+        for i in range(4):
+            self._fill_round_rect(fx + i * (fw + gap), fy, fw, fh, fw / 2.0, white)
+
+    def _draw_wordmark(self, x: float, baseline: float, size: float = 16.5) -> float:
+        """Draw '1-866 NOENTRY' with NO in brand red, the rest in ink."""
+        segs = (("1-866 ", NAVY), ("NO", BRAND_RED), ("ENTRY", NAVY))
+        cx = x
+        for text_seg, color in segs:
+            self._draw_line_op(text_seg, cx, baseline, size, True, color)
+            cx += text_width(text_seg, size, True)
+        return cx
+
+    def brand_header(self, *, company: str = "1-866 NOENTRY", tagline: str = "AI SECURITY MONITORING", right_text: str = "") -> None:
         """Company logo mark + wordmark at the top of the page, with an
         optional right-aligned meta line (e.g. the generation timestamp)."""
         if right_text:
             w = text_width(right_text, 8.5, False)
             self._draw_line_op(right_text, PAGE_W - MARGIN - w, self.y - 8.5, 8.5, False, MUTED)
 
-        box = 36.0
+        box = 42.0
         top = self.y
         bottom = top - box
-        r, g, b = NAVY
-        self._cur.ops.append(
-            b"%.3f %.3f %.3f rg %.2f %.2f %.2f %.2f re f\n" % (r, g, b, MARGIN, bottom, box, box)
-        )
-        r, g, b = ACCENT
-        self._cur.ops.append(
-            b"%.3f %.3f %.3f rg %.2f %.2f %.2f %.2f re f\n" % (r, g, b, MARGIN, bottom, box, 3.5)
-        )
-        mark = "1886"
-        ms = 10.5
-        mw = text_width(mark, ms, True)
-        self._draw_line_op(mark, MARGIN + (box - mw) / 2, bottom + box / 2 - ms / 2 + 2.5, ms, True, (1, 1, 1))
+        self._draw_noentry_emblem(MARGIN + box / 2.0, bottom + box / 2.0, box)
 
-        wx = MARGIN + box + 12
-        self._draw_line_op(company, wx, top - 17.0, 17.0, True, NAVY)
-        self._draw_line_op(tagline, wx, top - 17.0 - 12.0, 8.0, False, MUTED)
+        wx = MARGIN + box + 14.0
+        self._draw_wordmark(wx, top - 20.0, 16.5)
+        self._draw_line_op(tagline, wx, top - 20.0 - 12.0, 8.0, False, MUTED)
 
         self.y = bottom - 8.0
         # Full-width rule under the header.

@@ -230,8 +230,7 @@ class NotificationRepository:
         site_uuids: List[uuid.UUID],
         only_enabled: bool = True,
     ) -> Dict[uuid.UUID, List[str]]:
-        site_uuid_values = [_as_uuid(site_uuid) for site_uuid in (site_uuids or [])]
-        site_uuid_values = [site_uuid for site_uuid in site_uuid_values if site_uuid is not None]
+        site_uuid_values = [_as_uuid(site_uuid) for site_uuid in (site_uuids or []) if site_uuid is not None]
         if not site_uuid_values:
             return {}
 

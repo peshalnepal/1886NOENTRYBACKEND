@@ -270,6 +270,7 @@ class SitePrerecordSettingsDTO(_DTO):
 class ReportCreateDTO(_DTO):
     """Input for `ReportRepository.create` — one archived report PDF."""
     org_id: int
+    report_uuid: str
     report_type: str = "general"  # general | urgent
     filename: str
     generated_by: Optional[int] = None

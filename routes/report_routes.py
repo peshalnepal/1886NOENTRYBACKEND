@@ -183,6 +183,7 @@ report_repo = ReportRepository()
 def _report_to_out(row) -> ReportOut:
     return ReportOut(
         id=int(row.id),
+        report_uuid=str(row.report_uuid),
         org_id=int(row.org_id),
         report_type=str(row.report_type),
         filename=str(row.filename),
@@ -203,6 +204,7 @@ async def list_reports(
     end: Optional[datetime] = None,
     site_uuid: Optional[str] = None,
     operator_email: Optional[str] = None,
+    report_uuid: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
     org_id: Optional[int] = None,
@@ -213,7 +215,7 @@ async def list_reports(
 
     Filters: ``report_type`` (general|urgent), ``start``/``end`` (created_at
     range), ``site_uuid`` (reports covering that site), ``operator_email``
-    (who generated it).
+    (who generated it), ``report_uuid`` (exact report id lookup).
     """
     target_org = _resolve_org_id(ctx, org_id)
     rt = str(report_type or "").strip().lower() or None
@@ -229,10 +231,20 @@ async def list_reports(
             created_before=end,
             generated_by_email=(operator_email or "").strip() or None,
             site_uuid=(site_uuid or "").strip() or None,
+            report_uuid=(report_uuid or "").strip() or None,
             limit=limit,
             offset=offset,
         )
     return [_report_to_out(r) for r in rows]
+
+
+async def _load_report_pdf(report_id: int, ctx: OrgContext, org_id, session_factory):
+    target_org = _resolve_org_id(ctx, org_id)
+    async with session_factory() as db:
+        row = await report_repo.get_with_pdf(db, report_id=report_id, org_id=target_org)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return row
 
 
 @router.get("/{report_id}/download")
@@ -243,17 +255,30 @@ async def download_archived_report(
     session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
 ):
     """Download an archived report PDF (org-scoped)."""
-    target_org = _resolve_org_id(ctx, org_id)
-    async with session_factory() as db:
-        row = await report_repo.get_with_pdf(db, report_id=report_id, org_id=target_org)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Report not found")
-
+    row = await _load_report_pdf(report_id, ctx, org_id, session_factory)
     return Response(
         content=bytes(row.pdf_data or b""),
         media_type="application/pdf",
         headers={
             "Content-Disposition": f'attachment; filename="{row.filename}"',
+        },
+    )
+
+
+@router.get("/{report_id}/view")
+async def view_archived_report(
+    report_id: int,
+    org_id: Optional[int] = None,
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+):
+    """Return an archived report PDF for inline viewing (no download prompt)."""
+    row = await _load_report_pdf(report_id, ctx, org_id, session_factory)
+    return Response(
+        content=bytes(row.pdf_data or b""),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{row.filename}"',
         },
     )
 

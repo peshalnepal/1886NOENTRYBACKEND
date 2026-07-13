@@ -340,22 +340,17 @@ class NotificationFlusher:
                 raise
             except Exception:
                 raise
-
     async def _flush_user_batch(self, user_id: int, items: List[BufferedNotification], db: Optional[Any] = None) -> bool:
         if not items:
             return True
         if not self._session_factory:
             return False
 
-        site_groups: Dict[uuid.UUID, List[int]] = defaultdict(list)
-        create_rows: List[Dict[str, Any]] = []
-
-        # Operator approval gate: when a site's org has an operator, new alerts
-
+        # 1. Pre-calculate site-level operator data
         distinct_sites = list({item.ctx.site_uuid for item in items})
         operator_ids_by_site = await self._operator_ids_for_sites(distinct_sites)
-        requires_approval_by_site = {su: bool(ids) for su, ids in operator_ids_by_site.items()}
 
+        # 2. Materialize images concurrently in batches
         IMAGE_UPLOAD_CONCURRENCY = 10
         materialized: List[Tuple[Dict[str, Any], Optional[str], Optional[str]]] = []
         for batch_start in range(0, len(items), IMAGE_UPLOAD_CONCURRENCY):
@@ -371,25 +366,33 @@ class NotificationFlusher:
                 else:
                     materialized.append(r)
 
-        for idx, item in enumerate(items):
-            stored_extra_payload, stored_image_url, stored_image_key = materialized[idx]
-            if stored_image_url:
-                updated_msg = item.msg.model_copy(update={"image_url": stored_image_url})
-                items[idx] = BufferedNotification(msg=updated_msg, ctx=item.ctx, extra_payload=stored_extra_payload)
-                item = items[idx]
-            elif stored_extra_payload != (item.extra_payload or {}):
-                items[idx] = BufferedNotification(msg=item.msg, ctx=item.ctx, extra_payload=stored_extra_payload)
-                item = items[idx]
+        # 3. Prepare creation DTOs and update items efficiently
+        site_groups: Dict[uuid.UUID, List[int]] = defaultdict(list)
+        create_rows: List[NotificationCreateDTO] = []
 
+        for idx, item in enumerate(items):
+            stored_extra, stored_url, stored_key = materialized[idx]
+            
+            # Determine operator presence for this specific site
+            operator_ids = operator_ids_by_site.get(item.ctx.site_uuid) or []
+            approval_status = "pending" if operator_ids else "approved"
+            
+            # Gather message updates to avoid multiple model_copy calls
+            msg_updates = {}
+            if stored_url:
+                msg_updates["image_url"] = stored_url
+            if stored_key:
+                msg_updates["image_storage_key"] = stored_key
+
+            if msg_updates or stored_extra != (item.extra_payload or {}):
+                updated_msg = item.msg.model_copy(update=msg_updates) if msg_updates else item.msg
+                item = BufferedNotification(msg=updated_msg, ctx=item.ctx, extra_payload=stored_extra)
+                items[idx] = item
+
+            # Prepare payload for DB
             msg_payload = item.msg.model_dump()
-            if stored_image_url:
-                msg_payload["image_url"] = stored_image_url
-            if stored_image_key:
-                msg_payload["image_storage_key"] = stored_image_key
             site_groups[item.ctx.site_uuid].append(idx)
-            approval_status = (
-                "pending" if requires_approval_by_site.get(item.ctx.site_uuid, False) else "approved"
-            )
+            
             create_rows.append(
                 NotificationCreateDTO(
                     user_id=int(item.ctx.user_id),
@@ -399,7 +402,7 @@ class NotificationFlusher:
                     event_type=item.msg.alert_type,
                     title=item.msg.title,
                     message=item.msg.body,
-                    payload=_json_safe({"msg": msg_payload, "extra": stored_extra_payload}),
+                    payload=_json_safe({"msg": msg_payload, "extra": stored_extra}),
                     detected_at=dt_from_ts_ms(item.msg.ts_ms),
                     status="created",
                     sent_at=None,
@@ -407,45 +410,44 @@ class NotificationFlusher:
                 )
             )
 
-        recipients_by_site = await self._get_recipients_for_sites_cached(user_id=int(user_id), site_uuids=list(site_groups.keys()))
-        notification_ids_by_site: Dict[uuid.UUID, List[int]] = {}
-        
+        # 4. Persist to Database
         async def _do_create(_db):
             return await self._repo.create_notifications(_db, dtos=create_rows)
 
         try:
             rows = await self._run_with_session(db, _do_create, retry=True)
-            
+            if rows is None:
+                return False
         except Exception:
             logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
             return False
-        
-        if rows is None:
-            return False
 
-        for site_uuid, indices in site_groups.items():
-            notification_ids_by_site[site_uuid] = [int(rows[idx].id) for idx in indices if idx < len(rows) and getattr(rows[idx], "id", None) is not None]
-            
+        # 5. Publish to Hub & Trigger Clip Finalization
         clip_finalize_targets: List[Tuple[int, BufferedNotification]] = []
-        for idx in range(len(items)):
-            if idx >= len(rows):
-                break
-            row_id = getattr(rows[idx], "id", None)
+        notification_ids_by_site: Dict[uuid.UUID, List[int]] = defaultdict(list)
+        
+        for idx, row in enumerate(rows):
+            row_id = getattr(row, "id", None)
             if row_id is None:
                 continue
+                
             item = items[idx]
-            published_msg = item.msg.model_copy(update={"db_id": int(row_id)})
-            # Operator-gated: held alerts go live only to the org's operators
-            # (so they can approve from the realtime feed); the end user gets
-            # nothing until approval. With no operator, publish to the user.
+            notification_ids_by_site[item.ctx.site_uuid].append(int(row_id))
+            
             operator_ids = operator_ids_by_site.get(item.ctx.site_uuid) or []
+            approval_status = "pending" if operator_ids else "approved"
+            
+            # Single model_copy to prepare the published message
+            published_msg = item.msg.model_copy(update={
+                "db_id": int(row_id),
+                "approval_status": approval_status
+            })
+
             if operator_ids:
-                # Held for review: the client shows these only in the operator
-                # queue, never in any user's notification feed (incl. the operator).
-                held_msg = published_msg.model_copy(update={"approval_status": "pending"})
-                await self.hub.publish_to_users(operator_ids, held_msg)
+                await self.hub.publish_to_users(operator_ids, published_msg)
             else:
-                await self.hub.publish(published_msg.model_copy(update={"approval_status": "approved"}))
+                await self.hub.publish(published_msg)
+                
             if str(item.msg.clip_status or "") == "loading":
                 clip_finalize_targets.append((int(row_id), item))
 
@@ -460,61 +462,63 @@ class NotificationFlusher:
                 name=f"clip_finalize:{notification_id}",
             )
 
+        # 6. Process Emails
         if not self.email:
             return True
 
+        recipients_by_site = await self._get_recipients_for_sites_cached(
+            user_id=int(user_id), 
+            site_uuids=list(site_groups.keys())
+        )
+        
         sent_ids: List[int] = []
         failed_ids: List[int] = []
         sent_at = datetime.now(timezone.utc)
 
         for site_uuid, indices in site_groups.items():
-            # Held-for-approval alerts must not email recipients until an
-            # operator approves them (email-on-approval is a follow-on).
-            if requires_approval_by_site.get(site_uuid, False):
+            # Skip email if this site requires operator approval
+            if operator_ids_by_site.get(site_uuid):
                 continue
+                
             recipients = recipients_by_site.get(site_uuid, [])
             if not recipients:
                 continue
 
-            site_messages = [items[idx].msg for idx in indices]
+            # Only grab messages for rows that were successfully created
+            site_messages = [items[idx].msg for idx in indices if idx < len(rows) and getattr(rows[idx], "id", None)]
+            site_notif_ids = notification_ids_by_site.get(site_uuid, [])
+            
+            if not site_messages:
+                continue
+
             try:
                 await self.email.send_digest(site_messages, to_emails=recipients)
-                sent_ids.extend(notification_ids_by_site.get(site_uuid, []))
+                sent_ids.extend(site_notif_ids)
             except Exception:
                 logger.exception("Buffered email digest send failed user=%s site=%s count=%s", user_id, site_uuid, len(site_messages))
-                failed_ids.extend(notification_ids_by_site.get(site_uuid, []))
+                failed_ids.extend(site_notif_ids)
 
-        if not sent_ids and not failed_ids:
-            return True
+        # 7. Update Email Status in DB
+        if sent_ids or failed_ids:
+            async def _do_updates(_db):
+                if sent_ids:
+                    await self._repo.mark_notifications_sent(_db, notification_ids=sent_ids, sent_at=sent_at)
+                if failed_ids:
+                    await self._repo.mark_notifications_failed(_db, notification_ids=failed_ids, sent_at=sent_at)
 
-        async def _do_updates(_db):
-            if sent_ids:
-                await self._repo.mark_notifications_sent(_db, notification_ids=sent_ids, sent_at=sent_at)
-            if failed_ids:
-                await self._repo.mark_notifications_failed(_db, notification_ids=failed_ids, sent_at=sent_at)
-
-        try:
-            await self._run_with_session(db, _do_updates, retry=False)
-        except Exception:
-            logger.exception("Failed to update buffered notification statuses user=%s", user_id)
-            return True
+            try:
+                await self._run_with_session(db, _do_updates, retry=False)
+            except Exception:
+                logger.exception("Failed to update buffered notification statuses user=%s", user_id)
 
         return True
-
+    
     async def email_approved_notifications(
         self,
         *,
         notification_ids: List[int],
         site_uuids: List[uuid.UUID],
     ) -> None:
-        """Email the site recipients for operator-approved notifications.
-
-        Mirrors the email step of the normal flush path, but driven from the
-        approval route: it re-reads the approved rows, groups them per owner and
-        site, sends each site's configured recipients a digest, then marks the
-        rows sent/failed. Runs on its own session, so it is safe to fire and
-        forget after the approval has been committed.
-        """
         if not self.email or not notification_ids or not self._session_factory:
             return
 
@@ -528,54 +532,51 @@ class NotificationFlusher:
                 approval_status="approved",
             )
 
-        # Recipients are scoped per (owner user_id, site), so group both ways.
-        by_user_site: Dict[int, Dict[uuid.UUID, List[Any]]] = defaultdict(lambda: defaultdict(list))
+        # 1. Group cleanly by a tuple of (owner_id, site_uuid)
+        grouped_rows: Dict[Tuple[int, uuid.UUID], List[Any]] = defaultdict(list)
         for r in rows:
-            by_user_site[int(r.user_id)][r.site_uuid].append(r)
+            grouped_rows[(int(r.user_id), r.site_uuid)].append(r)
 
         sent_ids: List[int] = []
         failed_ids: List[int] = []
         sent_at = datetime.now(timezone.utc)
 
-        for owner_id, sites in by_user_site.items():
+        # 2. Iterate flatly instead of nested loops
+        for (owner_id, site_uuid), site_rows in grouped_rows.items():
+            # Note: _get_recipients_for_sites_cached takes a list of sites, so we wrap it
             recipients_by_site = await self._get_recipients_for_sites_cached(
-                user_id=owner_id, site_uuids=list(sites.keys())
+                user_id=owner_id, site_uuids=[site_uuid]
             )
-            for site_uuid, site_rows in sites.items():
-                recipients = recipients_by_site.get(site_uuid, [])
-                if not recipients:
+            recipients = recipients_by_site.get(site_uuid, [])
+            
+            if not recipients:
+                continue
+
+            messages: List[NotificationMessage] = []
+            ids_for_site: List[int] = []
+            
+            for r in site_rows:
+                payload = r.payload if isinstance(r.payload, dict) else {}
+                msg_payload = payload.get("msg")
+                if not isinstance(msg_payload, dict):
                     continue
-
-                messages: List[NotificationMessage] = []
-                ids_for_site: List[int] = []
-                for r in site_rows:
-                    payload = r.payload if isinstance(r.payload, dict) else {}
-                    msg_payload = payload.get("msg")
-                    if not isinstance(msg_payload, dict):
-                        continue
-                    try:
-                        messages.append(
-                            NotificationMessage.model_validate({**msg_payload, "db_id": int(r.id)})
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Could not rebuild approved notification for email id=%s", r.id, exc_info=True
-                        )
-                        continue
-                    ids_for_site.append(int(r.id))
-
-                if not messages:
-                    continue
-
                 try:
-                    await self.email.send_digest(messages, to_emails=recipients)
-                    sent_ids.extend(ids_for_site)
-                except Exception:
-                    logger.exception(
-                        "Approval email send failed owner=%s site=%s count=%s",
-                        owner_id, site_uuid, len(messages),
+                    messages.append(
+                        NotificationMessage.model_validate({**msg_payload, "db_id": int(r.id)})
                     )
-                    failed_ids.extend(ids_for_site)
+                    ids_for_site.append(int(r.id))
+                except Exception:
+                    logger.warning("Could not rebuild approved notification for email id=%s", r.id, exc_info=True)
+
+            if not messages:
+                continue
+
+            try:
+                await self.email.send_digest(messages, to_emails=recipients)
+                sent_ids.extend(ids_for_site)
+            except Exception:
+                logger.exception("Approval email send failed owner=%s site=%s count=%s", owner_id, site_uuid, len(messages))
+                failed_ids.extend(ids_for_site)
 
         if not sent_ids and not failed_ids:
             return
@@ -589,7 +590,7 @@ class NotificationFlusher:
                 await db.commit()
         except Exception:
             logger.exception("Failed to update approved notification email statuses ids=%s", notification_ids)
-
+            
     async def _prepare_notification_item(self, msg: NotificationMessage, ctx: CameraContext, extra_payload: Optional[Dict[str, Any]] = None) -> BufferedNotification:
         # Clip capture is decoupled from notification persistence: we mark
         # clip_status="loading" up front so the row persists, WS publishes, and

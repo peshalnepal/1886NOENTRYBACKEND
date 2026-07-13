@@ -792,6 +792,13 @@ class OrganizationReport(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    report_uuid = Column(
+        String(36),
+        nullable=False,
+        unique=True,
+        index=True,
+        default=lambda: str(uuid.uuid4()),
+    )
     org_id = Column(
         Integer,
         ForeignKey("organizations.id", ondelete="CASCADE"),

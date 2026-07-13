@@ -482,6 +482,7 @@ class ReportOut(BaseModel):
     """One archived report PDF (metadata only — download via its endpoint)."""
 
     id: int
+    report_uuid: str
     org_id: int
     report_type: str
     filename: str
