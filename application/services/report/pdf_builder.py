@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import zlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Tuple,Dict
 
 # A4 in points.
@@ -192,6 +193,27 @@ ACCENT: "Color" = BRAND_RED                  # accent (titles, rules)
 MUTED: "Color" = (0.42, 0.47, 0.55)
 INK: "Color" = (0.10, 0.12, 0.16)
 HAIRLINE: "Color" = (0.88, 0.90, 0.93)
+
+# The official logo, rasterized from Frontend/rtsp-ui/public/logo-mark.svg. It is
+# stored as JPEG because raw JPEG is the one format this writer embeds without
+# Pillow (which is not a backend dependency); regenerate it with
+# scripts/rasterize_logo.py if the SVG changes. ``brand_header`` falls back to
+# the drawn emblem when the asset is missing, so reports never fail over a logo.
+LOGO_PATH = Path(__file__).resolve().parent / "assets" / "logo-mark.jpg"
+_logo_cache: Optional[Tuple[bytes, int, int, int]] = None
+_logo_loaded = False
+
+
+def brand_logo() -> Optional[Tuple[bytes, int, int, int]]:
+    """The embeddable logo image, or None when the asset is unavailable."""
+    global _logo_cache, _logo_loaded
+    if not _logo_loaded:
+        _logo_loaded = True
+        try:
+            _logo_cache = normalize_to_jpeg(LOGO_PATH.read_bytes())
+        except Exception:
+            _logo_cache = None
+    return _logo_cache
 
 
 class PDFReport:
@@ -379,9 +401,33 @@ class PDFReport:
         ]
         self._cur.ops.append(b"%.3f %.3f %.3f rg " % (rr, gg, bb) + b" ".join(p) + b" f\n")
 
+    def _draw_image_at(self, jpeg: Tuple[bytes, int, int, int], x: float, y: float, w: float, h: float) -> None:
+        """Draw an image at an absolute position (x, y = lower-left, in points)."""
+        name = self._register_image(jpeg)
+        self._cur.ops.append(
+            b"q %.2f 0 0 %.2f %.2f %.2f cm /%s Do Q\n" % (w, h, x, y, name.encode("ascii"))
+        )
+
+    def _draw_logo(self, cx: float, cy: float, box: float) -> None:
+        """Draw the logo centered in a ``box``-sized square at (cx, cy).
+
+        Uses the real logo asset when present, else the drawn emblem.
+        """
+        logo = brand_logo()
+        if logo is None:
+            self._draw_noentry_emblem(cx, cy, box)
+            return
+        _, iw, ih = logo[0], logo[1], logo[2]
+        scale = box / float(max(iw, ih))
+        w, h = iw * scale, ih * scale
+        self._draw_image_at(logo, cx - w / 2.0, cy - h / 2.0, w, h)
+
     def _draw_noentry_emblem(self, cx: float, cy: float, box: float) -> None:
         """Draw the 1-866 NOENTRY warning-sign logo: a yellow diamond with a
-        black border and a white 'stop' hand, centered at (cx, cy)."""
+        black border and a white 'stop' hand, centered at (cx, cy).
+
+        Fallback for when the logo asset cannot be loaded — see ``_draw_logo``.
+        """
         d = box / 2.0 * 0.98  # half-diagonal
         diamond = b"%.2f %.2f m %.2f %.2f l %.2f %.2f l %.2f %.2f l h" % (
             cx, cy + d, cx + d, cy, cx, cy - d, cx - d, cy,
@@ -420,10 +466,10 @@ class PDFReport:
             w = text_width(right_text, 8.5, False)
             self._draw_line_op(right_text, PAGE_W - MARGIN - w, self.y - 8.5, 8.5, False, MUTED)
 
-        box = 42.0
+        box = 46.0
         top = self.y
         bottom = top - box
-        self._draw_noentry_emblem(MARGIN + box / 2.0, bottom + box / 2.0, box)
+        self._draw_logo(MARGIN + box / 2.0, bottom + box / 2.0, box)
 
         wx = MARGIN + box + 14.0
         self._draw_wordmark(wx, top - 20.0, 16.5)
@@ -484,8 +530,10 @@ class PDFReport:
         Mirrors the label/value rows of a security activity report.
         """
         text_value = str(value).strip() if value is not None else ""
-        if not text_value and not link_url:
-            text_value = "\u2014"
+        # An empty field reads better as an explicit statement than as a dash.
+        empty = not text_value and not link_url
+        if empty:
+            text_value = "Not recorded"
 
         label_size = 7.4
         lead = size * 1.38
@@ -512,9 +560,10 @@ class PDFReport:
             self._cur.links.append((MARGIN, baseline - 2.5, MARGIN + w, baseline + size, link_url))
             self.y -= lead
         else:
+            value_color = MUTED if empty else INK
             for line in self._wrap(text_value, size, False, self.content_width):
                 self._ensure(lead)
-                self._draw_line_op(line, MARGIN, self.y - size, size, False, INK)
+                self._draw_line_op(line, MARGIN, self.y - size, size, False, value_color)
                 self.y -= lead
 
         self.hairline()

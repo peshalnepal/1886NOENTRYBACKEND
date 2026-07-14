@@ -44,6 +44,13 @@ _DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;,]+)?(?P<b64>;base64)?,(?P<data>.*
 
 _REPORT_TYPE_LABELS = {"general": "General Alert Report", "urgent": "Urgent Alert Report"}
 
+# Pipeline alert types are machine tokens ("roi_enter"); the report shows the
+# reader-facing phrasing instead. Unknown types fall back to a de-slugged label.
+_ALERT_TYPE_LABELS = {
+    "roi_enter": "Restricted zone entry",
+    "any_detection": "Detection in view",
+}
+
 # Classes treated as vehicles for the structured-note field set.
 _VEHICLE_CLASSES = {"car", "truck", "motorcycle", "bus", "van", "vehicle"}
 
@@ -602,7 +609,7 @@ class PdfReportGenerator:
         doc.spacer(6.0)
 
         if not entries:
-            doc.section_band("OBSERVATIONS \u2014 0 RECORDS")
+            doc.section_band("OBSERVATIONS (0 RECORDS)")
             doc.spacer(8.0)
             doc.text(
                 "No operator-approved alerts were found for this organization in the "
@@ -613,7 +620,7 @@ class PdfReportGenerator:
             return doc.render()
 
         doc.section_band(
-            "OBSERVATIONS \u2014 %d RECORD%s" % (len(entries), "" if len(entries) == 1 else "S")
+            "OBSERVATIONS (%d RECORD%s)" % (len(entries), "" if len(entries) == 1 else "S")
         )
 
         for idx, entry in enumerate(entries, start=1):
@@ -624,7 +631,7 @@ class PdfReportGenerator:
     def _render_record(self, doc: PDFReport, idx: int, entry: _AlertEntry) -> None:
         """One observation: stacked label/value rows + large event photo."""
         doc.section_band(
-            "#%d \u2014 %s" % (idx, entry.title),
+            "#%d: %s" % (idx, entry.title),
             fill=(0.949, 0.949, 0.953),
             text_color=(0.090, 0.094, 0.102),
             size=9.5,
@@ -634,10 +641,14 @@ class PdfReportGenerator:
         doc.field_row("Site", entry.site_name)
         if entry.site_location:
             doc.field_row("Site Address", entry.site_location)
-        camera = entry.camera_name + (f" \u2014 {entry.camera_location}" if entry.camera_location else "")
+        camera = entry.camera_name + (f" ({entry.camera_location})" if entry.camera_location else "")
         doc.field_row("Camera", camera)
         doc.field_row("Type", self._detection_text(entry))
-        doc.field_row("Alert Message", entry.body or entry.title)
+        # The band already carries the title, so only show the message when it
+        # actually says something more.
+        message = str(entry.body or "").strip()
+        if message and message != str(entry.title or "").strip():
+            doc.field_row("Alert Message", message)
         doc.field_row("Notes", self._notes_text(entry))
         doc.field_row("Action Taken", self._actions_text(entry))
         if entry.approved_at is not None:
@@ -657,14 +668,22 @@ class PdfReportGenerator:
 
     def _detection_text(self, entry: _AlertEntry) -> str:
         parts: List[str] = []
-        label = str(entry.alert_type or "").replace("_", " ").strip()
+        label = _ALERT_TYPE_LABELS.get(str(entry.alert_type or "").strip().lower())
+        if label is None:
+            raw = str(entry.alert_type or "").replace("_", " ").strip()
+            label = raw[:1].upper() + raw[1:] if raw else ""
         if label:
-            parts.append(label[:1].upper() + label[1:])
+            parts.append(label)
         if entry.classes:
-            parts.append("Detected: " + ", ".join(entry.classes))
+            parts.append("Detected: " + ", ".join(self._pretty_class(c) for c in entry.classes))
         if entry.max_conf is not None:
             parts.append(f"{int(round(entry.max_conf * 100))}% confidence")
         return " \u00b7 ".join(parts) if parts else "Detection"
+
+    @staticmethod
+    def _pretty_class(name: Any) -> str:
+        c = str(name or "").replace("_", " ").strip()
+        return c[:1].upper() + c[1:] if c else ""
 
     def _notes_text(self, entry: _AlertEntry) -> str:
         """Structured operator observations rendered as bullet lines."""
@@ -701,7 +720,7 @@ class PdfReportGenerator:
 
         if not blocks:
             if entry.classes:
-                return f"\u2022 Detected: {', '.join(entry.classes)}"
+                return "\u2022 Detected: " + ", ".join(self._pretty_class(c) for c in entry.classes)
             return ""
         return "\n".join(blocks)
 
@@ -736,14 +755,14 @@ class PdfReportGenerator:
         prefix = "[1886NOENTRY][URGENT]" if result.report_type == "urgent" else "[1886NOENTRY]"
         label = _REPORT_TYPE_LABELS.get(result.report_type, "Alert Report")
         return (
-            f"{prefix} {label} — {result.org_name} "
+            f"{prefix} {label}: {result.org_name} "
             f"({result.alert_count} alert{'s' if result.alert_count != 1 else ''})"
         )
 
     def _email_text(self, result: ReportResult) -> str:
         return "\n".join(
             [
-                f"1886NOENTRY — {_REPORT_TYPE_LABELS.get(result.report_type, 'Alert Report')}",
+                f"1886NOENTRY: {_REPORT_TYPE_LABELS.get(result.report_type, 'Alert Report')}",
                 "",
                 f"Organization: {result.org_name}",
                 f"Reporting window: {self._fmt_window(result.start, result.end)}",
@@ -782,8 +801,8 @@ class PdfReportGenerator:
         <tr><td style="padding:10px 14px;font-weight:700;">Alerts with snapshot</td>
             <td style="padding:10px 14px;">{result.image_count}</td></tr>
       </table>
-      <div style="margin-top:16px;color:#334155;">The full report — operator notes, alert snapshots, and
-        video links — is attached as a PDF.</div>
+      <div style="margin-top:16px;color:#334155;">The full report, including operator notes, alert
+        snapshots, and video links, is attached as a PDF.</div>
     </div>
   </div>
 </body></html>
@@ -795,7 +814,7 @@ class PdfReportGenerator:
     @staticmethod
     def _fmt_dt(dt: Optional[datetime]) -> str:
         if not isinstance(dt, datetime):
-            return "n/a"
+            return "Not recorded"
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -805,7 +824,7 @@ class PdfReportGenerator:
         """Event time in the site's local timezone (like a guard's activity log),
         falling back to UTC when the site timezone is unknown/invalid."""
         if not isinstance(dt, datetime):
-            return "n/a"
+            return "Not recorded"
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         try:
