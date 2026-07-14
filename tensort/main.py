@@ -143,7 +143,7 @@ class PipelineRuntime(object):
                 
                 if existing:
                     # Update existing camera
-                    existing.rtsp_url = cfg_data.get("rtsp_url", existing.rtsp_url)
+                    existing.source_url = cfg_data.get("source_url", existing.source_url)
                     existing.config_json = cfg_data
                     #logger.info(f"Updated camera {camera_uuid} in database")
                 else:
@@ -152,7 +152,7 @@ class PipelineRuntime(object):
                         channel_id=cfg_data.get("channel_id", camera_uuid),
                         camera_uuid=camera_uuid,
                         user_id=cfg_data.get("user_id", 1),  # Default user_id
-                        rtsp_url=cfg_data["rtsp_url"],
+                        source_url=cfg_data["source_url"],
                         config_json=cfg_data
                     )
                     session.add(cam_config)
@@ -244,7 +244,7 @@ class PipelineRuntime(object):
             logger.exception(f"Failed to restore cameras from database: {e}")
 
     # ---------- camera operations ----------
-    def add_camera(self, rtsp_url: str, cfg_patch: Dict[str, Any]) -> Dict[str, Any]:
+    def add_camera(self, source_url: str, cfg_patch: Dict[str, Any]) -> Dict[str, Any]:
         # Use camera_uuid from patch if provided (from Azure), otherwise generate new
         cam_id = cfg_patch.get("camera_uuid")
         
@@ -256,7 +256,7 @@ class PipelineRuntime(object):
         cfg_data = {
             "camera_uuid": cam_id,
             "channel_id": cfg_patch.get("channel_id") or cam_id,
-            "rtsp_url": rtsp_url,
+            "source_url": source_url,
             "enabled": True,
             "detection_enabled": True,
             "notification_enabled": True,
@@ -291,7 +291,7 @@ class PipelineRuntime(object):
 
         return {
             "camera_uuid": cam_id,
-            "rtsp_url": rtsp_url,
+            "source_url": source_url,
             "config": self._cameras[cam_id],
         }
         
@@ -315,7 +315,7 @@ class PipelineRuntime(object):
         with self._lock:
             cams = []
             for cam_id, cfg in self._cameras.items():
-                cams.append({"camera_uuid": cam_id, "rtsp_url": cfg.get("rtsp_url"), "config": cfg})
+                cams.append({"camera_uuid": cam_id, "source_url": cfg.get("source_url"), "config": cfg})
             return cams
 
     def patch_camera(self, camera_uuid: str, patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -378,11 +378,22 @@ def _json():
     return data if isinstance(data, dict) else {}
 
 
-def _require_rtsp(url: str):
+# Camera source schemes accepted by the edge. RTSP is decoded by the GStreamer
+# pipeline; the others fall back to OpenCV's generic capture (see VideoChannel).
+_ACCEPTED_SOURCE_SCHEMES = (
+    "rtsp://", "rtsps://",
+    "webrtc://", "whep://", "wheps://",
+    "http://", "https://",
+    "rtmp://", "rtmps://",
+    "srt://",
+)
+
+
+def _require_source(url: str):
     if not url or not isinstance(url, str):
         return False
-    # basic check
-    return url.startswith("rtsp://") or url.startswith("rtsps://")
+    lowered = url.strip().lower()
+    return any(lowered.startswith(scheme) for scheme in _ACCEPTED_SOURCE_SCHEMES)
 
 
 def _runtime_status(*, include_stats: bool) -> Dict[str, Any]:
@@ -422,7 +433,7 @@ def list_cameras():
 @app.route("/api/cameras", methods=["POST"])
 def add_camera():
     body = _json()
-    rtsp_url = body.get("rtsp_url")
+    source_url = body.get("source_url")
     cfg = body.get("config")
     if not isinstance(cfg, dict):
         cfg = {}
@@ -430,16 +441,19 @@ def add_camera():
         cfg = dict(cfg)
 
     for k, v in body.items():
-        if k in {"config", "rtsp_url"}:
+        if k in {"config", "source_url"}:
             continue
         if k not in cfg and v is not None:
             cfg[k] = v
 
-    if not rtsp_url:
-        rtsp_url = cfg.get("rtsp_url")
+    if not source_url:
+        source_url = cfg.get("source_url")
 
-    if not _require_rtsp(rtsp_url):
-        return jsonify({"error": "rtsp_url is required and must start with rtsp://"}), 400
+    if not _require_source(source_url):
+        return jsonify({
+            "error": "source_url is required using a supported scheme: "
+                     "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
+        }), 400
 
     if "camera_uuid" not in cfg and body.get("camera_uuid"):
         cfg["camera_uuid"] = body.get("camera_uuid")
@@ -451,7 +465,7 @@ def add_camera():
         cfg["emit_format"] = "raw"
 
     try:
-        out = runtime.add_camera(rtsp_url, cfg)
+        out = runtime.add_camera(source_url, cfg)
         return jsonify(out), 201
     except Exception as e:
         logger.exception("add_camera failed: %s", e)

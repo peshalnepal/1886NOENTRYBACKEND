@@ -30,7 +30,7 @@ class CameraBaseSchema(BaseModel):
         description="Assigned device UUID (Jetson). Required on create; optional on edit if you allow moving devices."
     )
 
-    rtsp_url: str = Field(..., min_length=1, description="RTSP URL for the camera.")
+    source_url: str = Field(..., min_length=1, description="RTSP URL for the camera.")
     name: Optional[str] = None
     location: Optional[str] = None
     is_enabled: bool = True
@@ -44,12 +44,12 @@ class CameraBaseSchema(BaseModel):
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("rtsp_url", "name", "location"):
+        for attr in ("source_url", "name", "location"):
             v = getattr(self, attr, None)
             if isinstance(v, str) and not v.strip():
                 setattr(self, attr, None)
-        if not self.rtsp_url:
-            raise ValueError("rtsp_url must not be empty.")
+        if not self.source_url:
+            raise ValueError("source_url must not be empty.")
         return self
 
 
@@ -67,7 +67,7 @@ class CameraCreateSchema(BaseModel):
 
     site_uuid: uuid.UUID
     device_uuid: uuid.UUID
-    rtsp_url: str = Field(..., min_length=1)
+    source_url: str = Field(..., min_length=1)
     device_url: str = Field(..., min_length=1)
     name: Optional[str] = None
     location: Optional[str] = None
@@ -87,12 +87,12 @@ class CameraCreateSchema(BaseModel):
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("rtsp_url", "name", "location"):
+        for attr in ("source_url", "name", "location"):
             v = getattr(self, attr, None)
             if isinstance(v, str) and not v.strip():
                 setattr(self, attr, None)
-        if not self.rtsp_url:
-            raise ValueError("rtsp_url is required.")
+        if not self.source_url:
+            raise ValueError("source_url is required.")
         return self
 
 
@@ -118,7 +118,7 @@ class CameraEditSchema(BaseModel):
     site_uuid: Optional[uuid.UUID] = None
     device_uuid: Optional[uuid.UUID] = None  # allow re-assign device if you want
 
-    rtsp_url: Optional[str] = Field(default=None, min_length=1)
+    source_url: Optional[str] = Field(default=None, min_length=1)
     device_url: Optional[str] = Field(default=None, min_length=1)
     webrtc_url: Optional[str] = Field(default=None, min_length=1)
     name: Optional[str] = None
@@ -139,7 +139,7 @@ class CameraEditSchema(BaseModel):
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("rtsp_url", "name", "location"):
+        for attr in ("source_url", "name", "location"):
             v = getattr(self, attr, None)
             if isinstance(v, str) and not v.strip():
                 setattr(self, attr, None)
@@ -163,7 +163,7 @@ class CameraSchema(BaseModel):
     site_uuid: uuid.UUID
     device_uuid: Optional[uuid.UUID] = None
 
-    rtsp_url: str
+    source_url: str
     webrtc_url: Optional[str] = None
 
     is_enabled: bool

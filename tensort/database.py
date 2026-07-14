@@ -62,12 +62,36 @@ class DatabaseManager:
     def initialize_tables(self):
         from database_orm import Base
         try:
+            self._migrate_rtsp_url_to_source_url()
             Base.metadata.create_all(bind=self.sync_engine)
             logger.info("Database tables created/verified successfully")
             return True
         except Exception as e:
             logger.exception("Failed to create database tables: %s", e)
             return False
+
+    def _migrate_rtsp_url_to_source_url(self):
+        """Rename the legacy camera_configs.rtsp_url column to source_url.
+
+        The camera source is now a single generic ``source_url`` (rtsp/webrtc/
+        http/rtmp/srt). Existing Jetson SQLite DBs still have the old ``rtsp_url``
+        column; rename it in place (SQLite >= 3.25) so stored values are kept.
+        ``create_all`` never alters existing tables, so this runs first.
+        """
+        from sqlalchemy import inspect, text
+        try:
+            inspector = inspect(self.sync_engine)
+            if "camera_configs" not in inspector.get_table_names():
+                return
+            cols = {c["name"] for c in inspector.get_columns("camera_configs")}
+            if "rtsp_url" in cols and "source_url" not in cols:
+                with self.sync_engine.begin() as conn:
+                    conn.execute(text(
+                        "ALTER TABLE camera_configs RENAME COLUMN rtsp_url TO source_url"
+                    ))
+                logger.info("Renamed camera_configs.rtsp_url -> source_url.")
+        except Exception as exc:
+            logger.warning("Skipping camera_configs.rtsp_url->source_url migration: %s", exc)
 
     def get_session(self):
         return self.SessionLocal()

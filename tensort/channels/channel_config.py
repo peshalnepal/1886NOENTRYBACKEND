@@ -9,13 +9,13 @@ class VideoChannelConfig(object):
 
     Notes:
       - If channel_id is None, it is derived from camera_uuid (if present).
-      - If camera_uuid is None (new camera), rtsp_url must be provided.
+      - If camera_uuid is None (new camera), source_url must be provided.
     """
 
     __slots__ = (
         "channel_id",
         "camera_uuid",
-        "rtsp_url",
+        "source_url",
         "enabled",
         "detection_enabled",
         "notification_enabled",
@@ -35,7 +35,7 @@ class VideoChannelConfig(object):
         self,
         channel_id=None,
         camera_uuid=None,
-        rtsp_url=None,
+        source_url=None,
         enabled=True,
         detection_enabled=True,
         notification_enabled=True,
@@ -46,13 +46,16 @@ class VideoChannelConfig(object):
         reconnect_max_ms=8000,
         emit_format="raw",          # "raw" or "jpeg"
         jpeg_quality=80,
-        gst_latency_ms=5,
+        gst_latency_ms=200,         # RTSP jitter buffer; too low (e.g. 5) drops
+                                    # frames on any network jitter and forces
+                                    # constant reconnects. 200-300ms is right for
+                                    # LAN cameras and invisible at detection FPS.
         rtsp_transport="tcp",       # "tcp" or "udp"
         gst_decoder="nvv4l2decoder" # Jetson HW decode; fallback happens in code
     ):
         self.channel_id = channel_id
         self.camera_uuid = camera_uuid
-        self.rtsp_url = rtsp_url
+        self.source_url = source_url
         self.enabled = bool(enabled)
         self.detection_enabled = bool(detection_enabled)
         self.notification_enabled = bool(notification_enabled)
@@ -111,9 +114,9 @@ class VideoChannelConfig(object):
             self.rtsp_transport = "tcp"
 
     def validate(self):
-        # If creating new camera (no camera_uuid), rtsp_url must be provided
-        if not self.camera_uuid and not self.rtsp_url:
-            raise ValueError("rtsp_url is required when camera_uuid is not provided (new camera).")
+        # If creating new camera (no camera_uuid), a source must be provided
+        if not self.camera_uuid and not self.source_url:
+            raise ValueError("source_url is required when camera_uuid is not provided (new camera).")
 
         if self.sample_fps <= 0.0:
             raise ValueError("sample_fps must be > 0")

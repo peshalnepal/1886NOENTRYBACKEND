@@ -38,11 +38,11 @@ class ChannelEvent(object):
 
 
 class ChannelConnectedEvent(ChannelEvent):
-    __slots__ = ("rtsp_url",)
+    __slots__ = ("source_url",)
 
-    def __init__(self, channel_id, camera_uuid, rtsp_url, ts_ms):
+    def __init__(self, channel_id, camera_uuid, source_url, ts_ms):
         ChannelEvent.__init__(self, "connected", channel_id, camera_uuid, ts_ms)
-        self.rtsp_url = rtsp_url
+        self.source_url = source_url
 
 
 class ChannelDisconnectedEvent(ChannelEvent):
@@ -100,10 +100,14 @@ class RTSPEvent(ChannelEvent):
 
 class VideoChannel():
     """
-    RTSP ingest for Jetson inference only.
+    Multi-scheme video ingest for Jetson inference.
 
-    - Reads RTSP frames (GStreamer preferred on Jetson; OpenCV fallback)
-    - Emits RTSPEvent for your inference pipeline
+    Accepts any source_url scheme: rtsp/rtsps, srt, rtmp/rtmps, http/https
+    (HLS / MJPEG / progressive) and webrtc/whep. On Jetson it prefers
+    hardware-accelerated GStreamer pipelines (nvv4l2decoder + nvvidconv) and
+    falls back to CPU GStreamer, then to OpenCV/FFmpeg generic capture.
+
+    - Emits RTSPEvent for your inference pipeline (name kept for compatibility)
     - Frontend video streaming should come from your Azure Media Server (WebRTC/HLS)
     """
 
@@ -127,19 +131,44 @@ class VideoChannel():
         self._stopping = False
         self._cap_lock = threading.Lock()
         
-    def _build_gst_pipeline(self, rtsp_url, decoder):
+    @staticmethod
+    def _url_scheme(url):
+        url = str(url or "").strip().lower()
+        return url.split("://", 1)[0] if "://" in url else ""
+
+    def _gst_appsink_tail(self, hw):
+        """Trailing convert+resize+appsink segment shared by every pipeline.
+
+        ``hw=True`` uses Jetson's nvvidconv (handles NVMM output from
+        nvv4l2decoder); ``hw=False`` uses CPU videoscale/videoconvert. Both end
+        in BGR frames for the OpenCV appsink. Resize matches the historical RTSP
+        behaviour (fixed WxH; aspect handled later by the TRT letterbox).
+        """
+        resize = self.config.resize
+        if hw:
+            if resize is not None:
+                w, h = resize
+                conv = (
+                    "nvvidconv interpolation-method=1 ! "
+                    "video/x-raw,width={w},height={h},format=BGRx ! "
+                ).format(w=int(w), h=int(h))
+            else:
+                conv = "nvvidconv ! video/x-raw,format=BGRx ! "
+        else:
+            if resize is not None:
+                w, h = resize
+                conv = "videoscale ! video/x-raw,width={w},height={h} ! ".format(
+                    w=int(w), h=int(h)
+                )
+            else:
+                conv = ""
+        return conv + "videoconvert ! video/x-raw,format=BGR ! appsink drop=true sync=false max-buffers=1"
+
+    def _build_rtsp_pipeline(self, url, decoder):
+        """RTSP fast path: depay/parse H.264 + (HW or CPU) decode."""
         lat = int(self.config.gst_latency_ms)
         proto = self.config.rtsp_transport
         q = "queue max-size-buffers=1 leaky=downstream ! "
-
-        resize_caps = ""
-        if self.config.resize is not None:
-            w, h = self.config.resize
-            resize_caps = "nvvidconv interpolation-method=1 ! video/x-raw,width={w},height={h},format=BGRx ! ".format(
-                w=int(w), h=int(h)
-            )
-        else:
-            resize_caps = "nvvidconv ! video/x-raw,format=BGRx ! "
 
         if decoder == "nvv4l2decoder":
             return (
@@ -150,10 +179,8 @@ class VideoChannel():
                 "h264parse config-interval=1 ! "
                 "video/x-h264,stream-format=byte-stream,alignment=au ! "
                 "nvv4l2decoder enable-max-performance=1 ! "
-                + resize_caps +
-                "videoconvert ! video/x-raw,format=BGR ! "
-                "appsink drop=true sync=false max-buffers=1"
-            ).format(url=rtsp_url, lat=lat, proto=proto)
+                + self._gst_appsink_tail(hw=True)
+            ).format(url=url, lat=lat, proto=proto)
         # CPU fallback decoder (avdec_h264)
         return (
             "rtspsrc location={url} latency={lat} protocols={proto} "
@@ -161,27 +188,99 @@ class VideoChannel():
             + q +
             "rtph264depay ! h264parse config-interval=1 ! "
             "{dec} ! "
-            "videoconvert ! video/x-raw,format=BGR ! "
-            "appsink drop=true sync=false max-buffers=1"
-        ).format(url=rtsp_url, lat=lat, proto=proto, dec=decoder)
+            + self._gst_appsink_tail(hw=False)
+        ).format(url=url, lat=lat, proto=proto, dec=decoder)
+
+    def _build_uridecodebin_pipeline(self, url, hw):
+        """Generic pipeline for srt/rtmp/http(HLS/MJPEG/progressive) and rtsp.
+
+        ``uridecodebin`` auto-plugs the right source + demux + decoder for the
+        URI (and on Jetson picks nvv4l2decoder for H.264/H.265, emitting NVMM
+        that the hw tail's nvvidconv consumes). The quoted uri keeps query
+        strings (``?...``) from breaking gst-launch parsing.
+        """
+        q = "queue max-size-buffers=1 leaky=downstream ! "
+        return (
+            'uridecodebin uri="{url}" ! '.format(url=url)
+            + q
+            + self._gst_appsink_tail(hw=hw)
+        )
+
+    def _build_whep_pipeline(self, url, hw):
+        """Best-effort WebRTC/WHEP ingest via the gst webrtchttp ``whepsrc``.
+
+        Requires the GStreamer ``webrtchttp`` plugin (gst-plugins-rs). The
+        whep/webrtc scheme is normalised to the https signalling endpoint.
+        Falls back to other candidates / OpenCV if the plugin is unavailable.
+        """
+        endpoint = url
+        # wheps:// is WHEP over HTTPS, whep://webrtc:// are plain; map both to the
+        # http(s) signalling endpoint whepsrc expects.
+        for prefix, target in (("wheps://", "https://"), ("whep://", "https://"), ("webrtc://", "https://")):
+            if endpoint.lower().startswith(prefix):
+                endpoint = target + endpoint[len(prefix):]
+                break
+        q = "queue max-size-buffers=1 leaky=downstream ! "
+        return (
+            'whepsrc whep-endpoint="{ep}" ! '.format(ep=endpoint)
+            + q
+            + "decodebin ! "
+            + self._gst_appsink_tail(hw=hw)
+        )
+
+    def _gst_candidates(self):
+        """Ordered (name, pipeline) GStreamer attempts for the source scheme."""
+        url = self.config.source_url or ""
+        scheme = self._url_scheme(url)
+        cands = []
+        if scheme in ("rtsp", "rtsps"):
+            cands.append(("rtsp-nvv4l2decoder", self._build_rtsp_pipeline(url, self.config.gst_decoder)))
+            cands.append(("rtsp-avdec_h264", self._build_rtsp_pipeline(url, "avdec_h264")))
+            # Generic fallback also covers H.265 / non-H264 RTSP cameras.
+            cands.append(("rtsp-uridecodebin-hw", self._build_uridecodebin_pipeline(url, hw=True)))
+            cands.append(("rtsp-uridecodebin-cpu", self._build_uridecodebin_pipeline(url, hw=False)))
+        elif scheme in ("whep", "wheps", "webrtc"):
+            cands.append(("whep-hw", self._build_whep_pipeline(url, hw=True)))
+            cands.append(("whep-cpu", self._build_whep_pipeline(url, hw=False)))
+        else:
+            # srt / rtmp / rtmps / http / https (HLS, MJPEG, progressive) / other
+            cands.append(("uridecodebin-hw", self._build_uridecodebin_pipeline(url, hw=True)))
+            cands.append(("uridecodebin-cpu", self._build_uridecodebin_pipeline(url, hw=False)))
+        return cands
 
     def _open_capture(self):
+        url = self.config.source_url or ""
+        scheme = self._url_scheme(url) or "?"
+
         if self.config.decode_backend == "gstreamer":
-            for dec in (self.config.gst_decoder, "avdec_h264"):
-                gst = self._build_gst_pipeline(self.config.rtsp_url, dec)
-                cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+            for name, gst in self._gst_candidates():
+                cap = None
+                try:
+                    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+                except Exception:
+                    cap = None
                 if cap is not None and cap.isOpened():
-                    logger.info("[%s] opened with gstreamer decoder=%s", self.config.camera_uuid, dec)
+                    logger.info(
+                        "[%s] opened %s source via gstreamer pipeline=%s",
+                        self.config.camera_uuid, scheme, name,
+                    )
                     return cap
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
 
-            logger.warning("[%s] gstreamer failed, falling back to OpenCV default RTSP capture", self.config.camera_uuid)
-            cap = cv2.VideoCapture(self.config.rtsp_url)
-            return cap
+            logger.warning(
+                "[%s] all gstreamer pipelines failed for %s source; falling back to OpenCV/FFmpeg",
+                self.config.camera_uuid, scheme,
+            )
 
+        # OpenCV/FFmpeg generic capture (decode_backend="opencv" or gst fallback).
         try:
-            cap = cv2.VideoCapture(self.config.rtsp_url, cv2.CAP_FFMPEG)
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         except Exception:
-            cap = cv2.VideoCapture(self.config.rtsp_url)
+            cap = cv2.VideoCapture(url)
 
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
@@ -259,14 +358,14 @@ class VideoChannel():
                     self._cap = cap
 
                 if cap is None or not cap.isOpened():
-                    raise RuntimeError("Failed to open RTSP stream")
+                    raise RuntimeError("Failed to open video source")
 
                 ts_ms = int(time.time() * 1000)
                 self._push_from_thread(
                     ChannelConnectedEvent(
                         channel_id=self.config.channel_id,
                         camera_uuid=self.config.camera_uuid,
-                        rtsp_url=self.config.rtsp_url,
+                        source_url=self.config.source_url,
                         ts_ms=ts_ms,
                     )
                 )
