@@ -17,6 +17,8 @@ from routes.user_routes import router as users_router
 from routes.platform_admin_routes import router as platform_admin_router
 from routes.admin_routes import router as admin_router
 from routes.report_routes import router as reports_router
+from routes.wall_routes import router as walls_router
+from routes.public_routes import router as public_router
 
 from core.config import DEBUG
 from core.database import db_manager, async_engine
@@ -280,6 +282,8 @@ app.include_router(users_router, prefix="/api")
 app.include_router(platform_admin_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
 app.include_router(reports_router, prefix="/api")
+app.include_router(walls_router, prefix="/api")
+app.include_router(public_router, prefix="/api")
 
 @app.get("/")
 async def root():

@@ -813,3 +813,108 @@ class LoginRequest(BaseModel):
     @classmethod
     def normalize_email(cls, value: EmailStr) -> str:
         return str(value).lower().strip()
+
+
+# -------------------------
+# Custom walls
+# -------------------------
+
+# Bounds how many streams a single share link can fan out to a media server that
+# has no per-viewer limits of its own.
+MAX_WALL_CAMERAS = 24
+
+
+class WallCameraSchema(BaseModel):
+    """A camera as seen by an authenticated wall viewer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    camera_uuid: uuid.UUID
+    name: Optional[str] = None
+    location: Optional[str] = None
+    site_uuid: uuid.UUID
+    site_name: Optional[str] = None
+    webrtc_url: Optional[str] = None
+    position: int
+
+
+class WallSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    wall_uuid: uuid.UUID
+    name: str
+    cameras: List[WallCameraSchema] = Field(default_factory=list)
+
+    # Cameras stored on the wall that this caller may not see (their site grant
+    # was revoked, the site was soft-deleted, or the camera was disabled). Lets
+    # the UI say "showing 3 of 5" instead of silently dropping them.
+    total_camera_count: int = 0
+
+    share_enabled: bool = False
+    share_token: Optional[str] = None
+    share_expires_at: Optional[datetime] = None
+
+    created_at: datetime
+    updated_at: datetime
+
+
+class WallCreateSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=255)
+    camera_uuids: List[uuid.UUID] = Field(default_factory=list, max_length=MAX_WALL_CAMERAS)
+
+    @field_validator("camera_uuids")
+    @classmethod
+    def reject_duplicates(cls, value: List[uuid.UUID]) -> List[uuid.UUID]:
+        if len(set(value)) != len(value):
+            raise ValueError("camera_uuids contains duplicates")
+        return value
+
+
+class WallEditSchema(BaseModel):
+    """PATCH — omitted fields are left unchanged. ``camera_uuids`` replaces the
+    whole ordered membership when present."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    camera_uuids: Optional[List[uuid.UUID]] = Field(default=None, max_length=MAX_WALL_CAMERAS)
+
+    @field_validator("camera_uuids")
+    @classmethod
+    def reject_duplicates(cls, value: Optional[List[uuid.UUID]]) -> Optional[List[uuid.UUID]]:
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError("camera_uuids contains duplicates")
+        return value
+
+
+class WallShareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expires_at: Optional[datetime] = None
+
+
+# --- Public (unauthenticated) shapes ---
+#
+# Deliberately NOT derived from CameraSchema: that model requires `source_url`,
+# which can embed RTSP credentials. ROI polygons are omitted too — they reveal
+# where the tripwires are.
+
+
+class PublicWallCameraSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    camera_uuid: uuid.UUID
+    name: Optional[str] = None
+    location: Optional[str] = None
+    site_name: Optional[str] = None
+    webrtc_url: Optional[str] = None
+    position: int
+
+
+class PublicWallSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    cameras: List[PublicWallCameraSchema] = Field(default_factory=list)

@@ -1010,3 +1010,79 @@ class AccessGrant(Base):
             name="uq_access_grant_user_role_context",
         ),
     )
+
+
+# =========================
+# CUSTOM WALLS
+# =========================
+class Wall(Base):
+    """A named, ordered set of cameras spanning any number of sites in one org.
+
+    A wall may be published for public viewing via ``share_token``. Note that the
+    WHEP URLs it hands out are themselves unauthenticated (see ``mediamtx.yml``),
+    so revoking a token stops *discovery* of the wall, not playback by someone who
+    already saved a stream URL.
+    """
+
+    __tablename__ = "walls"
+
+    id = Column(Integer, primary_key=True, index=True)
+    wall_uuid = Column(GUID, default=uuid.uuid4, unique=True, nullable=False, index=True)
+
+    org_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_by = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    name = Column(String(255), nullable=False)
+
+    share_token = Column(String(64), nullable=True, unique=True, index=True)
+    share_enabled = Column(Boolean, nullable=False, default=False, server_default="0")
+    share_expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class WallCamera(Base):
+    """Ordered membership of a camera in a wall.
+
+    Rows are removed by the DB when either side is deleted (both FKs cascade), but
+    reads must still filter: a camera whose *site* was soft-deleted
+    (``Site.is_deleted``) survives that cascade entirely.
+    """
+
+    __tablename__ = "wall_cameras"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    wall_uuid = Column(
+        GUID,
+        ForeignKey("walls.wall_uuid", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    camera_uuid = Column(
+        GUID,
+        ForeignKey("camera.camera_uuid", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    position = Column(Integer, nullable=False, default=0)
+
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("wall_uuid", "camera_uuid", name="uq_wall_camera_pair"),
+        Index("ix_wall_cameras_wall_position", "wall_uuid", "position"),
+    )

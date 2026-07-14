@@ -38,6 +38,11 @@ from application.services.clip_storage import (
     extract_notification_clip_storage_keys as _extract_notification_clip_storage_keys,
 )
 from application.services.webrtcgateway import resolve_camera_webrtc_url, WebRTCGatewayClient
+from application.services.detection_stream import (
+    normalize_box_px,
+    resp_to_detection_out,
+    stream_camera_detections,
+)
 from core.security.tokens import decode_access_token
 from core.schemas import (
     BoxNorm,
@@ -237,60 +242,11 @@ async def _fetch_device_snapshot(*, device_url: str, camera_uuid: uuid.UUID) -> 
         detail=last_error or "Jetson snapshot request failed.",
     )
 
-def _normalize_box_px(box: Dict[str, Any], frame_w: Optional[int], frame_h: Optional[int]) -> Optional[BoxNorm]:
-    if not frame_w or not frame_h:
-        return None
-    x1, y1, x2, y2 = float(box["x1"]), float(box["y1"]), float(box["x2"]), float(box["y2"])
-    w = max(1.0, x2 - x1)
-    h = max(1.0, y2 - y1)
-    return BoxNorm(
-        x=max(0.0, min(1.0, x1 / frame_w)),
-        y=max(0.0, min(1.0, y1 / frame_h)),
-        w=max(0.0, min(1.0, w / frame_w)),
-        h=max(0.0, min(1.0, h / frame_h)),
-    )
-
-
-def _resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
-    fw = getattr(resp, "frame_w", None)
-    fh = getattr(resp, "frame_h", None)
-
-    merged = _overlay_payload_from_resp(
-        resp,
-        fallback_detections=_live_tracks(list(getattr(resp, "tracks", ()) or ())),
-    ).get("detections") or []
-
-    items: List[DetectionItemOut] = []
-    for d in merged:
-        box = d.get("box") or {}
-        if not all(k in box for k in ("x1", "y1", "x2", "y2")):
-            continue
-
-        box_px = BoxPx(x1=box["x1"], y1=box["y1"], x2=box["x2"], y2=box["y2"])
-        tid = d.get("track_id")
-        items.append(
-            DetectionItemOut(
-                box=box_px,
-                cls_name=str(d.get("cls_name") or ""),
-                conf=float(d.get("conf") or 0.0),
-                box_norm=_normalize_box_px(box, fw, fh) if normalize else None,
-                track_id=int(tid) if tid is not None else None,
-            )
-        )
-
-    return DetectionOut(
-        camera_uuid=str(resp.camera_uuid),
-        frame_ts_ms=int(resp.frame_ts_ms),
-        frame_seq=int(resp.frame_seq),
-        event_type=str(getattr(resp, "event_type", None)) if getattr(resp, "event_type", None) is not None else None,
-        reason=str(getattr(resp, "reason", None)) if getattr(resp, "reason", None) is not None else None,
-        inference_ms=int(resp.inference_ms) if getattr(resp, "inference_ms", None) is not None else None,
-        model_id=str(getattr(resp, "model_id", None)) if getattr(resp, "model_id", None) is not None else None,
-        frame_w=int(fw) if fw is not None else None,
-        frame_h=int(fh) if fh is not None else None,
-        detections=items,
-        pose=getattr(resp, "pose", None),
-    )
+# Serialization lives in application/services/detection_stream.py so the public
+# wall stream reuses exactly this shape. Kept under the old private names here to
+# avoid churning the call sites below.
+_normalize_box_px = normalize_box_px
+_resp_to_detection_out = resp_to_detection_out
 
 
 # -------------------------
@@ -527,43 +483,18 @@ async def stream_detections_sse(
         owner_id = await _ensure_stream_camera_access(db, cam, user)
 
     pipeline = await manager.get_activepipeline(user_id=owner_id)
-    cam_key = str(camera_uuid)
 
-    async def gen():
-        last_ts = int(after_ts_ms)
-        last_seq = int(after_seq)
+    gen = stream_camera_detections(
+        pipeline=pipeline,
+        camera_uuid=str(camera_uuid),
+        after_ts_ms=after_ts_ms,
+        after_seq=after_seq,
+        timeout_ms=timeout_ms,
+        normalize=normalize,
+        is_disconnected=request.is_disconnected,
+    )
 
-        initial = await pipeline.get_latest_detection(cam_key)
-        if initial is not None and last_ts == 0 and last_seq > 0:
-            last_ts = int(initial.frame_ts_ms)
-        if initial is not None:
-            its, isq = int(initial.frame_ts_ms), int(initial.frame_seq)
-            if its > last_ts or (its == last_ts and isq > last_seq):
-                last_ts, last_seq = its, isq
-                payload = _resp_to_detection_out(initial, normalize=normalize).model_dump()
-                yield f"event: detection\ndata: {json.dumps(payload)}\n\n"
-
-        while True:
-            if await request.is_disconnected():
-                return
-
-            resp = await pipeline.detect_store.wait_new(
-                cam_key,
-                after_ts_ms=last_ts,
-                after_seq=last_seq,
-                timeout_ms=int(timeout_ms),
-            )
-
-            if resp is None:
-                yield "event: heartbeat\ndata: {}\n\n"
-                continue
-
-            last_ts = int(resp.frame_ts_ms)
-            last_seq = int(resp.frame_seq)
-            payload = _resp_to_detection_out(resp, normalize=normalize).model_dump()
-            yield f"event: detection\ndata: {json.dumps(payload)}\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen, media_type="text/event-stream")
 
 
 @router.get("/detections/stream")

@@ -118,6 +118,7 @@ class Permission(str, Enum):
     ORG_MANAGE_SETTINGS = "org:manage_settings"
     ALERTS_APPROVE = "alerts:approve"
     REPORTS_SEND = "reports:send"
+    WALL_MANAGE = "wall:manage"
 
     # --- Site scope ---
     SITE_READ = "site:read"
@@ -138,6 +139,7 @@ _ORG_PERMISSIONS = frozenset(
         Permission.ORG_MANAGE_SETTINGS,
         Permission.ALERTS_APPROVE,
         Permission.REPORTS_SEND,
+        Permission.WALL_MANAGE,
     }
 )
 _SITE_PERMISSIONS = frozenset(
@@ -164,7 +166,12 @@ _SITE_PERMISSIONS = frozenset(
 ROLE_PERMISSIONS: dict[tuple[str, str], frozenset[Permission]] = {
     (OrgRole.ADMIN.value, RoleScope.ORG.value): _ORG_PERMISSIONS | _SITE_PERMISSIONS,
     (OrgRole.OPERATOR.value, RoleScope.ORG.value): frozenset(
-        {Permission.ORG_READ, Permission.ALERTS_APPROVE, Permission.REPORTS_SEND}
+        {
+            Permission.ORG_READ,
+            Permission.ALERTS_APPROVE,
+            Permission.REPORTS_SEND,
+            Permission.WALL_MANAGE,
+        }
     ),
     (OrgRole.MEMBER.value, RoleScope.ORG.value): frozenset({Permission.ORG_READ}),
     (SiteRole.ADMIN.value, RoleScope.SITE.value): _SITE_PERMISSIONS,
@@ -185,6 +192,7 @@ PERMISSION_DESCRIPTIONS: dict[str, str] = {
     Permission.ORG_MANAGE_SETTINGS.value: "Change organization-level settings.",
     Permission.ALERTS_APPROVE.value: "Review and approve/reject pending AI alerts.",
     Permission.REPORTS_SEND.value: "Generate and send reports to site members.",
+    Permission.WALL_MANAGE.value: "Build multi-site camera walls and publish them as public links.",
     Permission.SITE_READ.value: "View a site, its live streams and approved alerts.",
     Permission.SITE_ARM_DISARM.value: "Arm or disarm a site.",
     Permission.SITE_MANAGE.value: "Edit a site and its settings.",
