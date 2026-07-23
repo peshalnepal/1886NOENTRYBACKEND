@@ -287,6 +287,18 @@ dimension and must be re-exported by the development team.
 
 Edit `tensort/.env`, then `sudo systemctl restart jetson-cameras`:
 
+> **Always change settings through the service, not by running the program by
+> hand.** The program does not read `.env` itself — the systemd service supplies
+> it. If you start it manually with `python3 main.py`, **every setting in `.env`
+> is ignored** and built-in defaults are used instead, which will not match this
+> guide. To run it manually for diagnosis, load the file explicitly:
+>
+> ```
+> cd ~/1886NOENTRYBACKEND/tensort
+> set -a; . ./.env; set +a
+> .venv_trt/bin/python3 main.py
+> ```
+
 | Setting | Effect |
 |---|---|
 | `DEFAULT_SAMPLE_FPS` | Frames analysed per camera per second. **The main lever.** Orin: 12. Nano: 2. |
