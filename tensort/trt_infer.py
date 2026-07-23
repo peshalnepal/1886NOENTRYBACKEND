@@ -622,7 +622,7 @@ def build_default() -> TRTInfer:
         raise FileNotFoundError("DET_ENGINE not found: {}".format(det_engine))
 
     imgsz = int(os.getenv("IMG_SZ", "640"))
-    conf = float(os.getenv("CONF", "0.350"))   # matches .env.example CONF=0.350
+    conf = float(os.getenv("CONF", "0.350"))   # .env.example ships CONF=0.30
     iou = float(os.getenv("IOU", "0.45"))
     device_id = int(os.getenv("CUDA_DEVICE", "0"))
     nms_topk = int(os.getenv("NMS_TOPK", "50"))   # matches .env.example NMS_TOPK=50

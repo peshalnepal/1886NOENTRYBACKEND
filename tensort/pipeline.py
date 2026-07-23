@@ -461,7 +461,7 @@ class SimpleInferencePipeline(object):
         self._latest_snapshot_ts_ms = {}
         self._latest_lock = asyncio.Lock()
         self._snapshot_enabled = _env_bool("ENABLE_SNAPSHOT_CACHE", True)
-        self._snapshot_min_interval_ms = _env_int("SNAPSHOT_MIN_INTERVAL_MS", 500, minimum=0)   # matches .env.example SNAPSHOT_MIN_INTERVAL_MS=500
+        self._snapshot_min_interval_ms = _env_int("SNAPSHOT_MIN_INTERVAL_MS", 500, minimum=0)   # .env.example ships 1000
         self._snapshot_max_edge = _env_int("SNAPSHOT_MAX_EDGE", 960, minimum=64)
         self._snapshot_jpeg_quality = _env_int("SNAPSHOT_JPEG_QUALITY", 75, minimum=1)
         self._snapshot_on_detection_only = _env_bool("SNAPSHOT_ON_DETECTION_ONLY", True)    # matches .env.example SNAPSHOT_ON_DETECTION_ONLY=true
