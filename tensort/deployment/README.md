@@ -60,14 +60,25 @@ credentials for each camera.
 Plan capacity before you deploy. Exceeding it does not degrade gracefully; it
 drops frames and the detection overlay falls behind the live video.
 
-| Board | Recommended | Absolute max | Frame rate per camera |
+| Board | Recommended | Frame rate per camera | Total frames/sec |
 |---|---|---|---|
-| **Orin Nano (8 GB)** | 8–10 cameras | 10 | 12 fps |
-| **Original Nano (4 GB)** | **2–3 cameras** | 4 | 2 fps |
+| **Orin Nano (8 GB)** | 8–10 cameras | 12 fps | ~120 |
+| **Original Nano (4 GB)** | **2 cameras** | 12 fps | ~24 |
+| | **4 cameras** | 6–8 fps | ~28 |
+| | 10 cameras (not advised) | 2.5–3 fps | ~30 |
 
-The original Nano's limit is driven by its GPU (a 128-core Maxwell part) and by
-having only 4 GB of memory shared between CPU and GPU. It is suitable for a
-small site or a pilot. **For anything above 3 cameras, specify an Orin Nano.**
+**The original Nano's limit is processing speed, not memory.** It sustains only
+**25–40 frames per second in total, across all cameras combined** — one 128-core
+GPU, no multi-camera batching on this board, and image preparation that does not
+overlap with GPU work. Memory is comfortable to roughly 40 cameras; the
+processor is the wall long before that.
+
+Divide the total by your camera count to get the per-camera frame rate. Ten
+cameras at 12 fps would require 120 frames/sec — **three to five times what this
+board can deliver.** Asking for it does not fail loudly; it drops frames and the
+detection overlay drifts behind the live video.
+
+**For more than 4 cameras, specify an Orin Nano.**
 
 ---
 

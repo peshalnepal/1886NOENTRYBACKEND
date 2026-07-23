@@ -244,18 +244,36 @@ set_env_var() {
 
 # Conservative defaults for a 4 GB board. The TRT8 path has no dynamic batching,
 # so INFER_MAX_BATCH must be 1 — anything higher just splits into serial calls.
+# This board sustains only ~25-40 frames/sec TOTAL across all cameras:
+# one 128-core GPU, no batching in the TRT8 path, and CPU preprocessing that
+# does not overlap GPU execution. Budget = fps x cameras, not fps per camera.
+#
+# 6 fps suits the recommended 2-4 cameras (12-24 img/s). If you run more
+# cameras, LOWER this: 10 cameras needs <= 3. Watch infer_dropped in /health.
 set_env_var DET_ENGINE "./${ENGINE}"
 set_env_var IMG_SZ "${IMG_SZ}"
+# TRT8 on this branch is fixed batch=1; a higher value only splits into extra
+# serial GPU calls. INFER_BATCH_LINGER_MS is likewise unused here.
 set_env_var INFER_MAX_BATCH 1
+# Explicit 1, not 0: two CUDA contexts + two engines on a 4 GB board costs
+# ~600 MB and makes the GPU time-slice, which LOWERS throughput.
 set_env_var INFER_NUM_WORKERS 1
 set_env_var INFER_NUM_WORKERS_MAX 1
-set_env_var DEFAULT_SAMPLE_FPS 2
-set_env_var MAX_SAMPLE_FPS 5
+set_env_var DEFAULT_SAMPLE_FPS 6
+set_env_var MAX_SAMPLE_FPS 8
 set_env_var DEFAULT_RESIZE_W 640
 set_env_var DEFAULT_RESIZE_H 480
 set_env_var EMIT_EMPTY_DETECTIONS false
 set_env_var PORT "${PORT}"
-ok ".env configured with conservative 4 GB-board defaults (batch=1, 1 worker, 2 fps/cam)"
+ok ".env configured for a 4 GB board (batch=1, 1 worker, 6 fps/cam @ 2-4 cameras)"
+
+# Final guard: .env must point at an engine that exists, or the service starts
+# and then fails on every frame with FileNotFoundError.
+if [ ! -f "$ENGINE" ]; then
+  warn_track "DET_ENGINE points at ${ENGINE}, which does not exist. \
+Available: $(ls models/*.engine 2>/dev/null | tr '\n' ' ' || echo 'none'). \
+Re-run without SKIP_ENGINE=1, or set MODEL= to a model whose .onnx is present."
+fi
 
 # --- 8. systemd service + health check -----------------------------------------
 log "=== Step 8/8: Service installation and health check ==="
