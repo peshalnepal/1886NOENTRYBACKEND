@@ -186,16 +186,25 @@ def box_norm_xyxy(x1, y1, x2, y2, W, H):
 
 class TRTEngine(object):
     """
-    Double-buffered TensorRT engine.
+    Dynamic-batch TensorRT engine.
 
-    Two sets of pinned host buffers + two CUDA streams (ping / pong).
-    While stream[0] synchronises (waiting for GPU→CPU copy of frame N),
-    stream[1] can already be uploading frame N+1's tensor to the GPU.
-    This hides H2D transfer latency on Jetson's unified memory bus.
+    The engine is expected to be built with a dynamic batch axis and an
+    optimization profile (min=1 .. max=N). We allocate ONE set of pinned host
+    + device buffers sized for the profile's MAX batch, then per infer() call
+    set the actual batch with set_input_shape and transfer only the rows in use.
+
+    A fixed-shape (batch=1) engine still works: it is treated as max_batch=1,
+    so single-frame inference keeps running unchanged. This is the fallback for
+    an engine that was NOT re-exported with a dynamic axis.
+
+    Note: the previous ping-pong double-buffering (two streams hiding H2D
+    latency for serial single-frame inference) is intentionally removed —
+    throughput now comes from batching, and variable batch sizes don't map
+    cleanly onto fixed dual buffers. One stream, one buffer set.
 
     Usage:
-        tensor, r, pad = preprocess(bgr, imgsz)   # CPU — can run in parallel
-        outputs = engine.infer(tensor)             # GPU — overlaps with next CPU preprocess
+        tensor, r, pad = preprocess(bgr, imgsz)   # CPU, (1,3,H,W)
+        outputs = engine.infer(batch_tensor)       # GPU, (B,...) outputs
     """
 
     def __init__(self, engine_path: str, device_id: int = 0):
@@ -203,7 +212,6 @@ class TRTEngine(object):
             raise FileNotFoundError(engine_path)
 
         self.device_id = int(device_id)
-        self._buf_idx = 0   # ping-pong index (0 or 1)
 
         with CudaContext(self.device_id):
             self._trt_logger = trt.Logger(trt.Logger.WARNING)
@@ -212,97 +220,113 @@ class TRTEngine(object):
 
             self.context = self.engine.create_execution_context()
 
-            self.binding_names = []
+            # TensorRT 10 name-based tensor I/O API.
+            self.tensor_names = []
             self.input_index = None
+            self.input_name = None
             self.output_indices = []
-            self.output_shapes = {}
-            _shapes = []
-            _dtypes = []
-            for i in range(self.engine.num_bindings):
-                name = self.engine.get_binding_name(i)
-                self.binding_names.append(name)
-                dtype = trt.nptype(self.engine.get_binding_dtype(i))
-                shape = self.engine.get_binding_shape(i)
-                if -1 in tuple(shape):
-                    raise RuntimeError(
-                        "Dynamic shape binding ({}): {}. Export fixed-shape engine.".format(name, shape)
-                    )
-                _shapes.append(tuple(shape))
-                _dtypes.append(dtype)
-                if self.engine.binding_is_input(i):
+            self.output_names = []
+
+            self._dtypes = {}        # index -> numpy dtype
+            self._decl_shapes = {}   # index -> declared shape (may contain -1)
+
+            for i in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(i)
+                self.tensor_names.append(name)
+                self._dtypes[i] = trt.nptype(self.engine.get_tensor_dtype(name))
+                self._decl_shapes[i] = tuple(int(d) for d in self.engine.get_tensor_shape(name))
+                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                     self.input_index = i
-                    self.input_shape = tuple(shape)
+                    self.input_name = name
                 else:
                     self.output_indices.append(i)
-                    self.output_shapes[i] = tuple(shape)
+                    self.output_names.append(name)
 
             if self.input_index is None:
-                raise RuntimeError("No input binding found.")
+                raise RuntimeError("No input tensor found.")
 
-            # Allocate TWO sets of pinned host buffers (one per stream slot)
-            # but only ONE set of device buffers (GPU mem is shared; we sync
-            # before reuse so there is no race).
-            self._host_bufs = [[], []]   # [buf_idx][binding_idx]
-            self._dev_bufs = []          # [binding_idx]  — shared
-            self._bindings = []          # int pointers into _dev_bufs
+            in_decl = self._decl_shapes[self.input_index]
+            self._dynamic = any(d < 0 for d in in_decl)
 
-            for i, (shape, dtype) in enumerate(zip(_shapes, _dtypes)):
-                size = int(np.prod(shape))
-                for b in range(2):
-                    self._host_bufs[b].append(cuda.pagelocked_empty(size, dtype))
-                dev = cuda.mem_alloc(self._host_bufs[0][i].nbytes)
+            if self._dynamic:
+                # profile 0's MAX shape gives the largest batch the engine accepts
+                _min, _opt, _max = self.engine.get_tensor_profile_shape(self.input_name, 0)
+                self.max_batch = int(tuple(_max)[0])
+            else:
+                self.max_batch = int(in_decl[0])
+
+            # C,H,W are the fixed (non-batch) input dims.
+            self._fixed_chw = tuple(int(x) for x in in_decl[1:])
+            self._in_row_size = int(np.prod(self._fixed_chw)) if self._fixed_chw else 1
+
+            # Resolve a MAX shape per tensor (dynamic batch dim -> max_batch) so
+            # the single allocation below is large enough for any B <= max_batch.
+            self._max_sizes = {}     # index -> element count at max batch
+            for i in range(self.engine.num_io_tensors):
+                resolved = tuple(self.max_batch if d < 0 else d for d in self._decl_shapes[i])
+                self._max_sizes[i] = int(np.prod(resolved)) if resolved else 1
+
+            # ONE set of pinned host + device buffers, sized for max batch.
+            self._host_bufs = []     # [index] -> pagelocked ndarray
+            self._dev_bufs = []      # [index] -> device allocation
+            for i in range(self.engine.num_io_tensors):
+                host = cuda.pagelocked_empty(self._max_sizes[i], self._dtypes[i])
+                dev = cuda.mem_alloc(host.nbytes)
+                self._host_bufs.append(host)
                 self._dev_bufs.append(dev)
-                self._bindings.append(int(dev))
+                # Device buffers are reused for the engine's life, so the
+                # addresses are stable and can be bound once here.
+                self.context.set_tensor_address(self.tensor_names[i], int(dev))
 
-            # Two CUDA streams
-            self._streams = [cuda.Stream(), cuda.Stream()]
+            self._stream = cuda.Stream()
 
     def infer(self, input_chw: np.ndarray) -> List[np.ndarray]:
         """
-        input_chw: pre-built CHW float32 tensor from preprocess().
-        Returns list of output ndarrays (post-synchronise).
+        input_chw: pre-built (B,C,H,W) float32 tensor, B in [1, max_batch].
+        Returns list of output ndarrays with their actual batched shapes
+        (post-synchronise).
         """
-        if input_chw.shape != self.input_shape:
-            raise ValueError("Expected {}, got {}".format(self.input_shape, input_chw.shape))
+        if input_chw.ndim != 4:
+            raise ValueError("Expected 4D (B,C,H,W), got {}".format(input_chw.shape))
+        b = int(input_chw.shape[0])
+        if tuple(int(x) for x in input_chw.shape[1:]) != self._fixed_chw:
+            raise ValueError("Expected (B,{}), got {}".format(self._fixed_chw, input_chw.shape))
+        if b < 1 or b > self.max_batch:
+            raise ValueError("Batch {} out of range [1,{}]".format(b, self.max_batch))
 
-        b = self._buf_idx           # current ping/pong slot
-        stream = self._streams[b]
+        ii = self.input_index
+        stream = self._stream
 
         with CudaContext(self.device_id):
-            # Copy input tensor into pinned host buffer for this slot
-            np.copyto(self._host_bufs[b][self.input_index], input_chw.ravel())
+            # Tell TRT the actual batch for this call; resolves dynamic dims so
+            # get_tensor_shape() below returns concrete output shapes.
+            self.context.set_input_shape(self.input_name, (b,) + self._fixed_chw)
 
-            # H2D upload on this stream
-            cuda.memcpy_htod_async(
-                self._dev_bufs[self.input_index],
-                self._host_bufs[b][self.input_index],
-                stream,
-            )
+            # H2D: copy only the rows in use into the pinned buffer, then upload.
+            n_in = b * self._in_row_size
+            host_in = self._host_bufs[ii]
+            np.copyto(host_in[:n_in], input_chw.ravel())
+            cuda.memcpy_htod_async(self._dev_bufs[ii], host_in[:n_in], stream)
 
-            # GPU inference (async)
-            self.context.execute_async_v2(
-                bindings=self._bindings,
-                stream_handle=stream.handle,
-            )
+            # GPU inference (async); tensor addresses were bound in __init__.
+            self.context.execute_async_v3(stream_handle=stream.handle)
 
-            # D2H download on same stream
+            # D2H: resolve each output's real shape for this batch and copy only
+            # that many elements back.
+            pending = []
             for oi in self.output_indices:
-                cuda.memcpy_dtoh_async(
-                    self._host_bufs[b][oi],
-                    self._dev_bufs[oi],
-                    stream,
-                )
+                out_shape = tuple(int(x) for x in self.context.get_tensor_shape(self.tensor_names[oi]))
+                n_out = int(np.prod(out_shape)) if out_shape else 1
+                cuda.memcpy_dtoh_async(self._host_bufs[oi][:n_out], self._dev_bufs[oi], stream)
+                pending.append((oi, n_out, out_shape))
 
-            # Synchronise THIS stream only; the other slot is free to start uploading
             stream.synchronize()
 
             outs = [
-                self._host_bufs[b][oi].copy().reshape(self.output_shapes[oi])
-                for oi in self.output_indices
+                self._host_bufs[oi][:n_out].copy().reshape(out_shape)
+                for (oi, n_out, out_shape) in pending
             ]
 
-        # Advance ping-pong index
-        self._buf_idx = 1 - b
         return outs
 
 
@@ -334,21 +358,81 @@ class YoloV8DetTRT(object):
         self.iou = float(iou)
         self.allowed = set(allowed)
         self.topk = int(topk)
+        # Largest batch this engine actually accepts (1 for a fixed batch=1
+        # engine). Callers must not feed more than this.
+        self.max_batch = int(getattr(self.trt, "max_batch", 1))
 
     def run(self, bgr: np.ndarray) -> List[Dict]:
+        """Single-frame convenience path: preprocess -> infer (B=1) -> parse."""
         H0, W0 = bgr.shape[:2]
-
-        # FIX 2: preprocessing runs on CPU BEFORE touching the GPU.
-        # In a multi-camera scenario the InferenceWorker can preprocess the
-        # next frame's tensor while the GPU is still executing the current one.
         x, r, (padx, pady) = preprocess(bgr, self.imgsz)
+        outs = self.trt.infer(x)               # x is (1,3,H,W)
+        return self._parse_pred(outs[0], H0, W0, r, padx, pady)
 
-        # GPU inference — only memcpy + execute + memcpy + sync
-        outs = self.trt.infer(x)
-        pred = outs[0]
+    def run_batch(self, bgr_list: List[np.ndarray]) -> List[List[Dict]]:
+        """
+        Batched path: preprocess every frame, stack into a single (B,3,H,W)
+        tensor, run ONE GPU inference, then parse each image slice back to its
+        own original coordinates (each camera keeps its own scale + padding).
+        Returns one detection list per input frame, in the same order.
+        """
+        if not bgr_list:
+            return []
 
+        # Preprocess every frame up front (CPU). Each frame keeps its own scale
+        # + padding so it can be de-letterboxed back to its own resolution.
+        prepped = []   # (tensor(1,3,H,W), (H0,W0,r,padx,pady))
+        for bgr in bgr_list:
+            H0, W0 = bgr.shape[:2]
+            x, r, (padx, pady) = preprocess(bgr, self.imgsz)
+            prepped.append((x, (H0, W0, r, padx, pady)))
+
+        # Never feed the engine more than it accepts. A dynamic engine takes the
+        # whole batch in one call; a fixed batch=1 engine processes one frame per
+        # call (chunk size 1). This keeps things correct regardless of whether
+        # the dynamic engine has been re-exported yet.
+        eng_max = max(1, int(self.trt.max_batch))
+
+        results = []
+        for start in range(0, len(prepped), eng_max):
+            chunk = prepped[start:start + eng_max]
+            tensors = [c[0] for c in chunk]
+            batch = tensors[0] if len(tensors) == 1 else np.concatenate(tensors, axis=0)
+            pred = self.trt.infer(batch)[0]    # (b, ...)
+            for i, (_, (H0, W0, r, padx, pady)) in enumerate(chunk):
+                # pred[i:i+1] keeps the leading dim so _parse_pred sees (1, ...)
+                results.append(self._parse_pred(pred[i:i + 1], H0, W0, r, padx, pady))
+        return results
+
+    def _parse_pred(self, pred: np.ndarray, H0: int, W0: int, r: float, padx: int, pady: int) -> List[Dict]:
         if pred.ndim != 3:
             raise RuntimeError("Unexpected det output shape: {}".format(pred.shape))
+        if pred.shape[2] == 6 and pred.shape[1] != 6:
+            dets = pred[0]                 # (num_det, 6)
+            inv_r = 1.0 / max(r, 1e-9)
+            out = []
+            for det in dets:
+                score = float(det[4])
+                if score < self.conf:
+                    continue
+                label = COCO_NAMES.get(int(det[5]), str(int(det[5])))
+                if label not in self.allowed:
+                    continue
+                # de-letterbox back to original frame coords
+                x1o, y1o, x2o, y2o = clamp_xyxy(
+                    (float(det[0]) - padx) * inv_r,
+                    (float(det[1]) - pady) * inv_r,
+                    (float(det[2]) - padx) * inv_r,
+                    (float(det[3]) - pady) * inv_r,
+                    W0, H0,
+                )
+                out.append({
+                    "cls_name": label,
+                    "conf": score,
+                    "box": {"x1": x1o, "y1": y1o, "x2": x2o, "y2": y2o},
+                    "box_norm": box_norm_xyxy(x1o, y1o, x2o, y2o, W0, H0),
+                })
+            return out
 
         if pred.shape[1] < pred.shape[2]:
             p = pred[0]
@@ -470,12 +554,65 @@ class TRTInfer(object):
                 "reason": "{}: {} (after {} ms)".format(type(e).__name__, e, ms),
             }
 
+    def _fail_event(self, meta: Dict, reason: str) -> Dict:
+        return {
+            "type": "InferenceFailedEvent",
+            "channel_id": meta.get("channel_id"),
+            "camera_uuid": str(meta.get("camera_uuid", "unknown")),
+            "model_id": self.model_id,
+            "frame_ts_ms": int(meta.get("frame_ts_ms", int(time.time() * 1000))),
+            "frame_seq": int(meta.get("frame_seq", 0)),
+            "reason": reason,
+        }
+
+    def infer_multitask_batch(self, bgr_list: List[np.ndarray], meta_list: List[Dict]) -> List[Dict]:
+        """
+        Run a batch of frames through ONE GPU inference and return one event per
+        frame, in the same order as the inputs.
+
+        On a whole-batch failure every frame gets an InferenceFailedEvent so the
+        caller can still resolve each pending future (no frame is left hanging).
+        """
+        if not bgr_list:
+            return []
+
+        t0 = time.perf_counter()
+        try:
+            dets_list = self.det_runner.run_batch(bgr_list)
+        except Exception as e:
+            ms = int((time.perf_counter() - t0) * 1000)
+            reason = "{}: {} (after {} ms)".format(type(e).__name__, e, ms)
+            return [self._fail_event(m, reason) for m in meta_list]
+
+        # Batch wall-time; shared across the batch (per-frame split isn't
+        # meaningful since they run in one GPU call).
+        ms = int((time.perf_counter() - t0) * 1000)
+        batch_size = len(bgr_list)
+        results = []
+        for bgr, meta, dets in zip(bgr_list, meta_list, dets_list):
+            H, W = bgr.shape[:2]
+            results.append({
+                "type": "DetectionsProducedEvent",
+                "channel_id": meta.get("channel_id"),
+                "camera_uuid": str(meta.get("camera_uuid", "unknown")),
+                "model_id": self.model_id,
+                "frame_ts_ms": int(meta.get("frame_ts_ms", int(time.time() * 1000))),
+                "frame_seq": int(meta.get("frame_seq", 0)),
+                "frame_w": W,
+                "frame_h": H,
+                "detections": dets,
+                "pose": None,
+                "inference_ms": ms,
+                "batch_size": batch_size,
+            })
+        return results
+
 
 def build_default() -> TRTInfer:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     det_engine = os.getenv("DET_ENGINE")
     if not det_engine:
-        det_engine = os.path.join(base_dir, "models", "yolov8n.engine")
+        det_engine = os.path.join(base_dir, "models", "yolo26n.engine")
     elif not os.path.isabs(det_engine) and not os.path.exists(det_engine):
         candidate = os.path.join(base_dir, det_engine)
         if os.path.exists(candidate):

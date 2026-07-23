@@ -1,0 +1,29 @@
+# =============================================================================
+# Jetson Orin Nano  (JetPack 7.x, Ubuntu 24.04, Python 3.12) — pip requirements
+# =============================================================================
+#
+# IMPORTANT: Install these INSIDE a virtualenv created with
+#            `--system-site-packages` so the venv can still see the
+#            JetPack-provided TensorRT, CUDA and OpenCV.
+#
+# DO NOT pip-install these — they come from JetPack (`sudo apt install
+# nvidia-jetpack`) and MUST be the system copy:
+#   - tensorrt        (built for the system Python 3.12)
+#   - opencv (cv2)    (system OpenCV, built WITH GStreamer + HW decode)
+#   - numpy           (already provided by the system OpenCV/JetPack stack)
+#
+# The pip `opencv-python` wheel has NO GStreamer support and will break
+# hardware video decode on the Jetson — never install it here.
+# =============================================================================
+
+# --- Web server ---
+Flask>=3.0,<4.0
+
+# --- Database (async SQLite) ---
+SQLAlchemy>=2.0,<2.1
+aiosqlite>=0.20
+greenlet>=3.0
+
+# --- CUDA Python bindings (compiled against the JetPack CUDA toolkit) ---
+# Needs `nvcc` on PATH at build time — see the install doc, step 5.3.
+pycuda>=2025.1

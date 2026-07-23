@@ -53,15 +53,6 @@ class ChannelDisconnectedEvent(ChannelEvent):
         self.reason = reason
 
 
-class FrameDroppedEvent(ChannelEvent):
-    __slots__ = ("reason", "dropped_count")
-
-    def __init__(self, channel_id, camera_uuid, reason, dropped_count, ts_ms):
-        ChannelEvent.__init__(self, "dropped", channel_id, camera_uuid, ts_ms)
-        self.reason = reason
-        self.dropped_count = dropped_count
-
-
 class RTSPEvent(ChannelEvent):
     __slots__ = (
         "seq",

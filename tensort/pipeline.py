@@ -184,7 +184,7 @@ class CoalescingBuffer(object):
     event loop is single-threaded.
     """
     def __init__(self, max_pending_keys=1000):
-        self._latest = {}               # camera_uuid -> RTSPEvent
+        self._latest = {}
         self._pending = asyncio.Queue(maxsize=max_pending_keys)
         self._in_queue = set()
 
@@ -207,6 +207,56 @@ class CoalescingBuffer(object):
             if ev is not None:
                 return ev
 
+    async def get_batch(self, max_n, linger_s=0.0):
+        """
+        Assemble a batch of the freshest frames across DISTINCT cameras.
+
+        This is where cross-channel batching actually happens: the buffer holds
+        exactly one (newest) frame per camera, so a batch spans cameras, not
+        consecutive frames of one camera.
+
+        Blocks for the first frame, then keeps pulling newly-ready cameras until
+        either `max_n` distinct cameras are collected OR the linger window
+        elapses (size-OR-linger). Note batch fullness is bounded by how many
+        cameras produce a frame within `linger_s` — roughly aggregate_fps *
+        linger_s. To fill larger batches, raise sample_fps or the linger.
+        """
+        max_n = max(1, int(max_n))
+        evs = []
+
+        # Block for the first real event (skip keys whose frame was superseded).
+        while not evs:
+            key = await self._pending.get()
+            self._in_queue.discard(key)
+            ev = self._latest.pop(key, None)
+            if ev is not None:
+                evs.append(ev)
+
+        if max_n == 1:
+            return evs
+
+        loop = asyncio.get_event_loop()
+        deadline = (loop.time() + linger_s) if linger_s > 0.0 else None
+        while len(evs) < max_n:
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0.0:
+                    break
+                try:
+                    key = await asyncio.wait_for(self._pending.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+            else:
+                try:
+                    key = self._pending.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            self._in_queue.discard(key)
+            ev = self._latest.pop(key, None)
+            if ev is not None:
+                evs.append(ev)
+        return evs
+
 
 # ---------------------------------------------------------------------------
 # FIX 1: InferenceWorker — unchanged; now used in a pool
@@ -220,7 +270,10 @@ class InferenceWorker(object):
     def __init__(self, loop, worker_id=0, max_q=2):
         self._loop = loop
         self._worker_id = int(worker_id)
-        self._q = queue.Queue(maxsize=max_q)
+        # Queue holds whole BATCH JOBS (each a list of (bgr, meta, fut)). The
+        # batch is already assembled by the dispatcher, so a small depth is
+        # enough: 1 in-flight + a little slack.
+        self._q = queue.Queue(maxsize=max(2, int(max_q)))
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -230,21 +283,12 @@ class InferenceWorker(object):
         self._infer = None
         self._thread.start()
 
-    def submit(self, bgr, meta, fut):
+    def submit_job(self, job):
+        """job: list of (bgr, meta, fut). Returns False if the queue is full."""
         try:
-            self._q.put_nowait((bgr, meta, fut))
+            self._q.put_nowait(job)
             return True
         except queue.Full:
-            def _set():
-                if not fut.done():
-                    fut.set_result({
-                        "type": "InferenceFailedEvent",
-                        "camera_uuid": str(meta.get("camera_uuid", "unknown")),
-                        "frame_ts_ms": int(meta.get("frame_ts_ms", 0)),
-                        "frame_seq": int(meta.get("frame_seq", 0)),
-                        "reason": "Inference queue full (dropped)",
-                    })
-            self._loop.call_soon_threadsafe(_set)
             return False
 
     def stop(self):
@@ -260,47 +304,60 @@ class InferenceWorker(object):
         except Exception:
             pass
 
+    def _fail_result(self, meta, reason):
+        return {
+            "type": "InferenceFailedEvent",
+            "camera_uuid": str(meta.get("camera_uuid", "unknown")),
+            "frame_ts_ms": int(meta.get("frame_ts_ms", 0)),
+            "frame_seq": int(meta.get("frame_seq", 0)),
+            "reason": reason,
+        }
+
     def _run(self):
         from trt_infer import build_default
         try:
             self._infer = build_default()
-            logger.info("[worker-%d] TRTInfer ready", self._worker_id)
+            eng_max = int(getattr(self._infer, "max_batch", 1))
+            logger.info(
+                "[worker-%d] TRTInfer ready (engine_max_batch=%d)",
+                self._worker_id, eng_max,
+            )
+            if eng_max <= 1:
+                logger.warning(
+                    "[worker-%d] engine max_batch=1 — NOT a dynamic-batch engine; "
+                    "batches will be split to 1 frame each. Re-export a dynamic "
+                    "engine (see .env.example) for real batching.",
+                    self._worker_id,
+                )
         except Exception as e:
             logger.exception("[worker-%d] Failed to init TRT: %s", self._worker_id, e)
             self._infer = None
 
         while not self._stop.is_set():
             try:
-                item = self._q.get(timeout=0.05)
-            except Exception:
+                job = self._q.get(timeout=0.05)
+            except queue.Empty:
                 continue
 
-            if item is None:
+            if job is None:        # stop sentinel
                 continue
 
-            bgr, meta, fut = item
+            # job is an already-assembled batch: [(bgr, meta, fut), ...]
+            bgrs = [it[0] for it in job]
+            metas = [it[1] for it in job]
+            futs = [it[2] for it in job]
 
             if self._infer is None:
-                res = {
-                    "type": "InferenceFailedEvent",
-                    "camera_uuid": str(meta.get("camera_uuid", "unknown")),
-                    "frame_ts_ms": int(meta.get("frame_ts_ms", 0)),
-                    "frame_seq": int(meta.get("frame_seq", 0)),
-                    "reason": "TRT inference not initialized",
-                }
+                results = [self._fail_result(m, "TRT inference not initialized") for m in metas]
             else:
                 try:
-                    res = self._infer.infer_multitask(bgr, meta)
+                    results = self._infer.infer_multitask_batch(bgrs, metas)
                 except Exception as e:
-                    res = {
-                        "type": "InferenceFailedEvent",
-                        "camera_uuid": str(meta.get("camera_uuid", "unknown")),
-                        "frame_ts_ms": int(meta.get("frame_ts_ms", 0)),
-                        "frame_seq": int(meta.get("frame_seq", 0)),
-                        "reason": "{}: {}".format(type(e).__name__, e),
-                    }
+                    reason = "{}: {}".format(type(e).__name__, e)
+                    results = [self._fail_result(m, reason) for m in metas]
 
-            self._loop.call_soon_threadsafe(self._safe_set_result, fut, res)
+            for fut, res in zip(futs, results):
+                self._loop.call_soon_threadsafe(self._safe_set_result, fut, res)
 
     def _safe_set_result(self, fut, res):
         try:
@@ -318,19 +375,17 @@ class InferenceWorkerPool(object):
     """
     Wraps N InferenceWorker threads.
 
-    Camera uuid is hashed to a worker index so the same camera always goes
-    to the same worker (preserves ordering per-camera, avoids lock contention
-    between workers sharing a queue).
+    Batches are already assembled (cross-camera) by the dispatcher, so whole
+    batch jobs are round-robined across workers. On a single GPU one worker is
+    usually best (multiple CUDA contexts time-slice the GPU); extra workers only
+    help if batches arrive faster than one worker can drain them.
     """
     def __init__(self, loop, num_workers, max_q_per_worker=2):
         self._loop = loop
         self._max_q_per_worker = max_q_per_worker
         self._workers = []
+        self._rr = 0
         self.ensure_size(num_workers)
-
-    def _pick(self, camera_uuid):
-        # Stable assignment: same camera always → same worker
-        return self._workers[hash(str(camera_uuid)) % len(self._workers)]
 
     def ensure_size(self, num_workers):
         target = max(1, int(num_workers))
@@ -339,14 +394,29 @@ class InferenceWorkerPool(object):
             return current
         for i in range(current, target):
             self._workers.append(
-                InferenceWorker(self._loop, worker_id=i, max_q=self._max_q_per_worker)
+                InferenceWorker(
+                    self._loop,
+                    worker_id=i,
+                    max_q=self._max_q_per_worker,
+                )
             )
         logger.info("InferenceWorkerPool: %d workers", len(self._workers))
         return len(self._workers)
 
-    def submit(self, bgr, meta, fut):
-        worker = self._pick(meta.get("camera_uuid", ""))
-        return worker.submit(bgr, meta, fut)
+    def submit_batch(self, job):
+        """
+        Hand a whole batch job to a worker (round-robin). Tries every worker
+        once; returns False only if all worker queues are full.
+        """
+        n = len(self._workers)
+        if n == 0:
+            return False
+        for off in range(n):
+            w = self._workers[(self._rr + off) % n]
+            if w.submit_job(job):
+                self._rr = (self._rr + off + 1) % n
+                return True
+        return False
 
     def stop(self):
         for w in self._workers:
@@ -405,12 +475,23 @@ class SimpleInferencePipeline(object):
         self._inference_task = None
         self._infer_pool = None         # created on start()
         self._infer_q_max = int(infer_q_max)
-        # Cap how many frames can be in-flight at once. Must be >= number of
-        # cameras so every camera gets a fair shot at inference each cycle.
-        # Worker queue rejection (INFER_QUEUE_MAX) is the real memory guard —
-        # it only holds 2 frames (1 processing + 1 queued). This cap is a
-        # safety net against runaway inflight growth, not the primary throttle.
-        self._max_inflight = _env_int("MAX_INFLIGHT_FRAMES", 8, minimum=1)
+
+        # Batched inference: each worker collects up to INFER_MAX_BATCH frames
+        # from its hash-assigned cameras within an INFER_BATCH_LINGER_MS window
+        # and runs them as one (B,3,H,W) GPU call. Requires a dynamic-batch
+        # engine (see .env.example); falls back to B=1 with a fixed engine.
+        # INFER_MAX_BATCH must be <= the engine's maxShapes batch.
+        self._max_batch = _env_int("INFER_MAX_BATCH", 8, minimum=1)
+        self._batch_linger_s = _env_float("INFER_BATCH_LINGER_MS", 20.0, minimum=0.0) / 1000.0
+
+        # Cap how many frames can be in-flight at once. With batching this must
+        # be large enough to keep every worker's batch fed, so the default
+        # scales with batch size. Worker queue depth (>= max_batch) is the real
+        # per-worker memory guard; this is a global safety net against runaway
+        # inflight growth.
+        self._max_inflight = _env_int(
+            "MAX_INFLIGHT_FRAMES", max(8, self._max_batch * 4), minimum=1
+        )
         self._log_every_n = _env_int("PIPELINE_LOG_EVERY_N_FRAMES", 0, minimum=0)
         self._stats = {
             "frames_in": 0,
@@ -427,12 +508,15 @@ class SimpleInferencePipeline(object):
         self._inflight = {}             # (camera_uuid, seq) -> asyncio.Future
 
         logger.info(
-            "[pipeline] config mem_total_mb=%s workers=%s worker_cap=%d infer_timeout_s=%.2f max_inflight=%d",
+            "[pipeline] config mem_total_mb=%s workers=%s worker_cap=%d infer_timeout_s=%.2f "
+            "max_inflight=%d max_batch=%d batch_linger_ms=%d",
             self._detected_mem_mb if self._detected_mem_mb is not None else "unknown",
             "auto" if self._num_workers == 0 else int(self._num_workers),
             int(self._num_workers_max),
             float(self._infer_result_timeout_s),
             int(self._max_inflight),
+            int(self._max_batch),
+            int(self._batch_linger_s * 1000),
         )
 
     # ------------------------------------------------------------------
@@ -674,80 +758,69 @@ class SimpleInferencePipeline(object):
 
         try:
             while not self._closing:
-                rtsp_ev = await self._buffer.get()
-                self._stats["frames_in"] += 1
-
-                if self._log_every_n and (int(getattr(rtsp_ev, "seq", 0)) % self._log_every_n == 0):
-                    logger.debug(
-                        "[pipeline] frame camera=%s seq=%s",
-                        rtsp_ev.camera_uuid, rtsp_ev.seq,
-                    )
-
-                bgr = getattr(rtsp_ev, "frame", None)
-                # Release frame from the event so GC can free it once we're done
-                rtsp_ev.frame = None
-
-                if bgr is None:
-                    self._stats["infer_fail"] += 1
-                    result = {
-                        "type": "InferenceFailedEvent",
-                        "camera_uuid": str(rtsp_ev.camera_uuid),
-                        "frame_ts_ms": int(rtsp_ev.ts_ms),
-                        "frame_seq": int(rtsp_ev.seq),
-                        "reason": "No frame data (emit_format=raw required)",
-                    }
-                    self._latest[str(rtsp_ev.camera_uuid)] = result
-                    await self.broadcaster.broadcast(result)
-                    await self._put_out(result)
+                # Assemble ONE cross-camera batch from the coalescing buffer:
+                # the freshest frame from up to max_batch distinct cameras,
+                # gathered within the linger window. THIS is where "all channels
+                # in one batch" happens.
+                events = await self._buffer.get_batch(self._max_batch, self._batch_linger_s)
+                if not events:
                     continue
 
                 if self._infer_pool is None:
-                    bgr = None
+                    for ev in events:
+                        ev.frame = None
                     continue
 
-                # Back-pressure: if too many frames are already in flight,
-                # drop this one to prevent unbounded memory growth.
+                # Back-pressure: if too many frames are already in flight, drop
+                # this whole batch to prevent unbounded memory growth.
                 if len(self._inflight) >= self._max_inflight:
-                    bgr = None
-                    self._stats["infer_dropped"] += 1
+                    for ev in events:
+                        ev.frame = None
+                    self._stats["infer_dropped"] += len(events)
                     continue
 
-                camera_uuid_str = str(rtsp_ev.camera_uuid)
-                meta = {
-                    "camera_uuid": camera_uuid_str,
-                    "channel_id": getattr(rtsp_ev, "channel_id", None),
-                    "frame_ts_ms": int(rtsp_ev.ts_ms),
-                    "frame_seq": int(rtsp_ev.seq),
-                    "_bgr_ref": bgr,
-                    "_ts_ms": int(rtsp_ev.ts_ms),
-                }
+                self._stats["frames_in"] += len(events)
 
-                fut = loop.create_future()
-                inflight_key = (camera_uuid_str, int(rtsp_ev.seq))
+                job = []   # [(bgr, meta, fut), ...]
+                for rtsp_ev in events:
+                    camera_uuid_str = str(rtsp_ev.camera_uuid)
+                    bgr = getattr(rtsp_ev, "frame", None)
+                    rtsp_ev.frame = None   # let the event be GC'd
 
-                # No lock — single event-loop thread
-                self._inflight[inflight_key] = fut
+                    if bgr is None:
+                        self._stats["infer_fail"] += 1
+                        result = {
+                            "type": "InferenceFailedEvent",
+                            "camera_uuid": camera_uuid_str,
+                            "frame_ts_ms": int(rtsp_ev.ts_ms),
+                            "frame_seq": int(rtsp_ev.seq),
+                            "reason": "No frame data (emit_format=raw required)",
+                        }
+                        self._latest[camera_uuid_str] = result
+                        await self.broadcaster.broadcast(result)
+                        await self._put_out(result)
+                        continue
 
-                ok = self._infer_pool.submit(bgr, meta, fut)
+                    meta = {
+                        "camera_uuid": camera_uuid_str,
+                        "channel_id": getattr(rtsp_ev, "channel_id", None),
+                        "frame_ts_ms": int(rtsp_ev.ts_ms),
+                        "frame_seq": int(rtsp_ev.seq),
+                        "_bgr_ref": bgr,
+                        "_ts_ms": int(rtsp_ev.ts_ms),
+                    }
 
-                if not ok:
-                    # Worker queue full — clean up immediately
-                    self._inflight.pop(inflight_key, None)
-                    meta.pop("_bgr_ref", None)
-                    bgr = None
-                    self._stats["infer_dropped"] += 1
-                else:
-                    # Release local ref — worker + meta["_bgr_ref"] still hold it
-                    bgr = None
+                    fut = loop.create_future()
+                    inflight_key = (camera_uuid_str, int(rtsp_ev.seq))
+                    self._inflight[inflight_key] = fut
 
-                    # Fire-and-forget: wire result handler to future done callback
+                    # Fire-and-forget: wire result handler to the future.
                     def _on_done(f, _meta=meta, _key=inflight_key):
                         asyncio.ensure_future(self._handle_result(f.result(), _meta))
                         loop.call_soon(self._drop_inflight, _key)
-
                     fut.add_done_callback(_on_done)
 
-                    # Lightweight watchdog — no frame reference
+                    # Lightweight per-frame watchdog — no frame reference.
                     if self._infer_result_timeout_s > 0.0:
                         watchdog_meta = {
                             "camera_uuid": camera_uuid_str,
@@ -757,6 +830,27 @@ class SimpleInferencePipeline(object):
                         asyncio.ensure_future(
                             self._watchdog_future(fut, inflight_key, watchdog_meta)
                         )
+
+                    job.append((bgr, meta, fut))
+
+                if not job:
+                    continue
+
+                ok = self._infer_pool.submit_batch(job)
+                if not ok:
+                    # All worker queues full — drop this batch. Resolving each
+                    # future as failed triggers its _on_done, which cleans up
+                    # inflight + the frame reference.
+                    self._stats["infer_dropped"] += len(job)
+                    for (_bgr, _meta, _fut) in job:
+                        if not _fut.done():
+                            _fut.set_result({
+                                "type": "InferenceFailedEvent",
+                                "camera_uuid": _meta.get("camera_uuid", "unknown"),
+                                "frame_ts_ms": _meta.get("frame_ts_ms", 0),
+                                "frame_seq": _meta.get("frame_seq", 0),
+                                "reason": "Inference queue full (dropped)",
+                            })
 
         except asyncio.CancelledError:
             raise
@@ -877,6 +971,8 @@ class SimpleInferencePipeline(object):
             "num_workers": len(self._infer_pool._workers) if self._infer_pool else 0,
             "workers_auto": self._num_workers == 0,
             "worker_cap": int(self._num_workers_max),
+            "max_batch": int(self._max_batch),
+            "batch_linger_ms": int(self._batch_linger_s * 1000),
             "infer_timeout_s": float(self._infer_result_timeout_s),
             "mem_total_mb": self._detected_mem_mb,
         })
