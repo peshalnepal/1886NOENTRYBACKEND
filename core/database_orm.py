@@ -173,15 +173,19 @@ class User(Base):
     # RBAC grants are queried explicitly via AuthzService (lazy="raise"); the
     # cascade is declared on AccessGrant.user instead of a collection here.
 
-    sites = relationship("Site", back_populates="user", foreign_keys="Site.user_id", cascade="all, delete-orphan", passive_deletes=True)
-    devices = relationship("Device", back_populates="user", foreign_keys="Device.user_id", cascade="all, delete-orphan", passive_deletes=True)
-    cameras = relationship("Camera", back_populates="user", foreign_keys="Camera.user_id", cascade="all, delete-orphan", passive_deletes=True)
+    # No delete cascade: these are org-owned. Deleting a member detaches them
+    # (FK SET NULL) and leaves the resources with the organization, which is
+    # what tears them down via its own org_id CASCADE.
+    sites = relationship("Site", back_populates="user", foreign_keys="Site.user_id", passive_deletes=True)
+    devices = relationship("Device", back_populates="user", foreign_keys="Device.user_id", passive_deletes=True)
+    cameras = relationship("Camera", back_populates="user", foreign_keys="Camera.user_id", passive_deletes=True)
 
-    # site-scoped email recipients
+    # Site-scoped email recipients. No delete cascade: they belong to the site
+    # (and so to the org), and must keep receiving alerts after the admin who
+    # added them is gone.
     notification_emails = relationship(
         "NotificationEmail",
         back_populates="user",
-        cascade="all, delete-orphan",
         passive_deletes=True,
     )
 
@@ -202,7 +206,10 @@ class Site(Base):
     __tablename__ = "sites"
 
     site_uuid = Column(GUID, primary_key=True, default=uuid.uuid4, unique=True, nullable=False, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    # Org-owned: `org_id` is ownership. `user_id` is only the legacy runtime
+    # pipeline key, so a departing member must NOT take the org's resources
+    # with them — SET NULL, never CASCADE.
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     org_id = Column(
         Integer,
@@ -287,7 +294,10 @@ class Device(Base):
     __tablename__ = "devices"
 
     device_uuid = Column(GUID, primary_key=True, default=uuid.uuid4, unique=True, nullable=False, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    # Org-owned: `org_id` is ownership. `user_id` is only the legacy runtime
+    # pipeline key, so a departing member must NOT take the org's resources
+    # with them — SET NULL, never CASCADE.
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     org_id = Column(
         Integer,
@@ -383,7 +393,10 @@ class SiteSettings(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Settings belong to the SITE (site_uuid is unique — one row per site), not
+    # to whoever happened to save them. Kept only as an audit trail of the last
+    # editor, so it must never gate reads and must survive that user's deletion.
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     site_uuid = Column(
         GUID,
         ForeignKey("sites.site_uuid", ondelete="CASCADE"),
@@ -417,7 +430,10 @@ class Camera(Base):
     __tablename__ = "camera"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    # Org-owned: `org_id` is ownership. `user_id` is only the legacy runtime
+    # pipeline key, so a departing member must NOT take the org's resources
+    # with them — SET NULL, never CASCADE.
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     org_id = Column(
         Integer,
@@ -660,7 +676,10 @@ class NotificationEmail(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Recipients belong to the SITE (and so to the organization): any org admin
+    # may add or remove them, and they must outlive the admin who typed them in.
+    # Kept only as an audit trail of who added the row.
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     site_uuid = Column(GUID, ForeignKey("sites.site_uuid", ondelete="CASCADE"), nullable=False, index=True)
 
     email = Column(String(255), nullable=False)
@@ -673,7 +692,7 @@ class NotificationEmail(Base):
     site = relationship("Site", back_populates="notification_emails")
 
     __table_args__ = (
-        UniqueConstraint("user_id", "site_uuid", "email", name="uq_notif_email_user_site_email"),
+        UniqueConstraint("site_uuid", "email", name="uq_notif_email_site_email"),
     )
 
 # =========================

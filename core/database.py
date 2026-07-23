@@ -637,6 +637,222 @@ class DatabaseManager:
                 except Exception as exc:
                     logger.warning("Skipping camera.device_uuid migration: %s", exc)
 
+            # Migrate: sites/camera/devices are ORG-owned, but their legacy
+            # `user_id` FK still said ON DELETE CASCADE. That made deleting any
+            # member destroy every site/camera/device they happened to create —
+            # even though co-workers in the same org were still using them, and
+            # even though the org itself survived. `user_id` is only a runtime
+            # pipeline key now (ownership is `org_id`), so it must SET NULL.
+            # Org-wide teardown happens when the *organization* is deleted, via
+            # the org_id CASCADE.
+            if dialect_name.startswith("mysql"):
+                for table_name in ("sites", "camera", "devices"):
+                    try:
+                        fk_row = (
+                            await conn.execute(
+                                text("""
+                                    SELECT rc.CONSTRAINT_NAME
+                                    FROM information_schema.REFERENTIAL_CONSTRAINTS rc
+                                    JOIN information_schema.KEY_COLUMN_USAGE k
+                                      ON k.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+                                     AND k.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
+                                    WHERE rc.CONSTRAINT_SCHEMA = DATABASE()
+                                      AND rc.TABLE_NAME = :tbl
+                                      AND k.COLUMN_NAME = 'user_id'
+                                      AND k.REFERENCED_TABLE_NAME = 'users'
+                                      AND rc.DELETE_RULE = 'CASCADE'
+                                    LIMIT 1
+                                """),
+                                {"tbl": table_name},
+                            )
+                        ).fetchone()
+                        if not fk_row:
+                            continue
+
+                        constraint_name = fk_row[0]
+                        # The column must be nullable before SET NULL is legal.
+                        await conn.execute(
+                            text(f"ALTER TABLE {table_name} MODIFY user_id INT NULL")
+                        )
+                        await conn.execute(
+                            text(
+                                f"ALTER TABLE {table_name} "
+                                f"DROP FOREIGN KEY {constraint_name}"
+                            )
+                        )
+                        await conn.execute(
+                            text(
+                                f"ALTER TABLE {table_name} "
+                                f"ADD CONSTRAINT {constraint_name} "
+                                f"FOREIGN KEY (user_id) REFERENCES users(id) "
+                                f"ON DELETE SET NULL"
+                            )
+                        )
+                        logger.info(
+                            "Migrated %s.user_id FK from CASCADE to SET NULL "
+                            "(org-owned resources survive member deletion).",
+                            table_name,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Skipping %s.user_id FK migration: %s", table_name, exc
+                        )
+
+            # Migrate: site_settings and notification_emails are SITE-owned, not
+            # user-owned. Their `user_id` FK said CASCADE, so deleting the admin
+            # who happened to save a schedule / type a recipient silently wiped
+            # it — leaving the surviving org with a live site that emails nobody.
+            # `user_id` is now just an audit trail of the last editor: nullable,
+            # SET NULL, and never a read filter.
+            if dialect_name.startswith("mysql"):
+                for table_name in ("site_settings", "notification_emails"):
+                    try:
+                        fk_row = (
+                            await conn.execute(
+                                text("""
+                                    SELECT rc.CONSTRAINT_NAME
+                                    FROM information_schema.REFERENTIAL_CONSTRAINTS rc
+                                    JOIN information_schema.KEY_COLUMN_USAGE k
+                                      ON k.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+                                     AND k.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
+                                    WHERE rc.CONSTRAINT_SCHEMA = DATABASE()
+                                      AND rc.TABLE_NAME = :tbl
+                                      AND k.COLUMN_NAME = 'user_id'
+                                      AND k.REFERENCED_TABLE_NAME = 'users'
+                                      AND rc.DELETE_RULE = 'CASCADE'
+                                    LIMIT 1
+                                """),
+                                {"tbl": table_name},
+                            )
+                        ).fetchone()
+                        if not fk_row:
+                            continue
+
+                        constraint_name = fk_row[0]
+                        await conn.execute(
+                            text(f"ALTER TABLE {table_name} MODIFY user_id INT NULL")
+                        )
+                        await conn.execute(
+                            text(
+                                f"ALTER TABLE {table_name} "
+                                f"DROP FOREIGN KEY {constraint_name}"
+                            )
+                        )
+                        await conn.execute(
+                            text(
+                                f"ALTER TABLE {table_name} "
+                                f"ADD CONSTRAINT {constraint_name} "
+                                f"FOREIGN KEY (user_id) REFERENCES users(id) "
+                                f"ON DELETE SET NULL"
+                            )
+                        )
+                        logger.info(
+                            "Migrated %s.user_id FK from CASCADE to SET NULL "
+                            "(site-owned settings/recipients survive member deletion).",
+                            table_name,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Skipping %s.user_id FK migration: %s", table_name, exc
+                        )
+
+                # Recipient uniqueness moves from (user_id, site_uuid, email) to
+                # (site_uuid, email): the same address must not be emailed twice
+                # just because two admins each added it.
+                try:
+                    old_uq = (
+                        await conn.execute(
+                            text("""
+                                SELECT 1 FROM information_schema.STATISTICS
+                                WHERE TABLE_SCHEMA = DATABASE()
+                                  AND TABLE_NAME = 'notification_emails'
+                                  AND INDEX_NAME = 'uq_notif_email_user_site_email'
+                                LIMIT 1
+                            """)
+                        )
+                    ).fetchone()
+                    if old_uq:
+                        # Collapse duplicates that the looser constraint allowed,
+                        # keeping the lowest id per (site_uuid, email).
+                        await conn.execute(
+                            text("""
+                                DELETE ne FROM notification_emails ne
+                                JOIN (
+                                    SELECT site_uuid, email, MIN(id) AS keep_id
+                                    FROM notification_emails
+                                    GROUP BY site_uuid, email
+                                    HAVING COUNT(*) > 1
+                                ) dup
+                                  ON dup.site_uuid = ne.site_uuid
+                                 AND dup.email = ne.email
+                                WHERE ne.id > dup.keep_id
+                            """)
+                        )
+                        await conn.execute(
+                            text(
+                                "ALTER TABLE notification_emails "
+                                "DROP INDEX uq_notif_email_user_site_email"
+                            )
+                        )
+                        await conn.execute(
+                            text(
+                                "ALTER TABLE notification_emails "
+                                "ADD CONSTRAINT uq_notif_email_site_email "
+                                "UNIQUE (site_uuid, email)"
+                            )
+                        )
+                        logger.info(
+                            "Migrated notification_emails uniqueness to (site_uuid, email)."
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping notification_emails uniqueness migration: %s", exc
+                    )
+
+            # Migrate: organization_reports gained a stable, searchable
+            # report_uuid. create_all adds it on fresh DBs; existing archives are
+            # fixed here (add the column, backfill UUIDs, then enforce uniqueness).
+            if dialect_name.startswith("mysql"):
+                try:
+                    has_reports_table = (
+                        await conn.execute(
+                            text("""
+                                SELECT 1
+                                FROM information_schema.TABLES
+                                WHERE TABLE_SCHEMA = DATABASE()
+                                  AND TABLE_NAME   = 'organization_reports'
+                                LIMIT 1
+                            """)
+                        )
+                    ).fetchone()
+                    if has_reports_table:
+                        has_report_uuid = (
+                            await conn.execute(
+                                text("""
+                                    SELECT 1
+                                    FROM information_schema.COLUMNS
+                                    WHERE TABLE_SCHEMA = DATABASE()
+                                      AND TABLE_NAME   = 'organization_reports'
+                                      AND COLUMN_NAME  = 'report_uuid'
+                                    LIMIT 1
+                                """)
+                            )
+                        ).fetchone()
+                        if not has_report_uuid:
+                            await conn.execute(
+                                text("ALTER TABLE organization_reports ADD COLUMN report_uuid CHAR(36) NULL")
+                            )
+                            # Backfill existing rows with fresh UUIDs.
+                            await conn.execute(
+                                text("UPDATE organization_reports SET report_uuid = (UUID()) WHERE report_uuid IS NULL")
+                            )
+                            await conn.execute(
+                                text("ALTER TABLE organization_reports ADD UNIQUE INDEX ix_org_report_uuid (report_uuid)")
+                            )
+                            logger.info("Added organization_reports.report_uuid column.")
+                except Exception as exc:
+                    logger.warning("Skipping organization_reports.report_uuid migration: %s", exc)
+
             # ------------------------------------------------------------------
             # Multi-tenant RBAC migration (MySQL).
             #

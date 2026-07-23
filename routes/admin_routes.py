@@ -9,7 +9,7 @@ and to grant them site-level access:
     POST   /api/admin/orgs/{org_id}/members                  - create user + add to org
     POST   /api/admin/orgs/{org_id}/members/attach           - attach an existing user
     PATCH  /api/admin/orgs/{org_id}/members/{user_id}        - change OrgRole
-    DELETE /api/admin/orgs/{org_id}/members/{user_id}        - remove from org
+    DELETE /api/admin/orgs/{org_id}/members/{user_id}        - delete member account
 
     GET    /api/admin/orgs/{org_id}/sites                    - sites in this org
     GET    /api/admin/orgs/{org_id}/sites/{site_uuid}/members
@@ -32,7 +32,7 @@ import logging
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,12 +44,14 @@ from application.dtos import (
 )
 from application.repositories.organization_repository import OrganizationRepository
 from application.repositories.user_repository import UserRepository
-from core.database_orm import Site, User
+from core.database_orm import Organization, Site, User
 from core.security.hashing import get_password_hash
 from core.security.roles import OrgRole, Permission, SiteRole
+from application.services.manager import Manager
 from dependencies import (
     get_async_db,
     get_current_user,
+    get_manager,
     RequirePermission,
 )
 
@@ -293,14 +295,16 @@ async def update_member_role(
 class RemoveMemberResponse(BaseModel):
     """Body returned by DELETE /orgs/{org_id}/members/{user_id}.
 
-    `org_deleted=True` means removing this user emptied the last
-    admin seat and the whole organization (sites + cameras + members)
+    `account_deleted=True` means the member's whole account was erased,
+    not merely detached from the org. `org_deleted=True` means removing
+    this user emptied the last admin seat and the organization itself
     was cascaded away.
     """
 
     removed: bool
     was_last_admin: bool
     org_deleted: bool
+    account_deleted: bool = False
 
 
 @router.delete(
@@ -311,30 +315,58 @@ class RemoveMemberResponse(BaseModel):
 async def remove_member(
     org_id: int,
     user_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_async_db),
     actor: User = Depends(get_current_user),
+    manager: Manager = Depends(get_manager),
 ):
-    """Remove a user from this organization.
+    """Delete a member of this organization, account and all.
 
-    Cascade rule: if the removed user was the **last** Org Admin, the
-    entire organization (and every site, camera, member that lives
-    inside it) is deleted in the same transaction. This matches the
-    product requirement that an org without an admin cannot exist.
+    Removing someone used to only drop their `access_grants` row, which
+    left a live but org-less account behind: it could still log in, yet
+    appeared on no admin screen. Members here belong to the org, so the
+    removal runs the same full deletion pipeline as `/users/me` — sites,
+    cameras, notifications, blobs, OTP rows and the user row itself.
+
+    The actor's own account is refused: an admin leaving is
+    `DELETE /users/me`, which enforces the last-admin succession rule.
     """
+    if int(actor.id) == int(user_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Delete your own account via Settings → Delete Account.",
+        )
+
     org_repo = OrganizationRepository()
-    result = await org_repo.remove_org_membership_safe(
-        db, user_id=user_id, org_id=org_id
-    )
-    if not result["removed"]:
+    membership = await org_repo.get_org_membership(db, user_id=user_id, org_id=org_id)
+    if membership is None:
         raise HTTPException(status_code=404, detail="Membership not found")
 
-    await db.commit()
-    if result["org_deleted"]:
-        logger.warning(
-            "Org=%s deleted because last admin (user=%s) was removed by actor=%s",
-            org_id, user_id, int(actor.id),
-        )
-    return RemoveMemberResponse(**result)
+    was_last_admin = False
+    role_name = await org_repo.get_org_role_name(db, user_id=user_id, org_id=org_id)
+    if role_name == OrgRole.ADMIN.value:
+        was_last_admin = (await org_repo.count_admins(db, org_id=org_id)) <= 1
+
+    from routes.user_routes import perform_user_deletion
+
+    await perform_user_deletion(
+        user_id=int(user_id), request=request, db=db, manager=manager
+    )
+
+    org_deleted = (
+        await db.execute(select(Organization.id).where(Organization.id == org_id).limit(1))
+    ).scalar_one_or_none() is None
+
+    logger.info(
+        "Org=%s member=%s fully deleted by actor=%s (last_admin=%s, org_deleted=%s)",
+        org_id, user_id, int(actor.id), was_last_admin, org_deleted,
+    )
+    return RemoveMemberResponse(
+        removed=True,
+        was_last_admin=was_last_admin,
+        org_deleted=org_deleted,
+        account_deleted=True,
+    )
 
 
 # =====================================================================

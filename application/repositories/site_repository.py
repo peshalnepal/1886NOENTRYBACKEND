@@ -183,8 +183,6 @@ class SiteRepository:
         user_id: Optional[int] = None,
     ) -> Optional[SiteSettings]:
         stmt = select(SiteSettings).where(SiteSettings.site_uuid == _as_uuid(site_uuid))
-        if user_id is not None:
-            stmt = stmt.where(SiteSettings.user_id == int(user_id))
         return (await db.execute(stmt)).scalar_one_or_none()
 
     async def upsert_site_settings(
@@ -540,6 +538,48 @@ class SiteRepository:
             )
             await session.execute(delete(Camera).where(Camera.user_id == int(user_id)))
             await session.commit()
+
+    async def soft_delete_sites(
+        self,
+        session_factory,
+        *,
+        site_uuids: List[uuid.UUID],
+    ) -> int:
+        """Mark the given sites deleted so they leave queries immediately.
+
+        Site-scoped rather than user-scoped: sites belong to an organization,
+        so an account deletion may only touch the ones whose org is actually
+        being dissolved.
+        """
+        normalized = normalize_uuid_list(site_uuids)
+        if not normalized:
+            return 0
+        async with session_factory() as session:
+            result = await session.execute(
+                update(Site)
+                .where(Site.site_uuid.in_(normalized))
+                .values(is_deleted=True)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return result.rowcount or 0
+
+    async def delete_sites(
+        self,
+        session_factory,
+        *,
+        site_uuids: List[uuid.UUID],
+    ) -> int:
+        """Hard-delete the given sites. Returns affected count."""
+        normalized = normalize_uuid_list(site_uuids)
+        if not normalized:
+            return 0
+        async with session_factory() as session:
+            result = await session.execute(
+                delete(Site).where(Site.site_uuid.in_(normalized))
+            )
+            await session.commit()
+            return result.rowcount or 0
 
     async def soft_delete_sites_for_user(
         self,

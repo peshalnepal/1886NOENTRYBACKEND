@@ -55,7 +55,7 @@ def _get_notification_service(request: Request):
 def _invalidate_notification_email_cache(
     request: Request,
     *,
-    user_id: int,
+    user_id: Optional[int] = None,
     site_uuid: Optional[uuid.UUID] = None,
 ) -> None:
     if request is None:
@@ -65,7 +65,10 @@ def _invalidate_notification_email_cache(
     if svc is None or not hasattr(svc, "invalidate_recipient_cache"):
         return
 
-    svc.invalidate_recipient_cache(user_id=int(user_id), site_uuid=site_uuid)
+    # `user_id` is only an audit value here and may be NULL; when a site is
+    # given the flusher clears that site across every user, which is what a
+    # site-owned recipient list needs.
+    svc.invalidate_recipient_cache(user_id=int(user_id or 0), site_uuid=site_uuid)
 
 # -------------------------
 # Endpoints
@@ -139,16 +142,17 @@ async def add_notification_email(
 
     created_rows = []
     for target_site in target_sites:
-        owner_id = _email_owner_id(target_site, ctx)
+        # Recipients are resolved by site, so store the actual adder as an audit
+        # trail rather than impersonating the site owner.
         if await notif_repo.notification_email_exists(
-            db, user_id=owner_id, site_uuid=target_site.site_uuid, email=normalized_email
+            db, site_uuid=target_site.site_uuid, email=normalized_email
         ):
             continue
 
         row = await notif_repo.create_notification_email(
             db,
             dto=NotificationEmailCreateDTO(
-                user_id=owner_id,
+                user_id=int(ctx.user.id),
                 site_uuid=target_site.site_uuid,
                 email=normalized_email,
                 is_enabled=True,
@@ -195,7 +199,10 @@ async def delete_notification_email(
 ):
     """
     Delete one notification email entry by ID (org admin only).
-    If all_sites=true, remove the same user/email pair from all sites.
+    If all_sites=true, remove that address from every site in the caller's org.
+
+    Any org admin may delete any recipient: recipients belong to the site, not
+    to the admin who happened to add them.
     """
     email = await notif_repo.get_notification_email(db, email_id=email_id)
     if not email:
@@ -219,17 +226,24 @@ async def delete_notification_email(
     email_site_uuid = email.site_uuid
 
     if all_sites:
-        await notif_repo.delete_notification_email(
-            db, user_id=email_user_id, email=email_email
-        )
+        # Scope by the caller's org sites, not by `user_id`: the stored user is
+        # only an audit trail (and may be NULL), and matching on it would both
+        # miss rows other admins added and reach into other tenants.
+        org_site_uuids = await site_repo.list_site_uuids(db, org_id=ctx.org_id)
+        for target_site_uuid in org_site_uuids:
+            await notif_repo.delete_notification_email(
+                db, site_uuid=target_site_uuid, email=email_email
+            )
     else:
         await notif_repo.delete_notification_email(db, email_id=email_id)
 
     await db.commit()
     if request is not None:
-        _invalidate_notification_email_cache(
-            request,
-            user_id=email_user_id,
-            site_uuid=None if all_sites else email_site_uuid,
-        )
+        # Clear per affected site: the cache is site-keyed now, so a single
+        # user-keyed sweep would miss the other members' entries.
+        affected = org_site_uuids if all_sites else [email_site_uuid]
+        for target_site_uuid in affected:
+            _invalidate_notification_email_cache(
+                request, user_id=email_user_id, site_uuid=target_site_uuid
+            )
     return None

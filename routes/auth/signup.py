@@ -15,7 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.dtos import OrganizationCreateDTO, OrgMembershipUpsertDTO
 from application.repositories.organization_repository import OrganizationRepository
-from application.repositories.verify_repository import EmailVerificationRepository
+from application.repositories.verify_repository import (
+    PURPOSE_PASSWORD_RESET,
+    PURPOSE_SIGNUP,
+    EmailVerificationRepository,
+)
 from core.database_orm import SignupTempData, User,EmailVerification, utc_now
 from core.security.roles import OrgRole
 from core.env import env_bool, env_int
@@ -24,6 +28,9 @@ from core.schemas import (
     AuthTokenOut,
     AuthUserOut,
     LoginRequest,
+    PasswordResetCodeOut,
+    PasswordResetConfirm,
+    PasswordResetRequest,
     SignupCodeOut,
     SignupRequestCode,
     SignupVerifyRequest,
@@ -428,3 +435,188 @@ async def me(
     current_user: User = Depends(get_current_user),
 ):
     return await _to_user_out_with_orgs(db, current_user)
+
+
+# =====================================================================
+# Forgot password
+# =====================================================================
+def _build_reset_email_body(user_name: str, code: str) -> str:
+    return (
+        f"Hello {user_name},\n\n"
+        "Use the code below to reset your 1886NoEntry password:\n\n"
+        f"{code}\n\n"
+        f"The code expires in {OTP_TTL_SECONDS // 60} minutes.\n"
+        "If you did not request a password reset, you can ignore this email — "
+        "your password has not been changed.\n"
+    )
+
+
+def _send_reset_code_email_sync(email: str, user_name: str, code: str) -> None:
+    if not SMTP_HOST or not SMTP_FROM:
+        raise RuntimeError("SMTP is not configured for password reset")
+
+    message = MIMEText(
+        _build_reset_email_body(user_name=user_name, code=code), "plain", "utf-8"
+    )
+    message["Subject"] = "1886NoEntry password reset code"
+    message["From"] = SMTP_FROM
+    message["To"] = email
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=12) as server:
+        if SMTP_USE_TLS:
+            server.starttls()
+        if SMTP_USERNAME and SMTP_PASSWORD:
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.sendmail(SMTP_FROM, [email], message.as_string())
+
+
+@router.post(
+    "/password/forgot",
+    response_model=PasswordResetCodeOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def password_forgot(
+    payload: PasswordResetRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Email a password-reset code.
+
+    Always reports success. Telling an anonymous caller whether an address has
+    an account turns this endpoint into a user-enumeration oracle, so the
+    unknown-email path returns the same body (and takes the same visible path)
+    as the real one.
+    """
+    email = str(payload.user_email).lower().strip()
+    now = utc_now()
+    expires_at = now + timedelta(seconds=OTP_TTL_SECONDS)
+    generic = PasswordResetCodeOut(
+        message=(
+            f"If an account exists for {email}, a reset code has been sent. "
+            "Enter it below to choose a new password."
+        ),
+        expires_at=expires_at,
+    )
+
+    user = (
+        await db.execute(select(User).where(User.email == email).limit(1))
+    ).scalar_one_or_none()
+    if user is None:
+        logger.info("Password reset requested for unknown email %s", email)
+        return generic
+
+    verify_repo = EmailVerificationRepository()
+    active = await verify_repo.get_latest_active(db, email, purpose=PURPOSE_PASSWORD_RESET)
+    if active is not None and active.sent_at is not None:
+        age = (now - _as_utc(active.sent_at)).total_seconds()
+        if age < OTP_RESEND_COOLDOWN_SECONDS:
+            retry_after = OTP_RESEND_COOLDOWN_SECONDS - int(age)
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {max(1, retry_after)} seconds before requesting a new code.",
+            )
+
+    code = generate_otp()
+    code_hash = hash_otp(email=email, otp=code, secret_pepper=OTP_SECRET_PEPPER)
+
+    try:
+        await verify_repo.invalidate_active(db, email, purpose=PURPOSE_PASSWORD_RESET)
+        await verify_repo.create(
+            db,
+            email=email,
+            code_hash=code_hash,
+            ip=_request_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            purpose=PURPOSE_PASSWORD_RESET,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    try:
+        await asyncio.to_thread(
+            _send_reset_code_email_sync, email, user.user_name, code
+        )
+    except Exception as exc:
+        logger.exception("Failed to send password reset email to %s", email)
+        if AUTH_DEBUG_RETURN_OTP:
+            return generic.model_copy(update={"debug_code": code})
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to send reset code. Please try again.",
+        ) from exc
+
+    return generic
+
+
+@router.post("/password/reset", response_model=AuthTokenOut)
+async def password_reset(
+    payload: PasswordResetConfirm,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Verify the reset code and set the new password.
+
+    On success the user is signed in directly — they just proved control of
+    the mailbox and chose the password, so a second login step adds nothing.
+    """
+    email = str(payload.user_email).lower().strip()
+    new_password = payload.new_password.get_secret_value()
+
+    verify_repo = EmailVerificationRepository()
+    verification = await verify_repo.get_latest_active(
+        db, email, purpose=PURPOSE_PASSWORD_RESET
+    )
+    if verification is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Reset code expired or missing. Request a new code.",
+        )
+
+    if verification.attempts >= OTP_MAX_ATTEMPTS:
+        await verify_repo.consume(db, int(verification.id))
+        await db.commit()
+        raise HTTPException(
+            status_code=429,
+            detail="Too many invalid attempts. Request a new reset code.",
+        )
+
+    if not verify_otp_hash(
+        email=email,
+        otp=payload.code,
+        secret_pepper=OTP_SECRET_PEPPER,
+        stored_hash=verification.code_hash,
+    ):
+        await verify_repo.increment_attempts(db, int(verification.id))
+        if verification.attempts + 1 >= OTP_MAX_ATTEMPTS:
+            await verify_repo.consume(db, int(verification.id))
+        await db.commit()
+        raise HTTPException(status_code=400, detail="Invalid reset code")
+
+    user = (
+        await db.execute(select(User).where(User.email == email).limit(1))
+    ).scalar_one_or_none()
+    if user is None:
+        # The account was deleted between request and confirm.
+        await verify_repo.consume(db, int(verification.id))
+        await db.commit()
+        raise HTTPException(status_code=400, detail="Invalid reset code")
+
+    try:
+        await verify_repo.consume(db, int(verification.id))
+        user.hashed_password = get_password_hash(new_password)
+        if not bool(getattr(user, "email_verified", False)):
+            user.email_verified = True
+            user.verified_at = utc_now()
+        user.last_login_at = utc_now()
+        await db.commit()
+        await db.refresh(user)
+    except Exception:
+        await db.rollback()
+        raise
+
+    logger.info("Password reset completed for user=%s", int(user.id))
+    token = _build_access_token(user)
+    return AuthTokenOut(
+        access_token=token, user=await _to_user_out_with_orgs(db, user)
+    )

@@ -187,7 +187,6 @@ class NotificationRepository:
         site_uuid: uuid.UUID,
     ) -> SitePrerecordSettings:
         stmt = select(SiteSettings.config).where(
-            SiteSettings.user_id == int(user_id),
             SiteSettings.site_uuid == _as_uuid(site_uuid),
         )
         config = (await db.execute(stmt)).scalar_one_or_none()
@@ -213,7 +212,6 @@ class NotificationRepository:
         only_enabled: bool = True,
     ) -> List[str]:
         stmt = select(NotificationEmail.email).where(
-            NotificationEmail.user_id == int(user_id),
             NotificationEmail.site_uuid == _as_uuid(site_uuid),
         )
         if only_enabled:
@@ -235,7 +233,6 @@ class NotificationRepository:
             return {}
 
         stmt = select(NotificationEmail.site_uuid, NotificationEmail.email).where(
-            NotificationEmail.user_id == int(user_id),
             NotificationEmail.site_uuid.in_(site_uuid_values),
         )
         if only_enabled:
@@ -905,7 +902,8 @@ class NotificationRepository:
         site_uuids: Optional[List[uuid.UUID]] = None,
         only_enabled: Optional[bool] = None,
     ) -> List[NotificationEmail]:
-        """Return NotificationEmail rows, scoped by user and/or site(s)."""
+        """Return NotificationEmail rows, scoped by site(s).
+        """
         stmt = select(NotificationEmail)
         if user_id is not None:
             stmt = stmt.where(NotificationEmail.user_id == int(user_id))
@@ -944,10 +942,16 @@ class NotificationRepository:
         return (await db.execute(stmt)).scalars().first()
 
     async def notification_email_exists(
-        self, db: AsyncSession, *, user_id: int, site_uuid: uuid.UUID, email: str
+        self, db: AsyncSession, *, user_id: Optional[int] = None, site_uuid: uuid.UUID, email: str
     ) -> bool:
+        """Is this address already a recipient for this site?
+
+        Deliberately ignores `user_id`: uniqueness is per (site, email), so an
+        address another admin already added counts as existing — otherwise the
+        same person gets every alert twice.
+        """
         row = await self.get_notification_email(
-            db, user_id=user_id, site_uuid=site_uuid, email=email
+            db, site_uuid=site_uuid, email=email
         )
         return row is not None
 

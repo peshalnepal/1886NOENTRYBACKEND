@@ -330,6 +330,96 @@ class OrganizationRepository:
             "was_last_admin": was_last_admin,
         }
 
+    async def count_org_members(
+        self, db: AsyncSession, *, org_id: int, exclude_user_id: Optional[int] = None
+    ) -> int:
+        """How many distinct users hold an org-scoped grant in this org.
+
+        `exclude_user_id` answers "is anyone else still here?" — used by the
+        last-admin succession check on account deletion.
+        """
+        stmt = (
+            select(func.count(func.distinct(AccessGrant.user_id)))
+            .select_from(AccessGrant)
+            .join(Role, Role.id == AccessGrant.role_id)
+            .where(
+                AccessGrant.org_id == int(org_id),
+                Role.scope == RoleScope.ORG.value,
+            )
+        )
+        if exclude_user_id is not None:
+            stmt = stmt.where(AccessGrant.user_id != int(exclude_user_id))
+        return int((await db.execute(stmt)).scalar_one() or 0)
+
+    async def get_org_role_name(
+        self, db: AsyncSession, *, user_id: int, org_id: int
+    ) -> Optional[str]:
+        """The user's org-scoped role name, or None if they aren't a member."""
+        res = await db.execute(
+            select(Role.name)
+            .select_from(AccessGrant)
+            .join(Role, Role.id == AccessGrant.role_id)
+            .where(
+                AccessGrant.user_id == int(user_id),
+                AccessGrant.org_id == int(org_id),
+                Role.scope == RoleScope.ORG.value,
+            )
+            .limit(1)
+        )
+        return res.scalar_one_or_none()
+
+    async def list_org_ids_for_user(
+        self, db: AsyncSession, *, user_id: int
+    ) -> List[int]:
+        """Org ids the user holds an org-scoped grant in.
+
+        Snapshotted *before* an account deletion, because the grants are
+        CASCADE-wiped along with the user row and the orgs they pointed at
+        can no longer be found afterwards.
+        """
+        res = await db.execute(
+            select(AccessGrant.org_id)
+            .where(
+                AccessGrant.user_id == int(user_id),
+                AccessGrant.org_id.is_not(None),
+            )
+            .distinct()
+        )
+        return [int(oid) for oid in res.scalars().all()]
+
+    async def delete_if_abandoned(
+        self, db: AsyncSession, *, org_ids: List[int]
+    ) -> List[int]:
+        """Drop any of `org_ids` that no longer has a single member.
+
+        Deleting a user CASCADEs their `access_grants` away and only SET NULLs
+        `organizations.owner_user_id`, so removing the sole member of an org
+        leaves an owner-less, member-less tenant behind. This mirrors the
+        cascade rule in `remove_org_membership_safe`: an org nobody belongs to
+        must not survive.
+
+        Returns the ids actually deleted. Does NOT commit.
+        """
+        if not org_ids:
+            return []
+
+        abandoned = (
+            await db.execute(
+                select(Organization.id).where(
+                    Organization.id.in_([int(o) for o in org_ids]),
+                    ~select(AccessGrant.id)
+                    .where(AccessGrant.org_id == Organization.id)
+                    .exists(),
+                )
+            )
+        ).scalars().all()
+
+        deleted: List[int] = []
+        for org_id in abandoned:
+            if await self.delete_organization(db, int(org_id)):
+                deleted.append(int(org_id))
+        return deleted
+
     # ------------------------------------------------------------------
     # Site memberships (site-scoped access grants)
     # ------------------------------------------------------------------

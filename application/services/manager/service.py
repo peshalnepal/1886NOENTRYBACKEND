@@ -201,8 +201,16 @@ class Manager:
 
     # --- Cleanup delegation ---
     
-    async def cleanup_user_resources(self, db: AsyncSession, *, user_id: int) -> Dict[str, Any]:
-        return await self._cleanup_ctrl.cleanup_user_resources(db, user_id=user_id)
+    async def cleanup_user_resources(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        camera_uuids: Optional[List[uuid.UUID]] = None,
+    ) -> Dict[str, Any]:
+        return await self._cleanup_ctrl.cleanup_user_resources(
+            db, user_id=user_id, camera_uuids=camera_uuids
+        )
 
     async def cleanup_device_resources(self, db: AsyncSession, *, device_uuid: uuid.UUID, active: Optional[ModelPipeline]) -> None:
         return await self._cleanup_ctrl.cleanup_device_resources(db, device_uuid=device_uuid, active=active)

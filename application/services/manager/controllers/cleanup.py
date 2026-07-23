@@ -23,19 +23,39 @@ class CleanupController:
     def __init__(self, state: ManagerState):
         self._state = state
 
-    async def cleanup_user_resources(self, db: AsyncSession, *, user_id: int) -> Dict[str, Any]:
+    async def cleanup_user_resources(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        camera_uuids: Optional[List[uuid.UUID]] = None,
+    ) -> Dict[str, Any]:
         """
         Clean up external/runtime resources for a user before deleting the DB user row.
         This does not delete DB rows directly; caller should delete the User after this succeeds.
+
+        `camera_uuids` restricts the edge/WebRTC teardown to a specific set —
+        the cameras of organizations actually being dissolved. Cameras are
+        org-owned, so tearing down by `user_id` would black out live feeds that
+        the departing member merely created and the rest of the org still
+        depends on. Pass an empty list to skip camera teardown entirely; omit
+        the argument for the legacy user-scoped behaviour.
         """
         uid = int(user_id)
         errors: List[str] = []
         edge_deleted: List[str] = []
         streams_deleted: List[str] = []
 
-        user_cameras = await self._state.channel_repo.list_cameras(
-            db, user_id=uid, include_device=True
-        )
+        if camera_uuids is None:
+            user_cameras = await self._state.channel_repo.list_cameras(
+                db, user_id=uid, include_device=True
+            )
+        elif camera_uuids:
+            user_cameras = await self._state.channel_repo.list_cameras(
+                db, camera_uuids=list(camera_uuids), include_device=True
+            )
+        else:
+            user_cameras = []
 
         edge_seen: Set[Tuple[str, str]] = set()
         stream_seen: Set[str] = set()

@@ -316,7 +316,7 @@ class SiteUpdate(BaseModel):
 
 class SiteOut(BaseModel):
     site_uuid: uuid.UUID
-    user_id: int
+    user_id: Optional[int] = None
     name: str
     site_code: Optional[str] = None
     address: Optional[str] = None
@@ -467,7 +467,7 @@ class DeviceUpdate(BaseModel):
 
 class DeviceOut(BaseModel):
     device_uuid: uuid.UUID
-    user_id: int
+    user_id: Optional[int] = None
     device_url: str
     name: Optional[str] = None
     device_code: Optional[str] = None
@@ -590,7 +590,7 @@ class NotificationEmailCreate(BaseModel):
 
 class NotificationEmailOut(BaseModel):
     id: int
-    user_id: int
+    user_id: Optional[int] = None
     site_uuid: uuid.UUID
     email: str
     is_enabled: bool
@@ -813,6 +813,57 @@ class LoginRequest(BaseModel):
     @classmethod
     def normalize_email(cls, value: EmailStr) -> str:
         return str(value).lower().strip()
+
+
+class PasswordResetRequest(BaseModel):
+    """Step 1 of the forgot-password flow: ask for a code."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    user_email: EmailStr
+
+    @field_validator("user_email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return str(value).lower().strip()
+
+
+class PasswordResetCodeOut(BaseModel):
+    """Deliberately does not reveal whether the account exists."""
+
+    message: str
+    expires_at: datetime
+    debug_code: str | None = None
+
+
+class PasswordResetConfirm(BaseModel):
+    """Step 2 of the forgot-password flow: code + the new password."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    user_email: EmailStr
+    code: str = Field(..., min_length=6, max_length=10)
+    new_password: SecretStr
+
+    @field_validator("user_email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return str(value).lower().strip()
+
+    @field_validator("code")
+    @classmethod
+    def normalize_code(cls, value: str) -> str:
+        code = value.strip()
+        if not code.isdigit():
+            raise ValueError("Verification code must contain digits only")
+        return code
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_password(cls, value: SecretStr) -> SecretStr:
+        if len(value.get_secret_value()) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        return value
 
 
 # -------------------------

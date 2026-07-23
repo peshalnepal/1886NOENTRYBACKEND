@@ -162,7 +162,7 @@ class NotificationCreateDTO(_DTO):
 
 class NotificationEmailCreateDTO(_DTO):
     """Input for `NotificationRepository.create_notification_email`."""
-    user_id: int
+    user_id: Optional[int] = None
     site_uuid: uuid.UUID
     email: str
     is_enabled: bool = True

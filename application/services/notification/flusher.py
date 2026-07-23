@@ -98,7 +98,14 @@ class NotificationFlusher:
     def invalidate_recipient_cache(self, *, user_id: int, site_uuid: Optional[uuid.UUID] = None) -> None:
         uid = int(user_id)
         if site_uuid is not None:
-            self._recipient_cache.pop((uid, str(site_uuid)), None)
+            # Recipients are site-owned, but the cache is keyed by
+            # (pipeline-owner user, site). Dropping only this caller's entry
+            # would leave every other member serving a stale recipient list
+            # for the same site, so clear the site across all users.
+            site_key = str(site_uuid)
+            for key in list(self._recipient_cache.keys()):
+                if key[1] == site_key:
+                    self._recipient_cache.pop(key, None)
             return
 
         for key in list(self._recipient_cache.keys()):
