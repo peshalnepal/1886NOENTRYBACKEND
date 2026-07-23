@@ -2,8 +2,20 @@
 
 # Core dependencies
 Flask==2.0.3            # last version supporting Python 3.6
-numpy==1.19.5           # Python 3.6 compatible
-opencv-python==4.5.5.64
+
+# DO NOT add opencv-python or numpy here.
+#
+# Both come from JetPack (system dist-packages) and MUST stay the system copy:
+#   - opencv (cv2): the PyPI wheel is built WITHOUT GStreamer. A cp36 aarch64
+#     wheel does exist, so `pip install` succeeds inside a
+#     --system-site-packages venv and silently SHADOWS the JetPack cv2 —
+#     killing every nvv4l2decoder/nvvidconv pipeline in channels/channel.py.
+#     Cameras then fail to open or fall back to slow CPU decode.
+#   - numpy: the system cv2 is compiled against the JetPack numpy; a pip numpy
+#     of a different ABI causes import errors or silent array corruption.
+#
+# Verify after install:
+#   python3 -c "import cv2,re;print(re.search(r'GStreamer:\s+YES',cv2.getBuildInformation()) is not None)"
 
 # Database (async SQLite)
 SQLAlchemy==1.4.51      # last 1.4.x; 2.0+ requires Python 3.7+
