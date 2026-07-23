@@ -215,8 +215,13 @@ class TRTEngine(object):
 
         with CudaContext(self.device_id):
             self._trt_logger = trt.Logger(trt.Logger.WARNING)
-            with open(engine_path, "rb") as f, trt.Runtime(self._trt_logger) as runtime:
-                self.engine = runtime.deserialize_cuda_engine(f.read())
+            # Keep the Runtime alive for the engine's lifetime and do not rely on
+            # the context-manager protocol: TRT 10 deprecates __exit__/__del__
+            # based destruction, and an engine must not outlive the runtime that
+            # deserialized it.
+            self._runtime = trt.Runtime(self._trt_logger)
+            with open(engine_path, "rb") as f:
+                self.engine = self._runtime.deserialize_cuda_engine(f.read())
 
             self.context = self.engine.create_execution_context()
 
@@ -516,6 +521,12 @@ class TRTInfer(object):
             topk=nms_topk,
             device_id=self.device_id,
         )
+        # Re-expose the engine's max batch on the TRTInfer facade. The worker
+        # pool reads max_batch off THIS object; without it every start logged a
+        # false "engine max_batch=1 — NOT a dynamic-batch engine" warning (and
+        # reported max_batch=1 in /health) even on a correct 10-wide engine,
+        # sending operators off to re-export an engine that was already fine.
+        self.max_batch = int(getattr(self.det_runner, "max_batch", 1))
 
     def infer_multitask(self, bgr: np.ndarray, meta: Dict) -> Dict:
         t0 = time.perf_counter()
