@@ -23,7 +23,12 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.channels.channel import VideoChannel, VideoChannelConfig
-from application.services.tracker import MultiCameraByteTrack, ROI, ROIAlertEngine
+from application.services.tracker import (
+    MultiCameraByteTrack,
+    ROI,
+    ROIAlertEngine,
+    nms_payload_detections,
+)
 from application.services.notification import NotificationMessage, NotificationService
 from application.repositories.notification_repository import CameraContext
 from application.services.common import (
@@ -340,6 +345,13 @@ class ModelPipeline:
         
         cfg = tracker_cfg or {}
         self._tracker = MultiCameraByteTrack(**cfg)
+        self._nms_iou = max(0.0, float(os.getenv("DETECTION_NMS_IOU", "0.55")))
+        self._nms_overlap = max(
+            0.0, float(os.getenv("DETECTION_NMS_OVERLAP", "0.70"))
+        )
+        self._nms_size_ratio = max(
+            0.0, float(os.getenv("DETECTION_NMS_SIZE_RATIO", "0.65"))
+        )
         self._roi_engine = ROIAlertEngine()
         
         self.interesting_classes = interesting_classes or {"person", "car", "motorcycle", "truck"}
@@ -1379,7 +1391,18 @@ class ModelPipeline:
         if frame_seq is None or frame_ts_ms is None:
             return None
 
-        dets = payload.get("detections") or []
+        # Suppress duplicate boxes at ingestion, before the payload fans out to
+        # the drawn overlay (resp.detections) and the tracker. A box leaked past
+        # the edge's NMS otherwise shows up twice on one object: once as a raw
+        # drawn detection and once as a second track id. Doing it here, rather
+        # than only inside the tracker, is what makes the extra box disappear
+        # from the picture as well as from the id set.
+        dets = nms_payload_detections(
+            payload.get("detections") or [],
+            iou_thr=self._nms_iou,
+            overlap_thr=self._nms_overlap,
+            size_ratio_thr=self._nms_size_ratio,
+        )
         pose = payload.get("pose")
         inf_ms = payload.get("inference_ms")
         model_id = payload.get("model_id")

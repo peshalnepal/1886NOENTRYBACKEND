@@ -103,6 +103,92 @@ def _sanitize_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, Any
     return clean
 
 
+def nms_payload_detections(
+    detections: Any,
+    iou_thr: float = 0.55,
+    overlap_thr: float = 0.70,
+    size_ratio_thr: float = 0.65,
+) -> List[Dict[str, Any]]:
+    """
+    Greedy NMS over raw edge detections, in the wire format they arrive in.
+
+    Operates on the payload shape (``{"box": {"x1","y1","x2","y2"}, "cls_name",
+    "conf"}``) rather than the tracker's internal float32 bbox, so it can run at
+    ingestion — BEFORE the payload fans out to the drawn overlay and the tracker
+    separately. Deduping inside the tracker alone fixes the track ids but not
+    the picture: the live overlay draws the raw edge boxes too (see
+    ``_overlay_payload_from_resp``), so a leaked duplicate stays visible.
+
+    Suppression uses the same two-part test as ``_dedupe_detections`` plus a
+    plain-IoU arm:
+
+      * ``iou_thr``    — classic NMS: heavy mutual overlap.
+      * ``overlap_thr`` + ``size_ratio_thr`` — catches the offset duplicate that
+        plain IoU misses (IoU ~0.49) without merging two occluding vehicles
+        (IoU ~0.60), by additionally requiring the boxes be similar in size.
+
+    Only same-class boxes suppress each other, and the highest-confidence box in
+    a cluster survives. Entries whose box cannot be parsed are passed through
+    untouched rather than dropped — this is a de-duplication pass, not a
+    validation pass; the tracker's ``_sanitize_detections`` owns that.
+    """
+    if not isinstance(detections, list) or len(detections) < 2:
+        return list(detections) if isinstance(detections, list) else []
+
+    parsed: List[Optional[np.ndarray]] = []
+    confs: List[float] = []
+    for d in detections:
+        box = d.get("box") if isinstance(d, dict) else None
+        arr: Optional[np.ndarray] = None
+        if isinstance(box, dict):
+            try:
+                x1, y1 = float(box["x1"]), float(box["y1"])
+                x2, y2 = float(box["x2"]), float(box["y2"])
+            except (KeyError, TypeError, ValueError):
+                arr = None
+            else:
+                if x2 < x1:
+                    x1, x2 = x2, x1
+                if y2 < y1:
+                    y1, y2 = y2, y1
+                candidate = np.array([x1, y1, x2, y2], dtype=np.float32)
+                if np.all(np.isfinite(candidate)):
+                    arr = candidate
+        parsed.append(arr)
+        try:
+            confs.append(float(d.get("conf", 0.0)) if isinstance(d, dict) else 0.0)
+        except (TypeError, ValueError):
+            confs.append(0.0)
+
+    # Unparseable boxes are never suppressed and never suppress others.
+    order = sorted(
+        (i for i, a in enumerate(parsed) if a is not None),
+        key=lambda i: -confs[i],
+    )
+    suppressed: set = set()
+    for pos, i in enumerate(order):
+        if i in suppressed:
+            continue
+        di = detections[i]
+        cls_i = str(di.get("cls_name", "unknown"))
+        for j in order[pos + 1:]:
+            if j in suppressed:
+                continue
+            if str(detections[j].get("cls_name", "unknown")) != cls_i:
+                continue
+            box_i, box_j = parsed[i], parsed[j]
+            if _iou(box_i, box_j) >= iou_thr:
+                suppressed.add(j)
+                continue
+            overlap, size_ratio = _overlap_min(box_i, box_j)
+            if overlap >= overlap_thr and size_ratio >= size_ratio_thr:
+                suppressed.add(j)
+
+    if not suppressed:
+        return list(detections)
+    return [d for i, d in enumerate(detections) if i not in suppressed]
+
+
 def _overlap_min(a: BBox, b: BBox) -> Tuple[float, float]:
     """
     Return (intersection / smaller area, smaller area / larger area).
@@ -143,6 +229,13 @@ def _dedupe_detections(
     "multiple boxes on a car that hasn't moved" symptom. No amount of gate or
     confirmation tuning fixes this: it is a duplicate *input*, faithfully
     tracked twice.
+
+    Second line of defence. ``nms_payload_detections`` normally suppresses these
+    at ingestion (see ModelPipeline._payload_to_resp), which also keeps the
+    duplicate out of the DRAWN overlay — something this pass cannot do, because
+    by here the overlay has already been built from the raw payload. This stays
+    because ByteTrackLite is public and may be fed detections that never went
+    through that path.
 
     A pair is a duplicate only if it is BOTH mostly-overlapping (by
     ``_overlap_min``) AND similar in size. Both conditions are needed:
