@@ -103,6 +103,80 @@ def _sanitize_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, Any
     return clean
 
 
+def _overlap_min(a: BBox, b: BBox) -> Tuple[float, float]:
+    """
+    Return (intersection / smaller area, smaller area / larger area).
+
+    Plain IoU cannot separate a leaked duplicate from two heavily-occluded
+    vehicles: a loose duplicate scores ~0.49 while two cars overlapping in
+    perspective score ~0.60. Intersection-over-smaller-area plus a size-
+    similarity ratio does separate them — a duplicate is both mostly-contained
+    AND about the same size, whereas a small box nested inside a much larger one
+    (a car inside a truck's box) is contained but very different in size.
+    """
+    x1 = max(float(a[0]), float(b[0]))
+    y1 = max(float(a[1]), float(b[1]))
+    x2 = min(float(a[2]), float(b[2]))
+    y2 = min(float(a[3]), float(b[3]))
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = max(0.0, float(a[2] - a[0])) * max(0.0, float(a[3] - a[1]))
+    area_b = max(0.0, float(b[2] - b[0])) * max(0.0, float(b[3] - b[1]))
+    smaller = min(area_a, area_b)
+    larger = max(area_a, area_b)
+    if smaller <= 0.0 or larger <= 0.0:
+        return 0.0, 0.0
+    return inter / smaller, smaller / larger
+
+
+def _dedupe_detections(
+    detections: List[Dict[str, Any]],
+    overlap_thr: float = 0.70,
+    size_ratio_thr: float = 0.65,
+) -> List[Dict[str, Any]]:
+    """
+    Collapse near-duplicate boxes on the same object into one detection.
+
+    The edge runs its own NMS, but a leaked duplicate still reaches us: two
+    boxes on one vehicle, offset by a few pixels. Association has no reason to
+    reject either (both overlap a track well), so the second box spawns a second
+    track and the object is drawn with TWO ids at once, indefinitely — the
+    "multiple boxes on a car that hasn't moved" symptom. No amount of gate or
+    confirmation tuning fixes this: it is a duplicate *input*, faithfully
+    tracked twice.
+
+    A pair is a duplicate only if it is BOTH mostly-overlapping (by
+    ``_overlap_min``) AND similar in size. Both conditions are needed:
+
+      * overlap alone merges a car detected inside a truck's larger box;
+      * size alone merges two same-model cars parked side by side.
+
+    Only same-class pairs are considered, so a person standing in front of a car
+    is never merged. Thresholds stay deliberately conservative — two vehicles
+    heavily occluding each other are geometrically indistinguishable from a
+    loose duplicate, and drawing two boxes on one car is a far milder failure
+    than dropping a real vehicle. Highest confidence wins, as in NMS.
+    """
+    if len(detections) < 2:
+        return detections
+
+    order = sorted(range(len(detections)), key=lambda i: -float(detections[i]["conf"]))
+    kept: List[int] = []
+    for i in order:
+        di = detections[i]
+        for j in kept:
+            dj = detections[j]
+            if di["cls_name"] != dj["cls_name"]:
+                continue
+            overlap, size_ratio = _overlap_min(di["bbox"], dj["bbox"])
+            if overlap >= overlap_thr and size_ratio >= size_ratio_thr:
+                break                                  # duplicate of a stronger box
+        else:
+            kept.append(i)
+    if len(kept) == len(detections):
+        return detections
+    return [detections[i] for i in sorted(kept)]       # restore input order
+
+
 def _xyxy_to_cxcyah(b: BBox) -> np.ndarray:
     w = b[2] - b[0]                                # box width  = x2 - x1
     h = b[3] - b[1]                                # box height = y2 - y1
@@ -262,6 +336,13 @@ class ByteTrackLite:
         # time-scaled term above cannot grow without bound on a very long gap
         # and start linking genuinely unrelated objects across the frame.
         assoc_dist_max_scale: float = 12.0,
+        # Collapse same-class detections that both overlap this much (as a
+        # fraction of the SMALLER box) and are at least dedupe_size_ratio as
+        # similar in size, so a duplicate box leaked past the edge's NMS does
+        # not spawn a second track on an object that already has one.
+        # Set dedupe_overlap to 0 to disable.
+        dedupe_overlap: float = 0.70,
+        dedupe_size_ratio: float = 0.65,
     ) -> None:
         self.high_th = float(high_th)
         self.low_th = float(low_th)
@@ -299,6 +380,8 @@ class ByteTrackLite:
         self.assoc_dist_min_interval = float(assoc_dist_min_interval)
         self.assoc_dist_per_s = float(assoc_dist_per_s)
         self.assoc_dist_max_scale = float(assoc_dist_max_scale)
+        self.dedupe_overlap = float(dedupe_overlap)
+        self.dedupe_size_ratio = float(dedupe_size_ratio)
 
         self._next_id = 1
         self._tracks: List[Track] = []
@@ -358,6 +441,12 @@ class ByteTrackLite:
         # Drop malformed detections up front so a single bad entry can't crash
         # the frame, and so downstream code can assume valid float32 bboxes.
         detections = _sanitize_detections(detections)
+        # Then collapse duplicate boxes on one object, before association gets a
+        # chance to promote the extra box into a second track.
+        if self.dedupe_overlap > 0.0:
+            detections = _dedupe_detections(
+                detections, self.dedupe_overlap, self.dedupe_size_ratio
+            )
 
         # Track the observed inter-frame interval so every time-based threshold
         # self-tunes to the actual delivery rate (which for a Jetson cycling
