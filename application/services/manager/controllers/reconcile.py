@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.services.edgeinference import EdgeCameraInventoryError
+from application.repositories.device_repository import normalize_device_url
 
 from application.services.manager.helpers import (
     _edge_health_ready,
@@ -50,6 +51,7 @@ class DeviceReconciler:
         *,
         user_id: int,
         device_uuids: List[Union[str, uuid.UUID]],
+        org_id: Optional[int] = None,
     ) -> None:
         """
         Best-effort targeted reconcile for devices affected by a site schedule change.
@@ -77,9 +79,16 @@ class DeviceReconciler:
                 seen_device_keys.add(device_key)
 
                 try:
-                    dev = await self._state.device_repo.get_device(db, device_uuid=device_uuid, user_id=uid)
+                    if org_id is not None:
+                        dev = await self._state.device_repo.get_device(
+                            db, device_uuid=device_uuid, org_id=int(org_id)
+                        )
+                    else:
+                        dev = await self._state.device_repo.get_device(
+                            db, device_uuid=device_uuid, user_id=uid
+                        )
                     if dev is None:
-                        raise ValueError(f"Device not found: {device_key}")                
+                        raise ValueError(f"Device not found: {device_key}")
                 except Exception:
                     logger.warning(
                         "Skipping missing device during best-effort reconcile device=%s",
@@ -87,8 +96,7 @@ class DeviceReconciler:
                         exc_info=True,
                     )
                     continue
-                device_url=getattr(dev, "device_url", None)
-                device_url=str(device_url or "").strip().rstrip("/")
+                device_url = normalize_device_url(getattr(dev, "device_url", None))
                 target_key = device_url or device_key
                 if target_key in seen_urls:
                     continue
@@ -172,10 +180,18 @@ class DeviceReconciler:
             if not raw_url:
                 raise ValueError(f"Device missing device_url: {device_uuid}")
             
-            device_url = str(raw_url).strip().rstrip("/")
+            device_url = normalize_device_url(raw_url)
+            if not device_url:
+                raise ValueError(f"Device missing device_url: {device_uuid}")
 
-            # 2. Find all logical "peer" devices sharing this exact physical URL
-            peer_devices = await self._state.device_repo.list_devices(db, device_url=device_url)            
+            # 2. Find all logical "peer" devices sharing this exact physical URL.
+            # Scoped to the owning org: cameras from another org must never be
+            # provisioned onto this box just because the URLs collide.
+            peer_devices = await self._state.device_repo.list_devices(
+                db,
+                device_url=device_url,
+                org_id=getattr(dev, "org_id", None),
+            )
             reconcile_device_uuids: List[uuid.UUID] = []
             seen_reconcile_devices: Set[str] = set()
             for peer in peer_devices:
@@ -271,7 +287,9 @@ class DeviceReconciler:
                     webrtc_errors.append(f"Failed to remove stream {cu}: {e}")
 
         # --- Edge device reconcile ---
-        device_url = dev.device_url
+        # `device_url` stays the normalized value computed above; re-reading the
+        # raw column here would send un-normalized URLs to the edge client and
+        # desync it from the peer lookup that built `desired_set`.
         edge_warnings: List[str] = []
         try:
             edge_set = await self._call_with_timeout(
@@ -389,8 +407,7 @@ class DeviceReconciler:
             du = getattr(dev, "device_uuid", None)
             if du is None:
                 continue
-            device_url=getattr(dev, "device_url", None)
-            device_url=str(device_url or "").strip().rstrip("/")
+            device_url = normalize_device_url(getattr(dev, "device_url", None))
             key = device_url or str(du)
             if key in seen_targets:
                 continue

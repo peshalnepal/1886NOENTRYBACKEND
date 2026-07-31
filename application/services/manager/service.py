@@ -190,8 +190,8 @@ class Manager:
 
     # --- Reconcile delegation ---
     
-    async def reconcile_devices_best_effort(self, *, user_id: int, device_uuids: List[Union[str, uuid.UUID]]) -> None:
-        return await self._reconcile_ctrl.reconcile_devices_best_effort(user_id=user_id, device_uuids=device_uuids)
+    async def reconcile_devices_best_effort(self, *, user_id: int, device_uuids: List[Union[str, uuid.UUID]], org_id: Optional[int] = None) -> None:
+        return await self._reconcile_ctrl.reconcile_devices_best_effort(user_id=user_id, device_uuids=device_uuids, org_id=org_id)
 
     async def reconcile_device_edge_simple(self, *, device_uuid: uuid.UUID, user_id: Optional[int] = None, dry_run: bool = False, delete_unknown: bool = True) -> Dict[str, List[str]]:
         return await self._reconcile_ctrl.reconcile_device_edge_simple(device_uuid=device_uuid, user_id=user_id, dry_run=dry_run, delete_unknown=delete_unknown)

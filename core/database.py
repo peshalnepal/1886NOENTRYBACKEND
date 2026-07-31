@@ -892,6 +892,24 @@ class DatabaseManager:
                         "Skipping users.is_platform_admin migration: %s", exc
                     )
 
+                try:
+                    result = await conn.execute(
+                        text(
+                            "UPDATE devices "
+                            "SET device_url = TRIM(TRAILING '/' FROM TRIM(device_url)) "
+                            "WHERE BINARY device_url <> "
+                            "      BINARY TRIM(TRAILING '/' FROM TRIM(device_url))"
+                        )
+                    )
+                    if result.rowcount:
+                        logger.info(
+                            "Normalized devices.device_url on %s row(s).", result.rowcount
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping devices.device_url normalization: %s", exc
+                    )
+
                 # --- schedule-aware arm/disarm override on sites -------------
                 for col_name, col_def in (
                     ("arm_override", "TINYINT(1) NULL"),

@@ -689,6 +689,7 @@ async def edit_camera(
     cam, _cfg, _pid = full
     await _ensure_camera_access(db, cam, ctx)
     owner_id = _camera_owner_id(cam, ctx.user.id)
+    prev_device_uuid = getattr(cam, "device_uuid", None)
 
     pipeline = await manager.get_activepipeline(user_id=owner_id)
     patch_payload = payload.model_dump(exclude_unset=True)
@@ -708,6 +709,25 @@ async def edit_camera(
         raise HTTPException(status_code=500, detail="Failed to edit camera")
 
     cam_out = result.cameras[0]
+    new_device_uuid = getattr(cam_out, "device_uuid", None)
+    if prev_device_uuid is not None and str(prev_device_uuid) != str(new_device_uuid):
+        affected = [d for d in (prev_device_uuid, new_device_uuid) if d is not None]
+        try:
+            await manager.reconcile_devices_best_effort(
+                user_id=owner_id,
+                device_uuids=affected,
+                org_id=ctx.org_id,
+            )
+        except Exception:
+            logger.warning(
+                "Best-effort reconcile after device re-assignment failed for camera %s "
+                "(old_device=%s new_device=%s); edge may be stale until next sync.",
+                cam_out.camera_uuid,
+                prev_device_uuid,
+                new_device_uuid,
+                exc_info=True,
+            )
+
     from routes.notifications_routes import invalidate_camera_mode_cache
 
     await invalidate_camera_mode_cache(cam_out.camera_uuid)

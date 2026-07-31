@@ -189,18 +189,27 @@ class ByteTrackLite:
       - create new tracks from unmatched high-conf dets
       - confirm after min_hits
 
-    Low / irregular FPS robustness
-    ------------------------------
-    This tracker is designed to run on streams where a single Jetson cycles
-    through ~20 cameras, so each camera may only deliver one frame every 4-10s
-    (0.1-0.25 FPS), and the interval jitters. To cope:
+    Frame-rate robustness
+    ---------------------
+    Defaults are tuned for the current edge pipeline: ~8-10 FPS per camera
+    (dt ~0.1-0.125s), with all cameras batched in parallel on the Jetson. The
+    thresholds remain self-tuning, so a camera that degrades to a much slower
+    rate still tracks:
 
       * Every time-based threshold self-tunes to the *observed* inter-frame
-        interval (an EMA of dt), instead of assuming ~30 FPS. A fixed 0.1s
+        interval (an EMA of dt), instead of assuming a fixed rate. A fixed 0.1s
         staleness budget used to purge every track on the very next frame, so
         nothing ever survived long enough to confirm.
       * Velocity prediction is allowed to extrapolate ~one frame ahead rather
         than a fixed 0.15s.
+      * The center-distance fallback stays dormant at these rates (IoU alone is
+        reliable when objects move less than their own size per frame) and
+        re-enables itself automatically if a camera slows down.
+
+    NOTE: low_th must stay at or above the edge's CONF filter (see
+    Backend/tensort/.env.example). If the Jetson filters at a HIGHER confidence
+    than low_th, the stage-2 rescue band is empty and a briefly-dimmer detection
+    drops the track instead of re-linking it — visible as boxes blinking out.
 
     Association stays IoU-only (overlap-based). By default the public output is
     realtime-only: tracks that did not match a detection on the current frame
@@ -211,13 +220,19 @@ class ByteTrackLite:
     def __init__(
         self,
         high_th: float = 0.5,
-        low_th: float = 0.3,
+        # Matches the edge CONF filter (0.20) so the stage-2 rescue band
+        # [low_th, high_th) actually receives detections.
+        low_th: float = 0.20,
         min_iou_high: float = 0.40,
         min_iou_low: float = 0.20,
-        min_hits: int = 2,
-        max_misses: int = 4,
+        # ~3 frames (~300ms) to confirm at 10 FPS — still fast, but rejects the
+        # 1-2 frame noise that the lower edge threshold lets through.
+        min_hits: int = 3,
+        # ~0.8-1.0s of occlusion/flicker tolerance at 10 FPS. This is the main
+        # anti-ID-churn knob; 4 frames was ~0.4s and dropped tracks too eagerly.
+        max_misses: int = 8,
         max_stale_s: Optional[float] = None,
-        stale_frames: float = 3.0,
+        stale_frames: float = 8.0,
         predict_horizon_frames: float = 1.5,
         match_same_class: bool = True,
         emit_coasting_tracks: bool = False,

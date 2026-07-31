@@ -20,6 +20,21 @@ from application.repositories._helpers import as_uuid as _as_uuid
 from core.database_orm import Camera, Device, SiteDevice
 
 
+def normalize_device_url(value: Optional[str]) -> Optional[str]:
+    """Canonical form of a device_url: trimmed, no trailing slash.
+
+    Devices that share a physical box are matched by exact string equality on
+    this column, so both the stored value and any comparison value must be
+    normalized the same way -- otherwise `http://host:8000/` and
+    `http://host:8000` look like two different boxes and reconcile computes a
+    desired camera set that is missing the peer's cameras.
+    """
+    if value is None:
+        return None
+    cleaned = str(value).strip().rstrip("/")
+    return cleaned or None
+
+
 class DeviceRepository:
     """All persistence for the Device model."""
 
@@ -66,7 +81,7 @@ class DeviceRepository:
             stmt = stmt.where(Device.org_id == int(org_id))
 
         if device_url:
-            stmt = stmt.where(Device.device_url == device_url)
+            stmt = stmt.where(Device.device_url == normalize_device_url(device_url))
 
         if only_enabled is True:
             stmt = stmt.where(Device.is_enabled.is_(True))
@@ -158,7 +173,7 @@ class DeviceRepository:
             org_id=int(dto.org_id),
             user_id=user_id,
             created_by=user_id,
-            device_url=dto.device_url,
+            device_url=normalize_device_url(dto.device_url),
             name=dto.name,
             device_code=dto.device_code,
             is_enabled=bool(dto.is_enabled),
@@ -178,6 +193,8 @@ class DeviceRepository:
         values: Dict[str, Any] = dto.model_dump(exclude_unset=True)
         if not values:
             return 0
+        if "device_url" in values:
+            values["device_url"] = normalize_device_url(values["device_url"])
         result = await db.execute(
             update(Device)
             .where(Device.device_uuid == _as_uuid(device_uuid))
