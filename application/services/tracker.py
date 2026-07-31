@@ -191,27 +191,32 @@ class ByteTrackLite:
 
     Frame-rate robustness
     ---------------------
-    Defaults are tuned for the current edge pipeline: ~8-10 FPS per camera
-    (dt ~0.1-0.125s), with all cameras batched in parallel on the Jetson. The
-    thresholds remain self-tuning, so a camera that degrades to a much slower
-    rate still tracks:
+    The delivered rate per camera varies by two orders of magnitude: a camera
+    on a dedicated pipeline sees ~8-10 FPS (dt ~0.1s), while one Jetson
+    round-robining ~20 cameras delivers ~0.1-0.25 FPS (dt ~4-10s). Every
+    time-based threshold therefore self-tunes to the *observed* inter-frame
+    interval (an EMA of dt) instead of assuming a fixed rate:
 
-      * Every time-based threshold self-tunes to the *observed* inter-frame
-        interval (an EMA of dt), instead of assuming a fixed rate. A fixed 0.1s
-        staleness budget used to purge every track on the very next frame, so
-        nothing ever survived long enough to confirm.
-      * Velocity prediction is allowed to extrapolate ~one frame ahead rather
-        than a fixed 0.15s.
-      * The center-distance fallback stays dormant at these rates (IoU alone is
+      * The staleness budget scales with the interval. A fixed 0.1s budget used
+        to purge every track on the very next frame, so nothing ever survived
+        long enough to confirm.
+      * Velocity prediction extrapolates ~one frame ahead rather than a fixed
+        0.15s.
+      * The center-distance fallback stays dormant at high rates (IoU alone is
         reliable when objects move less than their own size per frame) and
-        re-enables itself automatically if a camera slows down.
+        enables itself automatically once the interval crosses
+        ``assoc_dist_min_interval``.
+      * Confirmation is bounded by ``confirm_max_s`` as well as ``min_hits``,
+        so a slow camera does not need min_hits*dt (12s at 0.25 FPS) before it
+        can draw anything.
 
     NOTE: low_th must stay at or above the edge's CONF filter (see
     Backend/tensort/.env.example). If the Jetson filters at a HIGHER confidence
     than low_th, the stage-2 rescue band is empty and a briefly-dimmer detection
     drops the track instead of re-linking it — visible as boxes blinking out.
 
-    Association stays IoU-only (overlap-based). By default the public output is
+    Association is IoU-first, with a center-distance fallback that engages only
+    on slow streams (see ``assoc_center_dist``). By default the public output is
     realtime-only: tracks that did not match a detection on the current frame
     are kept only inside the tracker, never emitted as drawable boxes. This
     prevents old bboxes from trailing fast-moving objects while still allowing
@@ -226,8 +231,17 @@ class ByteTrackLite:
         min_iou_high: float = 0.40,
         min_iou_low: float = 0.20,
         # ~3 frames (~300ms) to confirm at 10 FPS — still fast, but rejects the
-        # 1-2 frame noise that the lower edge threshold lets through.
+        # 1-2 frame noise that the lower edge threshold lets through. On a slow
+        # camera this is capped by confirm_max_s below, because 3 frames at one
+        # frame per 4s would mean a 12s wait before anything is drawable.
         min_hits: int = 3,
+        # Upper bound, in seconds, on how long a track may stay tentative. A
+        # track that has been matched at least twice and has existed for this
+        # long is confirmed even if it has not reached min_hits yet. At 10 FPS
+        # min_hits is reached in ~0.3s so this never triggers; at 0.25 FPS it is
+        # what makes a box appear at all. Two hits is still required, so a
+        # single spurious detection never confirms.
+        confirm_max_s: float = 1.5,
         # ~0.8-1.0s of occlusion/flicker tolerance at 10 FPS. This is the main
         # anti-ID-churn knob; 4 frames was ~0.4s and dropped tracks too eagerly.
         max_misses: int = 8,
@@ -239,12 +253,22 @@ class ByteTrackLite:
         assoc_center_dist: bool = True,
         assoc_dist_scale: float = 2.5,
         assoc_dist_min_interval: float = 0.25,
+        # Extra distance budget per second of elapsed time, as a multiple of
+        # object size. A size-only gate ignores how long the object had to move:
+        # at one frame per 4s a car crosses far more than a few car-lengths, so
+        # the gate could never reach it and a new id was minted every frame.
+        assoc_dist_per_s: float = 1.5,
+        # Hard ceiling on the gate, as a multiple of object size, so the
+        # time-scaled term above cannot grow without bound on a very long gap
+        # and start linking genuinely unrelated objects across the frame.
+        assoc_dist_max_scale: float = 12.0,
     ) -> None:
         self.high_th = float(high_th)
         self.low_th = float(low_th)
         self.min_iou_high = float(min_iou_high)
         self.min_iou_low = float(min_iou_low)
         self.min_hits = int(min_hits)
+        self.confirm_max_s = float(confirm_max_s)
         # max_misses = 0: drop a track as soon as it misses a frame. Raise it
         # only if you want short internal occlusion tolerance. Public output
         # still suppresses missed tracks unless emit_coasting_tracks=True.
@@ -273,6 +297,8 @@ class ByteTrackLite:
         self.assoc_center_dist = bool(assoc_center_dist)
         self.assoc_dist_scale = float(assoc_dist_scale)
         self.assoc_dist_min_interval = float(assoc_dist_min_interval)
+        self.assoc_dist_per_s = float(assoc_dist_per_s)
+        self.assoc_dist_max_scale = float(assoc_dist_max_scale)
 
         self._next_id = 1
         self._tracks: List[Track] = []
@@ -285,6 +311,24 @@ class ByteTrackLite:
     def _frame_interval(self) -> float:
         """Best estimate of the current inter-frame interval (seconds)."""
         return float(self._dt_ema) if self._dt_ema is not None else 0.0
+
+    def _should_confirm(self, t: Track, now_ts: float) -> bool:
+        """
+        Whether a tentative track has earned confirmation.
+
+        Frame count alone (``min_hits``) assumes a steady frame rate. One Jetson
+        round-robining ~20 cameras delivers ~0.25 FPS per camera, where 3 hits
+        is a 12-second wait — and since only confirmed tracks are drawn, the
+        overlay stayed empty for objects that had been tracked the whole time.
+        The age-based path confirms a track that has survived long enough,
+        while still requiring a second sighting so one-frame noise never
+        confirms.
+        """
+        if t.hits >= self.min_hits:
+            return True
+        if self.confirm_max_s <= 0.0:
+            return False
+        return t.hits >= 2 and (now_ts - t.start_ts) >= self.confirm_max_s
 
     def _purge(self, now_ts: float) -> None:
         interval = self._frame_interval()
@@ -326,6 +370,17 @@ class ByteTrackLite:
                 self._dt_ema = raw_dt if self._dt_ema is None else (0.7 * self._dt_ema + 0.3 * raw_dt)
         self._last_now_ts = now_ts
 
+        # Seed the interval estimate from the gap that is about to be matched,
+        # BEFORE association runs. _frame_interval() is otherwise still 0.0 on
+        # the first re-match, so use_dist stayed off for exactly the frame where
+        # a cold track (velocity still zero, hence a predicted box equal to the
+        # old one) needs the distance fallback most. On a slow camera that lost
+        # the object's very first re-match and started the churn cycle.
+        if self._dt_ema is None and self._tracks:
+            gap = now_ts - max(t.last_update_ts for t in self._tracks)
+            if gap > 0:
+                self._dt_ema = gap
+
         self._purge(now_ts)
         hi = [d for d in detections if float(d["conf"]) >= self.high_th]                 # high-conf dets
         lo = [d for d in detections if self.low_th <= float(d["conf"]) < self.high_th]   # low-conf dets
@@ -347,9 +402,19 @@ class ByteTrackLite:
         # behaviour is byte-for-byte the old pure-IoU association.
         use_dist = self.assoc_center_dist and self._frame_interval() >= self.assoc_dist_min_interval
         # cost layout:  IoU match  -> [0, 1-min_iou]  (< 1, always preferred)
-        #               dist match -> [1, 2)          (only when use_dist)
+        #               dist match -> [1, 1.5)        (only when use_dist)
         #               forbidden  -> 1e6
-        _ACCEPT = 1.6
+        #
+        # _ACCEPT must sit strictly ABOVE the top of the distance band. It used
+        # to be 1.6 while the distance cost was 1 + dist/gate (range [1, 2)),
+        # which silently rejected every pairing with dist > 0.6*gate: the gate
+        # admitted a pair and the accept test then threw it away. The effective
+        # gate was 60% of the configured one, so a car moving more than
+        # 0.6*assoc_dist_scale*size per frame got a brand-new id EVERY frame,
+        # never reached min_hits, and never confirmed — no box was ever drawn.
+        # Scaling the distance band to [1, 1.5) makes a match anywhere inside
+        # the gate acceptable, so assoc_dist_scale is now the only gate.
+        _ACCEPT = 1.5
 
         def _match(track_idxs, det_idxs, det_list, min_iou):
             """Hungarian match between a subset of tracks and a subset of detections."""
@@ -365,6 +430,10 @@ class ByteTrackLite:
                 pcx = 0.5 * (float(pb[0]) + float(pb[2]))
                 pcy = 0.5 * (float(pb[1]) + float(pb[3]))
                 ph = float(pb[3]) - float(pb[1])
+                # Per-track elapsed time: a track that has been coasting through
+                # misses has had longer to move than one matched last frame, so
+                # it earns a proportionally wider gate below.
+                gap_s = max(0.0, now_ts - t.last_update_ts)
                 for jj, dj in enumerate(det_idxs):
                     d = det_list[dj]
                     if self.match_same_class and t.cls_name != d["cls_name"]:
@@ -388,12 +457,25 @@ class ByteTrackLite:
                     ratio = dh / ph
                     if ratio < 0.5 or ratio > 2.0:                                        # reject very different scales
                         continue
-                    gate = 0.5 * (dw + dh) * self.assoc_dist_scale
+                    # Gate grows with the time the object had to move, capped at
+                    # assoc_dist_max_scale * size. Size alone is not enough: the
+                    # same car is a 200px gate at 10 FPS and needs ~800px after a
+                    # 4s round-robin gap.
+                    size = 0.5 * (dw + dh)
+                    scale = min(
+                        self.assoc_dist_scale + self.assoc_dist_per_s * gap_s,
+                        self.assoc_dist_max_scale,
+                    )
+                    gate = size * scale
                     if gate <= 0.0:
                         continue
                     dist = float(np.hypot(dcx - pcx, dcy - pcy))
                     if dist < gate:
-                        cost[ii, jj] = 1.0 + dist / gate                                  # [1, 2): always worse than any IoU match
+                        # [1, 1.5): always worse than any IoU match (< 1), and
+                        # always below _ACCEPT so the gate above is the only
+                        # rejection test. Closer candidates still cost less, so
+                        # Hungarian keeps picking the best pairing.
+                        cost[ii, jj] = 1.0 + 0.5 * (dist / gate)
             matches = []
             for ii, jj in _assign(cost):
                 if cost[ii, jj] >= _ACCEPT:                                               # forbidden or out-of-gate → reject
@@ -418,7 +500,7 @@ class ByteTrackLite:
             t = self._tracks[ti]
             t.update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts, max_dt=max_track_dt)
             live_track_ids.add(t.track_id)
-            if t.hits >= self.min_hits:                                                   # graduate to confirmed if enough hits
+            if self._should_confirm(t, now_ts):                                           # graduate to confirmed
                 t.confirmed = True
                 events.append(("track_confirmed", t.track_id))
 
@@ -432,7 +514,7 @@ class ByteTrackLite:
             was_confirmed = t.confirmed
             t.update(lo[dj]["bbox"], float(lo[dj]["conf"]), now_ts, max_dt=max_track_dt)
             live_track_ids.add(t.track_id)
-            if (not was_confirmed) and t.hits >= self.min_hits:
+            if (not was_confirmed) and self._should_confirm(t, now_ts):
                 t.confirmed = True
                 events.append(("track_confirmed", t.track_id))
 
