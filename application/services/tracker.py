@@ -16,6 +16,45 @@ except Exception:
 BBox = np.ndarray
 
 
+# Classes the detector routinely confuses with one another. A four-wheeled
+# vehicle flips between "car" and "truck" (and "bus", where enabled) from frame
+# to frame depending on viewing angle and how much of it is visible — the label
+# is unstable, the object is not. Two consequences, both visible as "the same
+# car tracked twice":
+#
+#   * one frame can carry BOTH a car box and a truck box on one vehicle, which
+#     class-scoped NMS will not suppress;
+#   * across frames the flip breaks same-class association, so the track id
+#     ping-pongs 1,2,1,2 as each label spawns its own track.
+#
+# Grouping them makes both paths treat the labels as interchangeable. Only
+# genuinely confusable classes belong here: "person" and "motorcycle" are never
+# mistaken for a car in a way that should merge their boxes, and grouping them
+# would hide a pedestrian standing beside a vehicle.
+CONFUSABLE_CLASS_GROUPS: Tuple[Tuple[str, ...], ...] = (
+    ("car", "truck", "bus", "van"),
+)
+
+_CLASS_GROUP: Dict[str, int] = {
+    name: gi
+    for gi, group in enumerate(CONFUSABLE_CLASS_GROUPS)
+    for name in group
+}
+
+
+def _same_object_class(a: str, b: str) -> bool:
+    """
+    True when two class labels could plausibly describe the same object.
+
+    Confusable classes share a group token; everything else compares by raw
+    name, so unrelated classes still never match each other.
+    """
+    if a == b:
+        return True
+    ga, gb = _CLASS_GROUP.get(a), _CLASS_GROUP.get(b)
+    return ga is not None and ga == gb
+
+
 def _iou(a: BBox, b: BBox) -> float:
     x1 = max(float(a[0]), float(b[0]))
     y1 = max(float(a[1]), float(b[1]))
@@ -174,7 +213,9 @@ def nms_payload_detections(
         for j in order[pos + 1:]:
             if j in suppressed:
                 continue
-            if str(detections[j].get("cls_name", "unknown")) != cls_i:
+            if not _same_object_class(
+                str(detections[j].get("cls_name", "unknown")), cls_i
+            ):
                 continue
             box_i, box_j = parsed[i], parsed[j]
             if _iou(box_i, box_j) >= iou_thr:
@@ -258,7 +299,7 @@ def _dedupe_detections(
         di = detections[i]
         for j in kept:
             dj = detections[j]
-            if di["cls_name"] != dj["cls_name"]:
+            if not _same_object_class(di["cls_name"], dj["cls_name"]):
                 continue
             overlap, size_ratio = _overlap_min(di["bbox"], dj["bbox"])
             if overlap >= overlap_thr and size_ratio >= size_ratio_thr:
@@ -271,18 +312,18 @@ def _dedupe_detections(
 
 
 def _xyxy_to_cxcyah(b: BBox) -> np.ndarray:
-    w = b[2] - b[0]                                # box width  = x2 - x1
-    h = b[3] - b[1]                                # box height = y2 - y1
-    cx = b[0] + 0.5 * w                            # center x   = left edge + half width
-    cy = b[1] + 0.5 * h                            # center y   = top edge + half height
-    a = w / max(h, 1e-6)                           # aspect ratio = w/h (guard against div-by-zero)
+    w = b[2] - b[0]
+    h = b[3] - b[1]
+    cx = b[0] + 0.5 * w
+    cy = b[1] + 0.5 * h
+    a = w / max(h, 1e-6)
     return np.array([cx, cy, a, h], dtype=np.float32)
 
 def _cxcyah_to_xyxy(s: np.ndarray) -> BBox:
-    cx, cy, a, h = s                               # unpack state
-    w = a * h                                      # recover width from aspect * height
-    return np.array([cx - 0.5*w, cy - 0.5*h,       # x1, y1 (top-left)
-                     cx + 0.5*w, cy + 0.5*h],      # x2, y2 (bottom-right)
+    cx, cy, a, h = s
+    w = a * h
+    return np.array([cx - 0.5*w, cy - 0.5*h,
+                     cx + 0.5*w, cy + 0.5*h],
                     dtype=np.float32)
 
 @dataclass
@@ -299,6 +340,14 @@ class Track:
     misses: int = 0
     confirmed: bool = False
 
+    # Confidence-weighted vote per observed label. Within a confusable group the
+    # per-frame label is unstable (a van reads "car" on one frame and "truck" on
+    # the next), so reporting whatever the FIRST frame happened to say freezes a
+    # coin-flip for the life of the track — and cls_name drives ROI class
+    # filtering and the notification text. Voting reports the label the evidence
+    # actually favours, and lets it change as more frames arrive.
+    cls_votes: Dict[str, float] = field(default_factory=dict)
+
     # velocity is now 3D: [vcx, vcy, vh]. Aspect ratio is held constant — see predict().
     vel: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
 
@@ -309,15 +358,29 @@ class Track:
         # ~one frame ahead instead of the old fixed 0.15s, which made prediction
         # a no-op for slow/irregular streams.
         dt = min(max(1e-3, now_ts - self.last_ts), max(1e-3, max_dt))
-        state = _xyxy_to_cxcyah(self.bbox)                 # convert current bbox into (cx, cy, a, h)
-        state[0] += self.vel[0] * dt                       # advance center x by vcx*dt
-        state[1] += self.vel[1] * dt                       # advance center y by vcy*dt
+        state = _xyxy_to_cxcyah(self.bbox)
+        state[0] += self.vel[0] * dt
+        state[1] += self.vel[1] * dt
         # Advance height by vh*dt (aspect 'a' is held constant). Floor the height
         # so a shrinking object over a long (up to ~2s) frame interval can't push
         # the predicted box to zero/negative height — that would produce an
         # inverted, degenerate box and a garbage IoU, dropping the track.
         state[3] = max(1e-3, state[3] + self.vel[2] * dt)
-        return _cxcyah_to_xyxy(state)                      # convert back to xyxy for IoU computation
+        return _cxcyah_to_xyxy(state)
+
+    def vote_class(self, cls_name: str, det_score: float) -> None:
+        """
+        Record one label observation and adopt the running winner.
+
+        Confidence-weighted so a hesitant 0.3 "truck" does not outweigh repeated
+        confident "car" readings. Only called for labels that already passed the
+        association class check, so a track never drifts to an unrelated class.
+        """
+        name = str(cls_name)
+        if not self.cls_votes:
+            self.cls_votes[self.cls_name] = max(1e-6, float(self.score))
+        self.cls_votes[name] = self.cls_votes.get(name, 0.0) + max(1e-6, float(det_score))
+        self.cls_name = max(self.cls_votes.items(), key=lambda kv: kv[1])[0]
 
     def update(self, det_bbox: BBox, det_score: float, now_ts: float, alpha: float = 0.4, max_dt: float = 0.5) -> None:
         # Estimate velocity over the *actual* elapsed time, not the prediction
@@ -326,13 +389,14 @@ class Track:
         # clamped (smaller) dt used to inflate the velocity and fling the next
         # prediction across the frame. For steady FPS (elapsed <= max_dt) this is
         # identical to before. ``max_dt`` is kept for call-site compatibility.
-        elapsed = max(1e-3, now_ts - self.last_ts)         # true time since last observation
-        old = _xyxy_to_cxcyah(self.bbox)                   # previous state in cxcyah
-        new = _xyxy_to_cxcyah(det_bbox)                    # new detection in cxcyah
+        elapsed = max(1e-3, now_ts - self.last_ts)
+        old = _xyxy_to_cxcyah(self.bbox)
+        new = _xyxy_to_cxcyah(det_bbox)
+        # [vcx, vcy, vh] — no va, aspect is held constant by predict().
         new_vel = np.array([
-            (new[0] - old[0]) / elapsed,                   # vcx = Δcx / elapsed
-            (new[1] - old[1]) / elapsed,                   # vcy = Δcy / elapsed
-            (new[3] - old[3]) / elapsed,                   # vh  = Δh  / elapsed  (no va — aspect ignored)
+            (new[0] - old[0]) / elapsed,
+            (new[1] - old[1]) / elapsed,
+            (new[3] - old[3]) / elapsed,
         ], dtype=np.float32)
         self.vel = alpha * self.vel + (1.0 - alpha) * new_vel
         self.bbox = det_bbox
@@ -343,8 +407,9 @@ class Track:
         self.misses = 0
 
     def on_miss(self, decay: float = 0.9) -> None:
-        self.misses += 1                                   # count this missed frame
-        self.vel *= decay                                  # damp velocity — confidence in our extrapolation drops with each miss
+        self.misses += 1
+        # Damp velocity: confidence in the extrapolation drops with each miss.
+        self.vel *= decay
 
 
 class ByteTrackLite:
@@ -564,20 +629,20 @@ class ByteTrackLite:
                 self._dt_ema = gap
 
         self._purge(now_ts)
-        hi = [d for d in detections if float(d["conf"]) >= self.high_th]                 # high-conf dets
-        lo = [d for d in detections if self.low_th <= float(d["conf"]) < self.high_th]   # low-conf dets
+        hi = [d for d in detections if float(d["conf"]) >= self.high_th]
+        lo = [d for d in detections if self.low_th <= float(d["conf"]) < self.high_th]
 
         events: List[Tuple[str, int]] = []
         # Extrapolate/update up to ~predict_horizon_frames of motion (bounded by
         # the observed interval) rather than a fixed sub-second window.
         max_track_dt = max(0.15, self._frame_interval() * self.predict_horizon_frames)
-        pred = [t.predict(now_ts, max_track_dt) for t in self._tracks]                   # predicted bbox per track
+        pred = [t.predict(now_ts, max_track_dt) for t in self._tracks]
 
-        # split tracks: confirmed get priority access to high-conf detections
+        # Confirmed tracks get priority access to high-conf detections.
         confirmed_idxs = [i for i, t in enumerate(self._tracks) if t.confirmed]
         tentative_idxs = [i for i, t in enumerate(self._tracks) if not t.confirmed]
-        matched_track_idxs: set = set()                                                  # tracks that got a det this frame
-        live_track_ids: set[int] = set()                                                  # track IDs updated/created this frame
+        matched_track_idxs: set = set()
+        live_track_ids: set[int] = set()
 
         # Enable the center-distance fallback only once the stream is slow enough
         # that IoU alone is unreliable. Below this interval (fast streams) the
@@ -604,7 +669,8 @@ class ByteTrackLite:
                 return []
             track_idxs = list(track_idxs)
             det_idxs = list(det_idxs)
-            # 1e6 = "impossible pair" — much safer than 1.0 because Hungarian won't pick it as locally optimal
+            # 1e6 = "impossible pair" — safer than 1.0, which Hungarian could
+            # still pick as a locally optimal assignment.
             cost = np.full((len(track_idxs), len(det_idxs)), 1e6, dtype=np.float32)
             for ii, ti in enumerate(track_idxs):
                 t = self._tracks[ti]
@@ -618,11 +684,13 @@ class ByteTrackLite:
                 gap_s = max(0.0, now_ts - t.last_update_ts)
                 for jj, dj in enumerate(det_idxs):
                     d = det_list[dj]
-                    if self.match_same_class and t.cls_name != d["cls_name"]:
-                        continue                                                          # leave at 1e6 → effectively forbidden
+                    if self.match_same_class and not _same_object_class(
+                        t.cls_name, d["cls_name"]
+                    ):
+                        continue                                                          # leave at 1e6 → forbidden
                     iou = _iou(pb, d["bbox"])
                     if iou >= min_iou:
-                        cost[ii, jj] = 1.0 - iou                                          # standard 1 - IoU cost (preferred)
+                        cost[ii, jj] = 1.0 - iou
                         continue
                     if not use_dist:
                         continue                                                          # pure-IoU regime: reject
@@ -637,7 +705,7 @@ class ByteTrackLite:
                     if ph <= 0.0 or dh <= 0.0:
                         continue
                     ratio = dh / ph
-                    if ratio < 0.5 or ratio > 2.0:                                        # reject very different scales
+                    if ratio < 0.5 or ratio > 2.0:                                        # very different scales
                         continue
                     # Gate grows with the time the object had to move, capped at
                     # assoc_dist_max_scale * size. Size alone is not enough: the
@@ -660,29 +728,30 @@ class ByteTrackLite:
                         cost[ii, jj] = 1.0 + 0.5 * (dist / gate)
             matches = []
             for ii, jj in _assign(cost):
-                if cost[ii, jj] >= _ACCEPT:                                               # forbidden or out-of-gate → reject
+                if cost[ii, jj] >= _ACCEPT:                                               # forbidden or out-of-gate
                     continue
-                matches.append((track_idxs[ii], det_idxs[jj]))                            # remap to original indices
+                matches.append((track_idxs[ii], det_idxs[jj]))
             return matches
 
-        unmatched_hi = set(range(len(hi)))                                                # all high-conf dets up for grabs
+        unmatched_hi = set(range(len(hi)))
 
         # ─── Stage 1a: confirmed tracks ↔ high-conf detections (priority pass) ───
         for ti, dj in _match(confirmed_idxs, unmatched_hi, hi, self.min_iou_high):
             matched_track_idxs.add(ti)
-            unmatched_hi.discard(dj)                                                      # this det is taken
+            unmatched_hi.discard(dj)
+            self._tracks[ti].vote_class(hi[dj]["cls_name"], float(hi[dj]["conf"]))
             self._tracks[ti].update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts, max_dt=max_track_dt)
             live_track_ids.add(self._tracks[ti].track_id)
-            # no confirmation event needed — track was already confirmed
 
         # ─── Stage 1b: tentative tracks ↔ remaining high-conf detections ───
         for ti, dj in _match(tentative_idxs, unmatched_hi, hi, self.min_iou_high):
             matched_track_idxs.add(ti)
             unmatched_hi.discard(dj)
             t = self._tracks[ti]
+            t.vote_class(hi[dj]["cls_name"], float(hi[dj]["conf"]))
             t.update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts, max_dt=max_track_dt)
             live_track_ids.add(t.track_id)
-            if self._should_confirm(t, now_ts):                                           # graduate to confirmed
+            if self._should_confirm(t, now_ts):
                 t.confirmed = True
                 events.append(("track_confirmed", t.track_id))
 
@@ -694,6 +763,7 @@ class ByteTrackLite:
             unmatched_lo.discard(dj)
             t = self._tracks[ti]
             was_confirmed = t.confirmed
+            t.vote_class(lo[dj]["cls_name"], float(lo[dj]["conf"]))
             t.update(lo[dj]["bbox"], float(lo[dj]["conf"]), now_ts, max_dt=max_track_dt)
             live_track_ids.add(t.track_id)
             if (not was_confirmed) and self._should_confirm(t, now_ts):
@@ -703,9 +773,9 @@ class ByteTrackLite:
         # ─── Tracks that got nothing this frame: bump misses, decay velocity ───
         for ti in range(len(self._tracks)):
             if ti not in matched_track_idxs:
-                self._tracks[ti].on_miss()                                                # misses++ AND vel *= 0.9
+                self._tracks[ti].on_miss()
 
-        # ─── New tracks from leftover high-conf dets (unchanged behavior) ───
+        # ─── New tracks from leftover high-conf dets ───
         for dj in sorted(unmatched_hi):
             d = hi[dj]
             tid = self._next_id
@@ -906,12 +976,11 @@ class ROIAlertEngine:
     Also avoids repeat notifications per (camera_uuid, roi_id, track_id).
     """
     def __init__(self) -> None:
-        self._notified: Dict[Tuple[str, str, int], bool] = {}
-        self._in_roi: Dict[Tuple[str, str, int], bool] = {}
         self._in_roi: Dict[Tuple[str, str, int], bool] = {}
         self._inside_streak: Dict[Tuple[str, str, int], int] = {}
         self._outside_streak: Dict[Tuple[str, str, int], int] = {}
-        
+
+
     def process(
         self,
         camera_uuid: str,
@@ -982,22 +1051,6 @@ class ROIAlertEngine:
 
         return alerts
 
-    def cleanup_dead_tracks(self, camera_uuid: str, active_track_ids) -> None:
-        """
-        Manual cleanup hook. Only needed if you filter `tracks` upstream of
-        process() (e.g. drop low-confidence tracks before passing them in),
-        because process()'s auto-cleanup uses whatever it received as the
-        source of truth for 'alive'.
-        """
-        cam = str(camera_uuid)
-        active = {int(i) for i in active_track_ids}
-        self._in_roi = {k: v for k, v in self._in_roi.items()
-                        if k[0] != cam or k[2] in active}
-        self._inside_streak = {k: v for k, v in self._inside_streak.items()
-                               if k[0] != cam or k[2] in active}
-        self._outside_streak = {k: v for k, v in self._outside_streak.items()
-                                if k[0] != cam or k[2] in active}
-
     def reset_camera(self, camera_uuid: str) -> None:
         """Wipe all ROI state for a camera (use on stream restart / reconfig)."""
         cam = str(camera_uuid)
@@ -1011,15 +1064,6 @@ class MultiCameraByteTrack:
     def __init__(self, **tracker_kwargs: Any) -> None:
         self._trackers: Dict[str, ByteTrackLite] = {}
         self._kwargs = tracker_kwargs
-
-    def update(self, camera_uuid: str, detections: List[Dict[str, Any]], ts_ms: int) -> Dict[str, Any]:
-        cam = str(camera_uuid)
-        ts_s = float(ts_ms) / 1000.0
-        
-        if cam not in self._trackers:
-            self._trackers[cam] = ByteTrackLite(**self._kwargs)
-            
-        return self._trackers[cam].update(detections, ts_s=ts_s)
 
     def update_from_event(self, ev: Dict[str, Any]) -> Dict[str, Any]:
         cam = str(ev["camera_uuid"])

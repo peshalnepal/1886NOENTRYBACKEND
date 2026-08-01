@@ -36,6 +36,7 @@ from application.services.common import (
     SiteArmStateResolver,
     SiteTriggerModeResolver,
 )
+from application.services.overlay_normalize import _append_overlay_detection
 
 
 logger = logging.getLogger(__name__)
@@ -62,15 +63,9 @@ class ObjDetectResponse:
     model_id: Optional[str] = None
     image_url: Optional[str] = None
 
-    # NEW: tracking + alert scaffolding
     tracks: Tuple[Dict[str, Any], ...] = ()
     track_events: Tuple[Tuple[str, int], ...] = ()
     alerts: Tuple[Dict[str, Any], ...] = ()
-
-
-from application.services.overlay_normalize import (
-    _append_overlay_detection,
-)
 
 
 def _humanize_roi_alert(cls_name: Any, ctx: CameraContext) -> Tuple[str, str]:
@@ -300,9 +295,6 @@ class DetectionHub:
                     pass
 
 
-# -------------------------
-# ModelPipeline (registry + pollers)
-# -------------------------
 class ModelPipeline:
     """
     Azure runtime registry + Jetson detection polling.
@@ -317,7 +309,7 @@ class ModelPipeline:
         channels: Optional[List[VideoChannel]] = None,
         *,
         detect_store: Optional[ObjDetectStorePort] = None,
-        notification_service: Optional[NotificationService] = None,  # NEW
+        notification_service: Optional[NotificationService] = None,
         tracker_cfg: Optional[dict] = None,
         interesting_classes: Optional[Set[str]] = None,
         notify_on_confirmed: bool = False,
@@ -458,22 +450,21 @@ class ModelPipeline:
         prev_ts, prev_seq = self._last_seen.get(key, (0, -1))
         cur_ts, cur_seq = int(resp.frame_ts_ms), int(resp.frame_seq)
 
-        # normal monotonic case
         if cur_ts > prev_ts:
             return True
         if cur_ts == prev_ts and cur_seq > prev_seq:
             return True
 
-        # exact duplicate frame (same ts and seq): not new, and not a restart.
+        # Exact duplicate frame: not new, and not a restart.
         if cur_ts == prev_ts and cur_seq == prev_seq:
             return False
 
-        # stale/backward frame but no actual regression (older seq with newer ts is handled above)
         regressed = (cur_ts < prev_ts) or (cur_ts == prev_ts and cur_seq < prev_seq)
         if not regressed:
             return False
 
-        # regression case: if we had a gap (disconnect), assume Jetson restarted -> accept & reset
+        # Regressed after a gap (disconnect): assume the Jetson restarted, so
+        # accept the frame and re-anchor rather than stalling forever.
         last_ok = self._last_ok_s.get(key, 0.0)
         if (time.monotonic() - last_ok) > 5.0:
             logger.warning(
@@ -612,7 +603,7 @@ class ModelPipeline:
     async def remove_channel(self, camera_uuid: str) -> bool:
         key = str(camera_uuid)
         async with self._lock:
-            ch = self._channels.pop(key, None)
+            self._channels.pop(key, None)
             t = self._poll_tasks.pop(key, None)
             self._last_seq.pop(key, None)
             self._last_seen.pop(key, None)
@@ -627,7 +618,6 @@ class ModelPipeline:
         self._tracker.remove_camera(key)
         self._roi_engine.reset_camera(key)
         self._roi_cache.pop(key, None)
-
 
         if t and not t.done():
             t.cancel()
@@ -675,7 +665,7 @@ class ModelPipeline:
         now = time.monotonic()
         self._last_seen[key] = (int(resp.frame_ts_ms), int(resp.frame_seq))
         self._last_ok_s[key] = now
-        self._last_seq[key] = int(resp.frame_seq)  # optional compat
+        self._last_seq[key] = int(resp.frame_seq)
 
         await self.detect_store.put(resp)
         return resp
@@ -834,15 +824,9 @@ class ModelPipeline:
             cam_uuid = str(resp2.camera_uuid)
             _cam_cfg = getattr(ch, "config", None)
 
-            # Compute the base overlay payload exactly once for the recorder.
-            # The per-alert notification emitters still build their own overlays
-            # because each one appends a different alert/track-specific detection
-            # on top of the base.
-            base_overlay: Optional[Dict[str, Any]] = None
-
             _cam_playback_override = str(getattr(_cam_cfg, "camera_playback_enabled", "inherit") or "inherit")
             _do_playback = (
-                _cam_playback_override == "always" or _cam_playback_override == "inherit"
+                _cam_playback_override in ("always", "inherit")
             ) and self.is_channel_enable(ch)
             if _do_playback:
                 try:
@@ -1053,27 +1037,22 @@ class ModelPipeline:
     def _reserve_detection_summary_alert(self, camera_uuid: str, cls_names: List[str]) -> bool:
         """
         Check if detection alert should be emitted using per-class cooldown.
-        Uses (camera_uuid, cls_name) tuple instead of just camera_uuid.
-        This allows different object classes to bypass each other's cooldown.
+
+        Keyed on (camera_uuid, cls_name) rather than camera_uuid alone, so a
+        newly-appearing class is not silenced by another class's cooldown.
         """
         cam = str(camera_uuid)
         cooldown_s = float(self._detection_summary_cooldown_s or 0.0)
         now = time.monotonic()
-        
-        # Check each class independently
+
         for cls_name in cls_names:
-            key = (cam, str(cls_name))  # (camera_uuid, class_name) tuple
+            key = (cam, str(cls_name))
             last = self._last_detection_summary_s.get(key, 0.0)
-            
             if cooldown_s > 0.0 and (now - last) < cooldown_s:
-                # This class was seen recently, skip it
                 continue
-            
-            # Class is not in cooldown, update and allow alert
             self._last_detection_summary_s[key] = now
             return True
-        
-        # All classes are in cooldown
+
         return False
 
     def _image_bytes_to_data_url(self, payload: bytes, content_type: Optional[str]) -> Optional[str]:
@@ -1423,10 +1402,8 @@ class ModelPipeline:
             )
             return None
 
-        cam = expected_cam
-
         return ObjDetectResponse(
-            camera_uuid=cam,
+            camera_uuid=expected_cam,
             frame_ts_ms=int(frame_ts_ms),
             frame_seq=int(frame_seq),
             event_type=str(event_type) if event_type is not None else None,

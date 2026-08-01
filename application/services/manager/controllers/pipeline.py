@@ -111,7 +111,7 @@ class PipelineController:
                     if len(devices) == 0:
                         site_devices = await self._state.device_repo.list_devices(
                             db, site_uuid=cam.site_uuid, user_id=uid
-                        )      
+                        )
                         repair_device = None
                         if site_devices:
                             enabled_devices = [d for d in site_devices if getattr(d, "is_enabled", True)]
