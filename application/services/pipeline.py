@@ -752,6 +752,7 @@ class ModelPipeline:
 
         tracker_payload = dict(payload or {})
         tracker_payload["camera_uuid"] = str(resp.camera_uuid)
+        tracker_payload["detections"] = list(resp.detections)
         tracker_out = self._tracker.update_from_event(tracker_payload)
         tracks = tuple(tracker_out.get("tracks", []) or [])
         track_events = tuple(tracker_out.get("events", []) or [])
