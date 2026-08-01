@@ -21,16 +21,21 @@ from sqlalchemy import select
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jetson-app")
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
 
 app = Flask(__name__)
-DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "5.0"))
+DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "10.0"))
 # Pre-resize to 640x480 before inference — cuts per-frame memory from ~6MB (1080p)
 # to ~700KB, critical for Jetson Nano (2-3GB RAM) with multiple cameras.
 # Set to 0 to disable (only if you have plenty of RAM).
 DEFAULT_RESIZE_W = int(os.getenv("DEFAULT_RESIZE_W", "640"))
 DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "480"))
 DEFAULT_JPEG_QUALITY = int(os.getenv("DEFAULT_JPEG_QUALITY", "70"))
-MAX_SAMPLE_FPS = float(os.getenv("MAX_SAMPLE_FPS", "25.0"))
+MAX_SAMPLE_FPS = float(os.getenv("MAX_SAMPLE_FPS", "12.0"))
 # -----------------------------
 # Pipeline runtime (async loop in background thread)
 # -----------------------------
@@ -102,8 +107,6 @@ class PipelineRuntime(object):
             self.loop = loop
             self.pipeline = pipeline
             self._ready.set()
-
-            #logger.info("Pipeline started in background thread.")
             loop.run_forever()
 
         except Exception as e:

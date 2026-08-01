@@ -263,7 +263,14 @@ set_env_var DEFAULT_SAMPLE_FPS 6
 set_env_var MAX_SAMPLE_FPS 8
 set_env_var DEFAULT_RESIZE_W 640
 set_env_var DEFAULT_RESIZE_H 480
-set_env_var EMIT_EMPTY_DETECTIONS false
+# Keep true even on this bandwidth-limited board: the cloud tracker ages tracks
+# by frame arrival, so withholding empty frames makes a departing object look
+# like a stalled stream and its box lingers/blinks. At 6 fps x 2-4 cameras the
+# extra SSE traffic is small.
+set_env_var EMIT_EMPTY_DETECTIONS true
+# Must stay <= the cloud tracker's low_th so its low-confidence rescue band is
+# not empty (see Backend/application/services/tracker.py).
+set_env_var CONF 0.20
 set_env_var PORT "${PORT}"
 ok ".env configured for a 4 GB board (batch=1, 1 worker, 6 fps/cam @ 2-4 cameras)"
 

@@ -44,14 +44,18 @@ APP_DIR="$(cd "${HERE}/.." && pwd)"      # the tensort/ folder
 cd "$APP_DIR"
 [ -f main.py ] || die "main.py not found in ${APP_DIR} — is the deployment/ folder inside tensort/?"
 
-MODEL="${MODEL:-yolo26n}"
+# yolo26s is the default: more accurate than yolo26n and still within the Orin
+# Nano's budget for ~10 cameras. Roll back with `MODEL=yolo26n ./setup_orin.sh`.
+MODEL="${MODEL:-yolo26s}"
 VENV="${VENV:-.venv_trt}"
 MAX_BATCH="${MAX_BATCH:-10}"
-OPT_BATCH="${OPT_BATCH:-6}"
+# Steady-state batches are full now that frames pool while the GPU is busy, so
+# optimize the engine's tactics for the batch size it will actually see.
+OPT_BATCH="${OPT_BATCH:-10}"
 IMG_SZ="${IMG_SZ:-640}"
 PORT="${PORT:-8080}"
 SERVICE_NAME="${SERVICE_NAME:-jetson-cameras}"
-WORKSPACE_MB="${WORKSPACE_MB:-2048}"
+WORKSPACE_MB="${WORKSPACE_MB:-3072}"
 ONNX="models/${MODEL}.onnx"
 ENGINE="models/${MODEL}.engine"
 RUN_USER="${SUDO_USER:-$(id -un)}"
