@@ -210,14 +210,7 @@ async def _delete_clip_records(
     return total_deleted
 
 
-def _coerce_positive_int(value: Any) -> Optional[int]:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
-
-
+from core.coercions import coerce_positive_int as _coerce_positive_int
 from application.services.overlay_normalize import (
     _append_overlay_detection,
 )

@@ -15,7 +15,9 @@ import numpy as np
 from pydantic import BaseModel
 
 from domain.events import DetectionsProducedEvent
+from core.coercions import coerce_positive_int as _coerce_positive_int
 from application.services.overlay_normalize import (
+    normalize_overlay_frame as _normalize_overlay_frame,
     _append_overlay_detection,
 )
 
@@ -36,66 +38,6 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
-
-
-def _coerce_positive_int(value: Any) -> Optional[int]:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed <= 0:
-        return None
-    return parsed
-
-
-def _normalize_overlay_frame(
-    *,
-    camera_uuid: Optional[str],
-    frame_ts_ms: Any,
-    frame_seq: Any,
-    frame_w: Any,
-    frame_h: Any,
-    detections: Any,
-) -> Optional[Dict[str, Any]]:
-    try:
-        ts_ms = int(frame_ts_ms)
-    except (TypeError, ValueError):
-        return None
-    try:
-        seq = int(frame_seq)
-    except (TypeError, ValueError):
-        return None
-
-    normalized_detections: List[Dict[str, Any]] = []
-    seen_exact: set[Tuple[Any, ...]] = set()
-    tracked_bases: set[Tuple[Any, ...]] = set()
-    untracked_indexes: Dict[Tuple[Any, ...], int] = {}
-    for raw_detection in list(detections or []):
-        _append_overlay_detection(
-            normalized_detections,
-            raw_detection,
-            seen_exact=seen_exact,
-            tracked_bases=tracked_bases,
-            untracked_indexes=untracked_indexes,
-        )
-
-    if not normalized_detections:
-        return None
-
-    frame: Dict[str, Any] = {
-        "frame_ts_ms": int(ts_ms),
-        "frame_seq": int(seq),
-        "detections": normalized_detections,
-    }
-    if camera_uuid:
-        frame["camera_uuid"] = str(camera_uuid)
-    normalized_w = _coerce_positive_int(frame_w)
-    normalized_h = _coerce_positive_int(frame_h)
-    if normalized_w is not None:
-        frame["frame_w"] = normalized_w
-    if normalized_h is not None:
-        frame["frame_h"] = normalized_h
-    return frame
 
 
 def _merge_overlay_frames(*sources: Any) -> List[Dict[str, Any]]:

@@ -12,6 +12,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobSasPermissions, ContentSettings, generate_blob_sas
 from azure.storage.blob.aio import BlobServiceClient
 
+from application.services.storage_common import parse_connection_string as _parse_connection_string
 from core.env import env_int
 
 _DATA_URL_RE = re.compile(
@@ -27,15 +28,6 @@ _IMAGE_MIME_EXTENSIONS = {
 
 # Payload sub-dicts that may carry the image reference, in priority order.
 _IMAGE_PAYLOAD_SECTIONS = ("extra", "msg")
-
-
-def _parse_connection_string(raw: str) -> Dict[str, str]:
-    parts: Dict[str, str] = {}
-    for item in str(raw or "").split(";"):
-        if "=" in item:
-            key, value = item.split("=", 1)
-            parts[key.strip().lower()] = value.strip()
-    return parts
 
 
 def extract_image_storage_key(payload: Any) -> str:

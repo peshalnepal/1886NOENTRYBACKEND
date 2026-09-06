@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.coercions import coerce_positive_int
+
 
 # --------------------------------- access ----------------------------------
 
@@ -167,3 +169,64 @@ def _append_overlay_detection(
         detections.append(normalized)
     tracked_bases.add(base_key)
     seen_exact.add(exact_key)
+
+def normalize_overlay_frame(
+    *,
+    camera_uuid: Optional[str],
+    frame_ts_ms: Any,
+    frame_seq: Any,
+    frame_w: Any,
+    frame_h: Any,
+    detections: Any,
+) -> Optional[Dict[str, Any]]:
+    """Build one overlay frame, or None if it carries no usable detections."""
+    try:
+        ts_ms = int(frame_ts_ms)
+        seq = int(frame_seq)
+    except (TypeError, ValueError):
+        return None
+
+    normalized_detections: List[Dict[str, Any]] = []
+    seen_exact: set[Tuple[Any, ...]] = set()
+    tracked_bases: set[Tuple[Any, ...]] = set()
+    untracked_indexes: Dict[Tuple[Any, ...], int] = {}
+    for raw_detection in list(detections or []):
+        _append_overlay_detection(
+            normalized_detections,
+            raw_detection,
+            seen_exact=seen_exact,
+            tracked_bases=tracked_bases,
+            untracked_indexes=untracked_indexes,
+        )
+
+    if not normalized_detections:
+        return None
+
+    frame: Dict[str, Any] = {
+        "frame_ts_ms": ts_ms,
+        "frame_seq": seq,
+        "detections": normalized_detections,
+    }
+    if camera_uuid:
+        frame["camera_uuid"] = str(camera_uuid)
+    for key, value in (("frame_w", frame_w), ("frame_h", frame_h)):
+        normalized = coerce_positive_int(value)
+        if normalized is not None:
+            frame[key] = normalized
+    return frame
+
+
+def normalize_overlay_frame_dict(
+    raw_frame: Any, *, default_camera_uuid: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Dict-shaped adapter over `normalize_overlay_frame`."""
+    if not isinstance(raw_frame, dict):
+        return None
+    return normalize_overlay_frame(
+        camera_uuid=str(raw_frame.get("camera_uuid") or default_camera_uuid or "").strip(),
+        frame_ts_ms=raw_frame.get("frame_ts_ms"),
+        frame_seq=raw_frame.get("frame_seq"),
+        frame_w=raw_frame.get("frame_w"),
+        frame_h=raw_frame.get("frame_h"),
+        detections=raw_frame.get("detections"),
+    )

@@ -16,23 +16,18 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.notification_repository import CameraContext
-from application.services.overlay_normalize import _append_overlay_detection
+from application.services.overlay_normalize import (
+    _append_overlay_detection,
+    normalize_overlay_frame_dict as _normalize_overlay_frame,
+)
+from application.services.storage_common import parse_connection_string as _parse_connection_string
+from core.coercions import coerce_positive_int as _coerce_positive_int
 from core.database_orm import VideoRecord
 from core.env import env_float, env_int
 
 logger = logging.getLogger(__name__)
 
 SessionFactory = Callable[[], AsyncSession]
-
-
-def _parse_connection_string(raw: str) -> Dict[str, str]:
-    parts: Dict[str, str] = {}
-    for item in str(raw or "").split(";"):
-        if "=" not in item:
-            continue
-        key, value = item.split("=", 1)
-        parts[key.strip().lower()] = value.strip()
-    return parts
 
 
 def _parse_ts(raw: Any) -> Optional[datetime]:
@@ -62,62 +57,6 @@ def _truncate_message(raw: Any, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: max(0, limit - 3)]}..."
-
-
-def _coerce_positive_int(value: Any) -> Optional[int]:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed <= 0:
-        return None
-    return parsed
-
-
-def _normalize_overlay_frame(raw_frame: Any, *, default_camera_uuid: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    if not isinstance(raw_frame, dict):
-        return None
-
-    try:
-        frame_ts_ms = int(raw_frame.get("frame_ts_ms"))
-    except (TypeError, ValueError):
-        return None
-    try:
-        frame_seq = int(raw_frame.get("frame_seq"))
-    except (TypeError, ValueError):
-        return None
-
-    detections: List[Dict[str, Any]] = []
-    seen_exact: set[Tuple[Any, ...]] = set()
-    tracked_bases: set[Tuple[Any, ...]] = set()
-    untracked_indexes: Dict[Tuple[Any, ...], int] = {}
-    for raw_detection in list(raw_frame.get("detections") or []):
-        _append_overlay_detection(
-            detections,
-            raw_detection,
-            seen_exact=seen_exact,
-            tracked_bases=tracked_bases,
-            untracked_indexes=untracked_indexes,
-        )
-
-    if not detections:
-        return None
-
-    frame: Dict[str, Any] = {
-        "frame_ts_ms": int(frame_ts_ms),
-        "frame_seq": int(frame_seq),
-        "detections": detections,
-    }
-    camera_uuid = str(raw_frame.get("camera_uuid") or default_camera_uuid or "").strip()
-    if camera_uuid:
-        frame["camera_uuid"] = camera_uuid
-    frame_w = _coerce_positive_int(raw_frame.get("frame_w"))
-    frame_h = _coerce_positive_int(raw_frame.get("frame_h"))
-    if frame_w is not None:
-        frame["frame_w"] = frame_w
-    if frame_h is not None:
-        frame["frame_h"] = frame_h
-    return frame
 
 
 def _normalize_overlay_payload(
