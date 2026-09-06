@@ -23,7 +23,6 @@ from dependencies import (
     OrgContext,
 )
 from core.security.roles import Permission
-from core.database_orm import User
 
 
 def _email_owner_id(site, ctx: OrgContext) -> int:
@@ -39,17 +38,12 @@ site_repo = SiteRepository()
 
 
 def _get_notification_service(request: Request):
+    """The notification service if the app has one, else None (never raises)."""
     svc = getattr(request.app.state, "notification_service", None)
     if svc is not None:
         return svc
-
     manager = getattr(request.app.state, "manager", None)
-    if manager is not None:
-        svc = getattr(manager, "_notification_service", None)
-        if svc is not None:
-            return svc
-
-    return None
+    return getattr(manager, "notification_service", None) if manager else None
 
 
 def _invalidate_notification_email_cache(
@@ -223,26 +217,25 @@ async def delete_notification_email(
 
     email_user_id = email.user_id
     email_email = email.email
-    email_site_uuid = email.site_uuid
 
     if all_sites:
         # Scope by the caller's org sites, not by `user_id`: the stored user is
         # only an audit trail (and may be NULL), and matching on it would both
         # miss rows other admins added and reach into other tenants.
-        org_site_uuids = await site_repo.list_site_uuids(db, org_id=ctx.org_id)
-        for target_site_uuid in org_site_uuids:
+        affected_site_uuids = await site_repo.list_site_uuids(db, org_id=ctx.org_id)
+        for target_site_uuid in affected_site_uuids:
             await notif_repo.delete_notification_email(
                 db, site_uuid=target_site_uuid, email=email_email
             )
     else:
+        affected_site_uuids = [email.site_uuid]
         await notif_repo.delete_notification_email(db, email_id=email_id)
 
     await db.commit()
     if request is not None:
-        # Clear per affected site: the cache is site-keyed now, so a single
-        # user-keyed sweep would miss the other members' entries.
-        affected = org_site_uuids if all_sites else [email_site_uuid]
-        for target_site_uuid in affected:
+        # Clear per affected site: the cache is site-keyed, so a single
+        # user-keyed sweep would miss other members' entries.
+        for target_site_uuid in affected_site_uuids:
             _invalidate_notification_email_cache(
                 request, user_id=email_user_id, site_uuid=target_site_uuid
             )

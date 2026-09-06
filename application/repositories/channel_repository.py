@@ -9,8 +9,8 @@ rows belong to SiteRepository.
 Transaction policy: never commits, only flushes. Caller owns the transaction.
 """
 
-import uuid
 import logging
+import uuid
 from datetime import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -53,17 +53,55 @@ SUNDAY_TO_SATURDAY = [6, 0, 1, 2, 3, 4, 5]
 DEFAULT_START_TIME = time(0, 0, 0)
 DEFAULT_END_TIME = time(23, 59, 59)
 
+TRIGGER_MODES = ("inherit", "roi_enter", "any_detection")
+PLAYBACK_MODES = ("inherit", "always", "never")
+
+
+def _coerce_trigger_mode(raw: Any) -> str:
+    """Normalize a per-camera notification trigger to a valid tri-state."""
+    value = str(raw).strip() if isinstance(raw, str) else ("" if raw is None else str(raw))
+    return value if value in TRIGGER_MODES else "inherit"
+
+
+def _coerce_playback_mode(raw: Any) -> str:
+    """Normalize a per-camera playback override to a valid tri-state.
+
+    Legacy rows stored a bool here, so True/False still map to always/never.
+    """
+    if raw is True:
+        return "always"
+    if raw is False:
+        return "never"
+    value = str(raw).strip() if raw is not None else ""
+    return value if value in PLAYBACK_MODES else "inherit"
+
 
 class ChannelRepository:
-    """
-    Camera + ChannelConfiguration + PipelineCamera-membership consistency.
+    """Camera + ChannelConfiguration + pipeline-membership consistency.
 
-    Each camera MUST have exactly 1 device assigned.
+    Every camera must have exactly one device assigned.
     """
 
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
+    @staticmethod
+    def _with_relations(stmt, *, include_config: bool, include_device: bool):
+        """Eager-load the optional camera relations (never lazy under async)."""
+        opts = []
+        if include_config:
+            opts.append(selectinload(Camera.channel_configuration))
+        if include_device:
+            opts.append(selectinload(Camera.device))
+        return stmt.options(*opts) if opts else stmt
+
+    @staticmethod
+    def _tristate_filter(stmt, column, wanted: Optional[bool]):
+        """Filter on a nullable boolean column, or not at all when `wanted` is None."""
+        if wanted is None:
+            return stmt
+        return stmt.where(column.is_(bool(wanted)))
+
     async def get_camera(
         self,
         db: AsyncSession,
@@ -73,14 +111,11 @@ class ChannelRepository:
         include_device: bool = False,
     ) -> Optional[Camera]:
         """Return a single Camera by uuid, optionally eager-loading relations."""
-        stmt = select(Camera).where(Camera.camera_uuid == _as_uuid(camera_uuid))
-        opts = []
-        if include_config:
-            opts.append(selectinload(Camera.channel_configuration))
-        if include_device:
-            opts.append(selectinload(Camera.device))
-        if opts:
-            stmt = stmt.options(*opts)
+        stmt = self._with_relations(
+            select(Camera).where(Camera.camera_uuid == _as_uuid(camera_uuid)),
+            include_config=include_config,
+            include_device=include_device,
+        )
         return (await db.execute(stmt)).scalar_one_or_none()
 
     async def get_camera_full(
@@ -124,13 +159,11 @@ class ChannelRepository:
         include_device: bool = False,
         order_by_created: bool = True,
     ) -> List[Camera]:
-        """
-        Return cameras matching any combination of the given filters.
+        """Cameras matching any combination of the given filters.
 
-        only_enabled / only_detection_enabled:
-          - None  -> no filter
-          - True  -> column is True
-          - False -> column is False
+        `only_enabled` / `only_detection_enabled` are tri-state: None means no
+        filter, True/False match the column. An explicitly empty uuid list
+        matches nothing and short-circuits to `[]`.
         """
         stmt = select(Camera)
 
@@ -139,58 +172,40 @@ class ChannelRepository:
                 PipelineCamera, PipelineCamera.camera_uuid == Camera.camera_uuid
             ).where(PipelineCamera.pipeline_id == _as_uuid(pipeline_id))
 
-        if camera_uuids is not None:
-            clean = [_as_uuid(c) for c in (camera_uuids or []) if c is not None]
+        # Each "in" filter: an empty list is a deliberate "match nothing".
+        for values, column in (
+            (camera_uuids, Camera.camera_uuid),
+            (site_uuids, Camera.site_uuid),
+            (device_uuids, Camera.device_uuid),
+        ):
+            if values is None:
+                continue
+            clean = [_as_uuid(v) for v in values if v is not None]
             if not clean:
                 return []
-            stmt = stmt.where(Camera.camera_uuid.in_(clean))
+            stmt = stmt.where(column.in_(clean))
 
         if user_id is not None:
             stmt = stmt.where(Camera.user_id == int(user_id))
-
         if org_id is not None:
             stmt = stmt.where(Camera.org_id == int(org_id))
-
-        if site_uuids is not None:
-            clean_sites = [_as_uuid(s) for s in (site_uuids or []) if s is not None]
-            if not clean_sites:
-                return []
-            stmt = stmt.where(Camera.site_uuid.in_(clean_sites))
-
         if site_uuid is not None:
             stmt = stmt.where(Camera.site_uuid == _as_uuid(site_uuid))
-
         if device_uuid is not None:
             stmt = stmt.where(Camera.device_uuid == _as_uuid(device_uuid))
 
-        if device_uuids is not None:
-            clean_d = [_as_uuid(d) for d in device_uuids if d is not None]
-            if not clean_d:
-                return []
-            stmt = stmt.where(Camera.device_uuid.in_(clean_d))
-
-        if only_enabled is True:
-            stmt = stmt.where(Camera.is_enabled.is_(True))
-        elif only_enabled is False:
-            stmt = stmt.where(Camera.is_enabled.is_(False))
-
-        if only_detection_enabled is True:
-            stmt = stmt.where(Camera.is_detection_enabled.is_(True))
-        elif only_detection_enabled is False:
-            stmt = stmt.where(Camera.is_detection_enabled.is_(False))
-
-        opts = []
-        if include_config:
-            opts.append(selectinload(Camera.channel_configuration))
-        if include_device:
-            opts.append(selectinload(Camera.device))
-        if opts:
-            stmt = stmt.options(*opts)
+        stmt = self._tristate_filter(stmt, Camera.is_enabled, only_enabled)
+        stmt = self._tristate_filter(
+            stmt, Camera.is_detection_enabled, only_detection_enabled
+        )
+        stmt = self._with_relations(
+            stmt, include_config=include_config, include_device=include_device
+        )
 
         if order_by_created:
             stmt = stmt.order_by(Camera.created_at.asc())
 
-        return (await db.execute(stmt)).scalars().all()
+        return list((await db.execute(stmt)).scalars().all())
 
     async def list_cameras_with_device_details(
         self,
@@ -217,11 +232,7 @@ class ChannelRepository:
             .where(*conds)
             .order_by(Camera.created_at.asc())
         )
-
-        if only_enabled is True:
-            stmt = stmt.where(Camera.is_enabled.is_(True))
-        elif only_enabled is False:
-            stmt = stmt.where(Camera.is_enabled.is_(False))
+        stmt = self._tristate_filter(stmt, Camera.is_enabled, only_enabled)
 
         rows = (await db.execute(stmt)).all()
 
@@ -373,91 +384,49 @@ class ChannelRepository:
         *,
         dto: CameraUpsertDTO,
     ) -> Tuple[Camera, Dict[str, Any], Optional[str]]:
+        """Create or update a Camera plus its ChannelConfiguration and pipeline
+        membership, from a `CameraUpsertDTO`.
+
+        Values come from the DTO first and fall back to the raw channel-config
+        blob, which is what the edit path merges its patch into.
         """
-        Create or update a Camera (+ ChannelConfiguration + pipeline membership)
-        from a `CameraUpsertDTO`.
-        """
-        # Unpack the DTO into the local names the body works with.
-        pipeline_id = dto.pipeline_id
-        channel_config = dto.channel_config
-        user_id = dto.user_id
-        cam_uuid = dto.cam_uuid
-        camera_code = dto.camera_code
-        site_uuid = dto.site_uuid
-        webrtc_url = dto.webrtc_url
-        source_url = dto.source_url
-        device_uuid = dto.device_uuid
-        name = dto.name
-        location = dto.location
-        timezone = dto.timezone
-        day_of_week = dto.day_of_week
-        start_time = dto.start_time
-        end_time = dto.end_time
-        is_enabled = dto.is_enabled
+        await self._ensure_pipeline_exists(db, dto.pipeline_id)
 
-        await self._ensure_pipeline_exists(db, pipeline_id)
+        d = self._to_dict(dto.channel_config)
 
-        d = self._to_dict(channel_config)
+        cam_uuid = self._optional_uuid(
+            dto.cam_uuid or d.get("camera_uuid") or d.get("camera_id")
+        )
+        device_uuid = self._optional_uuid(
+            dto.device_uuid if dto.device_uuid is not None else d.get("device_uuid")
+        )
 
-        raw_cam_uuid = cam_uuid or d.get("camera_uuid") or d.get("camera_id")
-        cam_uuid = None
-        if raw_cam_uuid:
-            cam_uuid = raw_cam_uuid if isinstance(raw_cam_uuid, uuid.UUID) else uuid.UUID(str(raw_cam_uuid))
-
-        if device_uuid is None:
-            device_uuid = d.get("device_uuid")
-        if device_uuid is not None:
-            device_uuid = device_uuid if isinstance(device_uuid, uuid.UUID) else uuid.UUID(str(device_uuid))
-
-        source_url = source_url or d.get("source_url")
-        if name is None:
-            name = d.get("name")
-        if location is None:
-            location = d.get("location")
-
-        if isinstance(name, str):
-            name = name.strip() or None
-        if isinstance(location, str):
-            location = location.strip() or None
-
-        enabled = d.get("enabled", d.get("is_enabled", True))
-        detection_enabled = d.get("detection_enabled", d.get("is_detection_enabled", True))
-        notification_enabled = d.get("notification_enabled", d.get("is_notification_enabled", True))
-        use_site_schedule = d.get("use_site_schedule", True)
-
-        has_roi = "roi" in d
-        roi = d.get("roi")
-
-        has_notification_trigger_mode = "notification_trigger_mode" in d
-        notification_trigger_mode_val = d.get("notification_trigger_mode")
-        if isinstance(notification_trigger_mode_val, str):
-            notification_trigger_mode_val = notification_trigger_mode_val.strip() or "inherit"
-        elif notification_trigger_mode_val is None:
-            notification_trigger_mode_val = "inherit"
-        else:
-            notification_trigger_mode_val = str(notification_trigger_mode_val)
-        if notification_trigger_mode_val not in ("inherit", "roi_enter", "any_detection"):
-            notification_trigger_mode_val = "inherit"
-
-        has_camera_playback_enabled = "camera_playback_enabled" in d
-        camera_playback_enabled_val = d.get("camera_playback_enabled")
-        if camera_playback_enabled_val is True:
-            camera_playback_enabled_val = "always"
-        elif camera_playback_enabled_val is False:
-            camera_playback_enabled_val = "never"
-        elif camera_playback_enabled_val is None:
-            camera_playback_enabled_val = "inherit"
-        else:
-            camera_playback_enabled_val = str(camera_playback_enabled_val).strip() or "inherit"
-        if camera_playback_enabled_val not in ("inherit", "always", "never"):
-            camera_playback_enabled_val = "inherit"
-
+        source_url = dto.source_url or d.get("source_url")
         if not source_url:
             raise ValueError("channel_config.source_url is required")
 
-        cam: Optional[Camera] = None
-        if cam_uuid:
-            cam = await self._get_camera_by_uuid(db, cam_uuid)
+        name = self._clean_str(dto.name if dto.name is not None else d.get("name"))
+        location = self._clean_str(
+            dto.location if dto.location is not None else d.get("location")
+        )
+
+        # The config blob may use either the runtime or the ORM field name.
+        enabled = d.get("enabled", d.get("is_enabled", True))
+        detection_enabled = d.get("detection_enabled", d.get("is_detection_enabled", True))
+        notification_enabled = d.get(
+            "notification_enabled", d.get("is_notification_enabled", True)
+        )
+        use_site_schedule = d.get("use_site_schedule", True)
+
+        # These three are patch-sensitive: only overwrite when the key is
+        # present, so an edit that omits them leaves the stored value alone.
+        has_roi = "roi" in d
+        has_trigger_mode = "notification_trigger_mode" in d
+        has_playback = "camera_playback_enabled" in d
+        trigger_mode = _coerce_trigger_mode(d.get("notification_trigger_mode"))
+        playback_mode = _coerce_playback_mode(d.get("camera_playback_enabled"))
+
+        cam = await self._get_camera_by_uuid(db, cam_uuid) if cam_uuid else None
 
         if cam:
             cam.source_url = source_url
@@ -467,97 +436,75 @@ class ChannelRepository:
             cam.use_site_schedule = bool(use_site_schedule)
 
             if has_roi:
-                cam.roi = roi
+                cam.roi = d.get("roi")
+            if has_trigger_mode:
+                cam.notification_trigger_mode = trigger_mode
+            if has_playback:
+                cam.camera_playback_enabled = playback_mode
 
-            if has_notification_trigger_mode:
-                cam.notification_trigger_mode = notification_trigger_mode_val
-            if has_camera_playback_enabled:
-                cam.camera_playback_enabled = camera_playback_enabled_val
-
-            if webrtc_url is not None:
+            if dto.webrtc_url is not None:
                 if cam.webrtc_url is None:
-                    cam.webrtc_url = webrtc_url
-                elif cam.webrtc_url != webrtc_url:
+                    cam.webrtc_url = dto.webrtc_url
+                elif cam.webrtc_url != dto.webrtc_url:
                     logger.warning(
                         "Ignoring webrtc_url change for camera=%s (immutable). old=%s new=%s",
-                        str(cam.camera_uuid),
+                        cam.camera_uuid,
                         cam.webrtc_url,
-                        webrtc_url,
+                        dto.webrtc_url,
                     )
 
-            if site_uuid is not None:
+            if dto.site_uuid is not None:
                 if cam.site_uuid is None:
-                    cam.site_uuid = site_uuid
-                elif cam.site_uuid != site_uuid:
-                    raise ValueError("Changing site_uuid for an existing camera is not supported")
+                    cam.site_uuid = dto.site_uuid
+                elif cam.site_uuid != dto.site_uuid:
+                    raise ValueError(
+                        "Changing site_uuid for an existing camera is not supported"
+                    )
 
-            if camera_code is not None:
-                cam.camera_code = camera_code
+            if dto.camera_code is not None:
+                cam.camera_code = dto.camera_code
             if name is not None:
                 cam.name = name
             if location is not None:
                 cam.location = location
 
             await db.flush()
-
-
         else:
-            if user_id is None:
-                raise ValueError("user_id is required to create a new camera")
-            if not camera_code:
-                raise ValueError("camera_code is required to create a new camera")
-            if site_uuid is None:
-                raise ValueError("site_uuid is required to create a new camera")
-            if device_uuid is None:
-                raise ValueError("device_uuid is required to create a new camera (each camera must have a device).")
-
-            site_org_id = await self._ensure_site_exists(db, site_uuid)
-            # Org ownership always follows the site the camera lives on.
-            cam_org_id = site_org_id if site_org_id is not None else dto.org_id
-            cam = Camera(
-                user_id=user_id,
-                created_by=dto.created_by if dto.created_by is not None else user_id,
-                org_id=cam_org_id,
-                site_uuid=site_uuid,
-                camera_code=camera_code,
+            cam = await self._create_camera(
+                db,
+                dto=dto,
+                cam_uuid=cam_uuid,
+                device_uuid=device_uuid,
                 source_url=source_url,
-                webrtc_url=webrtc_url,
                 name=name,
                 location=location,
-                is_enabled=bool(enabled),
-                is_detection_enabled=bool(detection_enabled),
-                is_notification_enabled=bool(notification_enabled),
-                use_site_schedule=bool(use_site_schedule),
-                roi=roi,
-                notification_trigger_mode=notification_trigger_mode_val if has_notification_trigger_mode else "inherit",
-                camera_playback_enabled=camera_playback_enabled_val if has_camera_playback_enabled else "inherit",
+                enabled=enabled,
+                detection_enabled=detection_enabled,
+                notification_enabled=notification_enabled,
+                use_site_schedule=use_site_schedule,
+                roi=d.get("roi"),
+                trigger_mode=trigger_mode if has_trigger_mode else "inherit",
+                playback_mode=playback_mode if has_playback else "inherit",
             )
-            if cam_uuid is not None:
-                cam.camera_uuid = cam_uuid
 
-            db.add(cam)
-            try:
-                await db.flush()
-            except IntegrityError as e:
-                raise ValueError(
-                    f"Camera already exists for user_id={user_id} camera_code={camera_code}"
-                ) from e
-                
         if device_uuid is not None:
-            await self.set_camera_device(db, camera_uuid=cam.camera_uuid, device_uuid=device_uuid)
-        else:
-            if cam.is_detection_enabled:
-                await self._ensure_camera_has_exactly_one_device(db, camera_uuid=cam.camera_uuid)
+            await self.set_camera_device(
+                db, camera_uuid=cam.camera_uuid, device_uuid=device_uuid
+            )
+        elif cam.is_detection_enabled:
+            await self._ensure_camera_has_exactly_one_device(
+                db, camera_uuid=cam.camera_uuid
+            )
 
         cfg_json = self._build_channel_configuration_json(d)
-        tz = d.get("timezone") or timezone
+        tz = d.get("timezone") or dto.timezone
 
         schedule = self._resolve_schedule(
             raw_schedule=d.get("schedule"),
-            day_of_week=day_of_week,
-            start_time=start_time,
-            end_time=end_time,
-            is_enabled=is_enabled,
+            day_of_week=dto.day_of_week,
+            start_time=dto.start_time,
+            end_time=dto.end_time,
+            is_enabled=dto.is_enabled,
         )
 
         cfg_json["schedule"] = schedule
@@ -578,13 +525,92 @@ class ChannelRepository:
             end_time=scalar_end,
         )
 
-        await self._set_pipeline_membership(db, camera_uuid=cam.camera_uuid, pipeline_id=pipeline_id)
+        await self._set_pipeline_membership(
+            db, camera_uuid=cam.camera_uuid, pipeline_id=dto.pipeline_id
+        )
 
         return cam, cfg_json, tz
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _optional_uuid(value: Any) -> Optional[uuid.UUID]:
+        if not value:
+            return None
+        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+    @staticmethod
+    def _clean_str(value: Any) -> Optional[str]:
+        """Trim a string, mapping blank to None; non-strings pass through."""
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    async def _create_camera(
+        self,
+        db: AsyncSession,
+        *,
+        dto: CameraUpsertDTO,
+        cam_uuid: Optional[uuid.UUID],
+        device_uuid: Optional[uuid.UUID],
+        source_url: str,
+        name: Optional[str],
+        location: Optional[str],
+        enabled: Any,
+        detection_enabled: Any,
+        notification_enabled: Any,
+        use_site_schedule: Any,
+        roi: Any,
+        trigger_mode: str,
+        playback_mode: str,
+    ) -> Camera:
+        """Insert a brand-new Camera row. Flush only; the caller commits."""
+        if dto.user_id is None:
+            raise ValueError("user_id is required to create a new camera")
+        if not dto.camera_code:
+            raise ValueError("camera_code is required to create a new camera")
+        if dto.site_uuid is None:
+            raise ValueError("site_uuid is required to create a new camera")
+        if device_uuid is None:
+            raise ValueError(
+                "device_uuid is required to create a new camera "
+                "(each camera must have a device)."
+            )
+
+        site_org_id = await self._ensure_site_exists(db, dto.site_uuid)
+        cam = Camera(
+            user_id=dto.user_id,
+            created_by=dto.created_by if dto.created_by is not None else dto.user_id,
+            # Org ownership always follows the site the camera lives on.
+            org_id=site_org_id if site_org_id is not None else dto.org_id,
+            site_uuid=dto.site_uuid,
+            camera_code=dto.camera_code,
+            source_url=source_url,
+            webrtc_url=dto.webrtc_url,
+            name=name,
+            location=location,
+            is_enabled=bool(enabled),
+            is_detection_enabled=bool(detection_enabled),
+            is_notification_enabled=bool(notification_enabled),
+            use_site_schedule=bool(use_site_schedule),
+            roi=roi,
+            notification_trigger_mode=trigger_mode,
+            camera_playback_enabled=playback_mode,
+        )
+        if cam_uuid is not None:
+            cam.camera_uuid = cam_uuid
+
+        db.add(cam)
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            raise ValueError(
+                f"Camera already exists for user_id={dto.user_id} "
+                f"camera_code={dto.camera_code}"
+            ) from exc
+        return cam
+
     async def _ensure_camera_has_exactly_one_device(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> None:
         assigned = (
             await db.execute(
@@ -742,27 +768,32 @@ class ChannelRepository:
         return sorted(schedule, key=lambda x: order_index.get(int(x["day_of_week"]), 999))
 
     def _scalar_schedule_window(self, schedule: List[Dict[str, Any]]) -> Tuple[int, time, time]:
+        """Pick one representative (day, start, end) for the legacy scalar columns.
+
+        Those columns carry a CHECK(start < end), so an all-overnight schedule
+        has no window that fits directly — the fallbacks below clamp one to the
+        day boundary rather than violate the constraint.
+        """
         for window in schedule or []:
-            day = int(window["day_of_week"])
-            start_time = self._coerce_time(window.get("start_time"), DEFAULT_START_TIME)
-            end_time = self._coerce_time(window.get("end_time"), DEFAULT_END_TIME)
-            if start_time < end_time:
-                return day, start_time, end_time
+            start = self._coerce_time(window.get("start_time"), DEFAULT_START_TIME)
+            end = self._coerce_time(window.get("end_time"), DEFAULT_END_TIME)
+            if start < end:
+                return int(window["day_of_week"]), start, end
 
         if not schedule:
             return 6, DEFAULT_START_TIME, DEFAULT_END_TIME
 
-        first_window = schedule[0]
-        day = int(first_window["day_of_week"])
-        start_time = self._coerce_time(first_window.get("start_time"), DEFAULT_START_TIME)
-        end_time = self._coerce_time(first_window.get("end_time"), DEFAULT_END_TIME)
+        first = schedule[0]
+        day = int(first["day_of_week"])
+        start = self._coerce_time(first.get("start_time"), DEFAULT_START_TIME)
+        end = self._coerce_time(first.get("end_time"), DEFAULT_END_TIME)
 
-        if start_time < DEFAULT_END_TIME:
-            return day, start_time, DEFAULT_END_TIME
-
-        if end_time > DEFAULT_START_TIME:
-            return (day + 1) % 7, DEFAULT_START_TIME, end_time
-
+        # Overnight window: keep the evening half on this day, else roll the
+        # morning half onto the next day.
+        if start < DEFAULT_END_TIME:
+            return day, start, DEFAULT_END_TIME
+        if end > DEFAULT_START_TIME:
+            return (day + 1) % 7, DEFAULT_START_TIME, end
         return day, DEFAULT_START_TIME, DEFAULT_END_TIME
 
     def _coerce_time(self, value: Any, default: time) -> time:

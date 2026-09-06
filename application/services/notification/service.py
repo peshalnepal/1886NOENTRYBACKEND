@@ -1,7 +1,5 @@
-"""Composed NotificationService class.
-
-This is the top-level delivery facade. It replaces the old mixin-based God Object.
-"""
+"""The `NotificationService` facade: one delivery surface over the flusher,
+clip manager and deleter."""
 
 from __future__ import annotations
 
@@ -105,17 +103,17 @@ class NotificationService:
         self._started = False
         await self.flusher.shutdown()
         await self.deleter.shutdown()
-        
-        if self._clip_service is not None:
+
+        for service, label in (
+            (self._clip_service, "Event clip service"),
+            (self._image_service, "Alert image service"),
+        ):
+            if service is None:
+                continue
             try:
-                await self._clip_service.close()
+                await service.close()
             except Exception:
-                logger.exception("Event clip service shutdown failed")
-        if self._image_service is not None:
-            try:
-                await self._image_service.close()
-            except Exception:
-                logger.exception("Alert image service shutdown failed")
+                logger.exception("%s shutdown failed", label)
 
     # --- Facade API for ModelPipeline and Routes ---
     
@@ -147,6 +145,29 @@ class NotificationService:
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
+    async def _load_notification_payloads(
+        self, *, notification_ids: List[int], site_uuids: List[uuid.UUID]
+    ) -> List[Any]:
+        """Fetch the given notifications, scoped to the caller's sites."""
+        if not notification_ids or self._session_factory is None:
+            return []
+        async with self._session_factory() as db:
+            rows = await self._repo.list_notifications(
+                db, ids=[int(i) for i in notification_ids], site_uuids=site_uuids or None
+            )
+        return [getattr(row, "payload", None) for row in rows]
+
+    @staticmethod
+    async def _delete_blobs(service, keys: List[str], *, label: str) -> None:
+        """Best-effort blob deletion: one failure must not stop the rest."""
+        if service is None:
+            return
+        for key in dict.fromkeys(k for k in keys if k):
+            try:
+                await service.delete_blob(blob_name=key)
+            except Exception:
+                logger.warning("Failed deleting %s blob %s", label, key, exc_info=True)
+
     async def set_clips_approval_for_notifications(
         self, *, notification_ids: List[int], site_uuids: List[uuid.UUID], approved: bool
     ) -> int:
@@ -158,69 +179,45 @@ class NotificationService:
         """
         from application.services.clip_storage import extract_notification_clip_external_ids
 
-        if not notification_ids or self._session_factory is None:
-            return 0
-
-        async with self._session_factory() as db:
-            rows = await self._repo.list_notifications(
-                db, ids=[int(i) for i in notification_ids], site_uuids=site_uuids or None
+        payloads = await self._load_notification_payloads(
+            notification_ids=notification_ids, site_uuids=site_uuids
+        )
+        external_ids = list(
+            dict.fromkeys(
+                ext
+                for payload in payloads
+                for ext in extract_notification_clip_external_ids(payload)
             )
-
-        external_ids: List[str] = []
-        for row in rows:
-            external_ids.extend(
-                extract_notification_clip_external_ids(getattr(row, "payload", None))
-            )
-        external_ids = list(dict.fromkeys(external_ids))
+        )
         if not external_ids:
             return 0
 
-        return await self.clip_manager.set_clips_approval(external_ids=external_ids, approved=approved)
+        return await self.clip_manager.set_clips_approval(
+            external_ids=external_ids, approved=approved
+        )
 
     async def purge_alert_media_for_notifications(
         self, *, notification_ids: List[int], site_uuids: List[uuid.UUID]
     ) -> None:
-        """Delete the image + clip blobs linked to alerts (operator rejection).
+        """Delete the image and clip blobs behind rejected alerts.
 
-        Reuses the same payload-driven media extraction/deletion the retention
-        service uses for expired alerts: the image and clip storage keys are
-        pulled straight from each notification payload and the blobs deleted via
-        the existing ``delete_blob`` services. The (now hidden) notification and
-        its VideoRecord rows are left in place and reaped later by retention.
+        Storage keys are pulled from each notification payload — the same
+        payload-driven extraction the retention service uses for expired alerts.
+        The (now hidden) notification and VideoRecord rows stay put and are
+        reaped later by retention.
         """
-        from application.services.clip_storage import extract_notification_clip_storage_keys
         from application.services.alert_image_storage import extract_image_storage_key
+        from application.services.clip_storage import extract_notification_clip_storage_keys
 
-        if not notification_ids or self._session_factory is None:
-            return
+        payloads = await self._load_notification_payloads(
+            notification_ids=notification_ids, site_uuids=site_uuids
+        )
 
-        async with self._session_factory() as db:
-            rows = await self._repo.list_notifications(
-                db, ids=[int(i) for i in notification_ids], site_uuids=site_uuids or None
-            )
+        image_keys = [key for p in payloads if (key := extract_image_storage_key(p))]
+        clip_keys = [k for p in payloads for k in extract_notification_clip_storage_keys(p)]
 
-        image_keys: List[str] = []
-        clip_keys: List[str] = []
-        for row in rows:
-            payload = getattr(row, "payload", None)
-            key = extract_image_storage_key(payload)
-            if key:
-                image_keys.append(key)
-            clip_keys.extend(extract_notification_clip_storage_keys(payload))
-
-        if self._image_service is not None:
-            for key in dict.fromkeys(image_keys):
-                try:
-                    await self._image_service.delete_blob(blob_name=key)
-                except Exception:
-                    logger.warning("Failed deleting rejected alert image blob %s", key, exc_info=True)
-
-        if self._clip_service is not None:
-            for key in dict.fromkeys(clip_keys):
-                try:
-                    await self._clip_service.delete_blob(blob_name=key)
-                except Exception:
-                    logger.warning("Failed deleting rejected alert clip blob %s", key, exc_info=True)
+        await self._delete_blobs(self._image_service, image_keys, label="rejected alert image")
+        await self._delete_blobs(self._clip_service, clip_keys, label="rejected alert clip")
 
     async def record_detection_overlay_frame(self, *, camera_uuid: str, frame_ts_ms: Any, frame_seq: Any, frame_w: Any = None, frame_h: Any = None, detections: Any = None) -> None:
         await self.clip_manager.record_detection_overlay_frame(

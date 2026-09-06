@@ -17,7 +17,6 @@ from application.dtos import OrganizationCreateDTO, OrgMembershipUpsertDTO
 from application.repositories.organization_repository import OrganizationRepository
 from application.repositories.verify_repository import (
     PURPOSE_PASSWORD_RESET,
-    PURPOSE_SIGNUP,
     EmailVerificationRepository,
 )
 from core.database_orm import SignupTempData, User,EmailVerification, utc_now

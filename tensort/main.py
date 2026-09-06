@@ -1,19 +1,16 @@
 # main.py  (Python 3.6)
 import asyncio
-import concurrent.futures
 import logging
 import threading
-import uuid
 import os
 from typing import Any, Dict
 
-from flask import Flask, request, jsonify, Response, stream_with_context
-import json
+from flask import Flask
 
 from channels.channel_config import VideoChannelConfig
-from database import db_manager, AsyncSessionLocal
-from database_orm import CameraConfig
-from sqlalchemy import select
+from repositories import CameraRepository
+from routes import register_routes
+from service import DiscoveryService
 
 # IMPORTANT:
 # Do NOT import trt_infer / simple_model_pipeline at top-level if they import PyCUDA/TensorRT.
@@ -29,41 +26,34 @@ except ImportError:
 
 app = Flask(__name__)
 DEFAULT_SAMPLE_FPS = float(os.getenv("DEFAULT_SAMPLE_FPS", "10.0"))
-# Pre-resize to 640x480 before inference — cuts per-frame memory from ~6MB (1080p)
-# to ~700KB, critical for Jetson Nano (2-3GB RAM) with multiple cameras.
-# Set to 0 to disable (only if you have plenty of RAM).
 DEFAULT_RESIZE_W = int(os.getenv("DEFAULT_RESIZE_W", "640"))
 DEFAULT_RESIZE_H = int(os.getenv("DEFAULT_RESIZE_H", "480"))
-DEFAULT_JPEG_QUALITY = int(os.getenv("DEFAULT_JPEG_QUALITY", "70"))
 MAX_SAMPLE_FPS = float(os.getenv("MAX_SAMPLE_FPS", "12.0"))
 # -----------------------------
 # Pipeline runtime (async loop in background thread)
 # -----------------------------
 class PipelineRuntime(object):
-    def __init__(self):
+    def __init__(self, repository=None):
         self.loop = None
         self.pipeline = None
         self._ready = threading.Event()
         self._lock = threading.Lock()
+        self._cameras = {}
+        self._repo = repository or CameraRepository()
+        self.discovery = None
 
-        # store configs (for PATCH, list, etc.)
-        self._cameras = {}  # camera_uuid -> dict(config)
-        
         # Initialize database tables
-        #logger.info("Initializing SQLite database...")
-        if not db_manager.initialize_tables():
+        if not self._repo.initialize_tables():
             logger.error("Failed to initialize database tables")
 
         t = threading.Thread(target=self._run_loop, name="pipeline-loop", daemon=True)
         t.start()
 
-        # wait for pipeline to be ready
         if not self._ready.wait(30.0):
             raise RuntimeError("Pipeline thread did not start within timeout.")
         
         # Restore cameras from database after pipeline is ready
         self._restore_cameras_from_db()
-
 
     def _normalize_camera_cfg(self, cfg_data: Dict[str, Any]) -> Dict[str, Any]:
         cfg_data = dict(cfg_data or {})
@@ -74,32 +64,18 @@ class PipelineRuntime(object):
             sample_fps = DEFAULT_SAMPLE_FPS
 
         cfg_data["sample_fps"] = max(0.1, min(sample_fps, MAX_SAMPLE_FPS))
-
-        # Pre-resize reduces per-frame memory (~6MB → ~700KB for 1080p) which is
-        # critical on Jetson Nano with multiple cameras. TRT letterbox still handles
-        # the final 640x640 pad, but the bulk resize is already done.
         if DEFAULT_RESIZE_W > 0 and DEFAULT_RESIZE_H > 0:
             cfg_data["resize"] = (DEFAULT_RESIZE_W, DEFAULT_RESIZE_H)
         else:
             cfg_data["resize"] = None
 
-        try:
-            jpeg_quality = int(cfg_data.get("jpeg_quality", DEFAULT_JPEG_QUALITY))
-        except Exception:
-            jpeg_quality = DEFAULT_JPEG_QUALITY
-        cfg_data["jpeg_quality"] = max(30, min(jpeg_quality, 95))
-
-        # force raw path for TRT inference
-        cfg_data["emit_format"] = "raw"
-
         return cfg_data
-    
+
     def _run_loop(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         try:
-            # Import heavy TRT modules here so CUDA/PyCUDA init happens in THIS thread
             from pipeline import SimpleInferencePipeline
 
             pipeline = SimpleInferencePipeline()   # NO build_default here
@@ -121,7 +97,6 @@ class PipelineRuntime(object):
     def _call(self, coro, timeout_s=10.0):
         if self.loop is None or self.pipeline is None:
             raise RuntimeError("Pipeline not ready")
-
         fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
         return fut.result(timeout=timeout_s)
 
@@ -132,71 +107,17 @@ class PipelineRuntime(object):
         return pipeline
 
     # ---------- database operations ----------
-    async def _save_camera_to_db_async(self, camera_uuid: str, cfg_data: Dict[str, Any]):
-        """
-        Save camera configuration to SQLite database (async).
-        """
-        try:
-            async with AsyncSessionLocal() as session:
-                # Check if camera already exists
-                result = await session.execute(
-                    select(CameraConfig).filter_by(camera_uuid=camera_uuid)
-                )
-                existing = result.scalar_one_or_none()
-                
-                if existing:
-                    # Update existing camera
-                    existing.source_url = cfg_data.get("source_url", existing.source_url)
-                    existing.config_json = cfg_data
-                    #logger.info(f"Updated camera {camera_uuid} in database")
-                else:
-                    # Create new camera
-                    cam_config = CameraConfig(
-                        channel_id=cfg_data.get("channel_id", camera_uuid),
-                        camera_uuid=camera_uuid,
-                        user_id=cfg_data.get("user_id", 1),  # Default user_id
-                        source_url=cfg_data["source_url"],
-                        config_json=cfg_data
-                    )
-                    session.add(cam_config)
-                    #logger.info(f"Saved new camera {camera_uuid} to database")
-                
-                await session.commit()
-        except Exception as e:
-            logger.exception(f"Failed to save camera {camera_uuid} to database: {e}")
-    
+    # Persistence lives in CameraRepository; these thin wrappers marshal the
+    # async repository calls onto the pipeline loop from the Flask thread.
     def _save_camera_to_db(self, camera_uuid: str, cfg_data: Dict[str, Any]):
-        """
-        Synchronous wrapper for async database save (runs in event loop).
-        """
-        self._call(self._save_camera_to_db_async(camera_uuid, cfg_data), timeout_s=5.0)
-    
-    async def _delete_camera_from_db_async(self, camera_uuid: str):
-        """
-        Delete camera configuration from SQLite database (async).
-        """
-        try:
-            async with AsyncSessionLocal() as session:
-                result = await session.execute(
-                    select(CameraConfig).filter_by(camera_uuid=camera_uuid)
-                )
-                camera = result.scalar_one_or_none()
-                if camera:
-                    await session.delete(camera)
-                    await session.commit()
-                    #logger.info(f"Deleted camera {camera_uuid} from database")
-        except Exception as e:
-            logger.exception(f"Failed to delete camera {camera_uuid} from database: {e}")
-    
+        self._call(self._repo.save(camera_uuid, cfg_data), timeout_s=5.0)
+
     def _delete_camera_from_db(self, camera_uuid: str):
-        """
-        Synchronous wrapper for async database delete.
-        """
-        self._call(self._delete_camera_from_db_async(camera_uuid), timeout_s=5.0)
-    
+        self._call(self._repo.delete(camera_uuid), timeout_s=5.0)
+
     def _restore_cameras_from_db(self):
         """
-        Restore all cameras from SQLite database on startup (sync version for init).
+        Restore all cameras from the database on startup.
         """
         try:
             pipeline = self._require_pipeline()
@@ -205,44 +126,37 @@ class PipelineRuntime(object):
             return
 
         try:
-            # Use sync session for startup (before async loop is running heavily)
-            session = db_manager.get_session()
-            try:
-                cameras = session.query(CameraConfig).all()
-                restored_count = 0
-                
-                for cam_config in cameras:
-                    try:
-                        cfg_data = dict(cam_config.config_json)
-                        camera_uuid = cam_config.camera_uuid
-                        
-                        # Ensure required fields are present
-                        cfg_data = self._normalize_camera_cfg(cfg_data)
-                        # Build config first — if this raises (bad stored JSON) we
-                        # must NOT add the camera to self._cameras, otherwise it
-                        # appears in list_cameras() as "on device" but has no active
-                        # pipeline channel (ghost camera that blocks future syncs).
-                        cfg = None
-                        if cfg_data.get("enabled", True):
-                            cfg = VideoChannelConfig(**cfg_data)
+            cameras = self._repo.list_all()
+            restored_count = 0
 
-                        # Only register in memory after config is validated
-                        with self._lock:
-                            self._cameras[camera_uuid] = cfg_data
+            for record in cameras:
+                camera_uuid = record["camera_uuid"]
+                try:
+                    cfg_data = record["config_json"]
 
-                        if cfg is not None:
-                            self._call(pipeline.add_channel(cfg), timeout_s=15.0)
-                            restored_count += 1
-                            #logger.info(f"Restored camera {camera_uuid} from database")
-                    except Exception as e:
-                        logger.exception(f"Failed to restore camera {cam_config.camera_uuid}: {e}")
-                
-                if restored_count > 0:
-                    logger.info(f"Successfully restored {restored_count} camera(s) from database")
-                else:
-                    logger.info("No cameras to restore from database")
-            finally:
-                session.close()
+                    cfg_data = self._normalize_camera_cfg(cfg_data)
+                    # Build config first — if this raises (bad stored JSON) we
+                    # must NOT add the camera to self._cameras, otherwise it
+                    # appears in list_cameras() as "on device" but has no active
+                    # pipeline channel (ghost camera that blocks future syncs).
+                    cfg = None
+                    if cfg_data.get("enabled", True):
+                        cfg = VideoChannelConfig(**cfg_data)
+
+                    # Only register in memory after config is validated
+                    with self._lock:
+                        self._cameras[camera_uuid] = cfg_data
+
+                    if cfg is not None:
+                        self._call(pipeline.add_channel(cfg), timeout_s=15.0)
+                        restored_count += 1
+                except Exception as e:
+                    logger.exception(f"Failed to restore camera {camera_uuid}: {e}")
+
+            if restored_count > 0:
+                logger.info(f"Successfully restored {restored_count} camera(s) from database")
+            else:
+                logger.info("No cameras to restore from database")
         except Exception as e:
             logger.exception(f"Failed to restore cameras from database: {e}")
 
@@ -250,12 +164,11 @@ class PipelineRuntime(object):
     def add_camera(self, source_url: str, cfg_patch: Dict[str, Any]) -> Dict[str, Any]:
         # Use camera_uuid from patch if provided (from Azure), otherwise generate new
         cam_id = cfg_patch.get("camera_uuid")
-        
+
         if not cam_id:
             raise ValueError("camera_uuid must be provided by backend (do not let Jetson generate IDs)")
         cam_id = str(cam_id)
-  
-        # defaults for Jetson inference
+
         cfg_data = {
             "camera_uuid": cam_id,
             "channel_id": cfg_patch.get("channel_id") or cam_id,
@@ -268,23 +181,19 @@ class PipelineRuntime(object):
             "resize": (DEFAULT_RESIZE_W, DEFAULT_RESIZE_H) if DEFAULT_RESIZE_W > 0 and DEFAULT_RESIZE_H > 0 else None,
             "reconnect_base_ms": 1000,
             "reconnect_max_ms": 8000,
-            "emit_format": "raw",
-            "jpeg_quality": DEFAULT_JPEG_QUALITY,
         }
-        
-        # apply patch from request
+
         for k, v in (cfg_patch or {}).items():
             if v is not None:
                 cfg_data[k] = v
-                
+
         cfg_data = self._normalize_camera_cfg(cfg_data)
 
         cfg = VideoChannelConfig(**cfg_data)  # your simple config class should accept these
 
-        # store config in memory
         with self._lock:
             self._cameras[cam_id] = dict(cfg_data)
-        
+
         # persist to database
         self._save_camera_to_db(cam_id, cfg_data)
 
@@ -297,14 +206,13 @@ class PipelineRuntime(object):
             "source_url": source_url,
             "config": self._cameras[cam_id],
         }
-        
+
     def remove_camera(self, camera_uuid: str) -> bool:
         with self._lock:
             existed = camera_uuid in self._cameras
             if existed:
                 del self._cameras[camera_uuid]
 
-        # stop runtime FIRST (prevents “still inferencing after delete” window)
         if existed:
             pipeline = self._require_pipeline()
             self._call(pipeline.remove_channel(camera_uuid), timeout_s=10.0)
@@ -312,7 +220,6 @@ class PipelineRuntime(object):
         # then delete from database
         self._delete_camera_from_db(camera_uuid)
         return existed
-
 
     def list_cameras(self):
         with self._lock:
@@ -343,304 +250,47 @@ class PipelineRuntime(object):
 
         return {"camera_uuid": camera_uuid, "config": cfg_data}
 
+    # The peek_* reads are plain dict lookups, so they run directly on the Flask
+    # thread instead of being marshalled onto the pipeline loop.
     def get_latest(self, camera_uuid: str) -> Dict[str, Any]:
-        pipeline = self._require_pipeline()
-        peek_latest = getattr(pipeline, "peek_latest", None)
-        if callable(peek_latest):
-            return peek_latest(camera_uuid)
-        return self._call(pipeline.get_latest(camera_uuid), timeout_s=5.0)
+        return self._require_pipeline().peek_latest(camera_uuid)
 
     def get_snapshot(self, camera_uuid: str):
-        pipeline = self._require_pipeline()
-        peek_latest_snapshot = getattr(pipeline, "peek_latest_snapshot", None)
-        if callable(peek_latest_snapshot):
-            return peek_latest_snapshot(camera_uuid)
-        return self._call(pipeline.get_latest_snapshot(camera_uuid), timeout_s=5.0)
+        return self._require_pipeline().peek_latest_snapshot(camera_uuid)
 
     def get_stats(self) -> Dict[str, Any]:
-        if self.loop is None or self.pipeline is None:
+        if self.pipeline is None:
             return {}
         try:
-            peek_stats = getattr(self.pipeline, "peek_stats", None)
-            if callable(peek_stats):
-                return peek_stats()
-            return self._call(self.pipeline.get_stats(), timeout_s=2.0)
+            return self.pipeline.peek_stats()
         except Exception:
             logger.exception("Failed to fetch pipeline stats")
             return {}
 
+    # ---------- discovery ----------
+    def start_discovery(self) -> None:
+        """Start the scheduled Hikvision discovery sweep.
+
+        Called after __init__ so the DB restore has already repopulated
+        self._cameras — otherwise the first sweep would see restored cameras
+        as unknown and could double-provision them.
+        """
+        try:
+            service = DiscoveryService(self)
+            self.discovery = service
+            service.start()
+        except Exception:
+            logger.exception("Failed to start camera discovery service")
+            self.discovery = None
+
 
 runtime = PipelineRuntime()
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def _json():
-    data = request.get_json(silent=True)
-    return data if isinstance(data, dict) else {}
-
-
-# Camera source schemes accepted by the edge. RTSP is decoded by the GStreamer
-# pipeline; the others fall back to OpenCV's generic capture (see VideoChannel).
-_ACCEPTED_SOURCE_SCHEMES = (
-    "rtsp://", "rtsps://",
-    "webrtc://", "whep://", "wheps://",
-    "http://", "https://",
-    "rtmp://", "rtmps://",
-    "srt://",
-)
-
-
-def _require_source(url: str):
-    if not url or not isinstance(url, str):
-        return False
-    lowered = url.strip().lower()
-    return any(lowered.startswith(scheme) for scheme in _ACCEPTED_SOURCE_SCHEMES)
-
-
-def _runtime_status(*, include_stats: bool) -> Dict[str, Any]:
-    payload = {
-        "ok": True,
-        "service": "jetson-tensort",
-        "pipeline_ready": bool(runtime.pipeline is not None and runtime.loop is not None),
-    }
-    if include_stats:
-        payload["stats"] = runtime.get_stats()
-    return payload
-
+runtime.start_discovery()
 
 # -----------------------------
-# Routes
+# Routes (blueprints in routes/)
 # -----------------------------
-@app.route("/", methods=["GET"])
-@app.route("/api", methods=["GET"])
-def root():
-    # Keep the root probe lightweight so reverse proxies and health checks can
-    # confirm the process is alive without waiting on pipeline stats collection.
-    return jsonify(_runtime_status(include_stats=False))
-
-
-@app.route("/health", methods=["GET"])
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify(_runtime_status(include_stats=True))
-
-
-@app.route("/cameras", methods=["GET"])
-@app.route("/api/cameras", methods=["GET"])
-def list_cameras():
-    return jsonify({"cameras": runtime.list_cameras()})
-
-@app.route("/cameras", methods=["POST"])
-@app.route("/api/cameras", methods=["POST"])
-def add_camera():
-    body = _json()
-    source_url = body.get("source_url")
-    cfg = body.get("config")
-    if not isinstance(cfg, dict):
-        cfg = {}
-    else:
-        cfg = dict(cfg)
-
-    for k, v in body.items():
-        if k in {"config", "source_url"}:
-            continue
-        if k not in cfg and v is not None:
-            cfg[k] = v
-
-    if not source_url:
-        source_url = cfg.get("source_url")
-
-    if not _require_source(source_url):
-        return jsonify({
-            "error": "source_url is required using a supported scheme: "
-                     "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
-        }), 400
-
-    if "camera_uuid" not in cfg and body.get("camera_uuid"):
-        cfg["camera_uuid"] = body.get("camera_uuid")
-
-    if "channel_id" not in cfg and body.get("channel_id"):
-        cfg["channel_id"] = body.get("channel_id")
-
-    if cfg.get("emit_format") not in ("jpeg", "raw"):
-        cfg["emit_format"] = "raw"
-
-    try:
-        out = runtime.add_camera(source_url, cfg)
-        return jsonify(out), 201
-    except Exception as e:
-        logger.exception("add_camera failed: %s", e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/cameras/<camera_uuid>", methods=["DELETE"])
-@app.route("/api/cameras/<camera_uuid>", methods=["DELETE"])
-def delete_camera(camera_uuid):
-    try:
-        existed = runtime.remove_camera(camera_uuid)
-        return jsonify({"deleted": True, "camera_uuid": camera_uuid, "existed": existed})
-    except Exception as e:
-        logger.exception("delete_camera failed: %s", e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/cameras/<camera_uuid>", methods=["PATCH"])
-@app.route("/api/cameras/<camera_uuid>", methods=["PATCH"])
-def patch_camera(camera_uuid):
-    body = _json()
-    patch = body.get("config") or body  # allow either {"config": {...}} or direct patch
-    if not isinstance(patch, dict) or not patch:
-        return jsonify({"error": "No fields to update"}), 400
-
-    try:
-        out = runtime.patch_camera(camera_uuid, patch)
-        return jsonify(out)
-    except KeyError:
-        return jsonify({"error": "Camera not found"}), 404
-    except Exception as e:
-        logger.exception("patch_camera failed: %s", e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/cameras/<camera_uuid>/latest", methods=["GET"])
-@app.route("/api/cameras/<camera_uuid>/latest", methods=["GET"])
-def latest(camera_uuid):
-    try:
-        result = runtime.get_latest(camera_uuid)
-        if result is None:
-            return jsonify({"error": "No detections yet"}), 404
-        return jsonify(result)
-    except Exception as e:
-        logger.exception("latest failed: %s", e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/cameras/<camera_uuid>/snapshot.jpg", methods=["GET"])
-@app.route("/api/cameras/<camera_uuid>/snapshot.jpg", methods=["GET"])
-def snapshot(camera_uuid):
-    try:
-        result = runtime.get_snapshot(camera_uuid)
-        if not result:
-            return jsonify({"error": "No snapshot available yet"}), 404
-
-        resp = Response(result, mimetype="image/jpeg")
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
-    except Exception as e:
-        logger.exception("snapshot failed: %s", e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/detection/<camera_uuid>", methods=["GET"])
-@app.route("/detections/<camera_uuid>", methods=["GET"])
-@app.route("/api/detection/<camera_uuid>", methods=["GET"])
-@app.route("/api/detections/<camera_uuid>", methods=["GET"])
-def detection(camera_uuid):
-    """
-    Alternative endpoint for Azure backend compatibility.
-    Returns same data as /cameras/<camera_uuid>/latest
-    """
-    try:
-        result = runtime.get_latest(camera_uuid)
-        if result is None:
-            return jsonify({"error": "No detections yet"}), 404
-        return jsonify(result)
-    except Exception as e:
-        logger.exception("detection failed: %s", e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/cameras/detections/stream", methods=["GET"])
-@app.route("/api/cameras/detections/stream", methods=["GET"])
-def stream_all_detections():
-    """
-    SSE endpoint for all detections.
-    """
-    return Response(stream_with_context(_sse_generator()), mimetype="text/event-stream")
-
-
-@app.route("/cameras/<camera_uuid>/detections/stream", methods=["GET"])
-@app.route("/api/cameras/<camera_uuid>/detections/stream", methods=["GET"])
-def stream_camera_detections(camera_uuid):
-    """
-    SSE endpoint for specific camera detections.
-    """
-    return Response(stream_with_context(_sse_generator(camera_uuid)), mimetype="text/event-stream")
-
-
-def _sse_generator(target_camera_uuid=None):
-    if runtime.pipeline is None:
-        return
-
-    # Subscribe
-    q = None
-    q_future = asyncio.run_coroutine_threadsafe(
-        runtime.pipeline.broadcaster.subscribe(target_camera_uuid),
-        runtime.loop
-    )
-    try:
-        q = q_future.result(timeout=5.0)
-    except Exception:
-        return
-
-    try:
-        while True:
-            fut = asyncio.run_coroutine_threadsafe(q.get(), runtime.loop)
-            try:
-                msg = fut.result(timeout=1.0) # Check every second to allow disconnect check
-            except concurrent.futures.TimeoutError:
-                if fut.done():
-                    try:
-                        msg = fut.result()
-                    except Exception:
-                        msg = None
-                    else:
-                        if isinstance(msg, dict):
-                            data_str = json.dumps(msg)
-                            yield f"data: {data_str}\n\n"
-                            continue
-
-                cancelled = fut.cancel()
-                if (not cancelled) and fut.done():
-                    try:
-                        msg = fut.result()
-                    except Exception:
-                        msg = None
-                    else:
-                        if isinstance(msg, dict):
-                            data_str = json.dumps(msg)
-                            yield f"data: {data_str}\n\n"
-                            continue
-
-                yield ": keepalive\n\n"
-                continue
-            except Exception as e:
-                logger.error(f"SSE stream error while waiting for detection: {e}")
-                break
-
-            if not isinstance(msg, dict):
-                continue
-
-            # Yield SSE
-            data_str = json.dumps(msg)
-            yield f"data: {data_str}\n\n"
-
-    except GeneratorExit:
-        # Client disconnected
-        return
-    except Exception as e:
-        logger.error(f"SSE stream error: {e}")
-    finally:
-        if q is not None and runtime.pipeline is not None and runtime.loop is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    runtime.pipeline.broadcaster.unsubscribe(q),
-                    runtime.loop
-                ).result(timeout=1.0)
-            except Exception:
-                pass
+register_routes(app, runtime)
 
 
 if __name__ == "__main__":

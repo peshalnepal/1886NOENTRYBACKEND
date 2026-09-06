@@ -8,9 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Set, Union
-
-from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Any, Awaitable, Dict, List, Optional, Set, Union
 
 from application.services.edgeinference import EdgeCameraInventoryError
 from application.repositories.device_repository import normalize_device_url
@@ -20,6 +18,7 @@ from application.services.manager.helpers import (
     _only_jetson_config,
 )
 from application.services.manager.types import EdgeDeviceUnavailableError
+from application.repositories._helpers import require_uuid
 from application.services.manager.controllers._state import ManagerState
 from application.services.manager.controllers.schedule import ScheduleResolver
 
@@ -27,19 +26,20 @@ logger = logging.getLogger(__name__)
 
 
 class DeviceReconciler:
-    def __init__(self, state: ManagerState, schedule_resolver: ScheduleResolver):
+    def __init__(
+        self,
+        state: ManagerState,
+        schedule_resolver: ScheduleResolver,
+        adopter: Optional[Any] = None,
+    ):
         self._state = state
         self._schedule_resolver = schedule_resolver
+        # Optional so existing constructions (and tests) that build a
+        # reconciler without adoption keep working; adoption is simply skipped.
+        self._adopter = adopter
 
-    def _as_uuid(self, v: Any, name: str) -> uuid.UUID:
-        if isinstance(v, uuid.UUID):
-            return v
-        try:
-            return uuid.UUID(str(v))
-        except Exception as e:
-            raise ValueError(f"Invalid {name}: {v}") from e
 
-    async def _call_with_timeout(self, coro: asyncio.coroutine, timeout_s: Optional[float] = None) -> Any:
+    async def _call_with_timeout(self, coro: Awaitable[Any], timeout_s: Optional[float] = None) -> Any:
         timeout = timeout_s or self._state.external_timeout_s
         try:
             return await asyncio.wait_for(coro, timeout=timeout)
@@ -68,7 +68,7 @@ class DeviceReconciler:
         async with self._state.session_factory() as db:
             for raw_device_uuid in device_uuids or []:
                 try:
-                    device_uuid = self._as_uuid(raw_device_uuid, "device_uuid")
+                    device_uuid = require_uuid(raw_device_uuid, "device_uuid")
                 except Exception:
                     logger.warning("Skipping invalid device UUID during best-effort reconcile: %r", raw_device_uuid)
                     continue
@@ -126,7 +126,7 @@ class DeviceReconciler:
         user_id: Optional[int] = None,
         dry_run: bool = False,
         delete_unknown: bool = True,
-    ) -> Dict[str, List[str]]:
+    ) -> Dict[str, Any]:
         """
         Wrapper around reconcile_device_edge_simple with exponential backoff retry.
         """
@@ -162,6 +162,56 @@ class DeviceReconciler:
                     )
         raise last_exception or RuntimeError("Device reconcile failed")
 
+    async def _recompute_desired(
+        self, *, device_uuids: List[uuid.UUID]
+    ) -> tuple[List[Any], Set[str], Set[str]]:
+        """Read the cameras for these devices and build the desired sets.
+
+        Returns (cams, desired_set, active_streams) — the single definition of
+        what this device *should* be running. Called once up front, and again
+        after adoption creates rows mid-reconcile so the newly-adopted cameras
+        go through the same detection + schedule gate as every other camera
+        instead of being special-cased into the diff.
+
+        Detection is provisioned on the edge only when the camera is
+        detection-enabled AND the site is currently armed. "Armed" is the
+        schedule's active state, optionally overridden by a temporary site
+        arm/disarm that clears at the next schedule boundary. A disarmed /
+        off-schedule site has its cameras torn down, so the Jetson actually
+        stops detecting.
+
+        Playback paths (`active_streams`) stay provisioned for enabled cameras
+        regardless of alert schedule state, so live view remains stable.
+        """
+        site_schedule_cache: Dict[str, Dict[str, Any]] = {}
+        desired: Set[str] = set()
+        streams: Set[str] = set()
+
+        async with self._state.session_factory() as db:
+            cams = await self._state.channel_repo.list_cameras(
+                db, device_uuids=device_uuids, include_config=True,
+            )
+            for cam in cams:
+                cfg = (
+                    cam.channel_configuration.configuration or {}
+                    if getattr(cam, "channel_configuration", None)
+                    and getattr(cam.channel_configuration, "configuration", None)
+                    else {}
+                )
+                schedule_state = await self._schedule_resolver.resolve_runtime_schedule(
+                    db,
+                    cam=cam,
+                    cfg_json=cfg,
+                    cfg_timezone=getattr(getattr(cam, "channel_configuration", None), "timezone", None),
+                    site_cache=site_schedule_cache,
+                )
+                if bool(cam.is_detection_enabled) and bool(schedule_state.get("armed", True)):
+                    desired.add(str(cam.camera_uuid))
+                if bool(cam.is_enabled) and getattr(cam, "camera_code", None):
+                    streams.add(str(cam.camera_code))
+
+        return cams, desired, streams
+
     async def reconcile_device_edge_simple(
         self,
         *,
@@ -169,7 +219,7 @@ class DeviceReconciler:
         user_id: Optional[int] = None,
         dry_run: bool = False,
         delete_unknown: bool = True,
-    ) -> Dict[str, List[str]]:
+    ) -> Dict[str, Any]:
         uid = int(user_id) if user_id is not None else None
         async with self._state.session_factory() as db:
             dev = await self._state.device_repo.get_device(db, device_uuid=device_uuid, user_id=uid)
@@ -183,6 +233,11 @@ class DeviceReconciler:
             device_url = normalize_device_url(raw_url)
             if not device_url:
                 raise ValueError(f"Device missing device_url: {device_uuid}")
+
+            # Read the owner while the session is still open. Adoption needs a
+            # user id to key the runtime pipeline, and the caller may not have
+            # passed one (background reconciles pass user_id=None).
+            device_owner_id = getattr(dev, "user_id", None)
 
             # 2. Find all logical "peer" devices sharing this exact physical URL.
             # Scoped to the owning org: cameras from another org must never be
@@ -207,40 +262,11 @@ class DeviceReconciler:
             if not reconcile_device_uuids:
                 reconcile_device_uuids = [device_uuid]
 
-            cams = await self._state.channel_repo.list_cameras(
-                db,
-                device_uuids=reconcile_device_uuids,
-                include_config=True,
-            )
-            
-            site_schedule_cache: Dict[str, Dict[str, Any]] = {}
-            desired_set: Set[str] = set()
-            active_streams: Set[str] = set()
-            for cam in cams:
-                cfg = (
-                    cam.channel_configuration.configuration or {}
-                    if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None)
-                    else {}
-                )
-                schedule_state = await self._schedule_resolver.resolve_runtime_schedule(
-                    db,
-                    cam=cam,
-                    cfg_json=cfg,
-                    cfg_timezone=getattr(getattr(cam, "channel_configuration", None), "timezone", None),
-                    site_cache=site_schedule_cache,
-                )
-                # Detection is provisioned on the edge only when the camera is
-                # detection-enabled AND the site is currently armed. "Armed" is the
-                # schedule's active state, optionally overridden by a temporary
-                # site arm/disarm that clears at the next schedule boundary. A
-                # disarmed / off-schedule site has its cameras torn down here, so
-                # the Jetson actually stops detecting.
-                if bool(cam.is_detection_enabled) and bool(schedule_state.get("armed", True)):
-                    desired_set.add(str(cam.camera_uuid))
-                # Keep playback paths provisioned for enabled cameras regardless of
-                # alert schedule state so live view remains stable.
-                if bool(cam.is_enabled) and getattr(cam, "camera_code", None):
-                    active_streams.add(str(cam.camera_code))
+        # Opens its own session, so it runs after the block above closes. The
+        # device lookup is done and nothing below needs `db`.
+        cams, desired_set, active_streams = await self._recompute_desired(
+            device_uuids=reconcile_device_uuids,
+        )
 
         # --- WebRTC stream provisioning (independent of edge device) ---
         # Always provision WHEP streams in MediaMTX so live view works even
@@ -291,6 +317,67 @@ class DeviceReconciler:
         # raw column here would send un-normalized URLs to the edge client and
         # desync it from the peer lookup that built `desired_set`.
         edge_warnings: List[str] = []
+
+        # Ask the Jetson to re-scan the network BEFORE reading its camera list.
+        # The edge is the source of truth for which cameras physically exist,
+        # so a camera plugged in since the last sweep must be in `edge_set`
+        # below — otherwise this reconcile would try to add a camera the edge
+        # already has, or miss one it just adopted.
+        #
+        # Best-effort by design: an edge that predates discovery returns None
+        # and reconcile proceeds exactly as it did before.
+        discovery_report: Optional[Dict[str, Any]] = None
+        try:
+            discovery_report = await self._call_with_timeout(
+                self._state.edge.sync_discovery(device_url=device_url),
+                timeout_s=self._state.edge.sync_timeout_s,
+            )
+        except Exception as e:
+            logger.info(
+                "Edge discovery sync failed for %s; continuing with the existing camera list: %s",
+                device_url, e,
+            )
+
+        # Register anything the sweep found that the cloud does not know about
+        # yet. This runs BEFORE the diff below so a freshly-adopted camera is
+        # already in `desired_set` and is treated as a normal camera on this
+        # very pass — otherwise it would be reported as "discovered but
+        # unregistered" for one more cycle.
+        adoption: Dict[str, Any] = {}
+        adopt_uid = uid if uid is not None else device_owner_id
+        if self._adopter is not None and isinstance(discovery_report, dict) and adopt_uid is not None:
+            try:
+                adoption = await self._adopter.adopt_discovered_cameras(
+                    device_uuid=device_uuid,
+                    device_url=device_url,
+                    user_id=int(adopt_uid),
+                    discovery_report=discovery_report,
+                    peer_device_uuids=reconcile_device_uuids,
+                    dry_run=dry_run,
+                )
+            except Exception:
+                logger.warning(
+                    "Adoption of discovered cameras failed for device %s", device_url, exc_info=True,
+                )
+                adoption = {"errors": ["Adoption of discovered cameras failed"]}
+
+            for err in adoption.get("errors") or []:
+                edge_warnings.append(str(err))
+
+            # Newly-adopted cameras exist in the DB only as of a moment ago, so
+            # the camera list and desired_set read at the top of this function
+            # predate them. Re-read rather than patch them in by hand: the
+            # schedule gate must be applied to them too, and `cams_by_uuid`
+            # below needs the new rows to build their edge payloads.
+            #
+            # Their WHEP streams are already provisioned — adoption goes through
+            # the normal channel-create path, which calls ensure_stream itself —
+            # so only the edge-side sets are rebuilt here.
+            if adoption.get("adopted"):
+                cams, desired_set, _streams = await self._recompute_desired(
+                    device_uuids=reconcile_device_uuids,
+                )
+
         try:
             edge_set = await self._call_with_timeout(
                 self._state.edge.list_cameras(device_url=device_url),
@@ -330,7 +417,38 @@ class DeviceReconciler:
         to_add = sorted(desired_set - edge_set)
         to_remove = sorted(edge_set - desired_set)
 
-        out: Dict[str, List[str]] = {
+        # Cameras the edge discovered on its own are NOT unknown strays — they
+        # are the edge exercising its role as source of truth. Deleting them
+        # here would tear down a camera the Jetson just adopted, and the next
+        # sweep would re-add it: a permanent add/delete loop. They stay on the
+        # edge and surface to the frontend as pending adoption instead.
+        discovered_uuids: Set[str] = set()
+        missing_cameras: List[Dict[str, Any]] = []
+        if isinstance(discovery_report, dict):
+            for entry in discovery_report.get("roster") or []:
+                if isinstance(entry, dict) and entry.get("camera_uuid"):
+                    discovered_uuids.add(str(entry["camera_uuid"]))
+            for entry in discovery_report.get("missing_cameras") or []:
+                if isinstance(entry, dict):
+                    missing_cameras.append(entry)
+
+        unadopted = sorted((set(to_remove) & discovered_uuids) - desired_set)
+        if unadopted:
+            to_remove = [cu for cu in to_remove if cu not in set(unadopted)]
+            edge_warnings.append(
+                "{} camera(s) discovered by the edge are not yet registered in the cloud "
+                "and were left running: {}".format(len(unadopted), ", ".join(unadopted))
+            )
+
+        for entry in missing_cameras:
+            edge_warnings.append(
+                "Camera went missing from the network: {} (last seen {})".format(
+                    entry.get("device_name") or entry.get("ip_address") or entry.get("identity"),
+                    entry.get("last_seen_at") or "unknown",
+                )
+            )
+
+        out: Dict[str, Any] = {
             "to_add": to_add,
             "to_remove": to_remove,
             "to_add_stream": to_add_stream,
@@ -339,6 +457,10 @@ class DeviceReconciler:
             "removed": list(webrtc_removed),
             "errors": list(webrtc_errors),
             "warnings": edge_warnings,
+            "discovered": sorted(unadopted),
+            "missing_cameras": missing_cameras,
+            "adopted": list(adoption.get("adopted") or []),
+            "linked": list(adoption.get("linked") or []),
         }
 
         if dry_run:

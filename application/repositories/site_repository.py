@@ -14,7 +14,7 @@ must stream through very large tables.
 import logging
 import uuid
 from datetime import time as dt_time
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from fastapi import HTTPException
 from sqlalchemy import delete, select, update
@@ -26,7 +26,6 @@ from application.repositories._helpers import as_uuid as _as_uuid, normalize_uui
 from core.database_orm import (
     Camera,
     ChannelConfiguration,
-    Notification,
     NotificationEmail,
     PipelineCamera,
     Site,
@@ -44,6 +43,29 @@ class SiteRepository:
     # ------------------------------------------------------------------
     # Site reads
     # ------------------------------------------------------------------
+    def _scoped_query(
+        self,
+        selectable,
+        *,
+        user_id: Optional[int] = None,
+        org_id: Optional[int] = None,
+        site_uuids: Optional[List[uuid.UUID]] = None,
+    ):
+        """Apply the standard active-site scoping filters to a SELECT.
+
+        `site_uuids` is a member's allow-list; `org_id` restricts to the owning
+        organization; `user_id` is the legacy creator filter for internal
+        callers. Soft-deleted sites are never returned.
+        """
+        stmt = selectable.where(Site.is_deleted == False)  # noqa: E712 — SQL, not Python
+        if user_id is not None:
+            stmt = stmt.where(Site.user_id == int(user_id))
+        if org_id is not None:
+            stmt = stmt.where(Site.org_id == int(org_id))
+        if site_uuids is not None:
+            stmt = stmt.where(Site.site_uuid.in_([_as_uuid(s) for s in site_uuids]))
+        return stmt
+
     async def get_site(
         self,
         db: AsyncSession,
@@ -54,27 +76,20 @@ class SiteRepository:
         site_uuids: Optional[List[uuid.UUID]] = None,
         raise_if_missing: bool = True,
     ) -> Optional[Site]:
-        """Fetch a single active site.
+        """Fetch a single active site, scoped as described on `_scoped_query`.
 
-        Scoping precedence (any combination may be supplied):
-          * `org_id`     - restrict to the owning organization.
-          * `site_uuids` - a member's allow-list of accessible sites
-            (None = no restriction; empty list = no access).
-          * `user_id`    - legacy creator/owner filter (internal callers).
+        An empty `site_uuids` allow-list means "no access" and always misses.
         """
-        if site_uuids is not None and not site_uuids:
-            site = None
-        else:
-            stmt = select(Site).where(
-                Site.site_uuid == _as_uuid(site_uuid), Site.is_deleted == False
+        site = None
+        if site_uuids is None or site_uuids:
+            stmt = self._scoped_query(
+                select(Site).where(Site.site_uuid == _as_uuid(site_uuid)),
+                user_id=user_id,
+                org_id=org_id,
+                site_uuids=site_uuids,
             )
-            if user_id is not None:
-                stmt = stmt.where(Site.user_id == int(user_id))
-            if org_id is not None:
-                stmt = stmt.where(Site.org_id == int(org_id))
-            if site_uuids is not None:
-                stmt = stmt.where(Site.site_uuid.in_([_as_uuid(s) for s in site_uuids]))
             site = (await db.execute(stmt)).scalar_one_or_none()
+
         if site is None and raise_if_missing:
             raise HTTPException(status_code=404, detail="Site not found")
         return site
@@ -92,15 +107,11 @@ class SiteRepository:
             raise HTTPException(status_code=400, detail="A scoping filter is required")
         if site_uuids is not None and not site_uuids:
             return []
-        stmt = select(Site).where(Site.is_deleted == False)
-        if user_id is not None:
-            stmt = stmt.where(Site.user_id == int(user_id))
-        if org_id is not None:
-            stmt = stmt.where(Site.org_id == int(org_id))
-        if site_uuids is not None:
-            stmt = stmt.where(Site.site_uuid.in_([_as_uuid(s) for s in site_uuids]))
-        stmt = stmt.order_by(Site.created_at.desc())
-        return (await db.execute(stmt)).scalars().all()
+
+        stmt = self._scoped_query(
+            select(Site), user_id=user_id, org_id=org_id, site_uuids=site_uuids
+        ).order_by(Site.created_at.desc())
+        return list((await db.execute(stmt)).scalars().all())
 
     async def list_site_uuids(
         self,
@@ -110,18 +121,14 @@ class SiteRepository:
         org_id: Optional[int] = None,
         site_uuids: Optional[List[uuid.UUID]] = None,
     ) -> List[uuid.UUID]:
-        """Return just the site uuids in scope (active sites only)."""
+        """Just the site uuids in scope (active sites only)."""
         if site_uuids is not None and not site_uuids:
             return []
-        stmt = select(Site.site_uuid).where(Site.is_deleted == False)
-        if user_id is not None:
-            stmt = stmt.where(Site.user_id == int(user_id))
-        if org_id is not None:
-            stmt = stmt.where(Site.org_id == int(org_id))
-        if site_uuids is not None:
-            stmt = stmt.where(Site.site_uuid.in_([_as_uuid(s) for s in site_uuids]))
-        rows = (await db.execute(stmt)).scalars().all()
-        return list(rows)
+
+        stmt = self._scoped_query(
+            select(Site.site_uuid), user_id=user_id, org_id=org_id, site_uuids=site_uuids
+        )
+        return list((await db.execute(stmt)).scalars().all())
 
     # ------------------------------------------------------------------
     # Site writes
@@ -176,81 +183,57 @@ class SiteRepository:
     # SiteSettings
     # ------------------------------------------------------------------
     async def get_site_settings(
-        self,
-        db: AsyncSession,
-        *,
-        site_uuid: uuid.UUID,
-        user_id: Optional[int] = None,
+        self, db: AsyncSession, *, site_uuid: uuid.UUID
     ) -> Optional[SiteSettings]:
         stmt = select(SiteSettings).where(SiteSettings.site_uuid == _as_uuid(site_uuid))
         return (await db.execute(stmt)).scalar_one_or_none()
 
     async def upsert_site_settings(
-        self,
-        db: AsyncSession,
-        *,
-        dto: SiteSettingsUpsertDTO,
+        self, db: AsyncSession, *, dto: SiteSettingsUpsertDTO
     ) -> SiteSettings:
+        """Persist the one SiteSettings row for a site.
+
+        The real multi-day schedule lives in `config["schedule"]`; the scalar
+        `day_of_week`/`start_time`/`end_time` columns keep a representative
+        window for backward compatibility.
         """
-        Persist one SiteSettings row per site from a `SiteSettingsUpsertDTO`.
-
-        The real multi-day schedule lives in config["schedule"]; the scalar
-        columns store a representative window for backward compatibility.
-        """
-        user_id = dto.user_id
-        site_uuid = dto.site_uuid
-        config = dto.config
-        day_of_week = dto.day_of_week
-        start_time = dto.start_time
-        end_time = dto.end_time
-        is_enabled = dto.is_enabled
-
-        row = await self.get_site_settings(db, site_uuid=site_uuid, user_id=user_id)
-
-        merged_config = dict(config or {})
-        normalized_schedule = VideoChannelConfig.normalize_schedule(merged_config.get("schedule"))
-        if not normalized_schedule:
-            normalized_schedule = VideoChannelConfig.normalize_schedule(
+        config = dict(dto.config or {})
+        schedule = VideoChannelConfig.normalize_schedule(config.get("schedule"))
+        if not schedule:
+            schedule = VideoChannelConfig.normalize_schedule(
                 [
                     {
-                        "day_of_week": day_of_week or [6, 0, 1, 2, 3, 4, 5],
-                        "start_time": (start_time or dt_time(0, 0, 0)).strftime("%H:%M:%S"),
-                        "end_time": (end_time or dt_time(23, 59, 59)).strftime("%H:%M:%S"),
-                        "is_enabled": bool(is_enabled),
+                        "day_of_week": dto.day_of_week or [6, 0, 1, 2, 3, 4, 5],
+                        "start_time": (dto.start_time or dt_time(0, 0, 0)).strftime("%H:%M:%S"),
+                        "end_time": (dto.end_time or dt_time(23, 59, 59)).strftime("%H:%M:%S"),
+                        "is_enabled": bool(dto.is_enabled),
                     }
                 ]
             ) or VideoChannelConfig.default_schedule()
+        config["schedule"] = schedule
 
-        merged_config["schedule"] = normalized_schedule
+        representative = schedule[0]
+        day = int(representative.get("day_of_week", 6))
+        start = dt_time.fromisoformat(str(representative.get("start_time") or "00:00:00"))
+        end = dt_time.fromisoformat(str(representative.get("end_time") or "23:59:59"))
+        # The scalar columns carry a CHECK(start < end), which an overnight
+        # window would violate; fall back to the full day for those.
+        if start >= end:
+            start, end = dt_time(0, 0, 0), dt_time(23, 59, 59)
 
-        representative = normalized_schedule[0]
-        representative_day = int(representative.get("day_of_week", 6))
-        resolved_start = dt_time.fromisoformat(str(representative.get("start_time") or "00:00:00"))
-        resolved_end = dt_time.fromisoformat(str(representative.get("end_time") or "23:59:59"))
-
-        if resolved_start >= resolved_end:
-            resolved_start = dt_time(0, 0, 0)
-            resolved_end = dt_time(23, 59, 59)
-
+        row = await self.get_site_settings(db, site_uuid=dto.site_uuid)
         if row is None:
             row = SiteSettings(
-                user_id=int(user_id),
-                site_uuid=_as_uuid(site_uuid),
-                config=merged_config,
-                day_of_week=representative_day,
-                start_time=resolved_start,
-                end_time=resolved_end,
-                is_enabled=bool(is_enabled),
+                user_id=int(dto.user_id),
+                site_uuid=_as_uuid(dto.site_uuid),
             )
             db.add(row)
-            await db.flush()
-            return row
 
-        row.config = merged_config
-        row.day_of_week = representative_day
-        row.start_time = resolved_start
-        row.end_time = resolved_end
-        row.is_enabled = bool(is_enabled)
+        row.config = config
+        row.day_of_week = day
+        row.start_time = start
+        row.end_time = end
+        row.is_enabled = bool(dto.is_enabled)
 
         await db.flush()
         return row
@@ -307,44 +290,6 @@ class SiteRepository:
     # ------------------------------------------------------------------
     # Site-graph deletion
     # ------------------------------------------------------------------
-    async def delete_site_graph(
-        self,
-        db: AsyncSession,
-        *,
-        site_uuid: uuid.UUID,
-        camera_uuids: Optional[List[uuid.UUID]] = None,
-    ) -> None:
-        """
-        Delete a site and every row that hangs off it, in one transaction.
-
-        Use delete_site_graph_batched() for large sites — this variant is kept
-        for small sites and tests. Flush only; caller commits.
-        """
-        normalized = normalize_uuid_list(camera_uuids)
-        sid = _as_uuid(site_uuid)
-
-        await db.execute(delete(Notification).where(Notification.site_uuid == sid))
-        await db.execute(delete(NotificationEmail).where(NotificationEmail.site_uuid == sid))
-        await db.execute(delete(SiteSettings).where(SiteSettings.site_uuid == sid))
-        await db.execute(delete(SiteDevice).where(SiteDevice.site_uuid == sid))
-
-        if normalized:
-            await db.execute(
-                delete(PipelineCamera).where(PipelineCamera.camera_uuid.in_(normalized))
-            )
-            await db.execute(
-                delete(ChannelConfiguration).where(
-                    ChannelConfiguration.camera_uuid.in_(normalized)
-                )
-            )
-            await db.execute(
-                delete(VideoRecord).where(VideoRecord.camera_uuid.in_(normalized))
-            )
-
-        await db.execute(delete(Camera).where(Camera.site_uuid == sid))
-        await db.execute(delete(Site).where(Site.site_uuid == sid))
-        await db.flush()
-
     async def delete_site_graph_batched(
         self,
         session_factory,  # callable returning an AsyncSession context manager
@@ -485,10 +430,9 @@ class SiteRepository:
 
     async def _fast_delete(self, session_factory, table, where_clause) -> int:
         """Single-transaction delete for smaller tables."""
-        async with session_factory() as session:
-            result = await session.execute(delete(table).where(where_clause))
-            await session.commit()
-            return result.rowcount or 0
+        return await self._commit_in_own_session(
+            session_factory, delete(table).where(where_clause)
+        )
 
     # ------------------------------------------------------------------
     # User-account deletion helpers
@@ -540,74 +484,39 @@ class SiteRepository:
             await session.commit()
 
     async def soft_delete_sites(
-        self,
-        session_factory,
-        *,
-        site_uuids: List[uuid.UUID],
+        self, session_factory, *, site_uuids: List[uuid.UUID]
     ) -> int:
-        """Mark the given sites deleted so they leave queries immediately.
+        """Mark the given sites deleted so they leave every query immediately.
 
-        Site-scoped rather than user-scoped: sites belong to an organization,
-        so an account deletion may only touch the ones whose org is actually
-        being dissolved.
+        Site-scoped rather than user-scoped: sites belong to an organization, so
+        an account deletion may only touch the ones whose org is being dissolved.
         """
         normalized = normalize_uuid_list(site_uuids)
         if not normalized:
             return 0
-        async with session_factory() as session:
-            result = await session.execute(
-                update(Site)
-                .where(Site.site_uuid.in_(normalized))
-                .values(is_deleted=True)
-                .execution_options(synchronize_session=False)
-            )
-            await session.commit()
-            return result.rowcount or 0
+        return await self._commit_in_own_session(
+            session_factory,
+            update(Site)
+            .where(Site.site_uuid.in_(normalized))
+            .values(is_deleted=True)
+            .execution_options(synchronize_session=False),
+        )
 
     async def delete_sites(
-        self,
-        session_factory,
-        *,
-        site_uuids: List[uuid.UUID],
+        self, session_factory, *, site_uuids: List[uuid.UUID]
     ) -> int:
         """Hard-delete the given sites. Returns affected count."""
         normalized = normalize_uuid_list(site_uuids)
         if not normalized:
             return 0
-        async with session_factory() as session:
-            result = await session.execute(
-                delete(Site).where(Site.site_uuid.in_(normalized))
-            )
-            await session.commit()
-            return result.rowcount or 0
+        return await self._commit_in_own_session(
+            session_factory, delete(Site).where(Site.site_uuid.in_(normalized))
+        )
 
-    async def soft_delete_sites_for_user(
-        self,
-        session_factory,
-        *,
-        user_id: int,
-    ) -> int:
-        """Mark every site owned by a user as deleted. Returns affected count."""
+    @staticmethod
+    async def _commit_in_own_session(session_factory, stmt) -> int:
+        """Run one statement in its own transaction, returning the row count."""
         async with session_factory() as session:
-            result = await session.execute(
-                update(Site)
-                .where(Site.user_id == int(user_id))
-                .values(is_deleted=True)
-                .execution_options(synchronize_session=False)
-            )
-            await session.commit()
-            return result.rowcount or 0
-
-    async def delete_sites_for_user(
-        self,
-        session_factory,
-        *,
-        user_id: int,
-    ) -> int:
-        """Hard-delete every site owned by a user. Returns affected count."""
-        async with session_factory() as session:
-            result = await session.execute(
-                delete(Site).where(Site.user_id == int(user_id))
-            )
+            result = await session.execute(stmt)
             await session.commit()
             return result.rowcount or 0

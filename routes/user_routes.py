@@ -5,8 +5,6 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from application.services.user_snapshot_cache import UserSnapshotCache
-
 from application.repositories.channel_repository import ChannelRepository
 from application.repositories.organization_repository import OrganizationRepository
 from application.repositories.site_repository import SiteRepository
@@ -31,7 +29,7 @@ from application.services.clip_storage import (
 )
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from dependencies import get_async_db, get_current_user, get_manager
 from application.services.manager import Manager
@@ -176,12 +174,10 @@ async def perform_user_deletion(
     """
     from routes.notifications_routes import invalidate_camera_mode_cache
 
-    logger.info(f"[User Delete] Starting deletion of user={user_id}")
+    logger.info("[User Delete] Starting deletion of user=%s", user_id)
 
-    # ========================================
-    # PHASE 0: Decide the mode. An org is dissolved only when this user is
-    # its last member; otherwise its resources must be left untouched.
-    # ========================================
+    # An org is dissolved only when this user was its last member; otherwise
+    # its sites/cameras belong to the remaining team and must be left alone.
     org_repo = OrganizationRepository()
     org_ids = await org_repo.list_org_ids_for_user(db, user_id=user_id)
     dissolving_org_ids = [
@@ -190,17 +186,11 @@ async def perform_user_deletion(
         if await org_repo.count_org_members(db, org_id=oid, exclude_user_id=user_id) == 0
     ]
     logger.info(
-        f"[User Delete] user={user_id} orgs={org_ids} "
-        f"dissolving={dissolving_org_ids} "
-        f"(orgs with remaining members keep all their resources)"
+        "[User Delete] user=%s orgs=%s dissolving=%s", user_id, org_ids, dissolving_org_ids
     )
 
-    # ========================================
-    # PHASE 1: Snapshot camera + site info BEFORE any changes.
-    # Scoped to the orgs actually being dissolved — NOT to the departing
-    # user. Keying this off `user_id` is what used to destroy a co-worker's
-    # sites just because the creator left.
-    # ========================================
+    # Snapshot by dissolving ORG, never by user: keying this off `user_id` is
+    # what used to destroy a co-worker's sites just because the creator left.
     channel_repo = ChannelRepository()
     site_repo = SiteRepository()
 
@@ -212,46 +202,43 @@ async def perform_user_deletion(
         )
         site_uuids.extend(await site_repo.list_site_uuids(db, org_id=oid))
 
-    logger.info(f"[User Delete] Snapshotted {len(camera_uuids)} cameras, {len(site_uuids)} sites")
+    logger.info(
+        "[User Delete] Snapshotted %s cameras, %s sites", len(camera_uuids), len(site_uuids)
+    )
 
-    # ========================================
-    # PHASE 1b: Disable all cameras in DB BEFORE edge/MediaMTX cleanup.
-    # Reconcile reads is_enabled/is_detection_enabled from DB; if it fires
-    # between our edge cleanup and DB deletion it re-adds the cameras.
-    # ========================================
+    # Close the reconcile race window before touching anything external.
     if camera_uuids:
-        logger.info(f"[User Delete] Phase 1b: Disabling {len(camera_uuids)} cameras in DB to prevent reconcile re-adds")
         await channel_repo.disable_cameras(db, camera_uuids=camera_uuids)
         await db.commit()
 
-    # ========================================
-    # PHASE 2: Stop cameras BEFORE any DB changes
-    # ========================================
-    logger.info(f"[User Delete] Phase 2: Stopping cameras on edge/WebRTC/pipeline")
-
-    # 2a: Purge notification service in-memory state
-    notif_svc = getattr(manager, "_notification_service", None) if manager is not None else None
+    # Stop the cameras everywhere they are running.
+    notif_svc = getattr(manager, "notification_service", None) if manager else None
     if notif_svc is not None:
         try:
             purge_fn = getattr(notif_svc, "purge_deleted_site_runtime_state", None)
             for site_uuid_val in site_uuids:
                 if callable(purge_fn):
-                    await purge_fn(user_id=user_id, site_uuid=site_uuid_val, camera_uuids=camera_uuids)
+                    await purge_fn(
+                        user_id=user_id,
+                        site_uuid=site_uuid_val,
+                        camera_uuids=camera_uuids,
+                    )
                 else:
-                    notif_svc.invalidate_recipient_cache(user_id=user_id, site_uuid=site_uuid_val)
-            for cam_uuid in camera_uuids:
-                inv_fn = getattr(notif_svc, "invalidate_camera_roi_state", None)
-                if callable(inv_fn):
+                    notif_svc.invalidate_recipient_cache(
+                        user_id=user_id, site_uuid=site_uuid_val
+                    )
+            inv_fn = getattr(notif_svc, "invalidate_camera_roi_state", None)
+            if callable(inv_fn):
+                for cam_uuid in camera_uuids:
                     inv_fn(str(cam_uuid))
-        except Exception as exc:
-            logger.warning(f"[User Delete] Notification service purge failed: {exc}", exc_info=True)
+        except Exception:
+            logger.warning("[User Delete] Notification service purge failed", exc_info=True)
 
-    # 2b: Edge devices, WebRTC streams, in-memory pipeline
     if manager is not None:
         try:
+            # Scoped to the dissolving orgs' cameras; the rest belong to
+            # co-members and must keep streaming.
             cleanup = await asyncio.wait_for(
-                # Scoped to dissolving orgs' cameras: the rest belong to
-                # co-members and must keep streaming.
                 manager.cleanup_user_resources(
                     db, user_id=user_id, camera_uuids=camera_uuids
                 ),
@@ -260,61 +247,35 @@ async def perform_user_deletion(
             if cleanup.get("errors"):
                 logger.warning("[User Delete] Partial cleanup errors: %s", cleanup["errors"])
         except asyncio.TimeoutError:
-            logger.warning(f"[User Delete] Manager cleanup timed out after 60s — proceeding")
-        except Exception as exc:
-            logger.warning(f"[User Delete] Manager cleanup failed — proceeding: {exc}", exc_info=True)
+            logger.warning("[User Delete] Manager cleanup timed out after 60s — proceeding")
+        except Exception:
+            logger.warning("[User Delete] Manager cleanup failed — proceeding", exc_info=True)
 
-    # ========================================
-    # PHASE 3a: Extract video record blob keys BEFORE site/camera
-    # deletion.  Site deletion CASCADE-deletes cameras, which
-    # CASCADE-deletes VideoRecords, losing their storage_key values.
-    # ========================================
+    # Snapshot the clip blob keys: deleting the cameras CASCADEs their
+    # VideoRecords away, taking the storage keys with them.
     video_clip_keys: List[str] = []
     if camera_uuids:
         video_clip_keys = await site_repo.list_video_record_keys_for_cameras(
             AsyncSessionLocal, camera_uuids=camera_uuids
         )
-        logger.info(f"[User Delete] Phase 3a: Extracted {len(video_clip_keys)} video record blob keys")
+        logger.info(
+            "[User Delete] Extracted %s video record blob keys", len(video_clip_keys)
+        )
 
-    # ========================================
-    # PHASE 3b: Fast Foreground DB Cleanup
-    # Delete camera relationships and camera rows so the UI is clean.
-    # Do NOT delete site or user rows yet — their FK CASCADEs would
-    # wipe Notification rows before the background task can extract
-    # blob storage keys.
-    # Cameras are disabled (Phase 1b) and runtime-stopped (Phase 2),
-    # so no new data arrives.
-    # Camera deletion SET NULLs Notification.camera_uuid and
-    # CASCADE-deletes VideoRecords (keys saved in Phase 3a).
-    # ========================================
-    logger.info(f"[User Delete] Phase 3b: Deleting camera rows (Foreground)")
-    try:
-        if camera_uuids:
-            await site_repo.delete_cameras_for_user(
-                AsyncSessionLocal, user_id=user_id, camera_uuids=camera_uuids
-            )
+    # Delete the camera rows and hide the sites. The site and user rows stay
+    # for now: their CASCADEs would wipe the notifications whose payloads still
+    # hold the blob keys harvested below.
+    if camera_uuids:
+        await site_repo.delete_cameras_for_user(
+            AsyncSessionLocal, user_id=user_id, camera_uuids=camera_uuids
+        )
+    if site_uuids:
+        await site_repo.soft_delete_sites(AsyncSessionLocal, site_uuids=site_uuids)
+    _invalidate_user_snapshot_cache(request, user_id)
 
-        # Mark the dissolving orgs' sites soft-deleted so they leave queries now
-        if site_uuids:
-            await site_repo.soft_delete_sites(AsyncSessionLocal, site_uuids=site_uuids)
-
-        _invalidate_user_snapshot_cache(request, user_id)
-    except Exception:
-        raise
-
-    # ========================================
-    # PHASE 3c: Delete the user row NOW, in the foreground.
-    # This used to be the last step of the background task, which meant a
-    # crash/restart mid-cleanup — or any exception in the notification
-    # batch-delete, which is caught and logged — left the `users` row alive
-    # forever. The account could still log in while all of its cameras and
-    # sites were gone. The user row is the thing that must never linger, so
-    # it is deleted synchronously and committed before we return.
-    #
-    # Notification rows survive this because their user_id FK is CASCADE:
-    # deleting the user wipes them, so blob storage keys must be harvested
-    # BEFORE this point (see Phase 3d) or the blobs leak.
-    # ========================================
+    # The user row is deleted synchronously, before the background sweep. It
+    # used to go last, so any failure in the background task left a live
+    # account that could still log in with all of its resources gone.
     user_email: Optional[str] = None
     org_ids: List[int] = []
 
@@ -327,16 +288,12 @@ async def perform_user_deletion(
             pre_session, user_id=user_id
         )
 
-    # ========================================
-    # PHASE 3d: Harvest notification blob keys BEFORE the CASCADE removes
-    # the rows, so the background task can still delete the blobs.
+    # Harvest the notification blob keys before deleting the user, whose
+    # CASCADE takes those rows (and their payloads) with it.
     #
-    # Two sources: the departing user's own notification rows (always), plus
-    # every row belonging to a dissolving org's sites — those siblings belong
-    # to co-members whose accounts may outlive this one, and their images and
-    # clips would otherwise be orphaned in blob storage once the site's
-    # CASCADE removes the rows that referenced them.
-    # ========================================
+    # Two sources: the departing user's own rows, plus every row on a
+    # dissolving org's sites — those belong to co-members whose accounts may
+    # outlive this one, and their blobs would otherwise be orphaned.
     alert_blob_keys: List[str] = []
     clip_blob_keys: List[str] = list(video_clip_keys)
 
@@ -378,8 +335,9 @@ async def perform_user_deletion(
                     continue
 
     logger.info(
-        f"[User Delete] Phase 3d: Harvested {len(alert_blob_keys)} alert / "
-        f"{len(clip_blob_keys)} clip blob keys"
+        "[User Delete] Harvested %s alert / %s clip blob keys",
+        len(alert_blob_keys),
+        len(clip_blob_keys),
     )
 
     async with AsyncSessionLocal() as del_session:
@@ -397,8 +355,9 @@ async def perform_user_deletion(
             )
             await del_session.commit()
             logger.info(
-                f"[User Delete] Phase 3c/3d: user row deleted={bool(deleted)}, "
-                f"abandoned orgs dropped={dropped}"
+                "[User Delete] user row deleted=%s, abandoned orgs dropped=%s",
+                bool(deleted),
+                dropped,
             )
         except Exception:
             await del_session.rollback()
@@ -406,68 +365,59 @@ async def perform_user_deletion(
 
     _invalidate_user_snapshot_cache(request, user_id)
 
-    # ========================================
-    # PHASE 4: Invalidate caches
-    # ========================================
     for cam_uuid in camera_uuids:
         try:
             await invalidate_camera_mode_cache(cam_uuid)
         except Exception:
-            pass
-
-    # ========================================
-    # PHASE 5: Background Heavy Table Cleanup (Notifications, Blobs, Sites, User)
-    # User and site rows are still alive, so Notification rows with
-    # user_id / site_uuid FKs have NOT been cascade-deleted.
-    # After batch-deleting notifications (extracting blob keys) and
-    # scheduling blob deletion, the background task deletes the
-    # site rows and user row.
-    # ========================================
-    logger.info(f"[User Delete] Phase 5: Spawning background task to clean up heavy tables (Notifications/Videos)")
+            logger.debug(
+                "Camera mode cache invalidation failed for %s", cam_uuid, exc_info=True
+            )
 
     async def _heavy_table_cleanup_task(
         uid: int, s_uuids: List, alert_keys: List[str], clip_keys: List[str]
     ):
         """Best-effort cleanup of things that only cost storage, never identity.
 
-        The user row, its grants, notifications and any abandoned org are
-        already gone (Phase 3c/3d) — everything here is safe to retry or lose
-        without leaving a usable account behind.
+        The user row, its grants and any abandoned org are already gone, so
+        everything here is safe to retry or lose without leaving a usable
+        account behind.
         """
-        logger.info(f"[User Cleanup Task] Starting background heavy cleanup for user={uid}")
-        from application.repositories.site_repository import SiteRepository
+        logger.info("[User Cleanup Task] Starting cleanup for user=%s", uid)
         repo_for_delete = SiteRepository()
 
         try:
             if alert_keys:
                 _spawn_bg_task(
-                    _delete_blobs_background(alert_keys, service_cls=AlertImageStorageService, label="alert image"),
+                    _delete_blobs_background(
+                        alert_keys,
+                        service_cls=AlertImageStorageService,
+                        label="alert image",
+                    ),
                     name=f"delete_user_alert_blobs:{uid}",
                 )
-
             if clip_keys:
                 _spawn_bg_task(
-                    _delete_blobs_background(clip_keys, service_cls=EventClipService, label="clip"),
+                    _delete_blobs_background(
+                        clip_keys, service_cls=EventClipService, label="clip"
+                    ),
                     name=f"delete_user_clip_blobs:{uid}",
                 )
 
-            # Sites are soft-deleted and the user row is gone; hard-delete the
-            # rows (CASCADE cleans up SiteSettings, SiteDevices, NotificationEmails).
-            # Only the dissolving orgs' sites are in this list.
+            # Only the dissolving orgs' sites are here. Their CASCADE cleans up
+            # SiteSettings, SiteDevices and NotificationEmails.
             if s_uuids:
                 await repo_for_delete.delete_sites(AsyncSessionLocal, site_uuids=s_uuids)
 
-            logger.info(f"[User Cleanup Task] Background heavy cleanup COMPLETE for user={uid}")
-
-        except Exception as e:
-            logger.error(f"[User Cleanup Task] Failed heavy cleanup for user={uid}: {e}", exc_info=True)
+            logger.info("[User Cleanup Task] Cleanup COMPLETE for user=%s", uid)
+        except Exception:
+            logger.exception("[User Cleanup Task] Failed cleanup for user=%s", uid)
 
     _spawn_bg_task(
         _heavy_table_cleanup_task(user_id, site_uuids, alert_blob_keys, clip_blob_keys),
         name=f"delete_user_heavy_tables:{user_id}",
     )
 
-    logger.info(f"[User Delete] HTTP response ready: user={user_id} effectively deleted from UI")
+    logger.info("[User Delete] user=%s deleted", user_id)
 
 
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)

@@ -21,7 +21,7 @@ Security notes for anyone editing this file:
 """
 
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Tuple
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse

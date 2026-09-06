@@ -19,17 +19,18 @@ class EmailVerificationRepository:
     async def invalidate_active(
         self, db: AsyncSession, email: str, purpose: str = PURPOSE_SIGNUP
     ) -> None:
-        stmt = (
+        """Consume every outstanding code for (email, purpose), so requesting a
+        new one always retires the old."""
+        await db.execute(
             update(EmailVerification)
             .where(
                 EmailVerification.email == email,
-                EmailVerification.used == False,
+                EmailVerification.used.is_(False),
                 self._purpose_clause(purpose),
             )
             .values(used=True, consumed_at=utc_now())
             .execution_options(synchronize_session=False)
         )
-        await db.execute(stmt)
 
     async def create(
         self,
@@ -41,7 +42,7 @@ class EmailVerificationRepository:
         purpose: str = PURPOSE_SIGNUP,
     ) -> EmailVerification:
         now = utc_now()
-        v = EmailVerification(
+        row = EmailVerification(
             email=email,
             code_hash=code_hash,
             sent_at=now,
@@ -52,9 +53,9 @@ class EmailVerificationRepository:
             user_agent=user_agent,
             additional_data=purpose,
         )
-        db.add(v)
+        db.add(row)
         await db.flush()
-        return v
+        return row
 
     @staticmethod
     def _purpose_clause(purpose: str):
@@ -74,36 +75,42 @@ class EmailVerificationRepository:
     async def get_latest_active(
         self, db: AsyncSession, email: str, purpose: str = PURPOSE_SIGNUP
     ) -> EmailVerification | None:
-        now = utc_now()
         stmt = (
             select(EmailVerification)
             .where(
                 EmailVerification.email == email,
-                EmailVerification.used == False,
-                EmailVerification.expires_at > now,
+                EmailVerification.used.is_(False),
+                EmailVerification.expires_at > utc_now(),
                 self._purpose_clause(purpose),
             )
             .order_by(EmailVerification.id.desc())
             .limit(1)
         )
-        res = await db.execute(stmt)
-        return res.scalar_one_or_none()
+        return (await db.execute(stmt)).scalar_one_or_none()
 
     async def increment_attempts(self, db: AsyncSession, verification_id: int) -> None:
-        stmt = (
+        """Bump the attempt counter in SQL.
+
+        `synchronize_session=False` is required, not cosmetic: the default
+        "evaluate" strategy cannot handle column arithmetic in VALUES. It also
+        leaves the caller's in-memory row untouched, which the OTP checks in
+        `routes/auth/signup.py` depend on — they compare `attempts + 1`
+        themselves to reason about the post-increment count.
+        """
+        await db.execute(
             update(EmailVerification)
             .where(EmailVerification.id == verification_id)
             .values(attempts=EmailVerification.attempts + 1)
+            .execution_options(synchronize_session=False)
         )
-        await db.execute(stmt)
 
     async def consume(self, db: AsyncSession, verification_id: int) -> None:
-        stmt = (
+        await db.execute(
             update(EmailVerification)
             .where(EmailVerification.id == verification_id)
             .values(used=True, consumed_at=utc_now())
+            .execution_options(synchronize_session=False)
         )
-        await db.execute(stmt)
 
     async def purge_for_email(self, db: AsyncSession, email: str) -> int:
         """Delete every OTP / pending-signup row belonging to `email`.

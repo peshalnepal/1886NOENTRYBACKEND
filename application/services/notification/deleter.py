@@ -14,6 +14,9 @@ from application.repositories.notification_repository import NotificationReposit
 
 logger = logging.getLogger(__name__)
 
+# How many blob deletes to run concurrently against Azure Storage.
+_BLOB_DELETE_CONCURRENCY = 10
+
 
 class NotificationDeleter:
     def __init__(
@@ -55,76 +58,82 @@ class NotificationDeleter:
         self._delete_task = None
 
     async def _delete_alert_blob_keys(self, storage_keys: List[str]) -> None:
-        unique_keys = [key for key in dict.fromkeys(str(key or "").strip() for key in storage_keys) if key]
-        if not unique_keys:
-            return
-
-        image_service = self._image_service
-        if not image_service:
+        """Delete alert images in bounded-concurrency batches, best effort."""
+        unique_keys = [
+            key
+            for key in dict.fromkeys(str(k or "").strip() for k in storage_keys)
+            if key
+        ]
+        if not unique_keys or not self._image_service:
             return
 
         try:
-            BLOB_DELETE_CONCURRENCY = 10
-            for i in range(0, len(unique_keys), BLOB_DELETE_CONCURRENCY):
-                batch = unique_keys[i : i + BLOB_DELETE_CONCURRENCY]
+            for i in range(0, len(unique_keys), _BLOB_DELETE_CONCURRENCY):
+                batch = unique_keys[i : i + _BLOB_DELETE_CONCURRENCY]
                 results = await asyncio.gather(
-                    *(image_service.delete_blob(blob_name=key) for key in batch),
+                    *(self._image_service.delete_blob(blob_name=key) for key in batch),
                     return_exceptions=True,
                 )
                 for key, result in zip(batch, results):
                     if isinstance(result, Exception):
-                        logger.warning("Failed deleting alert image blob %s after alert hide: %s", key, result)
+                        logger.warning(
+                            "Failed deleting alert image blob %s after alert hide: %s",
+                            key,
+                            result,
+                        )
         except Exception:
             logger.exception("Failed bulk-deleting alert images")
 
-    async def _batch_hide_notifications_by_id(self, *, user_id: int, notification_ids: List[int], batch_size: int = 1000) -> List[str]:
-        if not notification_ids:
+    async def _batch_hide_notifications_by_id(
+        self, *, user_id: int, notification_ids: List[int], batch_size: int = 1000
+    ) -> List[str]:
+        """Hide the given notifications in batches, returning their image keys.
+
+        The keys are collected before hiding so the caller can delete the blobs
+        afterwards, off the request path.
+        """
+        sorted_ids = sorted({int(nid) for nid in notification_ids if nid and int(nid) > 0})
+        if not sorted_ids:
             return []
 
-        sorted_ids = sorted(set(int(nid) for nid in notification_ids if nid > 0))
-        all_storage_keys: List[str] = []
-        total_hidden = 0
-
-        for batch_num, i in enumerate(range(0, len(sorted_ids), batch_size), start=1):
+        storage_keys: List[str] = []
+        for i in range(0, len(sorted_ids), batch_size):
             batch_ids = sorted_ids[i : i + batch_size]
             try:
                 async with self._session_factory() as db:
                     rows = await self._repo.list_notifications(
-                        db,
-                        user_id=int(user_id),
-                        ids=batch_ids,
-                        only_visible=True,
+                        db, user_id=int(user_id), ids=batch_ids, only_visible=True
                     )
 
                     matched_ids: List[int] = []
                     for row in rows:
                         try:
                             parsed_id = int(row.id)
-                        except Exception:
+                        except (TypeError, ValueError):
                             continue
                         if parsed_id <= 0:
                             continue
                         matched_ids.append(parsed_id)
-                        
-                        payload = row.payload
-                        if isinstance(payload, dict):
-                            storage_key = str(payload.get("image_storage_key") or "").strip()
-                            if storage_key:
-                                all_storage_keys.append(storage_key)
+
+                        if isinstance(row.payload, dict):
+                            key = str(row.payload.get("image_storage_key") or "").strip()
+                            if key:
+                                storage_keys.append(key)
 
                     if not matched_ids:
                         continue
 
-                    hidden_count = await self._repo.set_notifications_visibility(db, user_id=int(user_id), ids=matched_ids, visible=False)
+                    await self._repo.set_notifications_visibility(
+                        db, user_id=int(user_id), ids=matched_ids, visible=False
+                    )
                     await db.commit()
-
-                    hidden_count = hidden_count or len(matched_ids)
-                    total_hidden += hidden_count
-            except Exception as exc:
-                logger.exception("Batch hide failed for user=%s ids=%s: %s", user_id, len(batch_ids), exc)
+            except Exception:
+                logger.exception(
+                    "Batch hide failed for user=%s batch_size=%s", user_id, len(batch_ids)
+                )
                 raise
 
-        return all_storage_keys
+        return storage_keys
 
     async def _bulk_hide_notifications_by_filter(self, *, user_id: int, site_uuid: Optional[uuid.UUID] = None, camera_uuid: Optional[uuid.UUID] = None) -> None:
         """Hide notifications via a single bulk SQL statement, and clean up blobs via a streaming query."""

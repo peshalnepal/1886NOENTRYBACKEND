@@ -28,8 +28,8 @@ class CameraDeleteCleanupTests(unittest.IsolatedAsyncioTestCase):
         )
         manager = SimpleNamespace(
             get_loaded_pipeline=Mock(return_value=pipeline),
-            _edge=SimpleNamespace(delete_camera=AsyncMock()),
-            _webrtc=SimpleNamespace(delete_stream=AsyncMock(return_value=True)),
+            edge=SimpleNamespace(delete_camera=AsyncMock()),
+            webrtc=SimpleNamespace(delete_stream=AsyncMock(return_value=True)),
         )
 
         await _cleanup_camera_runtime(
@@ -41,19 +41,19 @@ class CameraDeleteCleanupTests(unittest.IsolatedAsyncioTestCase):
         )
 
         manager.get_loaded_pipeline.assert_called_once_with(user_id=5)
-        manager._edge.delete_camera.assert_awaited_once_with(
+        manager.edge.delete_camera.assert_awaited_once_with(
             device_url="http://edge.example:19030",
             camera_uuid=str(camera_uuid),
         )
-        manager._webrtc.delete_stream.assert_awaited_once_with(stream_key="cam-abcdef12")
+        manager.webrtc.delete_stream.assert_awaited_once_with(stream_key="cam-abcdef12")
         pipeline.remove_channel.assert_awaited_once_with(camera_uuid)
 
     async def test_cleanup_without_loaded_pipeline_still_deletes_edge_and_stream(self):
         camera_uuid = uuid.uuid4()
         manager = SimpleNamespace(
             get_loaded_pipeline=Mock(return_value=None),
-            _edge=SimpleNamespace(delete_camera=AsyncMock()),
-            _webrtc=SimpleNamespace(delete_stream=AsyncMock(return_value=False)),
+            edge=SimpleNamespace(delete_camera=AsyncMock()),
+            webrtc=SimpleNamespace(delete_stream=AsyncMock(return_value=False)),
         )
 
         await _cleanup_camera_runtime(
@@ -65,11 +65,11 @@ class CameraDeleteCleanupTests(unittest.IsolatedAsyncioTestCase):
         )
 
         manager.get_loaded_pipeline.assert_called_once_with(user_id=7)
-        manager._edge.delete_camera.assert_awaited_once_with(
+        manager.edge.delete_camera.assert_awaited_once_with(
             device_url="http://edge-a.example:19030",
             camera_uuid=str(camera_uuid),
         )
-        manager._webrtc.delete_stream.assert_awaited_once_with(stream_key="cam-12345678")
+        manager.webrtc.delete_stream.assert_awaited_once_with(stream_key="cam-12345678")
 
 
 if __name__ == "__main__":

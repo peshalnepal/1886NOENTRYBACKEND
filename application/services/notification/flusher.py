@@ -95,22 +95,25 @@ class NotificationFlusher:
                 logger.exception("Notification flush task shutdown failed")
         self._flush_task = None
 
-    def invalidate_recipient_cache(self, *, user_id: int, site_uuid: Optional[uuid.UUID] = None) -> None:
-        uid = int(user_id)
-        if site_uuid is not None:
-            # Recipients are site-owned, but the cache is keyed by
-            # (pipeline-owner user, site). Dropping only this caller's entry
-            # would leave every other member serving a stale recipient list
-            # for the same site, so clear the site across all users.
-            site_key = str(site_uuid)
-            for key in list(self._recipient_cache.keys()):
-                if key[1] == site_key:
-                    self._recipient_cache.pop(key, None)
-            return
+    def invalidate_recipient_cache(
+        self, *, user_id: int, site_uuid: Optional[uuid.UUID] = None
+    ) -> None:
+        """Drop cached recipient lists for a site (across every user) or, with
+        no site, for one user.
 
-        for key in list(self._recipient_cache.keys()):
-            if key[0] == uid:
-                self._recipient_cache.pop(key, None)
+        Recipients are site-owned but the cache is keyed by (pipeline-owner
+        user, site), so clearing only the calling user's entry would leave every
+        other member serving a stale list for the same site.
+        """
+        if site_uuid is not None:
+            site_key = str(site_uuid)
+            matches = lambda key: key[1] == site_key  # noqa: E731
+        else:
+            uid = int(user_id)
+            matches = lambda key: key[0] == uid  # noqa: E731
+
+        for key in [k for k in self._recipient_cache if matches(k)]:
+            self._recipient_cache.pop(key, None)
                 
     async def purge_deleted_site(self, *, user_id: int, site_uuid: Optional[uuid.UUID], camera_uuids: Optional[List[uuid.UUID]]) -> None:
         uid = int(user_id)
@@ -180,17 +183,21 @@ class NotificationFlusher:
                 if user_id in self._active_flush_users:
                     continue
 
-                total_items = sum(len(alerts) for sites in hierarchical.values() for alerts in sites.values())
-                
+                total_items = self._buffered_count(hierarchical)
                 if total_items == 0:
                     self._pending_by_user.pop(user_id, None)
                     self._pending_since.pop(user_id, None)
                     continue
 
                 since = self._pending_since.get(user_id, now)
-                if force_all or total_items >= self._buffer_max_items or (now - since) >= self._buffer_max_age_s:
-                    items = self._flatten_user_alerts(hierarchical)
-                    ready[user_id] = items
+                # Flush on shutdown, when the batch is full, or when the oldest
+                # item has waited long enough.
+                if (
+                    force_all
+                    or total_items >= self._buffer_max_items
+                    or (now - since) >= self._buffer_max_age_s
+                ):
+                    ready[user_id] = self._flatten_user_alerts(hierarchical)
                     self._pending_by_user.pop(user_id, None)
                     self._pending_since.pop(user_id, None)
                     self._active_flush_users.add(user_id)
@@ -215,34 +222,45 @@ class NotificationFlusher:
                 self._active_flush_users.discard(user_id)
 
                 if requeue_items:
-                    hierarchical: Dict[str, Dict[str, List[BufferedNotification]]] = {}
-                    for item in items:
-                        site_uuid_str = str(item.ctx.site_uuid)
-                        camera_uuid_str = str(item.msg.camera_uuid)
-                        
-                        if site_uuid_str not in hierarchical:
-                            hierarchical[site_uuid_str] = {}
-                        if camera_uuid_str not in hierarchical[site_uuid_str]:
-                            hierarchical[site_uuid_str][camera_uuid_str] = []
-                        
-                        hierarchical[site_uuid_str][camera_uuid_str].append(item)
-                    
-                    self._pending_by_user[user_id] = hierarchical
+                    self._pending_by_user[user_id] = self._group_by_site_and_camera(items)
+                    # Backdate so the retry is due immediately.
                     self._pending_since[user_id] = time.monotonic() - self._buffer_max_age_s
                     self._flush_event.set()
 
-                if user_id in self._pending_by_user:
-                    total_items = sum(len(alerts) for sites in self._pending_by_user[user_id].values() for alerts in sites.values())
-                    if total_items >= self._buffer_max_items:
-                        self._flush_event.set()
+                pending = self._pending_by_user.get(user_id)
+                if pending and self._buffered_count(pending) >= self._buffer_max_items:
+                    self._flush_event.set()
 
-    def _flatten_user_alerts(self, hierarchical: Dict[str, Dict[str, List[BufferedNotification]]]) -> List[BufferedNotification]:
-        all_items: List[BufferedNotification] = []
-        for sites in hierarchical.values():
-            for alerts in sites.values():
-                all_items.extend(alerts)
-        all_items.sort(key=lambda x: int(x.msg.ts_ms))
-        return all_items
+    @staticmethod
+    def _flatten_user_alerts(
+        hierarchical: Dict[str, Dict[str, List[BufferedNotification]]]
+    ) -> List[BufferedNotification]:
+        """Flatten the site -> camera -> alerts buffer into one chronological list."""
+        return sorted(
+            (
+                item
+                for sites in hierarchical.values()
+                for alerts in sites.values()
+                for item in alerts
+            ),
+            key=lambda item: int(item.msg.ts_ms),
+        )
+
+    @staticmethod
+    def _group_by_site_and_camera(
+        items: List[BufferedNotification],
+    ) -> Dict[str, Dict[str, List[BufferedNotification]]]:
+        """Inverse of `_flatten_user_alerts`, used to requeue a failed batch."""
+        grouped: Dict[str, Dict[str, List[BufferedNotification]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for item in items:
+            grouped[str(item.ctx.site_uuid)][str(item.msg.camera_uuid)].append(item)
+        return {site: dict(cams) for site, cams in grouped.items()}
+
+    @staticmethod
+    def _buffered_count(hierarchical: Dict[str, Dict[str, List[BufferedNotification]]]) -> int:
+        return sum(len(alerts) for sites in hierarchical.values() for alerts in sites.values())
 
     async def _get_recipients_for_sites_cached(self, *, user_id: int, site_uuids: List[uuid.UUID]) -> Dict[uuid.UUID, List[str]]:
         now = time.monotonic()
@@ -291,7 +309,6 @@ class NotificationFlusher:
                 missing.append(su)
 
         if missing and self._session_factory:
-
             org_repo = OrganizationRepository()
             async with self._session_factory() as db:
                 for su in missing:
@@ -303,11 +320,19 @@ class NotificationFlusher:
                             )
                         ).scalar_one_or_none()
                         if org_id is not None:
-                            operator_ids = await org_repo.list_operator_user_ids(db, org_id=int(org_id))
+                            operator_ids = await org_repo.list_operator_user_ids(
+                                db, org_id=int(org_id)
+                            )
                     except Exception:
-                        logger.warning("Operator-gate lookup failed for site=%s", su, exc_info=True)
-                        operator_ids = []
-                    self._approval_cache[str(su)] = (now + self._recipient_ttl_s, list(operator_ids))
+                        # Fail open: no operator means the alert reaches the end
+                        # user, which is better than silently dropping it.
+                        logger.warning(
+                            "Operator-gate lookup failed for site=%s", su, exc_info=True
+                        )
+                    self._approval_cache[str(su)] = (
+                        now + self._recipient_ttl_s,
+                        list(operator_ids),
+                    )
                     out[su] = list(operator_ids)
 
         return out
@@ -328,25 +353,29 @@ class NotificationFlusher:
         be withheld from the end user until approved). Uses the cached lookup."""
         return bool(await self.operator_user_ids_for_site(site_uuid))
     
-    async def _run_with_session(self, db: Optional[Any], fn: Callable[[Any], Any], retry: bool = False) -> Any:
+    async def _run_with_session(
+        self, db: Optional[Any], fn: Callable[[Any], Any], retry: bool = False
+    ) -> Any:
+        """Run `fn` on the caller's session, or in a fresh committed one.
+
+        With `retry`, a MySQL lock-wait timeout (error 1205) is retried with
+        exponential backoff — the notification insert contends with the
+        operator-approval writes under load.
+        """
         if db is not None:
             return await fn(db)
 
-        for attempt in range(3 if retry else 1):
+        attempts = 3 if retry else 1
+        for attempt in range(attempts):
             try:
-                async with self._session_factory() as _db:
-                    result = await fn(_db)
-                    await _db.commit()
-                    await _db.refresh(result) if result is not None else None
+                async with self._session_factory() as own_db:
+                    result = await fn(own_db)
+                    await own_db.commit()
                     return result
             except OperationalError as exc:
-                if retry and attempt < 2 and "1205" in str(exc):
-                    wait_s = 0.5 * (2 ** attempt)
-                    await asyncio.sleep(wait_s)
-                    continue
-                raise
-            except Exception:
-                raise
+                if attempt + 1 >= attempts or "1205" not in str(exc):
+                    raise
+                await asyncio.sleep(0.5 * (2 ** attempt))
     async def _flush_user_batch(self, user_id: int, items: List[BufferedNotification], db: Optional[Any] = None) -> bool:
         if not items:
             return True
@@ -511,7 +540,8 @@ class NotificationFlusher:
                 if sent_ids:
                     await self._repo.mark_notifications_sent(_db, notification_ids=sent_ids, sent_at=sent_at)
                 if failed_ids:
-                    await self._repo.mark_notifications_failed(_db, notification_ids=failed_ids, sent_at=sent_at)
+                    # No sent_at: the digest never went out for these.
+                    await self._repo.mark_notifications_failed(_db, notification_ids=failed_ids)
 
             try:
                 await self._run_with_session(db, _do_updates, retry=False)

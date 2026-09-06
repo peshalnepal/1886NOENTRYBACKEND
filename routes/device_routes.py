@@ -1,46 +1,40 @@
-# routes/devices.py
+"""Device (Jetson edge box) CRUD and edge reconcile."""
+
 import asyncio
 import logging
 import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-
-logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.dtos import DeviceCreateDTO, DeviceUpdateDTO
 from application.repositories.device_repository import DeviceRepository
-from core.database_orm import Device  # adjust import path
-from core.schemas import (
-    DeviceCreate,
-    DeviceUpdate,
-    DeviceOut,
-    EdgeCameraListOut,
-    EdgeReconcileOut,
-)
-from dependencies import (
-    get_db,
-    get_async_db,
-    get_current_user,
-    get_manager,
-    RequirePermission,
-    OrgContext,
-)
-from core.security.roles import Permission
 from application.services.manager import EdgeDeviceUnavailableError, Manager
+from core.database_orm import Device
+from core.schemas import DeviceCreate, DeviceOut, DeviceUpdate, EdgeReconcileOut
+from core.security.roles import Permission
+from dependencies import (
+    get_async_db,
+    get_manager,
+    OrgContext,
+    RequirePermission,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
 device_repo = DeviceRepository()
 
 
-
 def _is_blank(s: Optional[str]) -> bool:
     return s is None or (isinstance(s, str) and s.strip() == "")
 
+
 def _gen_code(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:6]}"
+
 
 async def _get_device_or_404(db: AsyncSession, org_id: int, device_uuid: uuid.UUID) -> Device:
     device = await device_repo.get_device(db, device_uuid=device_uuid, org_id=org_id)
@@ -118,8 +112,7 @@ async def update_device(
     device = await _get_device_or_404(db, ctx.org_id, device_uuid)
 
     data = payload.model_dump(exclude_unset=True)
-
-    # If they included device_code but it’s blank -> regenerate
+    # An explicitly blanked device_code means "regenerate it".
     if "device_code" in data and _is_blank(data.get("device_code")):
         data["device_code"] = _gen_code("dev")
 

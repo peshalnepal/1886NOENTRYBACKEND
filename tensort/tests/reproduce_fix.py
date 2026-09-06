@@ -41,7 +41,7 @@ async def test_broadcaster():
     q2 = await b.subscribe()
 
     msg = {"test": "data"}
-    await b.broadcast(msg)
+    b.broadcast(msg)          # synchronous — no task spawn on the result path
 
     m1 = await q1.get()
     m2 = await q2.get()
@@ -49,26 +49,6 @@ async def test_broadcaster():
     assert m1 == msg
     assert m2 == msg
     print("Broadcaster passed.")
-
-async def test_pipeline_integration():
-    print("Testing Pipeline Integration...")
-    p = SimpleInferencePipeline()
-    # Mock broadcast
-    p.broadcaster.broadcast = MagicMock(return_value=asyncio.Future())
-    p.broadcaster.broadcast.return_value.set_result(None)
-
-    # Inject a fake result
-    res = {"camera_uuid": "cam1", "detections": []}
-    await p._put_out(res)
-
-    # In real flow, _pump_inference calls broadcast. 
-    # But here we just want to verify logic structure.
-    # Actual test: does processing an item trigger broadcast?
-    
-    # Let's mock _pump_inference inner loop
-    # It reads from _buffer and broadcast.
-    # Too complex to mock full pipeline. Broadcaster test is sufficient for that part.
-    pass
 
 async def test_video_channel_stop():
     print("Testing VideoChannel stop...")

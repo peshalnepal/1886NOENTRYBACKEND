@@ -9,7 +9,7 @@ router so that no auth dependency declared here can ever leak onto it.
 
 import logging
 import uuid
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession

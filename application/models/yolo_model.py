@@ -2,11 +2,12 @@
 
 import asyncio
 import time
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
 import httpx
 import numpy as np
-import cv2
-from pydantic import BaseModel, Field
+
 from application.models.yolo_config import YoloModelConfig
 from domain.events import (
     RTSPEvent,

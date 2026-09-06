@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,7 +57,6 @@ class CleanupController:
         else:
             user_cameras = []
 
-        edge_seen: Set[Tuple[str, str]] = set()
         stream_seen: Set[str] = set()
 
         # Best-effort external cleanup while camera/device metadata still exists.
@@ -67,10 +66,6 @@ class CleanupController:
                 dev_url = str(getattr(dev, "device_url", "") or "").strip()
                 if not dev_url:
                     continue
-                key = (dev_url, cam_uuid_str)
-                if key in edge_seen:
-                    continue
-                edge_seen.add(key)
                 try:
                     await self._state.edge.delete_camera(device_url=dev_url, camera_uuid=cam_uuid_str)
                     edge_deleted.append(cam_uuid_str)
@@ -173,21 +168,31 @@ class CleanupController:
             )
 
             for cam in cameras_on_site:
-                seen_urls: Set[str] = set()
-                for dev in ([cam.device] if getattr(cam, "device", None) else []):
-                    dev_url = str(getattr(dev, "device_url", "") or "").strip()
-                    if not dev_url or dev_url in seen_urls:
-                        continue
-                    seen_urls.add(dev_url)
-                    await self._state.edge.delete_camera(device_url=dev_url, camera_uuid=str(cam.camera_uuid))
-                if cam.camera_code:
-                    await self._state.webrtc.delete_stream(stream_key=str(cam.camera_code))
-                await self._state.channel_repo.delete_camera(db, camera_uuid=cam.camera_uuid)
-                if active:
-                    try:
-                        await active.remove_channel(cam.camera_uuid)
-                    except Exception:
-                        logger.warning("Failed removing channel from cached ModelPipeline", exc_info=True)
+                # Isolated per camera, like cleanup_device_resources: one
+                # unreachable edge device must not abort the whole site
+                # teardown and strand the remaining cameras.
+                try:
+                    for dev in ([cam.device] if getattr(cam, "device", None) else []):
+                        dev_url = str(getattr(dev, "device_url", "") or "").strip()
+                        if not dev_url:
+                            continue
+                        await self._state.edge.delete_camera(device_url=dev_url, camera_uuid=str(cam.camera_uuid))
+                    if cam.camera_code:
+                        await self._state.webrtc.delete_stream(stream_key=str(cam.camera_code))
+                    await self._state.channel_repo.delete_camera(db, camera_uuid=cam.camera_uuid)
+                    if active:
+                        try:
+                            await active.remove_channel(cam.camera_uuid)
+                        except Exception:
+                            logger.warning("Failed removing channel from cached ModelPipeline", exc_info=True)
+
+                except Exception:
+                    logger.warning(
+                        "Failed cleanup camera %s on site %s",
+                        cam.camera_uuid,
+                        site_uuid,
+                        exc_info=True,
+                    )
 
         except Exception:
-            logger.exception("Error during device cleanup for %s", site_uuid)
+            logger.exception("Error during site cleanup for %s", site_uuid)

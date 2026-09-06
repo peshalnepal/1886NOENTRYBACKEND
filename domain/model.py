@@ -1,25 +1,20 @@
-# agents/domain/ai_models.py
-
 from __future__ import annotations
 
-from enum import Enum
-from typing import Optional, Protocol, Tuple, runtime_checkable
+from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
-
-from domain.events import ChannelEvent, RTSPEvent
 from application.models.vision_config import VisionModelConfig
+from domain.events import ChannelEvent, RTSPEvent
 
 
 @runtime_checkable
 class VisionModel(Protocol):
-    """
-    Domain port: anything that can turn an RTSPEvent into a domain ChannelEvent.
-    (Usually DetectionsProducedEvent or InferenceFailedEvent)
-    """
+    """Domain port: turns an `RTSPEvent` into a `ChannelEvent` — usually a
+    `DetectionsProducedEvent` or an `InferenceFailedEvent`."""
+
     cfg: VisionModelConfig
 
     async def infer(self, rtsp_ev: RTSPEvent) -> ChannelEvent: ...
 
     async def warmup(self) -> None: ...
+
     async def shutdown(self) -> None: ...

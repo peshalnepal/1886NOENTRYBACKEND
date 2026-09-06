@@ -13,17 +13,27 @@ def _det(x1, y1, x2, y2, *, conf=0.9, cls_name="car"):
     }
 
 
+# 10 FPS. These tests are about a big SPATIAL jump, not a long time gap: the
+# association gate scales with elapsed time (a slow camera legitimately gives an
+# object seconds to travel), so a jump only counts as "impossibly far" when it
+# happens between two consecutive frames at a normal frame rate. They used to
+# space frames 1-3s apart, which now reads as ample travel time and links the
+# boxes into one track — that is correct behaviour for a slow camera, and would
+# have made these tests assert the opposite of what they mean to guard.
+DT = 0.1
+
+
 class ByteTrackLiteFastMotionTests(unittest.TestCase):
     def test_fast_jump_does_not_return_old_missed_track(self):
         tracker = ByteTrackLite(min_hits=2, max_misses=0)
 
         tracker.update([_det(0, 0, 100, 60)], ts_s=0.0)
-        out2 = tracker.update([_det(8, 0, 108, 60)], ts_s=3.0)
+        out2 = tracker.update([_det(8, 0, 108, 60)], ts_s=DT)
         self.assertEqual(len(out2["tracks"]), 1)
         old_id = out2["tracks"][0]["track_id"]
         self.assertTrue(out2["tracks"][0]["confirmed"])
 
-        out3 = tracker.update([_det(320, 0, 420, 60)], ts_s=6.0)
+        out3 = tracker.update([_det(320, 0, 420, 60)], ts_s=2 * DT)
 
         self.assertEqual(len(out3["tracks"]), 1)
         self.assertNotEqual(out3["tracks"][0]["track_id"], old_id)
@@ -33,10 +43,10 @@ class ByteTrackLiteFastMotionTests(unittest.TestCase):
         tracker = ByteTrackLite(min_hits=2, max_misses=2)
 
         tracker.update([_det(0, 0, 100, 60)], ts_s=0.0)
-        out2 = tracker.update([_det(8, 0, 108, 60)], ts_s=1.0)
+        out2 = tracker.update([_det(8, 0, 108, 60)], ts_s=DT)
         old_id = out2["tracks"][0]["track_id"]
 
-        out3 = tracker.update([_det(320, 0, 420, 60)], ts_s=2.0)
+        out3 = tracker.update([_det(320, 0, 420, 60)], ts_s=2 * DT)
 
         emitted_ids = {t["track_id"] for t in out3["tracks"]}
         internal_ids = {t.track_id for t in tracker._tracks}
@@ -47,10 +57,10 @@ class ByteTrackLiteFastMotionTests(unittest.TestCase):
         tracker = ByteTrackLite(min_hits=2, max_misses=2, emit_coasting_tracks=True)
 
         tracker.update([_det(0, 0, 100, 60)], ts_s=0.0)
-        out2 = tracker.update([_det(8, 0, 108, 60)], ts_s=1.0)
+        out2 = tracker.update([_det(8, 0, 108, 60)], ts_s=DT)
         old_id = out2["tracks"][0]["track_id"]
 
-        out3 = tracker.update([_det(320, 0, 420, 60)], ts_s=2.0)
+        out3 = tracker.update([_det(320, 0, 420, 60)], ts_s=2 * DT)
 
         old = [t for t in out3["tracks"] if t["track_id"] == old_id]
         self.assertEqual(len(old), 1)

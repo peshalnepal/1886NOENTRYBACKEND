@@ -1,39 +1,15 @@
-import uuid
 from abc import ABC, abstractmethod
-from enum import Enum, auto
-from typing import AsyncGenerator, Optional,Literal,Tuple
+from typing import AsyncGenerator
 
-# Import the base ChannelEvent for generic type hinting
 from domain.events import ChannelEvent
 
 
-
-
-
 class Channel(ABC):
-    """
-    An abstract interface for a communication channel.
-
-    This defines the contract for any class that handles the real-time,
-    bidirectional communication with an external agent service (like OpenAI
-    or VAPI). It operates by processing and yielding generic ChannelEvents.
-    """
+    """Contract for real-time, bidirectional communication with an external
+    agent service. Implementations consume a `ChannelEvent` and stream back any
+    number of resulting events."""
 
     @abstractmethod
     async def stream(self, event: ChannelEvent) -> AsyncGenerator[ChannelEvent, None]:
-        """
-        Processes an incoming ChannelEvent and streams back resulting events.
-
-        This generic method allows different channel implementations to handle
-        various event types (e.g., user messages, system webhooks) and yield
-        any number of corresponding response events.
-
-        Args:
-            event: A ChannelEvent subclass representing the incoming data.
-
-        Yields:
-            An asynchronous generator of ChannelEvent objects.
-        """
-        # This is an abstract method; the yield is needed to satisfy the
-        # type checker for an async generat or.
+        # The bare yield is what makes this an async generator for type checkers.
         yield

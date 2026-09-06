@@ -19,7 +19,7 @@ services:
       - DB_INIT_RETRY_DELAY_S=5
       - DB_CONNECT_TIMEOUT_S=5
       - DB_IO_TIMEOUT_S=15
-      - DATABASE_URL=Driver={MySQL ODBC 8.0 Unicode Driver};Server=mysql;Port=3306;Database=appdb;User=appuser;Password=ChangeThis_AppPassword_2026!;Option=3;
+      - DATABASE_URL=Driver={MySQL ODBC 8.0 Unicode Driver};Server=noentry-mysql-4ep54c.mysql.database.azure.com;Port=3306;Database=appdb;User=mysqladmin;Password=ChangeThis_AdminPassword_2026!;Option=3;
       
       # SMTP
       - SMTP_USERNAME=peshalnepal3@gmail.com

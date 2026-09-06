@@ -65,7 +65,7 @@ is built inside the worker thread and must never be shared across threads.
 | `main.py` | Flask app + HTTP routes; starts the pipeline in a background thread; restores cameras from the DB on boot |
 | `pipeline.py` | `FramePool`, `SimpleInferencePipeline` (dispatch), `InferenceWorker`, `Broadcaster` |
 | `trt_infer.py` | `TRTEngine` (TensorRT bindings), `YoloV8DetTRT` (letterbox + parse), `build_default()` |
-| `channels/channel.py` | `VideoChannel` — one camera's decode thread and reconnect logic |
+| `channels/channel.py` | `VideoChannel` — one camera's decode thread and reconnect logic; emits `RTSPEvent` (connect/disconnect are log lines, not events) |
 | `channels/channel_config.py` | per-camera settings object |
 | `database.py`, `database_orm.py` | local SQLite; remembers cameras across restarts |
 | `deployment/setup_orin.sh` | builds the TensorRT engine **on the device** and installs the systemd unit |

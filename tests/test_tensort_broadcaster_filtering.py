@@ -14,8 +14,8 @@ class BroadcasterFilteringTests(unittest.IsolatedAsyncioTestCase):
         q_all = await broadcaster.subscribe()
         q_cam1 = await broadcaster.subscribe("cam-1")
 
-        await broadcaster.broadcast({"camera_uuid": "cam-2", "frame_seq": 1})
-        await broadcaster.broadcast({"camera_uuid": "cam-1", "frame_seq": 2})
+        broadcaster.broadcast({"camera_uuid": "cam-2", "frame_seq": 1})
+        broadcaster.broadcast({"camera_uuid": "cam-1", "frame_seq": 2})
 
         first_global = await asyncio.wait_for(q_all.get(), timeout=1.0)
         second_global = await asyncio.wait_for(q_all.get(), timeout=1.0)

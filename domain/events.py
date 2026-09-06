@@ -1,23 +1,21 @@
-# agents/domain/events.py
+"""Pipeline events: the vendor-agnostic vocabulary shared by channels, models
+and the notification layer."""
 
-import logging
-from typing import Any, Dict, List, Optional, Tuple, Literal,Union
 import uuid
-from pydantic import BaseModel, Field,ConfigDict
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-logger = logging.getLogger(__name__)
+from pydantic import BaseModel, ConfigDict, Field
+
 
 # =========================================================
 # Base Event System
 # =========================================================
 
 class Event(BaseModel):
-    """
-    Base class for all events in the system.
+    """Base class for every event.
 
-    Notes:
-    - arbitrary_types_allowed=True so we can carry in-memory frames (e.g., np.ndarray).
-    - Do NOT try to JSON serialize events that contain raw frames.
+    `arbitrary_types_allowed` lets an event carry an in-memory frame
+    (`np.ndarray`); such events must never be JSON-serialized.
     """
     event_type: str = "Event"
     payload: Dict[str, Any] = Field(default_factory=dict)
@@ -25,9 +23,7 @@ class Event(BaseModel):
 
 
 class ChannelEvent(Event):
-    """
-    Base class for events emitted by a channel (RTSP/Web/VAPI/etc).
-    """
+    """Base class for events emitted by a channel (RTSP / web / …)."""
     event_type: str = "ChannelEvent"
     channel_id: Optional[uuid.UUID] = None
 
@@ -40,41 +36,31 @@ EncodedFormat = Literal["raw", "jpeg", "png", "h264", "h265"]
 
 
 class RTSPEvent(ChannelEvent):
-    """
-    Canonical RTSP event carrying an IMAGE/VIDEO FRAME.
+    """One video frame from a camera, carried either raw or encoded.
 
-    You can carry frames in two ways:
+    In-process (fastest, not serializable): set `frame` to an ndarray with
+    `format="raw"` and `frame_shape=(H, W, C)`. This is what the Jetson's
+    GStreamer appsink produces.
 
-    1) In-process raw frame (fastest, not serializable):
-       - frame: np.ndarray (or similar)
-       - format="raw"
-       - frame_shape=(H, W, C)
-
-    2) Encoded payload (serializable if you base64 it later):
-       - encoded: bytes (e.g., JPEG bytes or H264/H265 access unit)
-       - format="jpeg" / "h264" / "h265"
-       - width/height optional but recommended
-
-    Recommended for Jetson local pipeline:
-      - Use raw frames (np.ndarray) from GStreamer appsink, keep everything in-process.
-    Recommended if sending frames over network:
-      - Use encoded bytes (jpeg/h264) and avoid raw frames.
+    Over the network: set `encoded` to the compressed bytes with a matching
+    `format` ("jpeg" / "h264" / "h265"); `width`/`height` are optional but
+    worth setting.
     """
     event_type: str = "RTSPEvent"
 
     camera_uuid: str
     ts_ms: int
-    seq: int 
+    seq: int
     format: EncodedFormat = "raw"
-    detection_enabled:bool=True
-    frame: Any = None  
-    frame_shape: Optional[Tuple[int, int, int]] = None 
+    detection_enabled: bool = True
+    frame: Any = None
+    frame_shape: Optional[Tuple[int, int, int]] = None
     encoded: Optional[bytes] = None
     width: Optional[int] = None
     height: Optional[int] = None
     fps_hint: Optional[float] = None
     keyframe: Optional[bool] = None
-    codec: Optional[str] = None  
+    codec: Optional[str] = None
 
 
 class ChannelConnectedEvent(ChannelEvent):
@@ -90,37 +76,39 @@ class ChannelDisconnectedEvent(ChannelEvent):
     event_type: str = "ChannelDisconnectedEvent"
     camera_uuid: str
     reason: str
-    device_url: Optional[str] = None  
+    device_url: Optional[str] = None
+
 
 class ChannelCreateEvent(Event):
-    """
-    Event to Add a Channel.
-    """
     event_type: Literal["Create_Channel"] = "Create_Channel"
     configs: Dict[str, Any]
 
+
 class ChannelRemoveEvent(Event):
-    """
-    Event to Remove a Channel.
-    """
     event_type: Literal["Remove_Channel"] = "Remove_Channel"
     channel_id: uuid.UUID
-    
+
+
 class ChannelEditEvent(Event):
-    """
-    Event to Edit a Channel.
-    """
     event_type: Literal["Edit_Channel"] = "Edit_Channel"
     channel_id: uuid.UUID
     configs: Dict[str, Any]
-    
+
+
 class FrameDroppedEvent(ChannelEvent):
     event_type: str = "FrameDroppedEvent"
     camera_uuid: str
     reason: str
     dropped_count: int = 1
 
-VideoChannelEvent=Union[ChannelConnectedEvent,ChannelDisconnectedEvent,ChannelCreateEvent,ChannelRemoveEvent,ChannelEditEvent]
+
+VideoChannelEvent = Union[
+    ChannelConnectedEvent,
+    ChannelDisconnectedEvent,
+    ChannelCreateEvent,
+    ChannelRemoveEvent,
+    ChannelEditEvent,
+]
 # =========================================================
 # Detection + Alerts
 # =========================================================
@@ -158,29 +146,23 @@ class SkeletonItem(BaseModel):
 
 
 class PoseResult(BaseModel):
-    """
-    Pose/skeleton output for a frame.
-    """
-    format: Literal["xy", "xyn"] = "xy"  # pixel coords or normalized coords
+    """Pose/skeleton output for one frame."""
+    format: Literal["xy", "xyn"] = "xy"  # pixel or normalized coordinates
     skeletons: List[SkeletonItem] = Field(default_factory=list)
 
 
 class SkeletonProducedEvent(ChannelEvent):
-    """
-    Dedicated event for pose/skeleton output.
-    Useful if some consumers only care about pose.
-    """
+    """Pose-only output, for consumers that do not care about detections."""
     event_type: str = "SkeletonProducedEvent"
     camera_uuid: str
     model_id: str
     frame_ts_ms: int
     frame_seq: int
     pose: PoseResult
-    
+
+
 class DetectionsProducedEvent(ChannelEvent):
-    """
-    Emitted after inference runs on a specific RTSPEvent frame.
-    """
+    """Emitted after inference runs on one `RTSPEvent` frame."""
     event_type: str = "DetectionsProducedEvent"
     camera_uuid: str
     model_id: str
@@ -189,7 +171,6 @@ class DetectionsProducedEvent(ChannelEvent):
     detections: List[DetectionItem] = Field(default_factory=list)
     inference_ms: Optional[int] = None
     pose: Optional[PoseResult] = None
-
 
 
 class InferenceFailedEvent(ChannelEvent):
@@ -214,13 +195,11 @@ class AlertRaisedEvent(ChannelEvent):
 
 
 # =========================================================
-# Clip (Last 20s) Events (optional)
+# Clip events
 # =========================================================
 
 class ClipRequestEvent(ChannelEvent):
-    """
-    Request the last N ms clip window for a camera.
-    """
+    """Request the last `window_ms` of footage for a camera."""
     event_type: str = "ClipRequestEvent"
     camera_uuid: str
     request_id: Optional[str] = None
@@ -229,9 +208,7 @@ class ClipRequestEvent(ChannelEvent):
 
 
 class ClipReadyEvent(ChannelEvent):
-    """
-    Response event when a clip is generated (file path or URL).
-    """
+    """Response once a clip exists, as a file path or URL in `clip_ref`."""
     event_type: str = "ClipReadyEvent"
     camera_uuid: str
     request_id: str

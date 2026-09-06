@@ -5,10 +5,9 @@ Extracted from the former monolithic application/services/manager.py.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +21,7 @@ from application.services.manager.helpers import (
     build_video_channel_config,
 )
 from application.services.manager.types import CameraOut
+from application.repositories._helpers import require_uuid
 from application.services.manager.controllers._state import ManagerState
 from application.services.manager.controllers.schedule import ScheduleResolver
 
@@ -59,37 +59,58 @@ class ChannelController:
 
         return out
 
-    def _as_uuid(self, v: Any, name: str) -> uuid.UUID:
-        if isinstance(v, uuid.UUID):
-            return v
-        try:
-            return uuid.UUID(str(v))
-        except Exception as e:
-            raise ValueError(f"Invalid {name}: {v}") from e
 
-    async def _bg_edge_upsert(self, *, device_url: str, payload: dict) -> None:
-        cam_uuid = payload.get("camera_uuid", "unknown")
-        coro = self._state.edge.upsert_camera(device_url=device_url, payload=payload)
-        await self._safe_bg_call(coro, "Background edge upsert succeeded camera_uuid=", "Background edge upsert failed camera_uuid=", cam_uuid)
+    @staticmethod
+    async def _safe_bg_call(coro, *, action: str, identifier: str) -> None:
+        """Await a fire-and-forget external call, logging instead of raising.
 
-    async def _bg_edge_delete(self, *, device_url: str, camera_uuid: str) -> None:
-        coro = self._state.edge.delete_camera(device_url=device_url, camera_uuid=camera_uuid)
-        await self._safe_bg_call(coro, "Background edge delete succeeded camera_uuid=", "Background edge delete failed camera_uuid=", camera_uuid)
-
-    async def _bg_edge_patch(self, *, device_url: str, camera_uuid: str, patch: dict) -> None:
-        coro = self._state.edge.patch_camera(device_url=device_url, camera_uuid=camera_uuid, patch=patch)
-        await self._safe_bg_call(coro, "Background edge patch succeeded camera_uuid=", "Background edge patch failed camera_uuid=", camera_uuid)
-
-    async def _bg_webrtc_update_stream(self, *, stream_key: str, source_url: str) -> None:
-        coro = self._state.webrtc.update_stream(stream_key=stream_key, source_url=source_url)
-        await self._safe_bg_call(coro, "Background WebRTC update succeeded stream_key=", "Background WebRTC update failed stream_key=", stream_key)
-
-    async def _safe_bg_call(self, coro: asyncio.coroutine, success_msg: str, error_msg: str, identifier: str) -> None:
+        These run detached from the request, so a failure must not propagate;
+        the periodic reconcile converges whatever is left inconsistent.
+        """
         try:
             await coro
-            logger.debug(f"{success_msg} %s", identifier)
+            logger.debug("Background %s succeeded for %s", action, identifier)
         except Exception:
-            logger.warning(f"{error_msg} %s — run Sync to fix", identifier, exc_info=True)
+            logger.warning(
+                "Background %s failed for %s — run Sync to fix",
+                action,
+                identifier,
+                exc_info=True,
+            )
+
+    async def _bg_edge_upsert(self, *, device_url: str, payload: dict) -> None:
+        await self._safe_bg_call(
+            self._state.edge.upsert_camera(device_url=device_url, payload=payload),
+            action="edge upsert",
+            identifier=str(payload.get("camera_uuid", "unknown")),
+        )
+
+    async def _bg_edge_delete(self, *, device_url: str, camera_uuid: str) -> None:
+        await self._safe_bg_call(
+            self._state.edge.delete_camera(
+                device_url=device_url, camera_uuid=camera_uuid
+            ),
+            action="edge delete",
+            identifier=camera_uuid,
+        )
+
+    async def _bg_edge_patch(self, *, device_url: str, camera_uuid: str, patch: dict) -> None:
+        await self._safe_bg_call(
+            self._state.edge.patch_camera(
+                device_url=device_url, camera_uuid=camera_uuid, patch=patch
+            ),
+            action="edge patch",
+            identifier=camera_uuid,
+        )
+
+    async def _bg_webrtc_update_stream(self, *, stream_key: str, source_url: str) -> None:
+        await self._safe_bg_call(
+            self._state.webrtc.update_stream(
+                stream_key=stream_key, source_url=source_url
+            ),
+            action="WebRTC update",
+            identifier=stream_key,
+        )
 
 
     async def add_channel(
@@ -112,14 +133,14 @@ class ChannelController:
         site_uuid = patch.get("site_uuid")
         if not site_uuid:
             raise ValueError("Create_Channel requires site_uuid")
-        site_uuid = self._as_uuid(site_uuid, "site_uuid")
+        site_uuid = require_uuid(site_uuid, "site_uuid")
 
         cam_uuid = patch.get("camera_uuid") or uuid.uuid4()
-        cam_uuid = self._as_uuid(cam_uuid, "camera_uuid")
+        cam_uuid = require_uuid(cam_uuid, "camera_uuid")
         patch["camera_uuid"] = cam_uuid
         patch["channel_id"] = cam_uuid
         camera_code = f"{camera_code_prefix}-{cam_uuid.hex[:8]}"
-        
+
         # 1. Validate ownership and find device FIRST (before creating stream)
         site = await self._state.site_repo.get_site(
             db, site_uuid=site_uuid, user_id=int(user_id), raise_if_missing=False
@@ -129,10 +150,10 @@ class ChannelController:
 
         raw_device_uuid = patch.get("device_uuid")
         requested_device_uuid = (
-            self._as_uuid(raw_device_uuid, "device_uuid")
+            require_uuid(raw_device_uuid, "device_uuid")
             if raw_device_uuid is not None else None
         )
-        
+
         site_devices = await self._state.device_repo.list_devices(db, site_uuid=site_uuid, user_id=user_id)
 
         if requested_device_uuid is not None:
@@ -178,7 +199,7 @@ class ChannelController:
             except Exception:
                 logger.warning("Failed to rollback WebRTC stream after DB upsert failure", exc_info=True)
             raise
-            
+
         det_enabled = bool(getattr(cam, "is_detection_enabled", True))
         schedule_state = await self._schedule_resolver.resolve_runtime_schedule(
             db,
@@ -207,7 +228,6 @@ class ChannelController:
                 name=f"edge_delete_{cam.camera_uuid}"
             )
 
-
         vcc = build_video_channel_config(
             cam,
             device_uuid=device_uuid,
@@ -219,32 +239,14 @@ class ChannelController:
         await model_pipeline.add_channel(VideoChannel(config=vcc))
 
         cameras_out = [
-            CameraOut(
-                camera_uuid=cam.camera_uuid,
-                camera_code=getattr(cam, "camera_code", None),
-                name=getattr(cam, "name", None),
-                location=getattr(cam, "location", None),
-                site_uuid=cam.site_uuid,
-                source_url=cam.source_url,
-                webrtc_url=cam.webrtc_url,
-                enabled=bool(cam.is_enabled),
-                detection_enabled=bool(cam.is_detection_enabled),
-                notification_enabled=bool(cam.is_notification_enabled),
+            CameraOut.from_camera(
+                cam,
                 device_uuid=device_uuid,
                 device_url=dev.device_url,
-                sample_fps=float(patch.get("sample_fps", 5.0)),
-                decode_backend=str(patch.get("decode_backend", "gstreamer")),
-                resize=patch.get("resize"),
-                emit_format=str(patch.get("emit_format", "raw")),
-                jpeg_quality=int(patch.get("jpeg_quality", 80)),
-                roi=cam.roi,
-                configuration=cfg_json or {},
+                cfg_json=cfg_json,
+                capture_cfg=patch,
                 timezone=tz,
-                notification_trigger_mode=str(getattr(cam, "notification_trigger_mode", "inherit") or "inherit"),
-                camera_playback_enabled=str(getattr(cam, "camera_playback_enabled", "inherit") or "inherit"),
                 use_site_schedule=schedule_state.get("use_site_schedule"),
-                created_at=getattr(cam, "created_at", None),
-                updated_at=getattr(cam, "updated_at", None),
             )
         ]
 
@@ -274,7 +276,7 @@ class ChannelController:
         cam_uuid = getattr(ev, "channel_id", None) or getattr(ev, "camera_uuid", None)
         if cam_uuid is None:
             raise ValueError("Edit_Channel missing channel_id (camera_uuid).")
-        cam_uuid = self._as_uuid(cam_uuid, "camera_uuid")
+        cam_uuid = require_uuid(cam_uuid, "camera_uuid")
 
         full = await self._state.channel_repo.get_camera_full(db, camera_uuid=cam_uuid)
         if not full:
@@ -306,7 +308,7 @@ class ChannelController:
         # Determine new device: requested > preserve old > auto-pick
         requested_device_uuid = patch.get("device_uuid")
         if requested_device_uuid is not None:
-            requested_device_uuid = self._as_uuid(requested_device_uuid, "device_uuid")
+            requested_device_uuid = require_uuid(requested_device_uuid, "device_uuid")
             site_devices = await self._state.device_repo.list_devices(db, site_uuid=cam_db.site_uuid, user_id=user_id)
             new_dev = await self._state.device_repo.get_device(db, device_uuid=requested_device_uuid, user_id=user_id)
             if not new_dev:
@@ -419,32 +421,14 @@ class ChannelController:
         await model_pipeline.edit_channel(VideoChannel(config=vcc))
 
         cameras_out = [
-            CameraOut(
-                camera_uuid=cam2.camera_uuid,
-                camera_code=getattr(cam2, "camera_code", None),
-                name=getattr(cam2, "name", None),
-                location=getattr(cam2, "location", None),
-                site_uuid=cam2.site_uuid,
-                source_url=cam2.source_url,
-                webrtc_url=cam2.webrtc_url,
-                enabled=bool(cam2.is_enabled),
-                detection_enabled=bool(cam2.is_detection_enabled),
-                notification_enabled=bool(cam2.is_notification_enabled),
+            CameraOut.from_camera(
+                cam2,
                 device_uuid=new_device_uuid,
                 device_url=new_dev.device_url,
-                sample_fps=float(merged_cfg.get("sample_fps", 5.0)),
-                decode_backend=str(merged_cfg.get("decode_backend", "gstreamer")),
-                resize=merged_cfg.get("resize"),
-                emit_format=str(merged_cfg.get("emit_format", "raw")),
-                jpeg_quality=int(merged_cfg.get("jpeg_quality", 80)),
-                roi=cam2.roi,
-                configuration=cfg_json or {},
+                cfg_json=cfg_json,
+                capture_cfg=merged_cfg,
                 timezone=tz,
-                notification_trigger_mode=str(getattr(cam2, "notification_trigger_mode", "inherit") or "inherit"),
-                camera_playback_enabled=str(getattr(cam2, "camera_playback_enabled", "inherit") or "inherit"),
                 use_site_schedule=schedule_state.get("use_site_schedule"),
-                created_at=getattr(cam2, "created_at", None),
-                updated_at=getattr(cam2, "updated_at", None),
             )
         ]
 
@@ -472,7 +456,7 @@ class ChannelController:
         cam_uuid = getattr(ev, "channel_id", None) or getattr(ev, "camera_uuid", None)
         if cam_uuid is None:
             raise ValueError("Remove_Channel missing channel_id (camera_uuid).")
-        cam_uuid = self._as_uuid(cam_uuid, "camera_uuid")
+        cam_uuid = require_uuid(cam_uuid, "camera_uuid")
 
         full = await self._state.channel_repo.get_camera_full(db, camera_uuid=cam_uuid)
         if full:

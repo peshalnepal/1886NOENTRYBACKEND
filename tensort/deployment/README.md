@@ -301,9 +301,16 @@ Edit `tensort/.env`, then `sudo systemctl restart jetson-cameras`:
 
 | Setting | Effect |
 |---|---|
-| `DEFAULT_SAMPLE_FPS` | Frames analysed per camera per second. **The main lever.** Orin: 12. Nano: 2. |
-| `EMIT_EMPTY_DETECTIONS` | `false` reduces network traffic substantially |
+| `DEFAULT_SAMPLE_FPS` | Frames analysed per camera per second. **The main lever.** Orin: 10. Nano: 2-6. |
+| `INFER_MAX_BATCH` | Frames per GPU call. Must be ≤ the engine's `maxShapes` batch (check `max_batch` in `/health`). |
+| `FRAME_POOL_CAP` / `FRAME_MAX_AGE_MS` | How many frames may wait for the GPU, and how old a frame may be before it is dropped instead of inferred. |
+| `CONF` | Detection threshold. Keep **≤ the cloud tracker's `low_th` (0.20)** or its low-confidence rescue band goes empty and boxes flicker. |
+| `EMIT_EMPTY_DETECTIONS` | Keep `true`. The cloud tracker ages tracks by frame arrival; withholding empty frames makes departing objects linger. |
 | `DEFAULT_RESIZE_W/H` | Smaller frames use less memory |
+
+Health counters worth watching (`/health`): `pool_evicted_total` climbing steadily
+means the cameras are producing faster than the GPU drains — lower
+`DEFAULT_SAMPLE_FPS`. `infer_fail` counts frames that errored or timed out.
 
 ### 5.5 Adding swap (original Nano)
 

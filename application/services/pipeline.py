@@ -1,18 +1,15 @@
 # application/services/pipeline.py
-"""
-Azure-side pipeline.
+"""The cloud-side detection pipeline.
 
-- NO RTSP ingest
-- NO frame streaming
-
-It keeps a registry of Camera Channels and maintains an in-memory "latest detection"
-cache per camera by polling Jetson: /detection/{camera_uuid}
+It never ingests RTSP or streams frames itself: it keeps a registry of camera
+channels, consumes each Jetson's detection stream, runs tracking and ROI rules
+over the results, and caches the latest detection per camera for the live
+overlay.
 """
 
-import base64
 import asyncio
+import base64
 import logging
-import os
 import random
 import time
 import uuid as _uuid
@@ -23,21 +20,21 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.channels.channel import VideoChannel, VideoChannelConfig
-from application.services.tracker import (
-    MultiCameraByteTrack,
-    ROI,
-    ROIAlertEngine,
-    nms_payload_detections,
-)
-from application.services.notification import NotificationMessage, NotificationService
 from application.repositories.notification_repository import CameraContext
 from application.services.common import (
     CameraContextResolver,
     SiteArmStateResolver,
     SiteTriggerModeResolver,
 )
+from application.services.notification import NotificationMessage, NotificationService
 from application.services.overlay_normalize import _append_overlay_detection
-
+from application.services.tracker import (
+    MultiCameraByteTrack,
+    ROI,
+    ROIAlertEngine,
+    nms_payload_detections,
+)
+from core.env import env_float, env_int
 
 logger = logging.getLogger(__name__)
 
@@ -68,75 +65,53 @@ class ObjDetectResponse:
     alerts: Tuple[Dict[str, Any], ...] = ()
 
 
+def _alert_label(cls_name: Any) -> str:
+    label = str(cls_name or "object").strip() or "object"
+    return label[:1].upper() + label[1:]
+
+
+def _alert_location(ctx: CameraContext) -> str:
+    parts = [p for p in (ctx.camera_name, ctx.site_name) if p]
+    return ", ".join(parts) if parts else "the monitored area"
+
+
+# The class word stays in the body because downstream object-name inference
+# runs a regex over that text. The timestamp is rendered client-side from
+# `ts_ms`, so it is deliberately absent here.
 def _humanize_roi_alert(cls_name: Any, ctx: CameraContext) -> Tuple[str, str]:
-    """Build a human-readable title/body for an ROI-enter alert.
-
-    Replaces the old debug-style ``"car entered ROI <uuid>-roi (track 112809)"``
-    with operator-friendly copy like ``"Car entered the restricted zone at
-    Front Gate · Main Site"``. The class word is preserved in the body so the
-    downstream object-name inference (regex over the body) still works, and the
-    location is drawn from the resolved camera/site names rather than raw UUIDs.
-    The timestamp is rendered by the client from ``ts_ms``, so it is not
-    duplicated in the text.
-    """
-    label = (str(cls_name or "object").strip() or "object")
-    label = label[:1].upper() + label[1:]
-
-    loc_parts = [p for p in (getattr(ctx, "camera_name", None), getattr(ctx, "site_name", None)) if p]
-    location = ", ".join(loc_parts) if loc_parts else "the monitored area"
-
-    title = f"{label} entered restricted zone"
-    body = f"{label} entered the restricted zone at {location}"
-    return title, body
+    label = _alert_label(cls_name)
+    return (
+        f"{label} entered restricted zone",
+        f"{label} entered the restricted zone at {_alert_location(ctx)}",
+    )
 
 
-def _humanize_item_detected(cls_name: Any, conf: float, ctx: CameraContext) -> Tuple[str, str]:
-    """Build a human-readable title/body for a confirmed-detection alert.
-
-    Replaces the old ``"car confirmed (track_id=112809, conf=0.87)"`` debug
-    string with operator-friendly copy. Keeps the class word in the body so the
-    downstream object-name inference still works.
-    """
-    label = (str(cls_name or "object").strip() or "object")
-    label = label[:1].upper() + label[1:]
-
-    loc_parts = [p for p in (getattr(ctx, "camera_name", None), getattr(ctx, "site_name", None)) if p]
-    location = ", ".join(loc_parts) if loc_parts else "the monitored area"
-
+def _humanize_item_detected(
+    cls_name: Any, conf: float, ctx: CameraContext
+) -> Tuple[str, str]:
+    label = _alert_label(cls_name)
     try:
-        pct = max(0, min(100, int(round(float(conf) * 100))))
+        pct = max(0, min(100, round(float(conf) * 100)))
     except (TypeError, ValueError):
         pct = 0
-
-    title = f"{label} detected"
-    body = f"{label} detected at {location} ({pct}% confidence)"
-    return title, body
+    return (
+        f"{label} detected",
+        f"{label} detected at {_alert_location(ctx)} ({pct}% confidence)",
+    )
 
 
 def _live_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Filter raw tracker output down to the tracks that should actually be drawn
-    on the live overlay (and recorded for playback).
+    """Tracks that should actually be drawn on the live overlay.
 
-    The tracker keeps "coasting" tracks alive for several frames after they stop
-    matching a detection (occlusion / flicker tolerance). Those tracks have no
-    real detection backing them on the current frame — their bbox is pure
-    velocity extrapolation that, for fast objects, freezes in place and leaves a
-    trail of stale ghost boxes behind the moving object.
-
-    For rendering we only want tracks that:
-      - were updated by a detection THIS frame (``misses == 0``), and
-      - are confirmed (survived ``min_hits``), so a single spurious detection
-        does not flash an ID'd box for one frame.
-
-    The raw Jetson detections are still drawn separately, so a real object is
-    never hidden by this filter — it only suppresses the ID'd ghost boxes.
+    Coasting tracks (kept alive for a few frames after they stop matching a
+    detection) have a pure velocity-extrapolated bbox, which trails stale ghost
+    boxes behind a fast object. Only confirmed tracks matched this frame are
+    drawn. Raw edge detections are drawn separately, so this never hides a real
+    object.
     """
     out: List[Dict[str, Any]] = []
     for t in tracks:
-        if not isinstance(t, dict):
-            continue
-        if not t.get("confirmed", False):
+        if not isinstance(t, dict) or not t.get("confirmed", False):
             continue
         try:
             if int(t.get("misses", 0) or 0) > 0:
@@ -153,8 +128,8 @@ def _overlay_payload_from_resp(
     fallback_detections: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     detections: List[Dict[str, Any]] = []
-    seen_exact: set[Tuple[Any, ...]] = set()
-    tracked_bases: set[Tuple[Any, ...]] = set()
+    seen_exact: Set[Tuple[Any, ...]] = set()
+    tracked_bases: Set[Tuple[Any, ...]] = set()
     untracked_indexes: Dict[Tuple[Any, ...], int] = {}
 
     for raw_detection in list(resp.detections or ()) + list(fallback_detections or ()):
@@ -193,7 +168,7 @@ class ObjDetectStorePort(Protocol):
         *,
         after_ts_ms: int,
         after_seq: int,
-        timeout_ms: int
+        timeout_ms: int,
     ) -> Optional[ObjDetectResponse]: ...
 
 
@@ -237,7 +212,7 @@ class InMemoryObjDetectStore:
         *,
         after_ts_ms: int,
         after_seq: int,
-        timeout_ms: int
+        timeout_ms: int,
     ) -> Optional[ObjDetectResponse]:
         key = str(camera_uuid)
         evt = await self._evt(key)
@@ -260,10 +235,8 @@ class InMemoryObjDetectStore:
 
 
 class DetectionHub:
-    """
-    Pub/Sub hub for all detections across all cameras.
-    Used for the global SSE stream.
-    """
+    """Pub/sub hub for all detections across all cameras, used by the global stream."""
+
     def __init__(self, max_q: int = 100):
         self._subs: Set[asyncio.Queue] = set()
         self._lock = asyncio.Lock()
@@ -282,12 +255,11 @@ class DetectionHub:
     async def publish(self, resp: ObjDetectResponse) -> None:
         async with self._lock:
             subs = list(self._subs)
-        if not subs:
-            return
         for q in subs:
             try:
                 q.put_nowait(resp)
             except asyncio.QueueFull:
+                # Drop the oldest frame rather than block the producer.
                 try:
                     q.get_nowait()
                     q.put_nowait(resp)
@@ -296,11 +268,9 @@ class DetectionHub:
 
 
 class ModelPipeline:
-    """
-    Azure runtime registry + Jetson detection polling.
+    """Azure runtime channel registry plus Jetson detection consumption.
 
-    Important:
-    - webrtc_url is treated as immutable (cannot be patched/edited here).
+    `webrtc_url` is immutable: `edit_channel` refuses a change to it.
     """
 
     def __init__(
@@ -319,87 +289,79 @@ class ModelPipeline:
         self.pipeline_id = pipeline_id
         self.detect_store = detect_store or InMemoryObjDetectStore()
         self.detection_hub = DetectionHub()
+
+        self._channels: Dict[str, VideoChannel] = {}
+        self._poll_tasks: Dict[str, asyncio.Task] = {}
         self._last_seen: Dict[str, Tuple[int, int]] = {}
         self._last_ok_s: Dict[str, float] = {}
+
         # Clock-skew monitor: the Jetson stamps frame_ts_ms with its own wall
-        # clock, and the clip window is sliced out of MediaMTX recordings stamped
-        # with the Azure clock. If the Jetson clock drifts from UTC, every clip is
-        # shifted and the event falls outside the captured window. We can't fix the
-        # Jetson clock from here, but we CAN detect the drift: the Azure clock ≈ the
-        # MediaMTX clock (both Azure/NTP), so (azure_now - frame_ts_ms) on arrival
-        # is the one-way lag; its rolling floor approximates the clock offset.
+        # clock, while clip windows are sliced out of MediaMTX recordings stamped
+        # with the Azure clock. Drift shifts every clip so the event falls outside
+        # the captured window. We cannot fix the Jetson clock from here, but the
+        # rolling floor of (azure_now - frame_ts_ms) approximates the offset.
         self._clock_skew_floor_ms: Dict[str, float] = {}
         self._clock_skew_floor_reset_s: Dict[str, float] = {}
         self._clock_skew_last_warn_s: Dict[str, float] = {}
-        self._channels: Dict[str, VideoChannel] = {}
-        self._poll_tasks: Dict[str, asyncio.Task] = {}
-        self._last_seq: Dict[str, int] = {}
-        
-        cfg = tracker_cfg or {}
-        self._tracker = MultiCameraByteTrack(**cfg)
-        self._nms_iou = max(0.0, float(os.getenv("DETECTION_NMS_IOU", "0.55")))
-        self._nms_overlap = max(
-            0.0, float(os.getenv("DETECTION_NMS_OVERLAP", "0.70"))
-        )
-        self._nms_size_ratio = max(
-            0.0, float(os.getenv("DETECTION_NMS_SIZE_RATIO", "0.65"))
-        )
+
+        self._tracker = MultiCameraByteTrack(**(tracker_cfg or {}))
+        self._nms_iou = env_float("DETECTION_NMS_IOU", 0.55, minimum=0.0)
+        self._nms_overlap = env_float("DETECTION_NMS_OVERLAP", 0.70, minimum=0.0)
+        self._nms_size_ratio = env_float("DETECTION_NMS_SIZE_RATIO", 0.65, minimum=0.0)
         self._roi_engine = ROIAlertEngine()
-        
-        self.interesting_classes = interesting_classes or {"person", "car", "motorcycle", "truck"}
+
+        self.interesting_classes = interesting_classes or {
+            "person", "car", "motorcycle", "truck",
+        }
         self.notify_on_confirmed = notify_on_confirmed
         self.notify_on_roi_enter = notify_on_roi_enter
-        
+
         self._roi_cache: Dict[str, Tuple[float, List[ROI]]] = {}
-        self._roi_cache_ttl_s = max(
-            0.0,
-            float(os.getenv("CAMERA_ROI_CACHE_TTL_S", "30.0")),
+        self._roi_cache_ttl_s = env_float("CAMERA_ROI_CACHE_TTL_S", 30.0, minimum=0.0)
+        self._roi_cache_error_ttl_s = env_float(
+            "CAMERA_ROI_CACHE_ERROR_TTL_S", 5.0, minimum=0.0
         )
+
         self._notification_service = notification_service
-        self._last_detection_summary_s: Dict[str, float] = {}
-        self._detection_summary_cooldown_s = max(
-            0.0,
-            float(os.getenv("DETECTION_ALERT_COOLDOWN_S", "8.0")),
+        self._last_detection_summary_s: Dict[Tuple[str, str], float] = {}
+        self._detection_summary_cooldown_s = env_float(
+            "DETECTION_ALERT_COOLDOWN_S", 8.0, minimum=0.0
         )
+
         self._ctx_resolver = CameraContextResolver(
             hit_ttl_s=60.0,
-            miss_ttl_s=float(os.getenv("CAMERA_CONTEXT_MISS_CACHE_TTL_S", "5.0")),
-            max_concurrent_lookups=int(
-                os.getenv("CAMERA_CONTEXT_MAX_CONCURRENT_DB_LOOKUPS", "4")
+            miss_ttl_s=env_float("CAMERA_CONTEXT_MISS_CACHE_TTL_S", 5.0),
+            max_concurrent_lookups=env_int(
+                "CAMERA_CONTEXT_MAX_CONCURRENT_DB_LOOKUPS", 4
             ),
         )
         self._trigger_mode_resolver = SiteTriggerModeResolver(
             default="roi_enter",
-            ttl_s=float(os.getenv("SITE_TRIGGER_MODE_CACHE_TTL_S", "30.0")),
+            ttl_s=env_float("SITE_TRIGGER_MODE_CACHE_TTL_S", 30.0),
         )
         self._arm_state_resolver = SiteArmStateResolver(
-            ttl_s=float(os.getenv("SITE_ARM_STATE_CACHE_TTL_S", "10.0")),
+            ttl_s=env_float("SITE_ARM_STATE_CACHE_TTL_S", 10.0),
         )
+
         self._session_factory: Optional[SessionFactory] = None
         self._device_fetch_limits: Dict[str, asyncio.Semaphore] = {}
-        self._max_concurrent_fetch_per_device = max(
-            1,
-            int(os.getenv("DETECTION_MAX_CONCURRENT_FETCH_PER_DEVICE", "8")),
+        self._max_concurrent_fetch_per_device = env_int(
+            "DETECTION_MAX_CONCURRENT_FETCH_PER_DEVICE", 8, minimum=1
         )
-        self._startup_jitter_ms = max(
-            0,
-            int(os.getenv("DETECTION_STARTUP_JITTER_MS", "100")),
+        self._startup_jitter_ms = env_int("DETECTION_STARTUP_JITTER_MS", 100, minimum=0)
+
+        # The clip window absorbs sub-second offsets; multi-second skew pushes the
+        # event outside the PRE/POST window. 0 disables the check.
+        self._clock_skew_warn_ms = env_int(
+            "DETECTION_CLOCK_SKEW_WARN_MS", 3000, minimum=0
         )
-        # Warn when the estimated Jetson↔Azure clock offset exceeds this many ms.
-        # The clip window absorbs sub-second offsets; multi-second skew shifts the
-        # event out of the PRE/POST window, so default to 3s. Set 0 to disable.
-        self._clock_skew_warn_ms = max(
-            0,
-            int(os.getenv("DETECTION_CLOCK_SKEW_WARN_MS", "3000")),
+        self._clock_skew_floor_window_s = env_float(
+            "DETECTION_CLOCK_SKEW_FLOOR_WINDOW_S", 300.0, minimum=30.0
         )
-        self._clock_skew_floor_window_s = max(
-            30.0,
-            float(os.getenv("DETECTION_CLOCK_SKEW_FLOOR_WINDOW_S", "300.0")),
+        self._clock_skew_warn_interval_s = env_float(
+            "DETECTION_CLOCK_SKEW_WARN_INTERVAL_S", 120.0, minimum=5.0
         )
-        self._clock_skew_warn_interval_s = max(
-            5.0,
-            float(os.getenv("DETECTION_CLOCK_SKEW_WARN_INTERVAL_S", "120.0")),
-        )
+
         self._lock = asyncio.Lock()
         self._started = False
         self._closing = False
@@ -409,6 +371,10 @@ class ModelPipeline:
 
         for ch in (channels or []):
             self._channels[ch.key()] = ch
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
         async with self._lock:
@@ -433,8 +399,12 @@ class ModelPipeline:
             self._started = False
             self._last_seen.clear()
             self._last_ok_s.clear()
-            self._last_seq.clear()
             self._last_detection_summary_s.clear()
+            self._clock_skew_floor_ms.clear()
+            self._clock_skew_floor_reset_s.clear()
+            self._clock_skew_last_warn_s.clear()
+            self._roi_cache.clear()
+
         for t in tasks:
             if t and not t.done():
                 t.cancel()
@@ -446,116 +416,6 @@ class ModelPipeline:
             except Exception:
                 logger.exception("Poller task failed during shutdown")
 
-    def _is_new_detection(self, key: str, resp: ObjDetectResponse) -> bool:
-        prev_ts, prev_seq = self._last_seen.get(key, (0, -1))
-        cur_ts, cur_seq = int(resp.frame_ts_ms), int(resp.frame_seq)
-
-        if cur_ts > prev_ts:
-            return True
-        if cur_ts == prev_ts and cur_seq > prev_seq:
-            return True
-
-        # Exact duplicate frame: not new, and not a restart.
-        if cur_ts == prev_ts and cur_seq == prev_seq:
-            return False
-
-        regressed = (cur_ts < prev_ts) or (cur_ts == prev_ts and cur_seq < prev_seq)
-        if not regressed:
-            return False
-
-        # Regressed after a gap (disconnect): assume the Jetson restarted, so
-        # accept the frame and re-anchor rather than stalling forever.
-        last_ok = self._last_ok_s.get(key, 0.0)
-        if (time.monotonic() - last_ok) > 5.0:
-            logger.warning(
-                "Detected possible Jetson restart (ts/seq regressed). Resetting last_seen. camera=%s prev=(%s,%s) cur=(%s,%s)",
-                key, prev_ts, prev_seq, cur_ts, cur_seq
-            )
-            return True
-
-        return False
-
-    def _monitor_clock_skew(self, key: str, frame_ts_ms: int) -> None:
-        """Estimate and warn on Jetson↔Azure clock drift (warn-only, no behavior change).
-
-        ``lag = azure_now_ms - frame_ts_ms`` is the one-way delay between the
-        Jetson stamping a frame and Azure receiving the detection. Real lag is
-        always positive and bounded below by the network/processing latency, so
-        the *minimum* lag over a window is a good estimate of the constant clock
-        offset: a near-zero/positive floor means the clocks agree; a large
-        positive floor means the Jetson clock is BEHIND Azure (and the clip window
-        will land in the past); a negative floor means the Jetson clock is AHEAD
-        (the frame is stamped in the "future", which is physically impossible
-        without skew, so it is a definitive signal). The floor is reset on a slow
-        window so a corrected clock recovers instead of latching forever.
-        """
-        if self._clock_skew_warn_ms <= 0:
-            return
-
-        now_s = time.time()
-        lag_ms = (now_s * 1000.0) - float(frame_ts_ms)
-
-        reset_at = self._clock_skew_floor_reset_s.get(key, 0.0)
-        floor = self._clock_skew_floor_ms.get(key)
-        if floor is None or now_s >= reset_at:
-            self._clock_skew_floor_ms[key] = lag_ms
-            self._clock_skew_floor_reset_s[key] = now_s + self._clock_skew_floor_window_s
-            floor = lag_ms
-        elif lag_ms < floor:
-            self._clock_skew_floor_ms[key] = lag_ms
-            floor = lag_ms
-
-        # A healthy floor is a small positive number (one-way latency). Flag only
-        # when it drifts beyond the threshold in either direction.
-        if -self._clock_skew_warn_ms <= floor <= self._clock_skew_warn_ms:
-            return
-
-        last_warn = self._clock_skew_last_warn_s.get(key, 0.0)
-        if (now_s - last_warn) < self._clock_skew_warn_interval_s:
-            return
-        self._clock_skew_last_warn_s[key] = now_s
-
-        direction = "AHEAD of" if floor < 0 else "BEHIND"
-        logger.warning(
-            "Jetson clock appears skewed camera=%s estimated_offset_ms=%d (Jetson clock is %s Azure/MediaMTX). "
-            "Clip windows are anchored on the Jetson wall clock; multi-second skew shifts the event out of the "
-            "captured PRE/POST window. Verify NTP/time sync on the Jetson host.",
-            key,
-            int(floor),
-            direction,
-        )
-
-    def set_notification_service(self, svc: NotificationService) -> None:
-        self._notification_service = svc
-
-    def set_session_factory(self, session_factory: SessionFactory) -> None:
-        self._session_factory = session_factory
-        self._ctx_resolver.set_session_factory(session_factory)
-        self._trigger_mode_resolver.set_session_factory(session_factory)
-        self._arm_state_resolver.set_session_factory(session_factory)
-        if self._notification_service is not None:
-            try:
-                self._notification_service.set_session_factory(session_factory)
-            except Exception:
-                logger.exception("Failed to set session factory on NotificationService")
-
-    def invalidate_camera_roi_state(self, camera_uuid: str) -> None:
-        """
-        Clear per-camera ROI edge-trigger state so ROI edits take effect immediately.
-        """
-        cam = str(camera_uuid)
-        self._roi_engine.reset_camera(cam)
-        self._roi_cache.pop(cam, None)
-
-    def invalidate_site_trigger_mode_cache(self, site_uuid: str) -> None:
-        """Invalidate the cached trigger_mode for a site (after settings are saved)."""
-        self._trigger_mode_resolver.invalidate(str(site_uuid))
-
-    def invalidate_site_arm_state(self, site_uuid: str) -> None:
-        """Invalidate the cached arm/disarm override for a site so a fresh
-        arm/disarm action gates notifications immediately instead of after TTL."""
-        self._arm_state_resolver.invalidate(str(site_uuid))
-
     async def add_channel(self, ch: VideoChannel) -> None:
         key = ch.key()
         async with self._lock:
@@ -566,23 +426,22 @@ class ModelPipeline:
             self._ensure_poller(key, ch)
 
     async def edit_channel(self, ch: VideoChannel) -> None:
-        """
-        Replace the channel (e.g., device_url changed).
-        Preserves webrtc_url immutability by refusing changes if attempted.
-        """
+        """Replace a channel in place, for example after device_url changed."""
         key = ch.key()
         async with self._lock:
             old = self._channels.get(key)
-
             if old is not None:
                 old_cfg = getattr(old, "config", None)
                 new_cfg = getattr(ch, "config", None)
                 if old_cfg is not None and new_cfg is not None:
-                    if getattr(old_cfg, "webrtc_url", None) != getattr(new_cfg, "webrtc_url", None):
-                        raise ValueError("webrtc_url is immutable; do not change it on edit.")
+                    if getattr(old_cfg, "webrtc_url", None) != getattr(
+                        new_cfg, "webrtc_url", None
+                    ):
+                        raise ValueError(
+                            "webrtc_url is immutable; do not change it on edit."
+                        )
 
             self._channels[key] = ch
-
             old_task = self._poll_tasks.pop(key, None)
             started = self._started and (not self._closing)
 
@@ -605,13 +464,17 @@ class ModelPipeline:
         async with self._lock:
             self._channels.pop(key, None)
             t = self._poll_tasks.pop(key, None)
-            self._last_seq.pop(key, None)
             self._last_seen.pop(key, None)
             self._last_ok_s.pop(key, None)
-            self._last_detection_summary_s.pop(key, None)
             self._clock_skew_floor_ms.pop(key, None)
             self._clock_skew_floor_reset_s.pop(key, None)
             self._clock_skew_last_warn_s.pop(key, None)
+            # Cooldown keys are (camera_uuid, cls_name), so drop by prefix.
+            for cooldown_key in [
+                k for k in self._last_detection_summary_s if k[0] == key
+            ]:
+                self._last_detection_summary_s.pop(cooldown_key, None)
+
         if isinstance(self.detect_store, InMemoryObjDetectStore):
             await self.detect_store.forget(key)
         self._ctx_resolver.invalidate(key)
@@ -630,21 +493,118 @@ class ModelPipeline:
 
         return True
 
+    def _ensure_poller(self, key: str, ch: VideoChannel) -> None:
+        t = self._poll_tasks.get(key)
+        if t is None or t.done():
+            self._poll_tasks[key] = self._task_spawner(
+                self._stream_loop(key, ch),
+                f"stream_jetson_detection:{key}",
+            )
+
+    # ------------------------------------------------------------------
+    # Registry accessors and cache invalidation
+    # ------------------------------------------------------------------
+
     def list_channel_ids(self) -> List[str]:
         return list(self._channels.keys())
 
-    async def get_channel_config(self, camera_uuid: str) -> Optional[VideoChannelConfig]:
+    async def get_channel_config(
+        self, camera_uuid: str
+    ) -> Optional[VideoChannelConfig]:
         key = str(camera_uuid)
         async with self._lock:
             ch = self._channels.get(key)
             return getattr(ch, "config", None) if ch else None
 
-    async def get_latest_detection(self, camera_uuid: str) -> Optional[ObjDetectResponse]:
+    async def get_latest_detection(
+        self, camera_uuid: str
+    ) -> Optional[ObjDetectResponse]:
         return await self.detect_store.get_latest(str(camera_uuid))
 
-    async def refresh_detection_once(self, camera_uuid: str) -> Optional[ObjDetectResponse]:
-        """
-        On-demand pull from Jetson once (useful if the cache is empty).
+    def set_notification_service(self, svc: NotificationService) -> None:
+        self._notification_service = svc
+
+    def set_session_factory(self, session_factory: SessionFactory) -> None:
+        self._session_factory = session_factory
+        self._ctx_resolver.set_session_factory(session_factory)
+        self._trigger_mode_resolver.set_session_factory(session_factory)
+        self._arm_state_resolver.set_session_factory(session_factory)
+        if self._notification_service is not None:
+            try:
+                self._notification_service.set_session_factory(session_factory)
+            except Exception:
+                logger.exception(
+                    "Failed to set session factory on NotificationService"
+                )
+
+    def invalidate_camera_roi_state(self, camera_uuid: str) -> None:
+        """Clear per-camera ROI edge-trigger state so ROI edits apply immediately."""
+        cam = str(camera_uuid)
+        self._roi_engine.reset_camera(cam)
+        self._roi_cache.pop(cam, None)
+
+    def invalidate_site_trigger_mode_cache(self, site_uuid: str) -> None:
+        self._trigger_mode_resolver.invalidate(str(site_uuid))
+
+    def invalidate_site_arm_state(self, site_uuid: str) -> None:
+        self._arm_state_resolver.invalidate(str(site_uuid))
+
+    # ------------------------------------------------------------------
+    # Ingestion
+    # ------------------------------------------------------------------
+
+    async def _stream_loop(self, key: str, ch: VideoChannel) -> None:
+        backoff_s = 0.5
+        max_backoff_s = 5.0
+
+        if self._startup_jitter_ms > 0:
+            await asyncio.sleep(random.uniform(0.0, self._startup_jitter_ms / 1000.0))
+
+        while True:
+            async with self._lock:
+                if self._closing or (not self._started):
+                    return
+                cur = self._channels.get(key)
+                if cur is None:
+                    return
+                ch = cur
+
+            if getattr(ch.config, "detection_enabled", True) is False:
+                await asyncio.sleep(0.5)
+                continue
+
+            try:
+                got_any = False
+                async for payload in ch.stream_detections():
+                    got_any = True
+                    await self._process_detection_payload(key, ch, payload)
+
+                    async with self._lock:
+                        if (
+                            self._closing
+                            or (not self._started)
+                            or (self._channels.get(key) is None)
+                        ):
+                            return
+
+                if got_any:
+                    backoff_s = 0.5
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Detection stream loop failed camera=%s", key)
+
+            await asyncio.sleep(backoff_s)
+            backoff_s = min(max_backoff_s, backoff_s * 2.0)
+
+    async def refresh_detection_once(
+        self, camera_uuid: str
+    ) -> Optional[ObjDetectResponse]:
+        """On-demand pull from the Jetson, useful when the cache is empty.
+
+        Goes through the same processing path as the stream so an on-demand
+        frame is not silently skipped by the tracker later.
         """
         key = str(camera_uuid)
         async with self._lock:
@@ -655,45 +615,311 @@ class ModelPipeline:
         sem = self._device_fetch_semaphore(getattr(ch.config, "device_url", None))
         async with sem:
             payload = await ch.fetch_detection_json()
-        resp = self._payload_to_resp(payload, ch)
-        if resp is None:
+
+        await self._process_detection_payload(key, ch, payload)
+        return await self.detect_store.get_latest(key)
+
+    def _payload_to_resp(
+        self, payload: Optional[Dict[str, Any]], ch: VideoChannel
+    ) -> Optional[ObjDetectResponse]:
+        if not payload or not isinstance(payload, dict):
             return None
 
+        if (
+            "frame_seq" not in payload
+            and "payload" in payload
+            and isinstance(payload["payload"], dict)
+        ):
+            payload = payload["payload"]
+
+        frame_seq = payload.get("frame_seq")
+        frame_ts_ms = payload.get("frame_ts_ms")
+        if frame_seq is None or frame_ts_ms is None:
+            return None
+
+        # Suppress duplicate boxes at ingestion, before the payload fans out to
+        # the drawn overlay and the tracker. A box that leaks past the edge's NMS
+        # otherwise shows up twice on one object: once as a raw drawn detection
+        # and once as a second track id.
+        dets = nms_payload_detections(
+            payload.get("detections") or [],
+            iou_thr=self._nms_iou,
+            overlap_thr=self._nms_overlap,
+            size_ratio_thr=self._nms_size_ratio,
+        )
+
+        frame_w = payload.get("frame_w") or payload.get("image_w") or payload.get("width")
+        frame_h = payload.get("frame_h") or payload.get("image_h") or payload.get("height")
+        event_type = payload.get("type")
+        reason = payload.get("reason")
+        inf_ms = payload.get("inference_ms")
+        model_id = payload.get("model_id")
+        image_url = payload.get("image_url")
+
+        expected_cam = str(ch.config.camera_uuid)
+        payload_cam = payload.get("camera_uuid")
+        if payload_cam is not None and str(payload_cam) != expected_cam:
+            logger.warning(
+                "Dropping detection payload with mismatched camera_uuid expected=%s got=%s",
+                expected_cam,
+                payload_cam,
+            )
+            return None
+
+        return ObjDetectResponse(
+            camera_uuid=expected_cam,
+            frame_ts_ms=int(frame_ts_ms),
+            frame_seq=int(frame_seq),
+            event_type=str(event_type) if event_type is not None else None,
+            reason=str(reason) if reason is not None else None,
+            frame_w=int(frame_w) if frame_w is not None else None,
+            frame_h=int(frame_h) if frame_h is not None else None,
+            site_uuid=ch.config.site_uuid,
+            device_uuid=ch.config.device_uuid,
+            detections=tuple(dets) if isinstance(dets, list) else (),
+            pose=payload.get("pose"),
+            inference_ms=int(inf_ms) if inf_ms is not None else None,
+            model_id=str(model_id) if model_id is not None else None,
+            image_url=str(image_url).strip() if image_url is not None else None,
+        )
+
+    def _is_new_detection(self, key: str, resp: ObjDetectResponse) -> bool:
+        prev_ts, prev_seq = self._last_seen.get(key, (0, -1))
+        cur_ts, cur_seq = int(resp.frame_ts_ms), int(resp.frame_seq)
+
+        if cur_ts > prev_ts:
+            return True
+        if cur_ts == prev_ts and cur_seq > prev_seq:
+            return True
+        if cur_ts == prev_ts and cur_seq == prev_seq:
+            return False
+
+        regressed = (cur_ts < prev_ts) or (cur_ts == prev_ts and cur_seq < prev_seq)
+        if not regressed:
+            return False
+
+        # Regressed after a gap: assume the Jetson restarted, so accept the frame
+        # and re-anchor rather than stalling forever.
+        last_ok = self._last_ok_s.get(key, 0.0)
+        if (time.monotonic() - last_ok) > 5.0:
+            logger.warning(
+                "Detected possible Jetson restart (ts/seq regressed). Resetting last_seen. "
+                "camera=%s prev=(%s,%s) cur=(%s,%s)",
+                key, prev_ts, prev_seq, cur_ts, cur_seq,
+            )
+            return True
+
+        return False
+
+    def _monitor_clock_skew(self, key: str, frame_ts_ms: int) -> None:
+        """Estimate and warn on Jetson to Azure clock drift. Warn only, no behaviour change.
+
+        Real lag is always positive and bounded below by network and processing
+        latency, so the minimum lag over a window estimates the constant clock
+        offset. A large positive floor means the Jetson clock is behind Azure; a
+        negative floor means it is ahead, which is physically impossible without
+        skew. The floor resets on a slow window so a corrected clock recovers.
+        """
+        if self._clock_skew_warn_ms <= 0:
+            return
+
+        now_s = time.time()
+        lag_ms = (now_s * 1000.0) - float(frame_ts_ms)
+
+        reset_at = self._clock_skew_floor_reset_s.get(key, 0.0)
+        floor = self._clock_skew_floor_ms.get(key)
+        if floor is None or now_s >= reset_at:
+            floor = lag_ms
+            self._clock_skew_floor_ms[key] = floor
+            self._clock_skew_floor_reset_s[key] = now_s + self._clock_skew_floor_window_s
+        elif lag_ms < floor:
+            floor = lag_ms
+            self._clock_skew_floor_ms[key] = floor
+
+        if -self._clock_skew_warn_ms <= floor <= self._clock_skew_warn_ms:
+            return
+
+        last_warn = self._clock_skew_last_warn_s.get(key, 0.0)
+        if (now_s - last_warn) < self._clock_skew_warn_interval_s:
+            return
+        self._clock_skew_last_warn_s[key] = now_s
+
+        direction = "AHEAD of" if floor < 0 else "BEHIND"
+        logger.warning(
+            "Jetson clock appears skewed camera=%s estimated_offset_ms=%d "
+            "(Jetson clock is %s Azure/MediaMTX). Clip windows are anchored on the "
+            "Jetson wall clock; multi-second skew shifts the event out of the captured "
+            "PRE/POST window. Verify NTP time sync on the Jetson host.",
+            key,
+            int(floor),
+            direction,
+        )
+
+    async def _process_detection_payload(
+        self, key: str, ch: VideoChannel, payload: Dict[str, Any]
+    ) -> None:
+        resp = self._payload_to_resp(payload, ch)
+        if resp is None:
+            return
+
         if not self._is_new_detection(key, resp):
-            return await self.detect_store.get_latest(key)
+            return
 
-        now = time.monotonic()
-        self._last_seen[key] = (int(resp.frame_ts_ms), int(resp.frame_seq))
-        self._last_ok_s[key] = now
-        self._last_seq[key] = int(resp.frame_seq)
+        self._monitor_clock_skew(key, int(resp.frame_ts_ms))
 
-        await self.detect_store.put(resp)
-        return resp
+        tracker_out = self._tracker.update_from_event({
+            "camera_uuid": str(resp.camera_uuid),
+            "frame_ts_ms": int(resp.frame_ts_ms),
+            "frame_seq": int(resp.frame_seq),
+            "detections": list(resp.detections),
+        })
+        tracks = tuple(tracker_out.get("tracks", []) or [])
+        track_events = tuple(tracker_out.get("events", []) or [])
 
-    async def _get_camera_ctx(self, camera_uuid: str) -> Optional[CameraContext]:
-        """Resolve user/site/device/camera names for a camera (TTL-cached)."""
-        return await self._ctx_resolver.resolve(camera_uuid)
+        alerts: List[Dict[str, Any]] = []
+        if resp.frame_w and resp.frame_h and tracks:
+            alerts = self._roi_engine.process(
+                camera_uuid=str(resp.camera_uuid),
+                frame_w=int(resp.frame_w),
+                frame_h=int(resp.frame_h),
+                tracks=list(tracks),
+                rois=await self._fetch_rois(str(resp.camera_uuid)),
+                ts_ms=int(resp.frame_ts_ms),
+            )
 
-    async def _publish_and_persist(
-        self, *, ctx: CameraContext, msg: NotificationMessage, overlay_payload: Dict[str, Any], extra_payload: Optional[Dict[str, Any]], persist_extra: Optional[Dict[str, Any]], task_name: str
+        resp2 = replace(
+            resp,
+            tracks=tracks,
+            track_events=track_events,
+            alerts=tuple(alerts),
+        )
+
+        self._last_seen[key] = (int(resp2.frame_ts_ms), int(resp2.frame_seq))
+        self._last_ok_s[key] = time.monotonic()
+
+        # Publish for the live overlay first. Clip recording, snapshot fetch and
+        # notification persistence all run after this, off the stream-consumer
+        # loop, so the overlay never falls behind the live video.
+        await self.detect_store.put(resp2)
+        await self.detection_hub.publish(resp2)
+
+        if self._notification_service is not None:
+            self._task_spawner(
+                self._post_publish_work(resp2, ch),
+                f"detection_post_publish:{key}",
+            )
+
+    # ------------------------------------------------------------------
+    # Post-publish work (off the hot path)
+    # ------------------------------------------------------------------
+
+    async def _post_publish_work(
+        self, resp: ObjDetectResponse, ch: VideoChannel
+    ) -> None:
+        try:
+            if self._notification_service is None:
+                return
+            await self._record_playback_frame(resp, ch)
+            if await self._notifications_allowed_now(ch):
+                await self._emit_notifications(resp, ch)
+        except Exception:
+            logger.exception(
+                "post-publish detection work failed camera=%s", resp.camera_uuid
+            )
+
+    async def _record_playback_frame(
+        self, resp: ObjDetectResponse, ch: VideoChannel
     ) -> None:
         svc = self._notification_service
         if svc is None:
             return
-        # If the site's org has an operator, hold the alert for approval: persist
-        # it (the flusher marks it pending/invisible) but do NOT push it to the
-        # end user's realtime stream. With no operator, publish immediately.
-        if not await svc.requires_operator_approval(ctx.site_uuid):
-            await svc.hub.publish(msg)
-        persist_payload = {**overlay_payload, **(extra_payload or {}), **(persist_extra or {})}
-        self._task_spawner(
-            svc.enqueue_notification(msg, ctx, extra_payload=persist_payload),
-            task_name,
+
+        cam_uuid = str(resp.camera_uuid)
+        override = str(
+            getattr(ch.config, "camera_playback_enabled", "inherit") or "inherit"
         )
+        if override not in ("always", "inherit") or not self.is_channel_enable(ch):
+            return
+
+        try:
+            # An explicit "always" override bypasses the site eligibility list.
+            eligible = override == "always" or await svc.is_camera_prerecord_eligible(
+                cam_uuid
+            )
+            if not eligible:
+                return
+
+            overlay = _overlay_payload_from_resp(
+                resp, fallback_detections=_live_tracks(list(resp.tracks))
+            )
+            await svc.record_detection_overlay_frame(
+                camera_uuid=cam_uuid,
+                frame_ts_ms=overlay.get("frame_ts_ms"),
+                frame_seq=overlay.get("frame_seq"),
+                frame_w=overlay.get("frame_w"),
+                frame_h=overlay.get("frame_h"),
+                detections=list(overlay.get("detections") or []),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record detection overlay frame camera=%s", cam_uuid
+            )
+
+    async def _emit_notifications(
+        self, resp: ObjDetectResponse, ch: VideoChannel
+    ) -> None:
+        cam_uuid = str(resp.camera_uuid)
+        allow_broad = await self._allow_broad_notifications(ch)
+
+        # _build_alert_extra_payload may fetch a snapshot over HTTP, so it is
+        # resolved lazily and at most once per frame.
+        cached: List[Optional[Dict[str, Any]]] = []
+
+        async def alert_extra() -> Optional[Dict[str, Any]]:
+            if not cached:
+                cached.append(await self._build_alert_extra_payload(resp=resp, ch=ch))
+            return cached[0]
+
+        # ROI entry is the most specific operator event. It wins, and suppresses
+        # the broader same-frame notices so one event never creates two pending
+        # notifications for the operator.
+        emitted = False
+
+        if self.notify_on_roi_enter and resp.alerts:
+            try:
+                emitted = await self._emit_roi_alert_notifications(
+                    resp, list(resp.alerts), extra_payload=await alert_extra()
+                )
+            except Exception:
+                logger.exception("Failed to emit ROI notifications camera=%s", cam_uuid)
+
+        if not emitted and allow_broad and self.notify_on_confirmed and resp.track_events:
+            try:
+                emitted = await self._emit_item_detected_notifications(
+                    resp, extra_payload=await alert_extra()
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to emit item-detected notifications camera=%s", cam_uuid
+                )
+
+        if not emitted and allow_broad:
+            summary_classes = self._interesting_detection_classes(resp)
+            if summary_classes and self._reserve_detection_summary_alert(
+                cam_uuid, summary_classes
+            ):
+                try:
+                    await self._emit_detection_summary_notification(
+                        resp, extra_payload=await alert_extra()
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to emit detection-summary notification camera=%s",
+                        cam_uuid,
+                    )
 
     def is_channel_enable(self, ch: VideoChannel) -> bool:
-        cfg = getattr(ch, "config", None)
-        return getattr(cfg, "enabled", True) is not False
+        return getattr(getattr(ch, "config", None), "enabled", True) is not False
 
     async def _notifications_allowed_now(self, ch: VideoChannel) -> bool:
         cfg = getattr(ch, "config", None)
@@ -703,9 +929,8 @@ class ModelPipeline:
         if getattr(cfg, "notification_enabled", True) is False:
             return False
 
-        # A site-level arm/disarm override wins over the schedule for every
-        # camera in the site (until it clears at the next schedule boundary). With
-        # no active override we fall back to the camera's own schedule.
+        # A site-level arm/disarm override wins over the schedule for every camera
+        # in the site until it clears at the next schedule boundary.
         site_uuid = getattr(cfg, "site_uuid", None)
         override = await self._arm_state_resolver.resolve(
             str(site_uuid) if site_uuid else None
@@ -718,16 +943,27 @@ class ModelPipeline:
             try:
                 return bool(is_scheduled_now())
             except Exception:
-                logger.exception("Failed to evaluate notification schedule camera=%s", ch.key())
+                logger.exception(
+                    "Failed to evaluate notification schedule camera=%s", ch.key()
+                )
 
         return True
 
-    def _interesting_detection_classes(
-        self,
-        resp: ObjDetectResponse,
-    ) -> List[str]:
-        cls_names: List[str] = []
+    async def _allow_broad_notifications(self, ch: VideoChannel) -> bool:
+        mode = str(
+            getattr(ch.config, "notification_trigger_mode", "inherit") or "inherit"
+        )
+        if mode in ("roi_enter", "any_detection"):
+            return mode == "any_detection"
 
+        site_uuid = getattr(ch.config, "site_uuid", None)
+        site_mode = await self._trigger_mode_resolver.resolve(
+            str(site_uuid) if site_uuid else None
+        )
+        return site_mode == "any_detection"
+
+    def _interesting_detection_classes(self, resp: ObjDetectResponse) -> List[str]:
+        cls_names: List[str] = []
         for det in list(resp.detections or ()):
             if not isinstance(det, dict):
                 continue
@@ -737,190 +973,29 @@ class ModelPipeline:
             if self.interesting_classes and cls_name not in self.interesting_classes:
                 continue
             cls_names.append(cls_name)
-
         return sorted(set(cls_names))
 
-    async def _process_detection_payload(self, key: str, ch: VideoChannel, payload: Dict[str, Any]) -> bool:
-        resp = self._payload_to_resp(payload, ch)
-        if resp is None:
-            return False
-
-        if not self._is_new_detection(key, resp):
-            return False
-
-        self._monitor_clock_skew(key, int(resp.frame_ts_ms))
-        tracker_payload = {
-            "camera_uuid": str(resp.camera_uuid),
-            "frame_ts_ms": int(resp.frame_ts_ms),
-            "frame_seq": int(resp.frame_seq),
-            "detections": list(resp.detections),
-        }
-        tracker_out = self._tracker.update_from_event(tracker_payload)
-        tracks = tuple(tracker_out.get("tracks", []) or [])
-        track_events = tuple(tracker_out.get("events", []) or [])
-
-        alerts: List[Dict[str, Any]] = []
-        if resp.frame_w and resp.frame_h and tracks:
-            rois = await self._fetch_rois(str(resp.camera_uuid))
-            alerts = self._roi_engine.process(
-                camera_uuid=str(resp.camera_uuid),
-                frame_w=int(resp.frame_w),
-                frame_h=int(resp.frame_h),
-                tracks=list(tracks),
-                rois=rois,
-                ts_ms=int(resp.frame_ts_ms),
-            )
-
-        resp2 = replace(
-            resp,
-            tracks=tracks,
-            track_events=track_events,
-            alerts=tuple(alerts),
-        )
-
+    def _reserve_detection_summary_alert(
+        self, camera_uuid: str, cls_names: List[str]
+    ) -> bool:
+        """Per-class cooldown, so a newly-appearing class is not silenced by another."""
+        cam = str(camera_uuid)
+        cooldown_s = float(self._detection_summary_cooldown_s or 0.0)
         now = time.monotonic()
-        self._last_seen[key] = (int(resp2.frame_ts_ms), int(resp2.frame_seq))
-        self._last_ok_s[key] = now
-        self._last_seq[key] = int(resp2.frame_seq)
 
-        # Publish for the live overlay first. Anything slow (clip recording,
-        # snapshot fetch, notification persistence) must happen AFTER this so
-        # the SSE stream to the frontend sees the freshest frame ASAP.
-        await self.detect_store.put(resp2)
-        await self.detection_hub.publish(resp2)
-
-        svc = self._notification_service
-        if svc is None:
+        for cls_name in cls_names:
+            key = (cam, str(cls_name))
+            last = self._last_detection_summary_s.get(key, 0.0)
+            if cooldown_s > 0.0 and (now - last) < cooldown_s:
+                continue
+            self._last_detection_summary_s[key] = now
             return True
 
-        # Fire-and-forget the post-publish work. Previously this block was
-        # awaited inline, which blocked the per-camera Jetson SSE consumer
-        # (the `async for payload in ch.stream_detections()` loop) on every
-        # frame and pushed the overlay several frames behind the live video.
-        # Spawning a task lets the consumer immediately read the next frame.
-        self._task_spawner(
-            self._post_publish_work(resp2, ch),
-            f"detection_post_publish:{key}",
-        )
+        return False
 
-        return True
-
-    async def _post_publish_work(
-        self,
-        resp2: ObjDetectResponse,
-        ch: VideoChannel,
-    ) -> None:
-        """
-        Runs off the stream-consumer hot path. Handles:
-          - overlay-frame recording for clip playback
-          - alert snapshot fetch (was the worst per-frame stall on alert frames)
-          - ROI / item-detected / detection-summary notifications
-
-        Any exception here is logged but never propagated, since it's detached
-        from the caller.
-        """
-        try:
-            svc = self._notification_service
-            if svc is None:
-                return
-
-            cam_uuid = str(resp2.camera_uuid)
-            _cam_cfg = getattr(ch, "config", None)
-
-            _cam_playback_override = str(getattr(_cam_cfg, "camera_playback_enabled", "inherit") or "inherit")
-            _do_playback = (
-                _cam_playback_override in ("always", "inherit")
-            ) and self.is_channel_enable(ch)
-            if _do_playback:
-                try:
-                    _prerecord_ok = (
-                        _cam_playback_override == "always"       # explicit override bypasses site list
-                        or await svc.is_camera_prerecord_eligible(cam_uuid)
-                    )
-                    if _prerecord_ok:
-                        base_overlay = _overlay_payload_from_resp(resp2, fallback_detections=_live_tracks(list(resp2.tracks)))
-                        await svc.record_detection_overlay_frame(
-                            camera_uuid=cam_uuid,
-                            frame_ts_ms=base_overlay.get("frame_ts_ms"),
-                            frame_seq=base_overlay.get("frame_seq"),
-                            frame_w=base_overlay.get("frame_w"),
-                            frame_h=base_overlay.get("frame_h"),
-                            detections=list(base_overlay.get("detections") or []),
-                        )
-                except Exception:
-                    logger.exception("Failed to record detection overlay frame camera=%s", cam_uuid)
-
-            if not await self._notifications_allowed_now(ch):
-                return
-
-            _cam_trigger_mode = str(getattr(_cam_cfg, "notification_trigger_mode", "inherit") or "inherit")
-            if _cam_trigger_mode in ("roi_enter", "any_detection"):
-                allow_broad_notifications = (_cam_trigger_mode == "any_detection")
-            else:
-                site_uuid_for_trigger = getattr(ch.config, "site_uuid", None)
-                site_trigger_mode = await self._trigger_mode_resolver.resolve(
-                    str(site_uuid_for_trigger) if site_uuid_for_trigger else None
-                )
-                allow_broad_notifications = (site_trigger_mode == "any_detection")
-
-            # _build_alert_extra_payload may HTTP-fetch a snapshot from Jetson
-            # (hundreds of ms). It was previously awaited on the stream loop;
-            # now it only runs here, off the hot path, and still lazily.
-            extra_payload: Optional[Dict[str, Any]] = None
-            extra_payload_loaded = False
-
-            async def _ensure_alert_extra_payload() -> Optional[Dict[str, Any]]:
-                nonlocal extra_payload, extra_payload_loaded
-                if not extra_payload_loaded:
-                    extra_payload = await self._build_alert_extra_payload(resp=resp2, ch=ch)
-                    extra_payload_loaded = True
-                return extra_payload
-
-            tracks = resp2.tracks
-            track_events = resp2.track_events
-            alerts = list(resp2.alerts or ())
-            emitted_detail = False
-
-            # ROI entry is the most specific operator event. Emit it first and
-            # suppress broader same-frame detection notices so one event does
-            # not create two pending notifications for the operator.
-            if self.notify_on_roi_enter and alerts:
-                try:
-                    emitted_detail = (
-                        await self._emit_roi_alert_notifications(
-                            resp2,
-                            alerts,
-                            extra_payload=await _ensure_alert_extra_payload(),
-                        )
-                    ) or emitted_detail
-                except Exception:
-                    logger.exception("Failed to emit ROI notifications camera=%s", cam_uuid)
-
-            if not emitted_detail and allow_broad_notifications and self.notify_on_confirmed and track_events:
-                try:
-                    emitted_detail = (
-                        await self._emit_item_detected_notifications(
-                            resp2,
-                            tracks,
-                            track_events,
-                            extra_payload=await _ensure_alert_extra_payload(),
-                        )
-                    ) or emitted_detail
-                except Exception:
-                    logger.exception("Failed to emit item-detected notifications camera=%s", cam_uuid)
-
-            if not emitted_detail and allow_broad_notifications:
-                summary_classes = self._interesting_detection_classes(resp2)
-                if summary_classes and self._reserve_detection_summary_alert(cam_uuid, summary_classes):
-                    try:
-                        await self._emit_detection_summary_notification(
-                            resp2,
-                            extra_payload=await _ensure_alert_extra_payload(),
-                        )
-                    except Exception:
-                        logger.exception("Failed to emit detection-summary notification camera=%s", cam_uuid)
-        except Exception:
-            logger.exception("post-publish detection work failed camera=%s", str(resp2.camera_uuid))
+    # ------------------------------------------------------------------
+    # ROI lookup
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_roi_points(raw: Any) -> List[Tuple[float, float]]:
@@ -952,10 +1027,10 @@ class ModelPipeline:
                 return True
             if s in ("false", "0", "no"):
                 return False
-        # Heuristic: all coords within [0, 1] => normalized
-        if points and all(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for (x, y) in points):
-            return True
-        return False
+        # All coordinates inside [0, 1] means normalized.
+        return bool(points) and all(
+            0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for (x, y) in points
+        )
 
     @staticmethod
     def _parse_roi_frame_size(row: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
@@ -965,22 +1040,28 @@ class ModelPipeline:
                 return iv if iv > 0 else None
             except (TypeError, ValueError):
                 return None
+
         return (
             _maybe_int(row.get("frame_w") or row.get("image_w") or row.get("width")),
             _maybe_int(row.get("frame_h") or row.get("image_h") or row.get("height")),
         )
 
     @staticmethod
-    def _clamp_unit_points(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    def _clamp_unit_points(
+        points: List[Tuple[float, float]]
+    ) -> List[Tuple[float, float]]:
         return [(min(1.0, max(0.0, x)), min(1.0, max(0.0, y))) for (x, y) in points]
+
+    def _cache_rois(self, camera_uuid: str, rois: List[ROI], ttl_s: float) -> List[ROI]:
+        self._roi_cache[camera_uuid] = (time.monotonic() + ttl_s, rois)
+        return rois
 
     async def _fetch_rois(self, camera_uuid: str) -> List[ROI]:
         if not self._session_factory:
             return []
 
-        now = time.monotonic()
         hit = self._roi_cache.get(camera_uuid)
-        if hit and hit[0] > now:
+        if hit and hit[0] > time.monotonic():
             return hit[1]
 
         try:
@@ -988,7 +1069,6 @@ class ModelPipeline:
             from sqlalchemy import select
 
             cam_uuid = _uuid.UUID(str(camera_uuid))
-
             async with self._session_factory() as session:
                 result = await session.execute(
                     select(Camera.roi).where(Camera.camera_uuid == cam_uuid)
@@ -996,38 +1076,41 @@ class ModelPipeline:
                 row = result.scalar_one_or_none()
 
             if not row or not isinstance(row, dict):
-                rois: List[ROI] = []
-                self._roi_cache[camera_uuid] = (now + self._roi_cache_ttl_s, rois)
-                return rois
+                return self._cache_rois(camera_uuid, [], self._roi_cache_ttl_s)
 
             points = self._parse_roi_points(row.get("points", []))
+            if len(points) < 3:
+                return self._cache_rois(camera_uuid, [], self._roi_cache_ttl_s)
+
             normalized = self._coerce_roi_normalized(row.get("normalized"), points)
             roi_frame_w, roi_frame_h = self._parse_roi_frame_size(row)
-
-            if not points or len(points) < 3:
-                rois = []
-                self._roi_cache[camera_uuid] = (now + self._roi_cache_ttl_s, rois)
-                return rois
-
             roi_points = self._clamp_unit_points(points) if normalized else points
-            rois = [
-                ROI(
-                    roi_id=f"{camera_uuid}-roi",
-                    points=roi_points,
-                    normalized=normalized,
-                    frame_w=roi_frame_w,
-                    frame_h=roi_frame_h,
-                )
-            ]
-            self._roi_cache[camera_uuid] = (now + self._roi_cache_ttl_s, rois)
-            return rois
+
+            return self._cache_rois(
+                camera_uuid,
+                [
+                    ROI(
+                        roi_id=f"{camera_uuid}-roi",
+                        points=roi_points,
+                        normalized=normalized,
+                        frame_w=roi_frame_w,
+                        frame_h=roi_frame_h,
+                    )
+                ],
+                self._roi_cache_ttl_s,
+            )
 
         except Exception as e:
             stale = self._roi_cache.get(camera_uuid)
             if stale:
                 return stale[1]
             logger.warning("Failed to fetch ROI for %s: %s", camera_uuid, e)
-            return []
+            # Short negative cache so a database outage does not re-query every frame.
+            return self._cache_rois(camera_uuid, [], self._roi_cache_error_ttl_s)
+
+    # ------------------------------------------------------------------
+    # Snapshots
+    # ------------------------------------------------------------------
 
     def _device_fetch_semaphore(self, device_url: Optional[str]) -> asyncio.Semaphore:
         key = str(device_url or "").strip().lower()
@@ -1037,32 +1120,14 @@ class ModelPipeline:
             self._device_fetch_limits[key] = sem
         return sem
 
-    def _reserve_detection_summary_alert(self, camera_uuid: str, cls_names: List[str]) -> bool:
-        """
-        Check if detection alert should be emitted using per-class cooldown.
-
-        Keyed on (camera_uuid, cls_name) rather than camera_uuid alone, so a
-        newly-appearing class is not silenced by another class's cooldown.
-        """
-        cam = str(camera_uuid)
-        cooldown_s = float(self._detection_summary_cooldown_s or 0.0)
-        now = time.monotonic()
-
-        for cls_name in cls_names:
-            key = (cam, str(cls_name))
-            last = self._last_detection_summary_s.get(key, 0.0)
-            if cooldown_s > 0.0 and (now - last) < cooldown_s:
-                continue
-            self._last_detection_summary_s[key] = now
-            return True
-
-        return False
-
-    def _image_bytes_to_data_url(self, payload: bytes, content_type: Optional[str]) -> Optional[str]:
+    @staticmethod
+    def _image_bytes_to_data_url(
+        payload: bytes, content_type: Optional[str]
+    ) -> Optional[str]:
         if not payload:
             return None
 
-        mime = str(content_type or "image/jpeg").split(";", 1)[0].strip().lower() or "image/jpeg"
+        mime = str(content_type or "image/jpeg").split(";", 1)[0].strip().lower()
         if not mime.startswith("image/"):
             mime = "image/jpeg"
 
@@ -1070,12 +1135,9 @@ class ModelPipeline:
         return f"data:{mime};base64,{encoded}"
 
     async def _build_alert_extra_payload(
-        self,
-        *,
-        resp: ObjDetectResponse,
-        ch: VideoChannel,
+        self, *, resp: ObjDetectResponse, ch: VideoChannel
     ) -> Optional[Dict[str, Any]]:
-        image_url = str(getattr(resp, "image_url", "") or "").strip()
+        image_url = str(resp.image_url or "").strip()
         if image_url:
             return {"image_url": image_url}
 
@@ -1084,18 +1146,105 @@ class ModelPipeline:
             async with sem:
                 snapshot = await ch.fetch_snapshot_bytes()
         except Exception:
-            logger.exception("Failed to fetch alert snapshot camera=%s", resp.camera_uuid)
+            logger.exception(
+                "Failed to fetch alert snapshot camera=%s", resp.camera_uuid
+            )
             return None
 
         if not snapshot:
             return None
 
-        payload, content_type = snapshot
-        data_url = self._image_bytes_to_data_url(payload, content_type)
-        if not data_url:
-            return None
+        data_url = self._image_bytes_to_data_url(*snapshot)
+        return {"image_url": data_url} if data_url else None
 
-        return {"image_url": data_url}
+    # ------------------------------------------------------------------
+    # Notification emission
+    # ------------------------------------------------------------------
+
+    async def _publish_and_persist(
+        self,
+        *,
+        ctx: CameraContext,
+        msg: NotificationMessage,
+        overlay_payload: Dict[str, Any],
+        extra_payload: Optional[Dict[str, Any]],
+        persist_extra: Optional[Dict[str, Any]],
+        task_name: str,
+    ) -> None:
+        svc = self._notification_service
+        if svc is None:
+            return
+
+        # If the site's org has an operator, hold the alert for approval: persist
+        # it as pending but do not push it to the end user's realtime stream.
+        if not await svc.requires_operator_approval(ctx.site_uuid):
+            await svc.hub.publish(msg)
+
+        persist_payload = {
+            **overlay_payload,
+            **(extra_payload or {}),
+            **(persist_extra or {}),
+        }
+        self._task_spawner(
+            svc.enqueue_notification(msg, ctx, extra_payload=persist_payload),
+            task_name,
+        )
+
+    async def _emit_detail_notification(
+        self,
+        resp: ObjDetectResponse,
+        ctx: CameraContext,
+        *,
+        overlay_source: Dict[str, Any],
+        alert_id: str,
+        title: str,
+        body: str,
+        alert_type: str,
+        cls_name: str,
+        conf: float,
+        track_id: Optional[int] = None,
+        roi_id: Optional[str] = None,
+        image_url: Optional[str] = None,
+        extra_payload: Optional[Dict[str, Any]] = None,
+        persist_extra: Optional[Dict[str, Any]] = None,
+        task_name: str,
+    ) -> None:
+        """Shared body for ROI-entry and item-detected notifications."""
+        overlay_payload = _overlay_payload_from_resp(
+            resp, fallback_detections=[overlay_source]
+        )
+
+        msg = NotificationMessage(
+            user_id=int(ctx.user_id),
+            id=alert_id,
+            ts_ms=int(resp.frame_ts_ms),
+            camera_uuid=str(resp.camera_uuid),
+            site_uuid=str(ctx.site_uuid),
+            site_name=ctx.site_name,
+            title=title,
+            body=body,
+            alert_type=alert_type,
+            cls_names=[cls_name],
+            max_conf=conf,
+            frame_w=overlay_payload.get("frame_w"),
+            frame_h=overlay_payload.get("frame_h"),
+            frame_seq=overlay_payload.get("frame_seq"),
+            detections=list(overlay_payload.get("detections") or []),
+            roi_id=roi_id,
+            track_id=track_id,
+            device_name=ctx.device_name,
+            camera_name=ctx.camera_name,
+            image_url=image_url,
+        )
+
+        await self._publish_and_persist(
+            ctx=ctx,
+            msg=msg,
+            overlay_payload=overlay_payload,
+            extra_payload=extra_payload,
+            persist_extra=persist_extra,
+            task_name=task_name,
+        )
 
     async def _emit_roi_alert_notifications(
         self,
@@ -1110,125 +1259,105 @@ class ModelPipeline:
         cam_uuid = str(resp.camera_uuid)
         ctx = await self._get_camera_ctx(cam_uuid)
         if ctx is None:
-            logger.warning("Skipping ROI alert publish because camera context was not found camera=%s", cam_uuid)
+            logger.warning(
+                "Skipping ROI alert publish because camera context was not found camera=%s",
+                cam_uuid,
+            )
             return False
 
         image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
         emitted = False
 
         for a in alerts:
-            overlay_payload = _overlay_payload_from_resp(resp, fallback_detections=[a])
+            cls_name = str(a.get("cls_name", "object"))
+            title, body = _humanize_roi_alert(a.get("cls_name"), ctx)
             raw_track_id = a.get("track_id")
-            track_id = int(raw_track_id) if raw_track_id is not None else None
 
-            roi_title, roi_body = _humanize_roi_alert(a.get("cls_name"), ctx)
-
-            msg = NotificationMessage(
-                user_id=int(ctx.user_id),
-                id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-{a.get('roi_id')}-{a.get('track_id')}",
-                ts_ms=int(resp.frame_ts_ms),
-                camera_uuid=cam_uuid,
-                site_uuid=str(ctx.site_uuid),
-                site_name=ctx.site_name,
-                title=roi_title,
-                body=roi_body,
+            await self._emit_detail_notification(
+                resp,
+                ctx,
+                overlay_source=a,
+                alert_id=(
+                    f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}"
+                    f"-{a.get('roi_id')}-{raw_track_id}"
+                ),
+                title=title,
+                body=body,
                 alert_type="roi_enter",
-                cls_names=[str(a.get("cls_name", "object"))],
-                max_conf=float(a.get("conf", 0.0) or 0.0),
-                frame_w=overlay_payload.get("frame_w"),
-                frame_h=overlay_payload.get("frame_h"),
-                frame_seq=overlay_payload.get("frame_seq"),
-                detections=list(overlay_payload.get("detections") or []),
+                cls_name=cls_name,
+                conf=float(a.get("conf", 0.0) or 0.0),
+                track_id=int(raw_track_id) if raw_track_id is not None else None,
                 roi_id=str(a.get("roi_id", "")),
-                track_id=track_id,
-                device_name=ctx.device_name,
-                camera_name=ctx.camera_name,
                 image_url=image_url,
-            )
-
-            await self._publish_and_persist(
-                ctx=ctx,
-                msg=msg,
-                overlay_payload=overlay_payload,
                 extra_payload=extra_payload,
                 persist_extra={"alert": a},
-                task_name=f"persist_roi_alert:{cam_uuid}"
+                task_name=f"persist_roi_alert:{cam_uuid}",
             )
             emitted = True
-        
+
         return emitted
 
     async def _emit_item_detected_notifications(
         self,
         resp: ObjDetectResponse,
-        tracks: Tuple[Dict[str, Any], ...],
-        track_events: Tuple[Tuple[str, int], ...],
         *,
         extra_payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if self._notification_service is None:
             return False
 
-        confirmed_track_ids = [int(track_id) for (ev_type, track_id) in track_events if ev_type == "track_confirmed"]
-        if not confirmed_track_ids:
+        confirmed_ids = [
+            int(track_id)
+            for (ev_type, track_id) in resp.track_events
+            if ev_type == "track_confirmed"
+        ]
+        if not confirmed_ids:
             return False
 
         tracks_by_id: Dict[int, Dict[str, Any]] = {}
-        for tr in tracks:
+        for tr in resp.tracks:
             try:
                 tracks_by_id[int(tr.get("track_id"))] = tr
-            except Exception:
+            except (TypeError, ValueError):
                 continue
 
         cam_uuid = str(resp.camera_uuid)
         ctx = await self._get_camera_ctx(cam_uuid)
         if ctx is None:
-            logger.warning("Skipping item-detected alert publish because camera context was not found camera=%s", cam_uuid)
+            logger.warning(
+                "Skipping item-detected alert publish because camera context was not "
+                "found camera=%s",
+                cam_uuid,
+            )
             return False
 
         image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
         emitted = False
 
-        for track_id in confirmed_track_ids:
+        for track_id in confirmed_ids:
             tr = tracks_by_id.get(track_id)
             if tr is None:
                 continue
 
-            overlay_payload = _overlay_payload_from_resp(resp, fallback_detections=[tr])
             cls_name = str(tr.get("cls_name") or "object")
             conf = float(tr.get("conf", 0.0) or 0.0)
+            title, body = _humanize_item_detected(cls_name, conf, ctx)
 
-            item_title, item_body = _humanize_item_detected(cls_name, conf, ctx)
-
-            msg = NotificationMessage(
-                user_id=int(ctx.user_id),
-                id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-track-{track_id}",
-                ts_ms=int(resp.frame_ts_ms),
-                camera_uuid=cam_uuid,
-                site_uuid=str(ctx.site_uuid),
-                site_name=ctx.site_name,
-                title=item_title,
-                body=item_body,
+            await self._emit_detail_notification(
+                resp,
+                ctx,
+                overlay_source=tr,
+                alert_id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-track-{track_id}",
+                title=title,
+                body=body,
                 alert_type="item_detected",
-                cls_names=[cls_name],
-                max_conf=conf,
-                frame_w=overlay_payload.get("frame_w"),
-                frame_h=overlay_payload.get("frame_h"),
-                frame_seq=overlay_payload.get("frame_seq"),
-                detections=list(overlay_payload.get("detections") or []),
+                cls_name=cls_name,
+                conf=conf,
                 track_id=track_id,
-                device_name=ctx.device_name,
-                camera_name=ctx.camera_name,
                 image_url=image_url,
-            )
-
-            await self._publish_and_persist(
-                ctx=ctx,
-                msg=msg,
-                overlay_payload=overlay_payload,
                 extra_payload=extra_payload,
                 persist_extra={"track": tr, "event": "track_confirmed"},
-                task_name=f"persist_track_confirmed:{cam_uuid}:{track_id}"
+                task_name=f"persist_track_confirmed:{cam_uuid}:{track_id}",
             )
             emitted = True
 
@@ -1239,20 +1368,16 @@ class ModelPipeline:
         resp: ObjDetectResponse,
         *,
         extra_payload: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        svc = self._notification_service
-        if svc is None:
-            return False
+    ) -> None:
+        if self._notification_service is None:
+            return
 
         cam_uuid = str(resp.camera_uuid)
-        raw_detections = list(resp.detections or [])
-        if not raw_detections:
-            return False
-
         filtered: List[Dict[str, Any]] = []
         classes: List[str] = []
         max_conf = 0.0
-        for d in raw_detections:
+
+        for d in list(resp.detections or ()):
             if not isinstance(d, dict):
                 continue
             cls_name = str(d.get("cls_name") or "").strip()
@@ -1260,25 +1385,27 @@ class ModelPipeline:
                 continue
             if self.interesting_classes and cls_name not in self.interesting_classes:
                 continue
-            conf = float(d.get("conf", 0.0) or 0.0)
-            max_conf = max(max_conf, conf)
+            max_conf = max(max_conf, float(d.get("conf", 0.0) or 0.0))
             classes.append(cls_name)
             filtered.append(d)
 
         if not filtered:
-            return False
+            return
 
         ctx = await self._get_camera_ctx(cam_uuid)
         if ctx is None:
-            logger.warning("Skipping detection-summary alert because camera context was not found camera=%s", cam_uuid)
-            return False
+            logger.warning(
+                "Skipping detection-summary alert because camera context was not found "
+                "camera=%s",
+                cam_uuid,
+            )
+            return
 
         uniq_classes = sorted(set(classes))
         classes_text = ", ".join(uniq_classes)
-        _verb = "is" if len(uniq_classes) == 1 else "are"
-        image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
+        verb = "is" if len(uniq_classes) == 1 else "are"
         overlay_payload = _overlay_payload_from_resp(resp)
-        
+
         msg = NotificationMessage(
             user_id=int(ctx.user_id),
             id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-summary",
@@ -1287,7 +1414,7 @@ class ModelPipeline:
             site_uuid=str(ctx.site_uuid),
             site_name=ctx.site_name,
             title=f"Detection: {classes_text}",
-            body=f"{int(max_conf * 100)}% chance that {classes_text} {_verb} being detected",
+            body=f"{int(max_conf * 100)}% chance that {classes_text} {verb} being detected",
             alert_type="detection_summary",
             cls_names=uniq_classes,
             max_conf=float(max_conf),
@@ -1297,7 +1424,7 @@ class ModelPipeline:
             detections=list(overlay_payload.get("detections") or []),
             device_name=ctx.device_name,
             camera_name=ctx.camera_name,
-            image_url=image_url,
+            image_url=str((extra_payload or {}).get("image_url") or "").strip() or None,
         )
 
         await self._publish_and_persist(
@@ -1306,118 +1433,8 @@ class ModelPipeline:
             overlay_payload=overlay_payload,
             extra_payload=extra_payload,
             persist_extra={"detections": filtered[:20], "event": "detection_summary"},
-            task_name=f"persist_detection_summary:{cam_uuid}"
+            task_name=f"persist_detection_summary:{cam_uuid}",
         )
-        return True
-        
-    async def _stream_loop(self, key: str, ch: VideoChannel) -> None:
-        backoff_s = 0.5
-        max_backoff_s = 5.0
 
-        if self._startup_jitter_ms > 0:
-            await asyncio.sleep(random.uniform(0.0, self._startup_jitter_ms / 1000.0))
-
-        while True:
-            async with self._lock:
-                if self._closing or (not self._started):
-                    return
-                cur = self._channels.get(key)
-                if cur is None:
-                    return
-                ch = cur
-
-            cfg = ch.config
-            if getattr(cfg, "detection_enabled", True) is False:
-                await asyncio.sleep(0.5)
-                continue
-
-            try:
-                got_any = False
-                async for payload in ch.stream_detections():
-                    got_any = True
-                    await self._process_detection_payload(key, ch, payload)
-
-                    async with self._lock:
-                        if self._closing or (not self._started) or (self._channels.get(key) is None):
-                            return
-
-                # normal stream end -> reconnect
-                if got_any:
-                    backoff_s = 0.5
-
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Detection stream loop failed camera=%s", key)
-
-            await asyncio.sleep(backoff_s)
-            backoff_s = min(max_backoff_s, backoff_s * 2.0)
-            
-    def _ensure_poller(self, key: str, ch: VideoChannel) -> None:
-        t = self._poll_tasks.get(key)
-        if t is None or t.done():
-            self._poll_tasks[key] = asyncio.create_task(
-                self._stream_loop(key, ch),
-                name="stream_jetson_detection:%s" % key,
-            )
-            
-    def _payload_to_resp(self, payload: Optional[Dict[str, Any]], ch: VideoChannel) -> Optional[ObjDetectResponse]:
-        if not payload or not isinstance(payload, dict):
-            return None
-
-        if "frame_seq" not in payload and "payload" in payload and isinstance(payload["payload"], dict):
-            payload = payload["payload"]
-
-        frame_seq = payload.get("frame_seq")
-        frame_ts_ms = payload.get("frame_ts_ms")
-        if frame_seq is None or frame_ts_ms is None:
-            return None
-
-        # Suppress duplicate boxes at ingestion, before the payload fans out to
-        # the drawn overlay (resp.detections) and the tracker. A box leaked past
-        # the edge's NMS otherwise shows up twice on one object: once as a raw
-        # drawn detection and once as a second track id. Doing it here, rather
-        # than only inside the tracker, is what makes the extra box disappear
-        # from the picture as well as from the id set.
-        dets = nms_payload_detections(
-            payload.get("detections") or [],
-            iou_thr=self._nms_iou,
-            overlap_thr=self._nms_overlap,
-            size_ratio_thr=self._nms_size_ratio,
-        )
-        pose = payload.get("pose")
-        inf_ms = payload.get("inference_ms")
-        model_id = payload.get("model_id")
-        image_url = payload.get("image_url")
-        event_type = payload.get("type")
-        reason = payload.get("reason")
-
-        frame_w = payload.get("frame_w") or payload.get("image_w") or payload.get("width")
-        frame_h = payload.get("frame_h") or payload.get("image_h") or payload.get("height")
-
-        expected_cam = str(ch.config.camera_uuid)
-        payload_cam = payload.get("camera_uuid")
-        if payload_cam is not None and str(payload_cam) != expected_cam:
-            logger.warning(
-                "Dropping detection payload with mismatched camera_uuid expected=%s got=%s",
-                expected_cam,
-                payload_cam,
-            )
-            return None
-
-        return ObjDetectResponse(
-            camera_uuid=expected_cam,
-            frame_ts_ms=int(frame_ts_ms),
-            frame_seq=int(frame_seq),
-            event_type=str(event_type) if event_type is not None else None,
-            reason=str(reason) if reason is not None else None,
-            frame_w=int(frame_w) if frame_w is not None else None,
-            frame_h=int(frame_h) if frame_h is not None else None,
-            site_uuid=ch.config.site_uuid,
-            device_uuid=ch.config.device_uuid,
-            detections=tuple(dets) if isinstance(dets, list) else (),
-            pose=pose,
-            inference_ms=int(inf_ms) if inf_ms is not None else None,
-            model_id=str(model_id) if model_id is not None else None,
-            image_url=str(image_url).strip() if image_url is not None else None,
-        )
+    async def _get_camera_ctx(self, camera_uuid: str) -> Optional[CameraContext]:
+        return await self._ctx_resolver.resolve(camera_uuid)

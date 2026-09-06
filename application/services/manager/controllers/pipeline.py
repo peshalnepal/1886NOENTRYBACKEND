@@ -9,14 +9,13 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional, Set, Union
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from application.channels.channel import VideoChannel
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent, VideoChannelEvent
 from application.services.pipeline import ModelPipeline
 
 from application.services.manager.helpers import build_video_channel_config
 from application.services.manager.types import CameraOut, PipelineUpdateResult
+from application.repositories._helpers import require_uuid
 from application.services.manager.controllers._state import ManagerState
 from application.services.manager.controllers.schedule import ScheduleResolver
 from application.services.manager.controllers.channel import ChannelController
@@ -30,19 +29,11 @@ class PipelineController:
         self._schedule_resolver = schedule_resolver
         self._channel_ctrl = channel_ctrl
 
-    def _as_uuid(self, v: Any, name: str) -> uuid.UUID:
-        if isinstance(v, uuid.UUID):
-            return v
-        try:
-            return uuid.UUID(str(v))
-        except Exception as e:
-            raise ValueError(f"Invalid {name}: {v}") from e
-
-    def _wire_pipeline(self, mp: ModelPipeline, notification_service: Optional[Any]) -> None:
+    def wire_pipeline(self, mp: ModelPipeline, notification_service: Optional[Any]) -> None:
+        """Give a freshly-built pipeline its session factory and notification sink."""
         mp.set_session_factory(self._state.session_factory)
-        if notification_service is None:
-            return
-        mp.set_notification_service(notification_service)
+        if notification_service is not None:
+            mp.set_notification_service(notification_service)
 
     def _event_includes_roi_patch(self, ev: VideoChannelEvent) -> bool:
         configs = getattr(ev, "configs", None)
@@ -100,7 +91,7 @@ class PipelineController:
                 notify_on_confirmed=notify_on_confirmed,
                 task_spawner=lambda coro, name: self._state.spawn_bg(coro, name=name),
             )
-            self._wire_pipeline(mp, notification_service)
+            self.wire_pipeline(mp, notification_service)
 
             if full_pl and getattr(full_pl, "cameras", None):
                 site_schedule_cache: Dict[str, Dict[str, Any]] = {}
@@ -223,11 +214,11 @@ class PipelineController:
             model_pipeline = await self.get_activepipeline(uid, notification_service, default_user_id)
             model_pipeline_pid = getattr(model_pipeline, "pipeline_id", None)
 
-        pid = self._as_uuid(model_pipeline_pid, "pipeline_id")
+        pid = require_uuid(model_pipeline_pid, "pipeline_id")
 
         if pipeline_id is not None:
             try:
-                supplied_pid = self._as_uuid(pipeline_id, "pipeline_id")
+                supplied_pid = require_uuid(pipeline_id, "pipeline_id")
                 if supplied_pid != pid:
                     logger.warning(
                         "update_pipeline called with pipeline_id=%s but active pipeline_id=%s user=%s; using active",
@@ -254,7 +245,7 @@ class PipelineController:
                         model_pipeline_pid = getattr(model_pipeline, "pipeline_id", None) or self._state.pipeline_id_by_user.get(uid)
                         if not model_pipeline_pid:
                             return None
-                        pid = self._as_uuid(model_pipeline_pid, "pipeline_id")
+                        pid = require_uuid(model_pipeline_pid, "pipeline_id")
                         continue
                     return None
 
@@ -277,7 +268,7 @@ class PipelineController:
                         if self._event_includes_roi_patch(ev):
                             cam_uuid = getattr(ev, "channel_id", None) or getattr(ev, "camera_uuid", None)
                             if cam_uuid is not None:
-                                roi_reset_camera_ids.add(self._as_uuid(cam_uuid, "camera_uuid"))
+                                roi_reset_camera_ids.add(require_uuid(cam_uuid, "camera_uuid"))
                         cams, evs = await self._channel_ctrl.edit_channel(db, pid=pid, ev=ev, user_id=uid, model_pipeline=model_pipeline)
                     elif et_norm == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
                         cams, evs = await self._channel_ctrl.remove_channel(db, pid=pid, ev=ev, user_id=uid, model_pipeline=model_pipeline)

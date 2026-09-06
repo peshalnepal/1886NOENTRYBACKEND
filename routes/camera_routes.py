@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from application.services.user_snapshot_cache import (
     CachedUserSnapshot,
-    UserSnapshotCache,
     UserSnapshotLookupError,
 )
 import httpx
@@ -20,6 +19,7 @@ from dependencies import (
     get_async_db,
     get_current_user,
     get_manager,
+    get_user_snapshot_cache,
     RequirePermission,
     OrgContext,
 )
@@ -45,17 +45,13 @@ from application.services.detection_stream import (
 )
 from core.security.tokens import decode_access_token
 from core.schemas import (
-    BoxNorm,
-    BoxPx,
-    CameraSchema,
     CameraCreateSchema,
     CameraEditSchema,
+    CameraSchema,
     CameraWithConfigSchema,
-    DetectionItemOut,
     DetectionOut,
-)  # type: ignore
+)
 from application.services.manager import Manager
-from application.services.pipeline import _overlay_payload_from_resp, _live_tracks
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/cameras", tags=["cameras"])
@@ -63,11 +59,6 @@ _SNAPSHOT_HTTP = httpx.AsyncClient(
     timeout=httpx.Timeout(8.0, connect=3.0, read=8.0, write=5.0, pool=5.0),
     follow_redirects=True,
 )
-
-def _ensure_user_owns_camera(cam: Any, user_id: int) -> None:
-    if int(getattr(cam, "user_id", -1)) != int(user_id):
-        raise HTTPException(status_code=404, detail="Camera not found")
-
 
 def _camera_owner_id(cam: Any, fallback_user_id: int) -> int:
     """Detection pipelines are keyed by a user id; use the camera's creator
@@ -124,18 +115,47 @@ async def _ensure_camera_access(db: AsyncSession, cam: Any, ctx: OrgContext) -> 
         raise HTTPException(status_code=404, detail="Camera not found")
 
 
-def _get_user_snapshot_cache(request: Request) -> UserSnapshotCache:
-    cache = getattr(request.app.state, "user_snapshot_cache", None)
-    if cache is None:
-        cache = UserSnapshotCache()
-        request.app.state.user_snapshot_cache = cache
-    return cache
-
-
 def _camera_webrtc_url(cam: Any) -> Optional[str]:
     return resolve_camera_webrtc_url(
         camera_code=getattr(cam, "camera_code", None),
         stored_url=getattr(cam, "webrtc_url", None),
+    )
+
+
+def _tri_state(cam: Any, attr: str) -> str:
+    """Read a tri-state camera column, defaulting to "inherit"."""
+    return str(getattr(cam, attr, "inherit") or "inherit")
+
+
+def _camera_with_config_out(
+    cam_out: Any, *, webrtc_url: Optional[str]
+) -> CameraWithConfigSchema:
+    """Build the camera response from a `CameraOut` (the manager's DTO).
+
+    `CameraOut` names the flags `enabled` / `detection_enabled` / …, while the
+    HTTP contract uses the `is_` prefix, so the mapping cannot be automatic.
+    """
+    now = datetime.now(timezone.utc)
+    return CameraWithConfigSchema(
+        camera_uuid=cam_out.camera_uuid,
+        camera_code=cam_out.camera_code,
+        name=getattr(cam_out, "name", None),
+        location=getattr(cam_out, "location", None),
+        site_uuid=cam_out.site_uuid,
+        device_uuid=cam_out.device_uuid,
+        source_url=cam_out.source_url,
+        webrtc_url=webrtc_url,
+        is_enabled=cam_out.enabled,
+        is_detection_enabled=cam_out.detection_enabled,
+        is_notification_enabled=cam_out.notification_enabled,
+        notification_trigger_mode=_tri_state(cam_out, "notification_trigger_mode"),
+        camera_playback_enabled=_tri_state(cam_out, "camera_playback_enabled"),
+        use_site_schedule=bool(getattr(cam_out, "use_site_schedule", True)),
+        roi=cam_out.roi,
+        configuration=cam_out.configuration,
+        timezone=cam_out.timezone,
+        created_at=getattr(cam_out, "created_at", None) or now,
+        updated_at=getattr(cam_out, "updated_at", None) or now,
     )
 
 async def _resolve_stream_user(
@@ -167,9 +187,10 @@ async def _resolve_stream_user(
     if sf is None:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    cache = _get_user_snapshot_cache(request)
     try:
-        user = await cache.get(session_factory=sf, user_id=user_id)
+        user = await get_user_snapshot_cache(request).get(
+            session_factory=sf, user_id=user_id
+        )
     except UserSnapshotLookupError:
         raise HTTPException(status_code=503, detail="Database not available")
     if user is None:
@@ -296,32 +317,28 @@ async def list_cameras(
         include_device=True,
     )
 
-    out: List[CameraSchema] = []
-    for cam in cams:
-        dev = cam.device if getattr(cam, "device", None) else None
-
-        out.append(
-            CameraSchema(
-                camera_uuid=cam.camera_uuid,
-                camera_code=cam.camera_code,
-                name=getattr(cam, "name", None),
-                location=getattr(cam, "location", None),
-                site_uuid=cam.site_uuid,
-                device_uuid=(dev.device_uuid if dev else None),
-                source_url=cam.source_url,
-                webrtc_url=_camera_webrtc_url(cam),
-                is_enabled=cam.is_enabled,
-                is_detection_enabled=cam.is_detection_enabled,
-                is_notification_enabled=cam.is_notification_enabled,
-                notification_trigger_mode=str(getattr(cam, "notification_trigger_mode", "inherit") or "inherit"),
-                camera_playback_enabled=str(getattr(cam, "camera_playback_enabled", "inherit") or "inherit"),
-                use_site_schedule=bool(getattr(cam, "use_site_schedule", True)),
-                roi=getattr(cam, "roi", None),
-                created_at=cam.created_at,
-                updated_at=cam.updated_at,
-            )
+    return [
+        CameraSchema(
+            camera_uuid=cam.camera_uuid,
+            camera_code=cam.camera_code,
+            name=getattr(cam, "name", None),
+            location=getattr(cam, "location", None),
+            site_uuid=cam.site_uuid,
+            device_uuid=getattr(getattr(cam, "device", None), "device_uuid", None),
+            source_url=cam.source_url,
+            webrtc_url=_camera_webrtc_url(cam),
+            is_enabled=cam.is_enabled,
+            is_detection_enabled=cam.is_detection_enabled,
+            is_notification_enabled=cam.is_notification_enabled,
+            notification_trigger_mode=_tri_state(cam, "notification_trigger_mode"),
+            camera_playback_enabled=_tri_state(cam, "camera_playback_enabled"),
+            use_site_schedule=bool(getattr(cam, "use_site_schedule", True)),
+            roi=getattr(cam, "roi", None),
+            created_at=cam.created_at,
+            updated_at=cam.updated_at,
         )
-    return out
+        for cam in cams
+    ]
 
 @router.get("/{camera_uuid}", response_model=CameraWithConfigSchema)
 async def get_camera(
@@ -337,22 +354,20 @@ async def get_camera(
     cam, cfg, _pid = full
     await _ensure_camera_access(db, cam, ctx)
 
-    dev = cam.device if getattr(cam, "device", None) else None
-
     return CameraWithConfigSchema(
         camera_uuid=cam.camera_uuid,
         camera_code=cam.camera_code,
         name=getattr(cam, "name", None),
         location=getattr(cam, "location", None),
         site_uuid=cam.site_uuid,
-        device_uuid=(dev.device_uuid if dev else None),
+        device_uuid=getattr(getattr(cam, "device", None), "device_uuid", None),
         source_url=cam.source_url,
         webrtc_url=_camera_webrtc_url(cam),
         is_enabled=cam.is_enabled,
         is_detection_enabled=cam.is_detection_enabled,
         is_notification_enabled=cam.is_notification_enabled,
-        notification_trigger_mode=str(getattr(cam, "notification_trigger_mode", "inherit") or "inherit"),
-        camera_playback_enabled=str(getattr(cam, "camera_playback_enabled", "inherit") or "inherit"),
+        notification_trigger_mode=_tri_state(cam, "notification_trigger_mode"),
+        camera_playback_enabled=_tri_state(cam, "camera_playback_enabled"),
         use_site_schedule=bool(getattr(cam, "use_site_schedule", True)),
         roi=getattr(cam, "roi", None),
         configuration=(cfg.configuration if cfg else {}),
@@ -644,27 +659,7 @@ async def create_camera(
         from routes.notifications_routes import invalidate_camera_mode_cache
 
         await invalidate_camera_mode_cache(cam_out.camera_uuid)
-        return CameraWithConfigSchema(
-            camera_uuid=cam_out.camera_uuid,
-            camera_code=cam_out.camera_code,
-            name=getattr(cam_out, "name", None),
-            location=getattr(cam_out, "location", None),
-            site_uuid=cam_out.site_uuid,
-            device_uuid=cam_out.device_uuid,
-            source_url=cam_out.source_url,
-            webrtc_url=webrtc_url,
-            is_enabled=cam_out.enabled,
-            is_detection_enabled=cam_out.detection_enabled,
-            is_notification_enabled=cam_out.notification_enabled,
-            notification_trigger_mode=str(getattr(cam_out, "notification_trigger_mode", "inherit") or "inherit"),
-            camera_playback_enabled=str(getattr(cam_out, "camera_playback_enabled", "inherit") or "inherit"),
-            use_site_schedule=bool(getattr(cam_out, "use_site_schedule", True)),
-            roi=cam_out.roi,
-            configuration=cam_out.configuration,
-            timezone=cam_out.timezone,
-            created_at=getattr(cam_out, "created_at", None) or datetime.now(timezone.utc),
-            updated_at=getattr(cam_out, "updated_at", None) or datetime.now(timezone.utc),
-        )
+        return _camera_with_config_out(cam_out, webrtc_url=webrtc_url)
     except HTTPException:
         raise
     except ValueError as e:
@@ -731,30 +726,7 @@ async def edit_camera(
     from routes.notifications_routes import invalidate_camera_mode_cache
 
     await invalidate_camera_mode_cache(cam_out.camera_uuid)
-    return CameraWithConfigSchema(
-        camera_uuid=cam_out.camera_uuid,
-        camera_code=cam_out.camera_code,
-        name=getattr(cam_out, "name", None),
-        location=getattr(cam_out, "location", None),
-        site_uuid=cam_out.site_uuid,
-        device_uuid=cam_out.device_uuid,
-        source_url=cam_out.source_url,
-        webrtc_url=resolve_camera_webrtc_url(
-            camera_code=getattr(cam_out, "camera_code", None),
-            stored_url=getattr(cam_out, "webrtc_url", None),
-        ),
-        is_enabled=cam_out.enabled,
-        is_detection_enabled=cam_out.detection_enabled,
-        is_notification_enabled=cam_out.notification_enabled,
-        notification_trigger_mode=str(getattr(cam_out, "notification_trigger_mode", "inherit") or "inherit"),
-        camera_playback_enabled=str(getattr(cam_out, "camera_playback_enabled", "inherit") or "inherit"),
-        use_site_schedule=bool(getattr(cam_out, "use_site_schedule", True)),
-        roi=cam_out.roi,
-        configuration=cam_out.configuration,
-        timezone=cam_out.timezone,
-        created_at=getattr(cam_out, "created_at", None) or datetime.now(timezone.utc),
-        updated_at=getattr(cam_out, "updated_at", None) or datetime.now(timezone.utc),
-    )
+    return _camera_with_config_out(cam_out, webrtc_url=_camera_webrtc_url(cam_out))
 
 
 from routes._background import _delete_blobs_background, _spawn_bg_task  # noqa: E402
@@ -768,61 +740,69 @@ async def _cleanup_camera_runtime(
     camera_code: Optional[str],
     device_urls: List[str],
 ) -> None:
-    """
-    Best-effort runtime cleanup for a single camera without creating a fresh
-    pipeline as a side effect.
-    """
-    device_url_targets = list(dict.fromkeys(str(url or "").strip() for url in device_urls if str(url or "").strip()))
+    """Best-effort teardown of one camera's runtime presence.
 
-    active_pipeline = None
+    Deliberately uses `get_loaded_pipeline`, never `get_activepipeline`: the
+    latter *builds and starts* a pipeline, so asking for one during a delete
+    would spin up the very thing being torn down.
+    """
+    device_url_targets = list(
+        dict.fromkeys(url.strip() for url in device_urls if url and url.strip())
+    )
+
     try:
         active_pipeline = manager.get_loaded_pipeline(user_id=user_id)
-        if active_pipeline is not None:
-            logger.info(f"[Camera Delete] Using already-loaded pipeline for cam={camera_uuid} user={user_id}")
-        else:
-            logger.info(f"[Camera Delete] No in-memory pipeline loaded for cam={camera_uuid} user={user_id}")
-    except Exception as exc:
+    except Exception:
         logger.warning(
-            f"[Camera Delete] Could not inspect loaded pipeline for cam={camera_uuid}: {exc}",
+            "[Camera Delete] Could not inspect loaded pipeline for cam=%s",
+            camera_uuid,
             exc_info=True,
         )
         active_pipeline = None
 
+    # The running channel may point at a device the DB row no longer names.
     if active_pipeline is not None:
         try:
             cfg = await active_pipeline.get_channel_config(camera_uuid)
-            runtime_device_url = str(getattr(cfg, "device_url", "") or "").strip() if cfg is not None else ""
-            if runtime_device_url:
-                device_url_targets = list(dict.fromkeys(device_url_targets + [runtime_device_url]))
-        except Exception as exc:
+            runtime_device_url = str(getattr(cfg, "device_url", "") or "").strip()
+            if runtime_device_url and runtime_device_url not in device_url_targets:
+                device_url_targets.append(runtime_device_url)
+        except Exception:
             logger.warning(
-                f"[Camera Delete] Failed reading loaded pipeline config for cam={camera_uuid}: {exc}",
+                "[Camera Delete] Failed reading pipeline config for cam=%s",
+                camera_uuid,
                 exc_info=True,
             )
 
     for dev_url in device_url_targets:
         try:
-            await manager._edge.delete_camera(device_url=dev_url, camera_uuid=str(camera_uuid))
-            logger.info(f"[Camera Delete] Deleted camera={camera_uuid} from edge device url={dev_url}")
+            await manager.edge.delete_camera(
+                device_url=dev_url, camera_uuid=str(camera_uuid)
+            )
         except Exception as exc:
-            logger.warning(f"[Camera Delete] Edge delete failed cam={camera_uuid} url={dev_url}: {exc}")
+            logger.warning(
+                "[Camera Delete] Edge delete failed cam=%s url=%s: %s",
+                camera_uuid,
+                dev_url,
+                exc,
+            )
 
     if camera_code:
         try:
-            deleted = await manager._webrtc.delete_stream(stream_key=str(camera_code))
-            if deleted:
-                logger.info(f"[Camera Delete] Deleted WebRTC stream for camera={camera_uuid}")
-            else:
-                logger.info(f"[Camera Delete] WebRTC stream already absent for camera={camera_uuid}")
+            await manager.webrtc.delete_stream(stream_key=str(camera_code))
         except Exception as exc:
-            logger.warning(f"[Camera Delete] WebRTC delete failed cam={camera_uuid} code={camera_code}: {exc}")
+            logger.warning(
+                "[Camera Delete] WebRTC delete failed cam=%s code=%s: %s",
+                camera_uuid,
+                camera_code,
+                exc,
+            )
 
     if active_pipeline is not None:
         try:
             await active_pipeline.remove_channel(camera_uuid)
-            logger.info(f"[Camera Delete] Evicted camera={camera_uuid} from loaded pipeline")
         except Exception as exc:
-            logger.warning(f"[Camera Delete] Pipeline evict failed cam={camera_uuid}: {exc}")
+            logger.warning("[Camera Delete] Pipeline evict failed cam=%s: %s", camera_uuid, exc)
 
 
 
@@ -833,22 +813,25 @@ async def delete_camera(
     manager: Manager = Depends(get_manager),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_CAMERAS)),
 ):
-    """
-    Full camera deletion:
-    1. Snapshot camera info
-    2. Stop camera on edge/WebRTC/pipeline (before any DB changes)
-    3. Extract blob keys from notifications + video records
-    4. Delete all linked DB rows (notifications, video records, relationships, camera)
-    5. Async blob deletion (alert images + clips)
-    6. Invalidate caches
+    """Delete a camera and everything attached to it.
+
+    Ordering matters throughout:
+
+    1. Disable the camera in the DB first. Reconcile decides what to provision
+       from `is_enabled`/`is_detection_enabled`, so a reconcile firing between
+       the edge teardown and the row delete would re-add the camera.
+    2. Stop it on the edge, WebRTC and the in-memory pipeline, so nothing new
+       is written while the delete runs.
+    3. Snapshot blob keys and notification ids *before* the row goes: deleting
+       the camera CASCADEs its VideoRecords away and SET NULLs
+       `Notification.camera_uuid`, which would strand both.
+    4. Delete the camera row, then sweep the heavy tables and blobs in the
+       background so the response is fast.
     """
     from routes.notifications_routes import invalidate_camera_mode_cache
 
-    logger.info(f"[Camera Delete] Starting deletion of camera={camera_uuid}")
+    logger.info("[Camera Delete] Starting deletion of camera=%s", camera_uuid)
 
-    # ========================================
-    # PHASE 1: Validate + snapshot info BEFORE any changes
-    # ========================================
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
@@ -859,46 +842,29 @@ async def delete_camera(
 
     cam_code: Optional[str] = getattr(cam, "camera_code", None)
     site_uuid = cam.site_uuid
+    device_url = str(getattr(getattr(cam, "device", None), "device_url", "") or "").strip()
+    device_urls = [device_url] if device_url else []
 
-    cam_device = cam.device if getattr(cam, "device", None) else None
-    device_urls = (
-        [str(cam_device.device_url).strip()]
-        if cam_device is not None and str(getattr(cam_device, "device_url", "") or "").strip()
-        else []
-    )
-
-    # ========================================
-    # PHASE 1b: Disable camera in DB BEFORE edge/MediaMTX cleanup.
-    # Reconcile reads is_enabled/is_detection_enabled from DB; if it fires
-    # between our edge cleanup and DB deletion it re-adds the camera.
-    # ========================================
-    logger.info(f"[Camera Delete] Phase 1b: Disabling camera in DB to prevent reconcile re-adds")
+    # 1. Close the reconcile race window before touching anything external.
     await repo.disable_cameras(db, camera_uuids=[camera_uuid], user_id=owner_id)
     await db.commit()
 
-    # ========================================
-    # PHASE 2: Stop camera BEFORE any DB changes
-    # Prevents new detections/clips being written while we delete.
-    # ========================================
-    logger.info(f"[Camera Delete] Phase 2: Stopping camera on edge/WebRTC/pipeline")
-
-    # 2a: Purge notification service in-memory state
-    notif_svc = getattr(manager, "_notification_service", None) if manager is not None else None
+    # 2. Stop the camera everywhere it is running.
+    notif_svc = getattr(manager, "notification_service", None) if manager else None
     if notif_svc is not None:
         try:
             purge_fn = getattr(notif_svc, "purge_deleted_site_runtime_state", None)
             if callable(purge_fn):
                 await purge_fn(
-                    user_id=owner_id,
-                    site_uuid=site_uuid,
-                    camera_uuids=[camera_uuid],
+                    user_id=owner_id, site_uuid=site_uuid, camera_uuids=[camera_uuid]
                 )
             else:
                 notif_svc.invalidate_camera_roi_state(str(camera_uuid))
-        except Exception as exc:
-            logger.warning(f"[Camera Delete] Notification service purge failed: {exc}", exc_info=True)
+        except Exception:
+            logger.warning(
+                "[Camera Delete] Notification service purge failed", exc_info=True
+            )
 
-    # 2b: Stop on edge device, WebRTC, and evict from pipeline
     if manager is not None:
         try:
             await asyncio.wait_for(
@@ -913,74 +879,51 @@ async def delete_camera(
             )
         except asyncio.TimeoutError:
             logger.warning(
-                f"[Camera Delete] Runtime cleanup timed out for cam={camera_uuid}; proceeding with DB delete"
+                "[Camera Delete] Runtime cleanup timed out for cam=%s; proceeding with DB delete",
+                camera_uuid,
             )
-        except Exception as exc:
-            logger.warning(f"[Camera Delete] Runtime cleanup failed for cam={camera_uuid}: {exc}", exc_info=True)
+        except Exception:
+            logger.warning(
+                "[Camera Delete] Runtime cleanup failed for cam=%s", camera_uuid, exc_info=True
+            )
 
-    # ========================================
-    # PHASE 3a: Extract video record blob keys BEFORE camera deletion.
-    # Camera deletion CASCADE-deletes VideoRecords, losing storage_key.
-    # ========================================
-    video_clip_keys: List[str] = []
-    video_repo = VideoRepository()
-    async with AsyncSessionLocal() as vr_session:
-        vr_rows = await video_repo.list_storage_keys(vr_session, camera_uuid=camera_uuid)
-        video_clip_keys = [k.strip() for k in vr_rows if k and k.strip()]
-    logger.info(f"[Camera Delete] Phase 3a: Extracted {len(video_clip_keys)} video record blob keys")
-
-    # ========================================
-    # PHASE 3b: Snapshot notification IDs for this camera BEFORE
-    # camera deletion SET NULLs Notification.camera_uuid.
-    # We store just the IDs so the background task can query by ID
-    # instead of by camera_uuid (which will be NULL after this).
-    # For cameras with millions of notifications this list may be
-    # large, but IDs are just integers so memory is bounded.
-    # ========================================
-    notification_ids: List[int] = []
-    notification_repo = NotificationRepository()
-    async with AsyncSessionLocal() as nid_session:
-        notification_ids = await notification_repo.list_notification_ids(
-            nid_session, camera_uuid=camera_uuid
+    # 3. Snapshot what the delete is about to make unreachable.
+    async with AsyncSessionLocal() as session:
+        video_clip_keys = await VideoRepository().list_storage_keys(
+            session, camera_uuid=camera_uuid
         )
-    logger.info(f"[Camera Delete] Phase 3b: Snapshotted {len(notification_ids)} notification IDs")
+        notification_ids = await NotificationRepository().list_notification_ids(
+            session, camera_uuid=camera_uuid
+        )
+    logger.info(
+        "[Camera Delete] Snapshotted %s clip blob keys and %s notification ids",
+        len(video_clip_keys),
+        len(notification_ids),
+    )
 
-    # ========================================
-    # PHASE 3c: Fast Foreground DB Cleanup
-    # ========================================
-    logger.info(f"[Camera Delete] Phase 3c: Deleting camera from DB (Foreground)")
-
+    # 4. Drop the camera row, then hand the heavy tables to the background.
     async with AsyncSessionLocal() as del_db:
         await repo.delete_camera(del_db, camera_uuid=camera_uuid)
         await del_db.commit()
 
-    logger.info(f"[Camera Delete] Camera row deleted")
-
-    # ========================================
-    # PHASE 4: Invalidate caches
-    # ========================================
     await invalidate_camera_mode_cache(camera_uuid)
-
-    # ========================================
-    # PHASE 5: Background Database Cleanup (Notifications & Blobs)
-    # Camera row is gone.  VideoRecords were cascade-deleted but their
-    # blob keys were captured in Phase 3a.  Notification.camera_uuid
-    # was SET NULL but we captured notification IDs in Phase 3b.
-    # ========================================
-    logger.info(f"[Camera Delete] Phase 5: Spawning background task to clean up heavy tables (Notifications/Videos)")
 
     async def _heavy_table_cleanup_task(
         cam_uuid: uuid.UUID,
         notif_ids: List[int],
         pre_video_keys: List[str],
     ):
-        logger.info(f"[Camera Cleanup Task] Starting background heavy cleanup for camera={cam_uuid}")
+        """Delete the camera's notifications and blobs after the response.
+
+        Notifications are matched by id, not camera_uuid: the column was
+        SET NULL when the camera row went away.
+        """
+        logger.info("[Camera Cleanup Task] Starting cleanup for camera=%s", cam_uuid)
         repo_for_delete = SiteRepository()
         alert_blob_keys: List[str] = []
         clip_blob_keys: List[str] = list(pre_video_keys)
 
         try:
-            # Batch delete notifications by ID (camera_uuid is NULL now)
             if notif_ids:
                 for i in range(0, len(notif_ids), 2000):
                     batch_ids = notif_ids[i : i + 2000]
@@ -997,29 +940,34 @@ async def delete_camera(
                         clip_keys_out=clip_blob_keys,
                     )
 
-            # Schedule the blob deletions
             if alert_blob_keys:
                 _spawn_bg_task(
-                    _delete_blobs_background(alert_blob_keys, service_cls=AlertImageStorageService, label="alert image"),
+                    _delete_blobs_background(
+                        alert_blob_keys,
+                        service_cls=AlertImageStorageService,
+                        label="alert image",
+                    ),
                     name=f"delete_camera_alert_blobs:{cam_uuid}",
                 )
-
             if clip_blob_keys:
                 _spawn_bg_task(
-                    _delete_blobs_background(clip_blob_keys, service_cls=EventClipService, label="clip"),
+                    _delete_blobs_background(
+                        clip_blob_keys, service_cls=EventClipService, label="clip"
+                    ),
                     name=f"delete_camera_clip_blobs:{cam_uuid}",
                 )
-            logger.info(f"[Camera Cleanup Task] Background heavy cleanup COMPLETE for camera={cam_uuid}")
-
-        except Exception as e:
-            logger.error(f"[Camera Cleanup Task] Failed heavy cleanup for camera={cam_uuid}: {e}", exc_info=True)
+            logger.info("[Camera Cleanup Task] Cleanup COMPLETE for camera=%s", cam_uuid)
+        except Exception:
+            logger.exception(
+                "[Camera Cleanup Task] Failed cleanup for camera=%s", cam_uuid
+            )
 
     _spawn_bg_task(
         _heavy_table_cleanup_task(camera_uuid, notification_ids, video_clip_keys),
         name=f"delete_camera_heavy_tables:{camera_uuid}",
     )
 
-    logger.info(f"[Camera Delete] HTTP response ready: camera={camera_uuid} effectively deleted from UI")
+    logger.info("[Camera Delete] camera=%s deleted", camera_uuid)
     return {"ok": True}
 
 @router.get("/{camera_uuid}/snapshot.jpg")
@@ -1033,29 +981,30 @@ async def snapshot_jpg(
         user = await _resolve_stream_user(request=request, access_token=access_token)
     except HTTPException as e:
         if e.status_code == 401:
-            logger.warning(f"Snapshot access denied for camera {camera_uuid}: {e.detail}")
+            logger.warning(
+                "Snapshot access denied for camera %s: %s", camera_uuid, e.detail
+            )
             raise HTTPException(
                 status_code=401,
-                detail="Authentication required. Please ensure you are logged in and have a valid token."
+                detail="Authentication required. Please ensure you are logged in and have a valid token.",
             )
         raise
-    
+
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
-        logger.warning(f"Camera {camera_uuid} not found for user {user.id}")
+        logger.warning("Camera %s not found for user %s", camera_uuid, user.id)
         raise HTTPException(status_code=404, detail="Camera not found")
 
     cam, _cfg, _pid = full
     await _ensure_stream_camera_access(db, cam, user)
 
-    dev = cam.device if getattr(cam, "device", None) else None
-    device_url = str(getattr(dev, "device_url", "") or "").strip() if dev is not None else ""
+    device_url = str(getattr(getattr(cam, "device", None), "device_url", "") or "").strip()
     if not device_url:
-        logger.warning(f"Camera {camera_uuid} has no device assigned or device_url missing")
+        logger.warning("Camera %s has no device assigned or device_url missing", camera_uuid)
         raise HTTPException(
-            status_code=409, 
-            detail="Camera is not properly configured. Device URL is missing. Please contact administrator."
+            status_code=409,
+            detail="Camera is not properly configured. Device URL is missing. Please contact administrator.",
         )
 
     return await _fetch_device_snapshot(device_url=device_url, camera_uuid=cam.camera_uuid)

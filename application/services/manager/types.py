@@ -1,7 +1,4 @@
-"""DTOs and exceptions for the manager package.
-
-Extracted verbatim from the former monolithic application/services/manager.py.
-"""
+"""DTOs and exceptions for the manager package."""
 
 from __future__ import annotations
 
@@ -42,6 +39,56 @@ class CameraOut(BaseModel):
     jpeg_quality: int = Field(default=80, ge=1, le=100)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    @classmethod
+    def from_camera(
+        cls,
+        cam: Any,
+        *,
+        device_uuid: uuid.UUID,
+        device_url: str,
+        cfg_json: Dict[str, Any],
+        capture_cfg: Dict[str, Any],
+        timezone: Optional[str],
+        use_site_schedule: Optional[bool],
+    ) -> "CameraOut":
+        """Project a persisted `Camera` plus its resolved config into the DTO.
+
+        `capture_cfg` is the config blob the capture defaults are read from —
+        the create path passes the request patch, the edit path the merged
+        config — which is the only thing that differs between call sites.
+        """
+        return cls(
+            camera_uuid=cam.camera_uuid,
+            camera_code=getattr(cam, "camera_code", None),
+            name=getattr(cam, "name", None),
+            location=getattr(cam, "location", None),
+            site_uuid=cam.site_uuid,
+            source_url=cam.source_url,
+            webrtc_url=cam.webrtc_url,
+            enabled=bool(cam.is_enabled),
+            detection_enabled=bool(cam.is_detection_enabled),
+            notification_enabled=bool(cam.is_notification_enabled),
+            device_uuid=device_uuid,
+            device_url=device_url,
+            sample_fps=float(capture_cfg.get("sample_fps", 5.0)),
+            decode_backend=str(capture_cfg.get("decode_backend", "gstreamer")),
+            resize=capture_cfg.get("resize"),
+            emit_format=str(capture_cfg.get("emit_format", "raw")),
+            jpeg_quality=int(capture_cfg.get("jpeg_quality", 80)),
+            roi=cam.roi,
+            configuration=cfg_json or {},
+            timezone=timezone,
+            notification_trigger_mode=str(
+                getattr(cam, "notification_trigger_mode", "inherit") or "inherit"
+            ),
+            camera_playback_enabled=str(
+                getattr(cam, "camera_playback_enabled", "inherit") or "inherit"
+            ),
+            use_site_schedule=use_site_schedule,
+            created_at=getattr(cam, "created_at", None),
+            updated_at=getattr(cam, "updated_at", None),
+        )
 
 
 class PipelineUpdateResult(BaseModel):

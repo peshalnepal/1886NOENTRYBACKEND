@@ -47,8 +47,8 @@ class SiteDeleteCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         manager = SimpleNamespace(
             get_loaded_pipeline=Mock(return_value=pipeline),
-            _edge=SimpleNamespace(delete_camera=AsyncMock()),
-            _webrtc=SimpleNamespace(delete_stream=AsyncMock()),
+            edge=SimpleNamespace(delete_camera=AsyncMock()),
+            webrtc=SimpleNamespace(delete_stream=AsyncMock()),
         )
 
         await _cleanup_cameras_background(
@@ -65,17 +65,17 @@ class SiteDeleteCleanupTests(unittest.IsolatedAsyncioTestCase):
         )
 
         manager.get_loaded_pipeline.assert_called_once_with(user_id=5)
-        manager._edge.delete_camera.assert_any_call(
+        manager.edge.delete_camera.assert_any_call(
             device_url="http://edge.example:19030",
             camera_uuid=str(snap_camera_uuid),
         )
-        manager._edge.delete_camera.assert_any_call(
+        manager.edge.delete_camera.assert_any_call(
             device_url="http://edge.example:19030",
             camera_uuid=str(runtime_only_camera_uuid),
         )
-        self.assertEqual(manager._edge.delete_camera.await_count, 2)
+        self.assertEqual(manager.edge.delete_camera.await_count, 2)
 
-        manager._webrtc.delete_stream.assert_awaited_once_with(stream_key="cam-12345678")
+        manager.webrtc.delete_stream.assert_awaited_once_with(stream_key="cam-12345678")
         pipeline.remove_channel.assert_any_await(snap_camera_uuid)
         pipeline.remove_channel.assert_any_await(runtime_only_camera_uuid)
         self.assertEqual(pipeline.remove_channel.await_count, 2)

@@ -16,8 +16,9 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.notification_repository import CameraContext
+from application.services.overlay_normalize import _append_overlay_detection
 from core.database_orm import VideoRecord
-
+from core.env import env_float, env_int
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +62,6 @@ def _truncate_message(raw: Any, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: max(0, limit - 3)]}..."
-
-
-from application.services.overlay_normalize import (
-    _append_overlay_detection,
-)
 
 
 def _coerce_positive_int(value: Any) -> Optional[int]:
@@ -346,40 +342,28 @@ class EventClipService:
         self.connection_string = (os.getenv("VIDEO_CLIP_BLOB_CONNECTION_STRING") or "").strip()
         self.container_name = (os.getenv("VIDEO_CLIP_BLOB_CONTAINER") or "event-clips").strip() or "event-clips"
 
-        # Read optional overrides from env (fallback to class constants)
         capture_enabled_raw = os.getenv("VIDEO_CLIP_CAPTURE_ENABLED", "").strip().lower()
-        capture_enabled = capture_enabled_raw not in {"0", "false", "no", "off"} if capture_enabled_raw else True
+        capture_enabled = (
+            capture_enabled_raw not in {"0", "false", "no", "off"}
+            if capture_enabled_raw
+            else True
+        )
         self.storage_enabled = bool(self.connection_string)
         self.enabled = bool(capture_enabled and self.playback_base_url)
 
-        # Pre/post-roll are the source of truth for the clip layout; the total
-        # duration is always derived from them so the event stays anchored at the
-        # PRE_EVENT_S mark. (A standalone VIDEO_CLIP_DURATION_S is still accepted
-        # for backward compatibility but only used when PRE/POST are not given.)
-        try:
-            self.PRE_EVENT_S = int(os.getenv("VIDEO_CLIP_PRE_EVENT_S") or self.PRE_EVENT_S)
-        except (ValueError, TypeError):
-            pass
-        try:
-            self.POST_EVENT_S = int(os.getenv("VIDEO_CLIP_POST_EVENT_S") or self.POST_EVENT_S)
-        except (ValueError, TypeError):
-            pass
+        # Env overrides for the class defaults. Pre/post-roll are the source of
+        # truth for the clip layout; the total duration is always derived from
+        # them so the event stays anchored at the PRE_EVENT_S mark.
+        self.PRE_EVENT_S = env_int("VIDEO_CLIP_PRE_EVENT_S", self.PRE_EVENT_S)
+        self.POST_EVENT_S = env_int("VIDEO_CLIP_POST_EVENT_S", self.POST_EVENT_S)
         self.CLIP_DURATION_S = self.PRE_EVENT_S + self.POST_EVENT_S
-        try:
-            self.MINIMUM_DURATION_S = int(os.getenv("VIDEO_CLIP_MIN_DURATION_S") or self.MINIMUM_DURATION_S)
-        except (ValueError, TypeError):
-            pass
-        try:
-            self.SAS_TTL_HOURS = int(os.getenv("VIDEO_CLIP_SAS_TTL_HOURS") or self.SAS_TTL_HOURS)
-        except (ValueError, TypeError):
-            pass
+        self.MINIMUM_DURATION_S = env_int("VIDEO_CLIP_MIN_DURATION_S", self.MINIMUM_DURATION_S)
+        self.SAS_TTL_HOURS = env_int("VIDEO_CLIP_SAS_TTL_HOURS", self.SAS_TTL_HOURS)
+        self.HTTP_TIMEOUT_S = env_float("VIDEO_CLIP_HTTP_TIMEOUT_S", self.HTTP_TIMEOUT_S)
+
         raw_fmt = (os.getenv("VIDEO_CLIP_DOWNLOAD_FORMAT") or "").strip().lower()
         if raw_fmt:
             self.DOWNLOAD_FORMAT = raw_fmt
-        try:
-            self.HTTP_TIMEOUT_S = float(os.getenv("VIDEO_CLIP_HTTP_TIMEOUT_S") or self.HTTP_TIMEOUT_S)
-        except (ValueError, TypeError):
-            pass
 
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(self.HTTP_TIMEOUT_S, connect=min(10.0, self.HTTP_TIMEOUT_S))

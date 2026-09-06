@@ -62,61 +62,72 @@ def _coerce_playback_mode(raw: Any) -> str:
 
 
 class NotificationRepository:
-    """
-    DB access for:
-      - camera context (user/site/device)
-      - notification emails (site-scoped)
-      - notifications table inserts/updates
+    """Persistence for camera context, site-scoped recipient emails and the
+    `notification` table. Never commits: the caller owns the transaction."""
 
-    Notes:
-    - No commits here. Caller controls transaction boundaries.
-    """
+    # The columns a CameraContext is built from, in `_camera_context` order.
+    _CAMERA_CONTEXT_COLUMNS = (
+        Camera.camera_uuid,
+        Camera.user_id,
+        Camera.site_uuid,
+        Site.name,
+        Camera.name,
+        Camera.camera_code,
+        Device.device_uuid,
+        Device.name,
+        Camera.notification_trigger_mode,
+        Camera.camera_playback_enabled,
+    )
 
-    async def get_camera_context(self, db: AsyncSession, *, camera_uuid: uuid.UUID) -> Optional[CameraContext]:
-        cam_uuid = _as_uuid(camera_uuid)
-        if cam_uuid is None:
-            return None
-
-        stmt = (
-            select(
-                Camera.user_id,
-                Camera.site_uuid,
-                Site.name,
-                Camera.name,
-                Camera.camera_code,
-                Device.device_uuid,
-                Device.name,
-                Camera.notification_trigger_mode,
-                Camera.camera_playback_enabled,
-            )
+    def _camera_context_query(self):
+        return (
+            select(*self._CAMERA_CONTEXT_COLUMNS)
             .select_from(Camera)
             .join(Site, Site.site_uuid == Camera.site_uuid)
             .outerjoin(Device, Device.device_uuid == Camera.device_uuid)
-            .where(Camera.camera_uuid == cam_uuid)
         )
 
-        row = (await db.execute(stmt)).first()
-        if not row:
-            return None
-
+    @staticmethod
+    def _camera_context(row) -> "tuple[uuid.UUID, CameraContext]":
         (
-            user_id, site_uuid, site_name, camera_name, camera_code,
-            device_uuid, device_name,
-            notification_trigger_mode, camera_playback_enabled,
+            camera_uuid,
+            user_id,
+            site_uuid,
+            site_name,
+            camera_name,
+            camera_code,
+            device_uuid,
+            device_name,
+            trigger_mode,
+            playback_enabled,
         ) = row
-        display_camera_name = camera_name or camera_code
-
-        return CameraContext(
+        return camera_uuid, CameraContext(
             user_id=int(user_id),
             site_uuid=site_uuid,
             site_name=site_name or "Unknown Site",
             camera_code=str(camera_code) if camera_code else None,
-            camera_name=display_camera_name,
+            camera_name=camera_name or camera_code,
             device_uuid=device_uuid,
             device_name=device_name,
-            notification_trigger_mode=_coerce_trigger_mode(notification_trigger_mode),
-            camera_playback_enabled=_coerce_playback_mode(camera_playback_enabled),
+            notification_trigger_mode=_coerce_trigger_mode(trigger_mode),
+            camera_playback_enabled=_coerce_playback_mode(playback_enabled),
         )
+
+    async def get_camera_context(
+        self, db: AsyncSession, *, camera_uuid: uuid.UUID
+    ) -> Optional[CameraContext]:
+        cam_uuid = _as_uuid(camera_uuid)
+        if cam_uuid is None:
+            return None
+
+        row = (
+            await db.execute(
+                self._camera_context_query().where(Camera.camera_uuid == cam_uuid)
+            )
+        ).first()
+        if not row:
+            return None
+        return self._camera_context(row)[1]
 
     async def list_camera_contexts(
         self,
@@ -129,55 +140,15 @@ class NotificationRepository:
         if not camera_uuid_values:
             return {}
 
-        stmt = (
-            select(
-                Camera.camera_uuid,
-                Camera.user_id,
-                Camera.site_uuid,
-                Site.name,
-                Camera.name,
-                Camera.camera_code,
-                Device.device_uuid,
-                Device.name,
-                Camera.notification_trigger_mode,
-                Camera.camera_playback_enabled,
+        rows = (
+            await db.execute(
+                self._camera_context_query().where(
+                    Camera.user_id == int(user_id),
+                    Camera.camera_uuid.in_(camera_uuid_values),
+                )
             )
-            .select_from(Camera)
-            .join(Site, Site.site_uuid == Camera.site_uuid)
-            .outerjoin(Device, Device.device_uuid == Camera.device_uuid)
-            .where(
-                Camera.user_id == int(user_id),
-                Camera.camera_uuid.in_(camera_uuid_values),
-            )
-        )
-
-        rows = (await db.execute(stmt)).all()
-        out: Dict[uuid.UUID, CameraContext] = {}
-        for (
-            camera_uuid,
-            camera_user_id,
-            site_uuid,
-            site_name,
-            camera_name,
-            camera_code,
-            device_uuid,
-            device_name,
-            notification_trigger_mode,
-            camera_playback_enabled,
-        ) in rows:
-            display_camera_name = camera_name or camera_code
-            out[camera_uuid] = CameraContext(
-                user_id=int(camera_user_id),
-                site_uuid=site_uuid,
-                site_name=site_name or "Unknown Site",
-                camera_code=str(camera_code) if camera_code else None,
-                camera_name=display_camera_name,
-                device_uuid=device_uuid,
-                device_name=device_name,
-                notification_trigger_mode=_coerce_trigger_mode(notification_trigger_mode),
-                camera_playback_enabled=_coerce_playback_mode(camera_playback_enabled),
-            )
-        return out
+        ).all()
+        return dict(self._camera_context(row) for row in rows)
 
     async def get_site_prerecord_settings(
         self,
@@ -186,14 +157,15 @@ class NotificationRepository:
         user_id: int,
         site_uuid: uuid.UUID,
     ) -> SitePrerecordSettings:
-        stmt = select(SiteSettings.config).where(
-            SiteSettings.site_uuid == _as_uuid(site_uuid),
-        )
-        config = (await db.execute(stmt)).scalar_one_or_none()
-        if not isinstance(config, dict):
-            return SitePrerecordSettings(enabled=False, camera_uuids=[])
+        config = (
+            await db.execute(
+                select(SiteSettings.config).where(
+                    SiteSettings.site_uuid == _as_uuid(site_uuid)
+                )
+            )
+        ).scalar_one_or_none()
 
-        block = config.get("multi_camera_prerecord")
+        block = config.get("multi_camera_prerecord") if isinstance(config, dict) else None
         if not isinstance(block, dict):
             return SitePrerecordSettings(enabled=False, camera_uuids=[])
 
@@ -203,23 +175,6 @@ class NotificationRepository:
             trigger_mode=_normalize_trigger_mode(block.get("trigger_mode")),
         )
 
-    async def list_notification_emails_for_site(
-        self,
-        db: AsyncSession,
-        *,
-        user_id: int,
-        site_uuid: uuid.UUID,
-        only_enabled: bool = True,
-    ) -> List[str]:
-        stmt = select(NotificationEmail.email).where(
-            NotificationEmail.site_uuid == _as_uuid(site_uuid),
-        )
-        if only_enabled:
-            stmt = stmt.where(NotificationEmail.is_enabled.is_(True))
-
-        res = await db.execute(stmt)
-        return [r[0] for r in res.all()]
-
     async def list_notification_emails_for_sites(
         self,
         db: AsyncSession,
@@ -228,7 +183,11 @@ class NotificationRepository:
         site_uuids: List[uuid.UUID],
         only_enabled: bool = True,
     ) -> Dict[uuid.UUID, List[str]]:
-        site_uuid_values = [_as_uuid(site_uuid) for site_uuid in (site_uuids or []) if site_uuid is not None]
+        """Recipient addresses grouped by site. Sites with no recipients are
+        absent from the result rather than mapped to an empty list."""
+        site_uuid_values = [
+            _as_uuid(site_uuid) for site_uuid in (site_uuids or []) if site_uuid is not None
+        ]
         if not site_uuid_values:
             return {}
 
@@ -238,12 +197,10 @@ class NotificationRepository:
         if only_enabled:
             stmt = stmt.where(NotificationEmail.is_enabled.is_(True))
 
-        rows = (await db.execute(stmt)).all()
         grouped: Dict[uuid.UUID, List[str]] = defaultdict(list)
-        for site_uuid, email in rows:
+        for site_uuid, email in (await db.execute(stmt)).all():
             grouped[site_uuid].append(email)
-
-        return {site_uuid: emails for site_uuid, emails in grouped.items()}
+        return dict(grouped)
 
     @staticmethod
     def _notification_from_dto(dto: NotificationCreateDTO) -> Notification:
@@ -382,23 +339,22 @@ class NotificationRepository:
         await db.flush()
         return row
 
-    async def mark_notification_sent(
-        self,
-        db: AsyncSession,
-        *,
-        notification_id: int,
-        sent_at: Optional[datetime] = None,
-        status: str = "sent",
-    ) -> None:
-        stmt = (
-            update(Notification)
-            .where(Notification.id == int(notification_id))
-            .values(
-                status=status,
-                sent_at=sent_at or datetime.now(timezone.utc),
-            )
+    @staticmethod
+    def _clean_ids(notification_ids: Optional[List[int]]) -> List[int]:
+        """Deduped, sorted, positive ids only."""
+        return sorted(
+            {int(nid) for nid in (notification_ids or []) if nid is not None and int(nid) > 0}
         )
-        await db.execute(stmt)
+
+    async def _set_notification_values(
+        self, db: AsyncSession, *, notification_ids: List[int], **values
+    ) -> None:
+        ids = self._clean_ids(notification_ids)
+        if not ids:
+            return
+        await db.execute(
+            update(Notification).where(Notification.id.in_(ids)).values(**values)
+        )
         await db.flush()
 
     async def mark_notifications_sent(
@@ -409,35 +365,12 @@ class NotificationRepository:
         sent_at: Optional[datetime] = None,
         status: str = "sent",
     ) -> None:
-        ids = sorted({int(notification_id) for notification_id in (notification_ids or []) if int(notification_id) > 0})
-        if not ids:
-            return
-
-        stmt = (
-            update(Notification)
-            .where(Notification.id.in_(ids))
-            .values(
-                status=status,
-                sent_at=sent_at or datetime.now(timezone.utc),
-            )
+        await self._set_notification_values(
+            db,
+            notification_ids=notification_ids,
+            status=status,
+            sent_at=sent_at or datetime.now(timezone.utc),
         )
-        await db.execute(stmt)
-        await db.flush()
-
-    async def mark_notification_failed(
-        self,
-        db: AsyncSession,
-        *,
-        notification_id: int,
-        status: str = "failed",
-    ) -> None:
-        stmt = (
-            update(Notification)
-            .where(Notification.id == int(notification_id))
-            .values(status=status)
-        )
-        await db.execute(stmt)
-        await db.flush()
 
     async def mark_notifications_failed(
         self,
@@ -446,17 +379,9 @@ class NotificationRepository:
         notification_ids: List[int],
         status: str = "failed",
     ) -> None:
-        ids = sorted({int(notification_id) for notification_id in (notification_ids or []) if int(notification_id) > 0})
-        if not ids:
-            return
-
-        stmt = (
-            update(Notification)
-            .where(Notification.id.in_(ids))
-            .values(status=status)
+        await self._set_notification_values(
+            db, notification_ids=notification_ids, status=status
         )
-        await db.execute(stmt)
-        await db.flush()
 
     # ------------------------------------------------------------------
     # Notification reads / lifecycle
@@ -712,6 +637,26 @@ class NotificationRepository:
         await db.flush()
         return result.rowcount or 0
 
+    def _visible_notification_filters(
+        self,
+        *,
+        user_id: int,
+        site_uuid: Optional[uuid.UUID] = None,
+        camera_uuid: Optional[uuid.UUID] = None,
+    ) -> list:
+        """Currently-visible notifications for a user, optionally narrowed to a
+        site and/or camera. Shared by the bulk hide and its blob-key sweep so
+        the two can never select different rows."""
+        filters = [
+            Notification.user_id == int(user_id),
+            Notification.visible.is_(True),
+        ]
+        if site_uuid is not None:
+            filters.append(Notification.site_uuid == _as_uuid(site_uuid))
+        if camera_uuid is not None:
+            filters.append(Notification.camera_uuid == _as_uuid(camera_uuid))
+        return filters
+
     async def hide_notifications_by_filter(
         self,
         db: AsyncSession,
@@ -720,15 +665,17 @@ class NotificationRepository:
         site_uuid: Optional[uuid.UUID] = None,
         camera_uuid: Optional[uuid.UUID] = None,
     ) -> int:
-        filters = [Notification.user_id == user_id, Notification.visible == True]
-        if site_uuid is not None:
-            filters.append(Notification.site_uuid == site_uuid)
-        if camera_uuid is not None:
-            filters.append(Notification.camera_uuid == camera_uuid)
-
-        stmt = update(Notification).where(*filters).values(visible=False)
-        result = await db.execute(stmt)
-        return result.rowcount
+        result = await db.execute(
+            update(Notification)
+            .where(
+                *self._visible_notification_filters(
+                    user_id=user_id, site_uuid=site_uuid, camera_uuid=camera_uuid
+                )
+            )
+            .values(visible=False)
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount or 0
 
     async def iter_storage_keys_by_filter(
         self,
@@ -739,15 +686,16 @@ class NotificationRepository:
         camera_uuid: Optional[uuid.UUID] = None,
         batch_size: int = 5000,
     ):
-        filters = [Notification.user_id == user_id, Notification.visible == True]
-        if site_uuid is not None:
-            filters.append(Notification.site_uuid == site_uuid)
-        if camera_uuid is not None:
-            filters.append(Notification.camera_uuid == camera_uuid)
-
-        stmt = select(Notification.payload).where(*filters)
+        """Stream the alert-image storage keys for the matching notifications,
+        so a huge account's blobs can be deleted without loading every payload.
+        """
+        stmt = select(Notification.payload).where(
+            *self._visible_notification_filters(
+                user_id=user_id, site_uuid=site_uuid, camera_uuid=camera_uuid
+            )
+        )
         result = await db.stream(stmt.execution_options(yield_per=batch_size))
-        
+
         async for row in result:
             payload = row[0]
             if not isinstance(payload, dict):

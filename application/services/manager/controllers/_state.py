@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import asyncio
 import uuid
-from typing import Callable, Dict, Any, Optional, Coroutine
+from typing import Any, Callable, Coroutine, Dict
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from application.services.pipeline import ModelPipeline

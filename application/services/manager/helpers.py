@@ -5,7 +5,7 @@ Extracted verbatim from the former monolithic application/services/manager.py.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 from application.channels.channel_config import VideoChannelConfig
 

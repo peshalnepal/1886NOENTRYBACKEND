@@ -1,11 +1,7 @@
+from typing import Literal, Optional, Tuple
 
-import asyncio
-import time
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from pydantic import Field
 
-import numpy as np
-import cv2
-from pydantic import BaseModel, Field
 from application.models.vision_config import VisionModelConfig, VisionTask
 
 class YoloModelConfig(VisionModelConfig):

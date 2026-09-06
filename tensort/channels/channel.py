@@ -27,49 +27,20 @@ _DONE = object()
 
 
 
-class ChannelEvent(object):
-    __slots__ = ("type", "channel_id", "camera_uuid", "ts_ms")
+class RTSPEvent(object):
+    """One decoded frame on its way to the inference pipeline.
 
-    def __init__(self, event_type, channel_id, camera_uuid, ts_ms):
-        self.type = event_type
-        self.channel_id = channel_id
-        self.camera_uuid = camera_uuid
-        self.ts_ms = ts_ms
+    The only event type the channel emits. Connect/disconnect used to be
+    events too, but nothing on the edge consumed them — the cloud infers link
+    state from the detection flow — so they are plain log lines now.
+    """
 
-
-class ChannelConnectedEvent(ChannelEvent):
-    __slots__ = ("source_url",)
-
-    def __init__(self, channel_id, camera_uuid, source_url, ts_ms):
-        ChannelEvent.__init__(self, "connected", channel_id, camera_uuid, ts_ms)
-        self.source_url = source_url
-
-
-class ChannelDisconnectedEvent(ChannelEvent):
-    __slots__ = ("reason",)
-
-    def __init__(self, channel_id, camera_uuid, reason, ts_ms):
-        ChannelEvent.__init__(self, "disconnected", channel_id, camera_uuid, ts_ms)
-        self.reason = reason
-
-
-class FrameDroppedEvent(ChannelEvent):
-    __slots__ = ("reason", "dropped_count")
-
-    def __init__(self, channel_id, camera_uuid, reason, dropped_count, ts_ms):
-        ChannelEvent.__init__(self, "dropped", channel_id, camera_uuid, ts_ms)
-        self.reason = reason
-        self.dropped_count = dropped_count
-
-
-class RTSPEvent(ChannelEvent):
     __slots__ = (
+        "channel_id",
+        "camera_uuid",
+        "ts_ms",
         "seq",
-        "format",
         "frame",
-        "width",
-        "height",
-        "fps_hint",
         "detection_enabled",
     )
 
@@ -79,23 +50,15 @@ class RTSPEvent(ChannelEvent):
         camera_uuid,
         ts_ms,
         seq,
-        fmt,
         frame,
-        width,
-        height,
-        fps_hint,
         detection_enabled=True,
     ):
-        ChannelEvent.__init__(self, "rtsp_frame", channel_id, camera_uuid, ts_ms)
+        self.channel_id = channel_id
+        self.camera_uuid = camera_uuid
+        self.ts_ms = ts_ms
         self.seq = seq
-        self.format = fmt
         self.frame = frame
-        self.width = width
-        self.height = height
-        self.fps_hint = fps_hint
         self.detection_enabled = detection_enabled
-
-
 
 
 class VideoChannel():
@@ -126,7 +89,6 @@ class VideoChannel():
         except Exception:
             out_q_max = 4
         self._out_q = asyncio.Queue(maxsize=out_q_max)
-        self._event_queue = None
         self._cap = None
         self._stopping = False
         self._cap_lock = threading.Lock()
@@ -331,20 +293,12 @@ class VideoChannel():
         except Exception:
             pass
 
-    def _handle_in_loop(self, ev):
-        self._put_latest(ev)
-        if self._event_queue is not None and isinstance(ev, RTSPEvent):
-            try:
-                self._event_queue.put_nowait(ev)
-            except Exception:
-                pass
-
     def _push_from_thread(self, ev):
         if self._loop is None:
             return
         if self._stop_thread_evt.is_set():
             return
-        self._loop.call_soon_threadsafe(self._handle_in_loop, ev)
+        self._loop.call_soon_threadsafe(self._put_latest, ev)
 
     def _worker(self):
         backoff_ms = int(self.config.reconnect_base_ms)
@@ -360,15 +314,7 @@ class VideoChannel():
                 if cap is None or not cap.isOpened():
                     raise RuntimeError("Failed to open video source")
 
-                ts_ms = int(time.time() * 1000)
-                self._push_from_thread(
-                    ChannelConnectedEvent(
-                        channel_id=self.config.channel_id,
-                        camera_uuid=self.config.camera_uuid,
-                        source_url=self.config.source_url,
-                        ts_ms=ts_ms,
-                    )
-                )
+                logger.info("[%s] connected", self.config.camera_uuid)
 
                 backoff_ms = int(self.config.reconnect_base_ms)
 
@@ -399,32 +345,22 @@ class VideoChannel():
 
                     frame = self._maybe_resize(frame)
                     self._seq += 1
-                    h, w = frame.shape[:2]
 
-
-                    ev = RTSPEvent(
-                        channel_id=self.config.channel_id,
-                        camera_uuid=self.config.camera_uuid,
-                        ts_ms=ts_ms,
-                        seq=self._seq,
-                        fmt=self.config.emit_format,
-                        frame=frame,
-                        width=int(w),
-                        height=int(h),
-                        fps_hint=float(self.config.sample_fps),
-                        detection_enabled=bool(self.config.detection_enabled),
+                    self._push_from_thread(
+                        RTSPEvent(
+                            channel_id=self.config.channel_id,
+                            camera_uuid=self.config.camera_uuid,
+                            ts_ms=ts_ms,
+                            seq=self._seq,
+                            frame=frame,
+                            detection_enabled=bool(self.config.detection_enabled),
+                        )
                     )
-                    self._push_from_thread(ev)
 
             except Exception as e:
-                ts_ms = int(time.time() * 1000)
-                self._push_from_thread(
-                    ChannelDisconnectedEvent(
-                        channel_id=self.config.channel_id,
-                        camera_uuid=self.config.camera_uuid,
-                        reason=str(e),
-                        ts_ms=ts_ms,
-                    )
+                logger.warning(
+                    "[%s] disconnected: %s (retry in %dms)",
+                    self.config.camera_uuid, e, backoff_ms,
                 )
 
                 if self._stop_thread_evt.wait(backoff_ms / 1000.0):
@@ -440,20 +376,13 @@ class VideoChannel():
                 except Exception:
                     pass
 
-    async def stream(self, event_queue=None) -> AsyncGenerator[ChannelEvent, None]:
-        """
-        Async generator of ChannelEvent.
-
-        If you pass event_queue (recommended: asyncio.Queue),
-        RTSPEvent is also pushed there best-effort for your inference pipeline.
-        """
+    async def stream(self) -> AsyncGenerator[RTSPEvent, None]:
+        """Async generator of decoded frames, newest-first under backpressure."""
         if not self.config.enabled:
             return
 
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
-
-        self._event_queue = event_queue
 
         if self._thread is None or not self._thread.is_alive():
             self._stop_thread_evt.clear()

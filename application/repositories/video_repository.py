@@ -9,7 +9,7 @@ Transaction policy: never commits, only flushes. Caller owns the transaction.
 
 import uuid
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from sqlalchemy import and_, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession

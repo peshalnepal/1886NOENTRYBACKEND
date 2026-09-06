@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, time as dt_time
-from typing import Any, Dict, List, Optional, Tuple, Literal
 import uuid
+from datetime import datetime, time as dt_time
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 from pydantic import (
     BaseModel,
@@ -33,6 +33,26 @@ class ROISchema(BaseModel):
 
 
 SCHEDULE_TIME_PATTERN = r"^\d{2}:\d{2}(:\d{2})?$"
+
+_UNSUPPORTED_SOURCE_URL = (
+    "Unsupported camera source URL. Expected one of: "
+    "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
+)
+
+
+def _validated_source_url(value: str) -> str:
+    """Trim a camera source URL, rejecting any unsupported scheme."""
+    if not is_supported_source_url(value):
+        raise ValueError(_UNSUPPORTED_SOURCE_URL)
+    return value.strip()
+
+
+def _blank_strings_to_none(model: BaseModel, attrs: Tuple[str, ...]) -> None:
+    """Normalize whitespace-only strings to None, in place."""
+    for attr in attrs:
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and not value.strip():
+            setattr(model, attr, None)
 
 
 def _normalize_schedule_fields(model: BaseModel) -> BaseModel:
@@ -146,18 +166,13 @@ class CameraCreateSchema(BaseModel):
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("source_url", "device_url", "name", "location", "detection_path_template", "timezone"):
-            v = getattr(self, attr, None)
-            if isinstance(v, str) and not v.strip():
-                setattr(self, attr, None)
+        _blank_strings_to_none(
+            self,
+            ("source_url", "device_url", "name", "location", "detection_path_template", "timezone"),
+        )
         if not self.source_url:
             raise ValueError("source_url is required.")
-        if not is_supported_source_url(self.source_url):
-            raise ValueError(
-                "Unsupported camera source URL. Expected one of: "
-                "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
-            )
-        self.source_url = self.source_url.strip()
+        self.source_url = _validated_source_url(self.source_url)
         return _normalize_schedule_fields(self)
 
 
@@ -221,18 +236,12 @@ class CameraEditSchema(BaseModel):
 
     @model_validator(mode="after")
     def _strip_blank_strings(self):
-        for attr in ("source_url", "name", "location", "detection_path_template", "timezone"):
-            v = getattr(self, attr, None)
-            if isinstance(v, str) and not v.strip():
-                setattr(self, attr, None)
+        _blank_strings_to_none(
+            self, ("source_url", "name", "location", "detection_path_template", "timezone")
+        )
         # Patch semantics: only validate the source when the caller sent one.
         if self.source_url is not None:
-            if not is_supported_source_url(self.source_url):
-                raise ValueError(
-                    "Unsupported camera source URL. Expected one of: "
-                    "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
-                )
-            self.source_url = self.source_url.strip()
+            self.source_url = _validated_source_url(self.source_url)
         return _normalize_schedule_fields(self)
 
 
@@ -315,6 +324,8 @@ class SiteUpdate(BaseModel):
 
 
 class SiteOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     site_uuid: uuid.UUID
     user_id: Optional[int] = None
     name: str
@@ -322,13 +333,9 @@ class SiteOut(BaseModel):
     address: Optional[str] = None
     timezone: Optional[str] = "UTC"
     # Caller's effective role on this site: "admin" | "arm_disarm" | "read_only".
-    # Org admins and platform admins always see "admin"; plain org members
-    # get the role from their site-scoped access grant (or "read_only" as a
-    # safe default).
+    # Org and platform admins always see "admin"; plain org members get the role
+    # from their site-scoped grant, defaulting to "read_only".
     viewer_role: Optional[str] = None
-
-    class Config:
-        from_attributes = True
 
 
 class LinkDeviceRequest(BaseModel):
@@ -364,12 +371,7 @@ class SiteCameraCreate(BaseModel):
     def _validate_schedule(self):
         if not self.source_url:
             raise ValueError("source_url is required.")
-        if not is_supported_source_url(self.source_url):
-            raise ValueError(
-                "Unsupported camera source URL. Expected one of: "
-                "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
-            )
-        self.source_url = self.source_url.strip()
+        self.source_url = _validated_source_url(self.source_url)
         return _normalize_schedule_fields(self)
 
 
@@ -379,18 +381,14 @@ class SiteMultiCameraPrerecordRule(BaseModel):
     trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
 
 
-class SiteMultiCameraPrerecordRuleUpdate(BaseModel):
-    enabled: bool = False
-    camera_uuids: List[uuid.UUID] = Field(default_factory=list)
-    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
-
-
 class SiteNotificationRule(BaseModel):
     trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
 
 
-class SiteNotificationRuleUpdate(BaseModel):
-    trigger_mode: Literal["roi_enter", "any_detection"] = SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER
+# The read and update shapes are identical today; the aliases keep the
+# request/response vocabulary explicit at the call sites.
+SiteMultiCameraPrerecordRuleUpdate = SiteMultiCameraPrerecordRule
+SiteNotificationRuleUpdate = SiteNotificationRule
 
 
 class SiteScheduleRule(BaseModel):
@@ -448,6 +446,37 @@ class EdgeReconcileOut(BaseModel):
     errors: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
 
+    discovered: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Cameras the edge device found on the network and adopted itself, "
+            "which have no cloud registration yet. Left running rather than "
+            "deleted; the frontend should offer to register them."
+        ),
+    )
+    missing_cameras: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Cameras that were previously present on the network and have "
+            "stopped answering. Each entry carries identity, ip_address, model, "
+            "last_seen_at and missing_since."
+        ),
+    )
+    adopted: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Cameras discovered on the network and newly registered as cloud "
+            "cameras in the device's site during this sync."
+        ),
+    )
+    linked: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Discovered cameras that already had a cloud camera registered for "
+            "them, so they were matched to the existing row instead of re-added."
+        ),
+    )
+
 
 class DeviceCreate(BaseModel):
     device_url: str = Field(..., min_length=1, max_length=2048)
@@ -466,15 +495,14 @@ class DeviceUpdate(BaseModel):
 
 
 class DeviceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     device_uuid: uuid.UUID
     user_id: Optional[int] = None
     device_url: str
     name: Optional[str] = None
     device_code: Optional[str] = None
     is_enabled: bool
-
-    class Config:
-        from_attributes = True
 
 
 # --- Report archive schemas ---
@@ -555,6 +583,8 @@ class ChartPoint(BaseModel):
 
 
 class DetectionsOverTimeOut(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     user_id: int
     site_uuid: Optional[str] = None
     hours: int
@@ -565,9 +595,6 @@ class DetectionsOverTimeOut(BaseModel):
     to: datetime
     total: int
     points: List[ChartPoint]
-
-    class Config:
-        populate_by_name = True
 
 
 class ClearNotificationsRequest(BaseModel):
@@ -603,6 +630,41 @@ class NotificationEmailCreateResult(BaseModel):
     target_site_count: int
 
 
+# --- Shared validation mixins ---
+#
+# Every inbound auth/user payload normalizes its email the same way and applies
+# the same rules to passwords and OTP codes. These mixins hold the single copy;
+# a schema opts in by listing the mixin and declaring the matching field.
+class _NormalizedEmailMixin(BaseModel):
+    @field_validator("user_email", check_fields=False)
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return str(value).lower().strip()
+
+
+class _MinPasswordMixin(BaseModel):
+    MIN_PASSWORD_LENGTH: ClassVar[int] = 8
+
+    @field_validator("password", "new_password", check_fields=False)
+    @classmethod
+    def validate_password(cls, value: SecretStr) -> SecretStr:
+        if len(value.get_secret_value()) < cls.MIN_PASSWORD_LENGTH:
+            raise ValueError(
+                f"Password must be at least {cls.MIN_PASSWORD_LENGTH} characters long"
+            )
+        return value
+
+
+class _DigitCodeMixin(BaseModel):
+    @field_validator("code", check_fields=False)
+    @classmethod
+    def normalize_code(cls, value: str) -> str:
+        code = value.strip()
+        if not code.isdigit():
+            raise ValueError("Verification code must contain digits only")
+        return code
+
+
 # --- User schemas ---
 class UserOut(BaseModel):
     id: int
@@ -619,9 +681,7 @@ class UserProfileUpdateRequest(BaseModel):
     @field_validator("user_email")
     @classmethod
     def normalize_email(cls, value: EmailStr | None) -> str | None:
-        if value is None:
-            return None
-        return str(value).lower().strip()
+        return None if value is None else str(value).lower().strip()
 
     @model_validator(mode="after")
     def validate_has_fields(self):
@@ -630,18 +690,11 @@ class UserProfileUpdateRequest(BaseModel):
         return self
 
 
-class ChangePasswordRequest(BaseModel):
+class ChangePasswordRequest(_MinPasswordMixin):
     model_config = ConfigDict(extra="forbid")
 
     current_password: SecretStr
     new_password: SecretStr
-
-    @field_validator("new_password")
-    @classmethod
-    def validate_new_password(cls, value: SecretStr) -> SecretStr:
-        if len(value.get_secret_value()) < 8:
-            raise ValueError("New password must be at least 8 characters long")
-        return value
 
 
 class DeleteAccountRequest(BaseModel):
@@ -753,27 +806,15 @@ class AuthTokenOut(BaseModel):
     user: AuthUserOut
 
 
-class SignupRequestCode(BaseModel):
+class SignupRequestCode(_NormalizedEmailMixin, _MinPasswordMixin):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     user_name: str = Field(..., min_length=1, max_length=255)
     user_email: EmailStr
     password: SecretStr
 
-    @field_validator("user_email")
-    @classmethod
-    def normalize_email(cls, value: EmailStr) -> str:
-        return str(value).lower().strip()
 
-    @field_validator("password")
-    @classmethod
-    def validate_password(cls, value: SecretStr) -> SecretStr:
-        if len(value.get_secret_value()) < 8:
-            raise ValueError("Password must be at least 8 characters long")
-        return value
-
-
-class SignupVerifyRequest(BaseModel):
+class SignupVerifyRequest(_DigitCodeMixin):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     signup_token: str = Field(..., min_length=16, max_length=255)
@@ -787,14 +828,6 @@ class SignupVerifyRequest(BaseModel):
             raise ValueError("signup_token is required")
         return token
 
-    @field_validator("code")
-    @classmethod
-    def normalize_code(cls, value: str) -> str:
-        code = value.strip()
-        if not code.isdigit():
-            raise ValueError("Verification code must contain digits only")
-        return code
-
 
 class SignupCodeOut(BaseModel):
     message: str
@@ -803,29 +836,19 @@ class SignupCodeOut(BaseModel):
     debug_code: str | None = None
 
 
-class LoginRequest(BaseModel):
+class LoginRequest(_NormalizedEmailMixin):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     user_email: EmailStr
     password: SecretStr
 
-    @field_validator("user_email")
-    @classmethod
-    def normalize_email(cls, value: EmailStr) -> str:
-        return str(value).lower().strip()
 
-
-class PasswordResetRequest(BaseModel):
+class PasswordResetRequest(_NormalizedEmailMixin):
     """Step 1 of the forgot-password flow: ask for a code."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     user_email: EmailStr
-
-    @field_validator("user_email")
-    @classmethod
-    def normalize_email(cls, value: EmailStr) -> str:
-        return str(value).lower().strip()
 
 
 class PasswordResetCodeOut(BaseModel):
@@ -836,7 +859,7 @@ class PasswordResetCodeOut(BaseModel):
     debug_code: str | None = None
 
 
-class PasswordResetConfirm(BaseModel):
+class PasswordResetConfirm(_NormalizedEmailMixin, _DigitCodeMixin, _MinPasswordMixin):
     """Step 2 of the forgot-password flow: code + the new password."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -844,26 +867,6 @@ class PasswordResetConfirm(BaseModel):
     user_email: EmailStr
     code: str = Field(..., min_length=6, max_length=10)
     new_password: SecretStr
-
-    @field_validator("user_email")
-    @classmethod
-    def normalize_email(cls, value: EmailStr) -> str:
-        return str(value).lower().strip()
-
-    @field_validator("code")
-    @classmethod
-    def normalize_code(cls, value: str) -> str:
-        code = value.strip()
-        if not code.isdigit():
-            raise ValueError("Verification code must contain digits only")
-        return code
-
-    @field_validator("new_password")
-    @classmethod
-    def validate_password(cls, value: SecretStr) -> SecretStr:
-        if len(value.get_secret_value()) < 8:
-            raise ValueError("Password must be at least 8 characters long")
-        return value
 
 
 # -------------------------

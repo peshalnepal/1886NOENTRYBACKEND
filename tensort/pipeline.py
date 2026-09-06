@@ -27,14 +27,12 @@ import threading
 import queue
 import os
 import time
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 try:
-    from channels.channel_config import VideoChannelConfig
-    from channels.channel import VideoChannel, RTSPEvent
+    from channels.channel import VideoChannel
 except Exception:
-    from .channels.channel_config import VideoChannelConfig
-    from .channels.channel import VideoChannel, RTSPEvent
+    from .channels.channel import VideoChannel
 
 logger = logging.getLogger(__name__)
 
@@ -541,19 +539,16 @@ class SimpleInferencePipeline(object):
 
         # Number of parallel inference threads (one per camera is a good default)
         self._num_workers = _env_int("INFER_NUM_WORKERS", 0, minimum=0)
-        # 0 → auto-size to number of cameras (capped at INFER_NUM_WORKERS_MAX)
         self._num_workers_max = _env_int("INFER_NUM_WORKERS_MAX", auto_worker_cap, minimum=1)
+        self._lock = asyncio.Lock()
+        self._inference_task = None
+        self._infer_pool = None
+        self._infer_q_max = int(infer_q_max)
 
         self._channels = {}
         self._channel_tasks = {}
         self._closing = False
         self._started = False
-
-        # Batched inference: the dispatcher draws up to INFER_MAX_BATCH frames
-        # from the shared FramePool and runs them as one (B,3,H,W) GPU call.
-        # Requires a dynamic-batch engine (see .env.example); falls back to B=1
-        # with a fixed engine. INFER_MAX_BATCH must be <= the engine's maxShapes
-        # batch.
         self._max_batch = _env_int("INFER_MAX_BATCH", 10, minimum=1)
         # Top-up window used only when the pool is underfilled (idle/cold start).
         self._batch_linger_s = _env_float("INFER_BATCH_LINGER_MS", 10.0, minimum=0.0) / 1000.0
@@ -568,10 +563,11 @@ class SimpleInferencePipeline(object):
             max_age_s=self._frame_max_age_s,
         )
 
+        # All three are plain dicts read/written from the loop thread and read
+        # lock-free from Flask threads — single-key dict access is GIL-atomic.
         self._latest = {}
         self._latest_snapshots = {}
         self._latest_snapshot_ts_ms = {}
-        self._latest_lock = asyncio.Lock()
         self._snapshot_enabled = _env_bool("ENABLE_SNAPSHOT_CACHE", True)
         self._snapshot_min_interval_ms = _env_int("SNAPSHOT_MIN_INTERVAL_MS", 500, minimum=0)   # .env.example ships 1000
         self._snapshot_max_edge = _env_int("SNAPSHOT_MAX_EDGE", 960, minimum=64)
@@ -594,25 +590,13 @@ class SimpleInferencePipeline(object):
         self._last_infer_error_sig = {}
         self._last_infer_error_ts = {}
 
-        self._lock = asyncio.Lock()
-        self._inference_task = None
-        self._infer_pool = None         # created on start()
-        self._infer_q_max = int(infer_q_max)
 
-        # Safety net only: the dispatcher waits for worker capacity before
-        # drawing a batch, so inflight is bounded by (queued + executing)
-        # batches by construction. Exceeding this means something leaked.
-        self._max_inflight = _env_int(
-            "MAX_INFLIGHT_FRAMES", max(8, self._max_batch * 4), minimum=1
-        )
-        self._log_every_n = _env_int("PIPELINE_LOG_EVERY_N_FRAMES", 0, minimum=0)
         self._stats = {
             "frames_in": 0,
             "infer_ok": 0,
             "infer_fail": 0,
             "infer_dropped": 0,
             "detections_total": 0,
-            "alerts_attempted": 0,
         }
         self.broadcaster = Broadcaster()
 
@@ -627,12 +611,11 @@ class SimpleInferencePipeline(object):
 
         logger.info(
             "[pipeline] config mem_total_mb=%s workers=%s worker_cap=%d infer_timeout_s=%.2f "
-            "max_inflight=%d max_batch=%d batch_linger_ms=%d pool_cap=%d frame_max_age_ms=%d",
+            "max_batch=%d batch_linger_ms=%d pool_cap=%d frame_max_age_ms=%d",
             self._detected_mem_mb if self._detected_mem_mb is not None else "unknown",
             "auto" if self._num_workers == 0 else int(self._num_workers),
             int(self._num_workers_max),
             float(self._infer_result_timeout_s),
-            int(self._max_inflight),
             int(self._max_batch),
             int(self._batch_linger_s * 1000),
             int(self._buffer._capacity),
@@ -723,15 +706,11 @@ class SimpleInferencePipeline(object):
 
         self._buffer.discard_camera(camera_key)
 
-        async with self._latest_lock:
-            self._latest.pop(camera_key, None)
-            self._latest_snapshots.pop(camera_key, None)
-            self._latest_snapshot_ts_ms.pop(camera_key, None)
+        self._latest.pop(camera_key, None)
+        self._latest_snapshots.pop(camera_key, None)
+        self._latest_snapshot_ts_ms.pop(camera_key, None)
         self._last_infer_error_sig.pop(camera_key, None)
         self._last_infer_error_ts.pop(camera_key, None)
-
-    def list_channels(self):
-        return list(self._channels.keys())
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -843,16 +822,8 @@ class SimpleInferencePipeline(object):
             async for ev in ch.stream():
                 if self._closing:
                     break
-                if isinstance(ev, RTSPEvent):
-                    if getattr(ev, "detection_enabled", True):
-                        self._buffer.put(ev)
-                else:
-                    # Connected/disconnected notices: nothing consumes these on
-                    # the edge, the cloud infers link state from detection flow.
-                    logger.info(
-                        "[pipeline] channel event camera=%s type=%s",
-                        camera_key, getattr(ev, "type", type(ev).__name__),
-                    )
+                if ev.detection_enabled:
+                    self._buffer.put(ev)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -866,7 +837,7 @@ class SimpleInferencePipeline(object):
     # ------------------------------------------------------------------
     # Inference dispatch — capacity-gated, never drops a whole batch
     # ------------------------------------------------------------------
-
+    
     async def _pump_inference(self):
         """
         Draw a batch from the FramePool and hand it to a worker.
@@ -888,8 +859,6 @@ class SimpleInferencePipeline(object):
                     await asyncio.sleep(0.05)
                     continue
 
-                # Wait for a worker slot. The timeout is a liveness fallback in
-                # case a ready callback is ever missed.
                 while not self._infer_pool.has_capacity():
                     self._worker_free_evt.clear()
                     try:
@@ -915,8 +884,8 @@ class SimpleInferencePipeline(object):
                         self._stats["infer_fail"] += 1
                         if self._should_log_infer_failure(camera_uuid_str, "no frame data"):
                             logger.warning(
-                                "[pipeline] camera=%s produced an event with no frame "
-                                "(emit_format=raw required)", camera_uuid_str,
+                                "[pipeline] camera=%s produced an event with no frame",
+                                camera_uuid_str,
                             )
                         continue
 
@@ -1064,20 +1033,14 @@ class SimpleInferencePipeline(object):
     # Public API
     # ------------------------------------------------------------------
 
+    # All three are called straight from Flask threads: plain dict reads are
+    # GIL-safe, so no event-loop hop (and no async wrapper) is needed.
+
     def peek_latest(self, camera_uuid):
-        # Plain dict read — GIL-safe, no event-loop hop needed.
         return self._latest.get(str(camera_uuid))
 
-    async def get_latest(self, camera_uuid):
-        return self.peek_latest(camera_uuid)
-
     def peek_latest_snapshot(self, camera_uuid):
-        # Reads a single dict entry; fine for health/debug paths that should not
-        # block on the pipeline loop.
         return self._latest_snapshots.get(str(camera_uuid))
-
-    async def get_latest_snapshot(self, camera_uuid):
-        return self.peek_latest_snapshot(camera_uuid)
 
     def peek_stats(self) -> Dict[str, Any]:
         stats = dict(self._stats)
@@ -1092,7 +1055,6 @@ class SimpleInferencePipeline(object):
             "pool_expired_total": int(self._buffer.expired_total),
             "frame_max_age_ms": int(self._frame_max_age_s * 1000),
             "inflight_count": len(self._inflight),
-            "max_inflight": int(self._max_inflight),
             "num_workers": len(self._infer_pool._workers) if self._infer_pool else 0,
             "workers_auto": self._num_workers == 0,
             "worker_cap": int(self._num_workers_max),
@@ -1102,9 +1064,6 @@ class SimpleInferencePipeline(object):
             "mem_total_mb": self._detected_mem_mb,
         })
         return stats
-
-    async def get_stats(self) -> Dict[str, Any]:
-        return self.peek_stats()
 
     # ------------------------------------------------------------------
     # FIX 4: snapshot encode in executor so event loop is never stalled

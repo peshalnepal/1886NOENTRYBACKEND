@@ -1,12 +1,12 @@
-from typing import Any, Dict, List, Optional, Tuple
-import httpx
-import os 
-from typing import Optional, Tuple,Literal
-
-from urllib.parse import quote
 import logging
+import os
 import time
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
+import httpx
+
+from core.env import env_bool, env_float
 from core.source_url import is_rtsp_source
 
 logger = logging.getLogger(__name__)
@@ -89,43 +89,41 @@ class WebRTCGatewayClient:
     """
 
     def __init__(self):
-        enabled_raw = str(os.getenv("WEBRTC_ADMIN_API_ENABLED", "true")).strip().lower()
-        self.admin_api_enabled = enabled_raw in {"1", "true", "yes", "on"}
-
+        self.admin_api_enabled = env_bool("WEBRTC_ADMIN_API_ENABLED", True)
         self.admin_api_url = (
-            os.getenv("WEBRTC_ADMIN_API_URL")
-            or "https://noentrymtxfdxidm.centralus.azurecontainer.io"
-        ).rstrip("/")
-        if not self.admin_api_enabled:
-            self.admin_api_url = ""
+            (
+                os.getenv("WEBRTC_ADMIN_API_URL")
+                or "https://noentrymtxfdxidm.centralus.azurecontainer.io"
+            ).rstrip("/")
+            if self.admin_api_enabled
+            else ""
+        )
 
         self.public_base = get_public_webrtc_base()
 
         self.api_user = os.getenv("MTX_API_USER") or os.getenv("MEDIAMTX_API_USER", "api")
-        # Use 'is not None' to allow empty-string passwords (empty string IS a valid password)
-        mtx_pass = os.getenv("MTX_API_PASS","api_pass_123")
-        if mtx_pass is None:
-            mtx_pass = os.getenv("MEDIAMTX_API_PASS","api_pass_123")
-        if mtx_pass is None:
-            mtx_pass = "api_pass_123"
-        self.api_pass = mtx_pass
+        # `is not None` rather than `or`: an empty string is a valid password.
+        api_pass = os.getenv("MTX_API_PASS")
+        if api_pass is None:
+            api_pass = os.getenv("MEDIAMTX_API_PASS")
+        self.api_pass = "api_pass_123" if api_pass is None else api_pass
 
-        request_timeout_s = float(os.getenv("WEBRTC_ADMIN_TIMEOUT_S", "15"))
-        connect_timeout_s = float(os.getenv("WEBRTC_ADMIN_CONNECT_TIMEOUT_S", "5"))
-        self._warn_interval_s = float(os.getenv("WEBRTC_WARN_INTERVAL_S", "60"))
+        self._warn_interval_s = env_float("WEBRTC_WARN_INTERVAL_S", 60.0)
         self._last_warn: Dict[str, float] = {}
 
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(request_timeout_s, connect=connect_timeout_s),
-            verify=False  # Disable SSL verification for self-signed certs
+            timeout=httpx.Timeout(
+                env_float("WEBRTC_ADMIN_TIMEOUT_S", 15.0),
+                connect=env_float("WEBRTC_ADMIN_CONNECT_TIMEOUT_S", 5.0),
+            ),
+            verify=False,  # the gateway commonly uses a self-signed cert
         )
-        
-        # Log configuration on initialization
+
         logger.info(
             "WebRTCGatewayClient initialized: admin_api_enabled=%s, admin_api_url=%s, public_base=%s",
             self.admin_api_enabled,
             self.admin_api_url if self.admin_api_enabled else "(disabled)",
-            self.public_base
+            self.public_base,
         )
 
     def _warn_throttled(self, key: str, message: str, *args: object) -> None:
@@ -156,89 +154,82 @@ class WebRTCGatewayClient:
             return f"{action} returned HTTP {response.status_code}: {body}"
         return f"{action} returned HTTP {response.status_code}"
 
-    async def ensure_stream(self, *, stream_key: str, source_url: str) -> Optional[str]:
+    async def _provision(
+        self, *, action: str, method: str, stream_key: str, payload: Dict[str, Any]
+    ) -> Optional[str]:
+        """One provisioning attempt against the admin API.
+
+        Returns None on success, or a human-readable reason on failure — the
+        caller decides whether that failure is fatal.
         """
-        Ensure stream exists in MediaMTX. Returns stable WHEP URL.
-        
-        Flow:
-        1. If admin API disabled, derive and return WHEP URL immediately
-        2. If admin API enabled, provision stream via /v3/config/paths/add
-        3. If add fails, try /v3/config/paths/patch
-        4. Return WHEP URL: {public_base}/{stream_key}/whep
-        
-        Returns the public WHEP URL that frontend can use to connect.
+        url = f"{self.admin_api_url}/v3/config/paths/{action}/{quote(stream_key, safe='')}"
+        try:
+            response = await self._client.request(
+                method, url, json=payload, auth=self._auth()
+            )
+            if response.status_code == 200:
+                return None
+            return self._response_error_message(
+                action=f"MediaMTX {action}", response=response
+            )
+        except Exception as exc:
+            if self._is_timeout_or_network_error(exc):
+                self._warn_throttled(
+                    f"ensure_stream_{action}_timeout",
+                    "MediaMTX %s timed out/unreachable. stream_key=%s admin_api=%s error=%s",
+                    action,
+                    stream_key,
+                    self.admin_api_url,
+                    str(exc),
+                )
+                return f"MediaMTX {action} timed out/unreachable: {type(exc).__name__}: {exc}"
+            logger.warning(
+                "MediaMTX %s request failed. stream_key=%s error=%s",
+                action,
+                stream_key,
+                exc,
+                exc_info=True,
+            )
+            return f"MediaMTX {action} request failed: {type(exc).__name__}: {exc}"
+
+    async def ensure_stream(self, *, stream_key: str, source_url: str) -> Optional[str]:
+        """Ensure the stream exists in MediaMTX and return its stable WHEP URL.
+
+        Tries `add` first, then `patch` (the path may already exist). With the
+        admin API disabled the derived URL is returned without provisioning.
         """
         whep_url = self._derive_public_webrtc_url(stream_key)
-        
         if not self.admin_api_url:
             logger.debug("Admin API disabled, returning derived WHEP URL: %s", whep_url)
             return whep_url
 
-        safe_name = quote(stream_key, safe="")
-        add_url = f"{self.admin_api_url}/v3/config/paths/add/{safe_name}"
         payload = _mediamtx_source_payload(source_url)
-        add_error: Optional[str] = None
+        errors: Dict[str, str] = {}
 
-        # 1. Try Add
-        try:
-            logger.debug("Attempting to provision stream: add_url=%s, stream_key=%s, source_url=%s", 
-                        add_url, stream_key, source_url)
-            r = await self._client.post(add_url, json=payload, auth=self._auth())
-            if r.status_code == 200:
-                logger.info("Stream provisioned successfully via add: stream_key=%s, whep_url=%s", 
-                           stream_key, whep_url)
-                return whep_url
-            add_error = self._response_error_message(action="MediaMTX add", response=r)
-            logger.warning("%s. stream_key=%s admin_api=%s", add_error, stream_key, self.admin_api_url)
-        except Exception as exc:
-            if self._is_timeout_or_network_error(exc):
-                add_error = f"MediaMTX add timed out/unreachable: {type(exc).__name__}: {exc}"
-                self._warn_throttled(
-                    "ensure_stream_add_timeout",
-                    "MediaMTX add timed out/unreachable. stream_key=%s admin_api=%s error=%s",
+        for action, method in (("add", "POST"), ("patch", "PATCH")):
+            error = await self._provision(
+                action=action, method=method, stream_key=stream_key, payload=payload
+            )
+            if error is None:
+                logger.info(
+                    "Stream provisioned via %s: stream_key=%s whep_url=%s",
+                    action,
                     stream_key,
-                    self.admin_api_url,
-                    str(exc),
+                    whep_url,
                 )
-            else:
-                add_error = f"MediaMTX add request failed: {type(exc).__name__}: {exc}"
-                logger.warning("MediaMTX add request failed, trying patch. stream_key=%s error=%s", 
-                             stream_key, str(exc), exc_info=True)
-
-        patch_url = f"{self.admin_api_url}/v3/config/paths/patch/{safe_name}"
-        patch_error: Optional[str] = None
-        try:
-            logger.debug("Attempting to provision stream: patch_url=%s, stream_key=%s", 
-                        patch_url, stream_key)
-            r = await self._client.patch(patch_url, json=payload, auth=self._auth())
-            if r.status_code == 200:
-                logger.info("Stream provisioned successfully via patch: stream_key=%s, whep_url=%s", 
-                           stream_key, whep_url)
                 return whep_url
-            patch_error = self._response_error_message(action="MediaMTX patch", response=r)
-            logger.error("%s. stream_key=%s admin_api=%s", patch_error, stream_key, self.admin_api_url)
-        except Exception as exc:
-            if self._is_timeout_or_network_error(exc):
-                patch_error = f"MediaMTX patch timed out/unreachable: {type(exc).__name__}: {exc}"
-                self._warn_throttled(
-                    "ensure_stream_patch_timeout",
-                    "MediaMTX patch timed out/unreachable. stream_key=%s admin_api=%s error=%s",
-                    stream_key,
-                    self.admin_api_url,
-                    str(exc),
-                )
-            else:
-                patch_error = f"MediaMTX patch request failed: {type(exc).__name__}: {exc}"
-                logger.error("MediaMTX patch request failed. stream_key=%s error=%s", 
-                           stream_key, str(exc), exc_info=True)
+            errors[action] = error
+            logger.warning(
+                "%s. stream_key=%s admin_api=%s", error, stream_key, self.admin_api_url
+            )
 
         raise RuntimeError(
             "Failed to provision MediaMTX stream '{}'. add_error={}; patch_error={}. "
             "This likely means: (1) MediaMTX is unreachable, (2) credentials are wrong, "
             "(3) WHEP protocol not enabled, or (4) stream format invalid.".format(
                 stream_key,
-                add_error or "unknown",
-                patch_error or "unknown",
+                errors.get("add", "unknown"),
+                errors.get("patch", "unknown"),
             )
         )
 
@@ -294,71 +285,54 @@ class WebRTCGatewayClient:
             raise
 
 
-    async def list_configured_paths(self) -> List[Dict[str, Any]]:
-        """
-        List configured paths in MediaMTX (i.e., what you've added via /v3/config/paths/add).
-        Returns the raw 'items' array (filtered for non-null).
+    async def _list_paths(self, endpoint: str, *, label: str) -> List[Dict[str, Any]]:
+        """GET a MediaMTX list endpoint, returning its `items` array.
+
+        Always degrades to `[]`: an unreachable gateway must not break the
+        caller's reconcile, and the warnings are throttled so a persistently
+        down MediaMTX cannot flood the log.
         """
         if not self.admin_api_url:
             return []
 
-        url = f"{self.admin_api_url}/v3/config/paths/list"
         try:
-            r = await self._client.get(url, auth=self._auth())
-            r.raise_for_status()
-            data = r.json() or {}
-            items = data.get("items") or []
-            # Some versions may include nulls in items; filter them out
-            return [it for it in items if isinstance(it, dict)]
+            response = await self._client.get(
+                f"{self.admin_api_url}{endpoint}", auth=self._auth()
+            )
+            response.raise_for_status()
+            items = (response.json() or {}).get("items") or []
+            # Some versions include nulls in items; drop anything unusable.
+            return [item for item in items if isinstance(item, dict)]
         except Exception as exc:
             if self._is_timeout_or_network_error(exc):
                 self._warn_throttled(
-                    "list_configured_paths_timeout",
-                    "MediaMTX list_configured_paths timeout/unreachable. admin_api=%s",
+                    f"{label}_timeout",
+                    "MediaMTX %s timeout/unreachable. admin_api=%s",
+                    label,
                     self.admin_api_url,
                 )
             elif isinstance(exc, httpx.HTTPStatusError):
                 self._warn_throttled(
-                    "list_configured_paths_status",
-                    "MediaMTX list_configured_paths HTTP error. status=%s admin_api=%s",
+                    f"{label}_status",
+                    "MediaMTX %s HTTP error. status=%s admin_api=%s",
+                    label,
                     exc.response.status_code,
                     self.admin_api_url,
                 )
             else:
-                logger.exception("MediaMTX list_configured_paths failed")
+                logger.exception("MediaMTX %s failed", label)
             return []
+
+    async def list_configured_paths(self) -> List[Dict[str, Any]]:
+        """Paths configured via `/v3/config/paths/add` — the source of truth for
+        which cameras this gateway is meant to serve."""
+        return await self._list_paths(
+            "/v3/config/paths/list", label="list_configured_paths"
+        )
 
     async def list_active_paths(self) -> List[Dict[str, Any]]:
-        """
-        List active paths (runtime) including 'readers' (viewers) and other stats.
-        """
-        if not self.admin_api_url:
-            return []
-
-        url = f"{self.admin_api_url}/v3/paths/list"
-        try:
-            r = await self._client.get(url, auth=self._auth())
-            r.raise_for_status()
-            data = r.json() or {}
-            items = data.get("items") or []
-            return [it for it in items if isinstance(it, dict)]
-        except Exception as exc:
-            if self._is_timeout_or_network_error(exc):
-                self._warn_throttled(
-                    "list_active_paths_timeout",
-                    "MediaMTX list_active_paths timeout/unreachable. admin_api=%s",
-                    self.admin_api_url,
-                )
-            elif isinstance(exc, httpx.HTTPStatusError):
-                self._warn_throttled(
-                    "list_active_paths_status",
-                    "MediaMTX list_active_paths HTTP error. status=%s admin_api=%s",
-                    exc.response.status_code,
-                    self.admin_api_url,
-                )
-            else:
-                logger.exception("MediaMTX list_active_paths failed")
-            return []
+        """Runtime paths, including `readers` (viewers) and traffic stats."""
+        return await self._list_paths("/v3/paths/list", label="list_active_paths")
 
     @staticmethod
     def _count_reader_types(readers: Any) -> Dict[str, int]:

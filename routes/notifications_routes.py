@@ -26,7 +26,6 @@ from application.services.user_snapshot_cache import (
 from core.database_orm import Notification, User
 from core.schemas import (
     ChartPoint,
-    ClearNotificationsRequest,
     DeleteNotificationsRequest,
     DetectionsOverTimeOut,
     NoteAttributes,
@@ -35,7 +34,6 @@ from core.schemas import (
 from core.security.tokens import decode_access_token
 from dependencies import (
     get_async_db,
-    get_current_user,
     get_notification_hub,
     get_notification_service,
     get_session_factory,
@@ -656,15 +654,33 @@ async def approve_notification(
     notification_service: NotificationService = Depends(get_notification_service),
     session_factory=Depends(get_session_factory),
 ):
-    """Operator approves a held alert; it becomes visible to admins/members.
+    """Approve one held alert, making it visible to admins/members.
 
-    Pass `?email=true` to also email the site's configured recipients (the
-    operator's "important" opt-in). Emailed approvals are archived as an
-    urgent report; plain approvals roll into the daily general report.
+    `?email=true` also emails the site's configured recipients (the operator's
+    "important" opt-in). Emailed approvals are archived as an urgent report;
+    plain ones roll into the daily general report.
     """
     affected = await _decide_notifications(
         db=db, ctx=ctx, ids=[notification_id], approve=True, hub=hub,
         notification_service=notification_service, email_owner=email,
+        session_factory=session_factory,
+    )
+    return {"approved": affected}
+
+
+@router.post("/approve")
+async def approve_notifications_bulk(
+    payload: ApprovalRequest,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
+    hub: WebNotificationHub = Depends(get_notification_hub),
+    notification_service: NotificationService = Depends(get_notification_service),
+    session_factory=Depends(get_session_factory),
+):
+    """Approve a batch of held alerts. See `approve_notification`."""
+    affected = await _decide_notifications(
+        db=db, ctx=ctx, ids=payload.notification_ids, approve=True, hub=hub,
+        notification_service=notification_service, email_owner=payload.email,
         session_factory=session_factory,
     )
     return {"approved": affected}
@@ -677,29 +693,12 @@ async def reject_notification(
     ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
     notification_service: NotificationService = Depends(get_notification_service),
 ):
-    """Operator rejects a held alert; it stays hidden from admins/members."""
+    """Reject one held alert; it stays hidden from admins/members."""
     affected = await _decide_notifications(
         db=db, ctx=ctx, ids=[notification_id], approve=False,
         notification_service=notification_service,
     )
     return {"rejected": affected}
-
-
-@router.post("/approve")
-async def approve_notifications_bulk(
-    payload: ApprovalRequest,
-    db: AsyncSession = Depends(get_async_db),
-    ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
-    hub: WebNotificationHub = Depends(get_notification_hub),
-    notification_service: NotificationService = Depends(get_notification_service),
-    session_factory=Depends(get_session_factory),
-):
-    affected = await _decide_notifications(
-        db=db, ctx=ctx, ids=payload.notification_ids, approve=True, hub=hub,
-        notification_service=notification_service, email_owner=payload.email,
-        session_factory=session_factory,
-    )
-    return {"approved": affected}
 
 
 @router.post("/reject")
@@ -709,6 +708,7 @@ async def reject_notifications_bulk(
     ctx: OrgContext = Depends(RequirePermission(Permission.ALERTS_APPROVE)),
     notification_service: NotificationService = Depends(get_notification_service),
 ):
+    """Reject a batch of held alerts. See `reject_notification`."""
     affected = await _decide_notifications(
         db=db, ctx=ctx, ids=payload.notification_ids, approve=False,
         notification_service=notification_service,
@@ -765,10 +765,12 @@ async def add_notification_note(
     return _to_out(row)
 
 
+# Both verbs are served: DELETE-with-a-body is awkward for some clients, so
+# POST /delete is kept as an alias for the same handler.
 @router.post("/delete")
-async def delete_notifications_post(
+@router.delete("")
+async def delete_notifications(
     payload: DeleteNotificationsRequest,
-    db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SETTINGS)),
     notification_service: NotificationService = Depends(get_notification_service),
 ):
@@ -779,20 +781,8 @@ async def delete_notifications_post(
         camera_uuid=payload.camera_uuid,
     )
 
-@router.delete("")
-async def delete_notifications(
-    payload: DeleteNotificationsRequest,
-    db: AsyncSession = Depends(get_async_db),
-    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SETTINGS)),
-    notification_service: NotificationService = Depends(get_notification_service),
-):
-    return await notification_service.handle_deletion_event(
-        user_id=int(ctx.user.id),
-        notification_ids=payload.notification_ids,
-        site_uuid=payload.site_uuid,
-        camera_uuid=payload.camera_uuid,
-    )
-    
+
+
 @router.get("/detections-over-time", response_model=DetectionsOverTimeOut)
 async def detections_over_time(
     site_uuid: Optional[str] = None,

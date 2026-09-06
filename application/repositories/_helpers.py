@@ -18,6 +18,17 @@ def as_uuid(value: Any) -> Optional[uuid.UUID]:
     return uuid.UUID(str(value))
 
 
+def require_uuid(value: Any, name: str) -> uuid.UUID:
+    """Coerce to ``uuid.UUID``, raising a caller-friendly ValueError."""
+    try:
+        parsed = as_uuid(value)
+    except Exception as exc:
+        raise ValueError(f"Invalid {name}: {value}") from exc
+    if parsed is None:
+        raise ValueError(f"Invalid {name}: {value}")
+    return parsed
+
+
 def normalize_uuid_list(values: Any) -> List[uuid.UUID]:
     """Parse an iterable of values into a deduped list of ``uuid.UUID``.
 

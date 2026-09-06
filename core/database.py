@@ -1,9 +1,8 @@
 # database_core.py
 import asyncio
 import logging
-import traceback
-import urllib.parse
 import os
+import urllib.parse
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine

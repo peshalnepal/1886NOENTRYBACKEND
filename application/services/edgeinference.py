@@ -1,23 +1,30 @@
-import os
-import httpx
+"""HTTP client for the Jetson edge inference service."""
+
 import asyncio
 import logging
+import os
 import uuid
-from datetime import datetime, date
+from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Set, Union
+
+import httpx
 from pydantic import BaseModel
 
-from core.env import env_bool, env_float
+from core.env import env_bool, env_float, env_int
 
 logger = logging.getLogger(__name__)
+
+# Statuses that mean "wrong path, try the next candidate" rather than a failure.
 _ROUTE_FALLBACK_STATUS_CODES = {404, 405}
+
+_HEALTH_KEYS = ("ok", "pipeline_ready", "startup_error")
 
 
 def _health_bits(health: Optional[Dict[str, Any]]) -> List[str]:
+    """The interesting health fields, formatted for an error message."""
     if not isinstance(health, dict):
         return []
-    bits = [f"{k}={v}" for k, v in health.items() if k in {"ok", "pipeline_ready", "startup_error"} and v]
-    return bits
+    return [f"{k}={v}" for k, v in health.items() if k in _HEALTH_KEYS and v]
 
 
 class EdgeCameraInventoryError(RuntimeError):
@@ -49,27 +56,47 @@ def to_jsonable(obj: Any) -> Any:
 
 
 class EdgeInferenceClient:
-    """
-    Talks to the Jetson TensorRT (inference) service.
+    """Talks to the Jetson TensorRT inference service.
+
+    Every call tries a couple of candidate paths (with and without an `/api`
+    prefix) because edge firmware versions disagree on the mount point, and
+    retries with backoff. Each class of call gets its own timeout budget: a
+    discovery sweep scans the network and is far slower than a plain read.
     """
 
     def __init__(self):
         self.add_path = os.getenv("EDGE_ADD_PATH", "/cameras")
         self.patch_path = os.getenv("EDGE_PATCH_PATH", "/cameras/{camera_uuid}")
         self.delete_path = os.getenv("EDGE_DELETE_PATH", "/cameras/{camera_uuid}")
-        self.api_key = os.getenv("EDGE_API_KEY")
         self.list_path = os.getenv("EDGE_LIST_PATH", self.add_path)
-        
+        self.sync_path = os.getenv("EDGE_SYNC_PATH", "/sync")
+        self.api_key = os.getenv("EDGE_API_KEY")
+
         self.request_timeout_s = env_float("EDGE_TIMEOUT_S", 15.0, minimum=0.1)
-        self.connect_timeout_s = env_float("EDGE_CONNECT_TIMEOUT_S", min(self.request_timeout_s, 10.0), minimum=0.1)
-        
-        self.list_timeout_s = env_float("EDGE_LIST_TIMEOUT_S", min(self.request_timeout_s, 5.0), minimum=0.1)
-        self.list_connect_timeout_s = env_float("EDGE_LIST_CONNECT_TIMEOUT_S", min(self.connect_timeout_s, self.list_timeout_s, 3.0), minimum=0.1)
-        
-        self.health_timeout_s = env_float("EDGE_HEALTH_TIMEOUT_S", min(self.list_timeout_s, 2.0), minimum=0.1)
-        self.health_connect_timeout_s = env_float("EDGE_HEALTH_CONNECT_TIMEOUT_S", min(self.connect_timeout_s, self.health_timeout_s, 1.5), minimum=0.1)
-        
-        self.retry_count = max(1, int(os.getenv("EDGE_HTTP_RETRIES", "3")))
+        self.connect_timeout_s = env_float(
+            "EDGE_CONNECT_TIMEOUT_S", min(self.request_timeout_s, 10.0), minimum=0.1
+        )
+        self.list_timeout_s = env_float(
+            "EDGE_LIST_TIMEOUT_S", min(self.request_timeout_s, 5.0), minimum=0.1
+        )
+        self.list_connect_timeout_s = env_float(
+            "EDGE_LIST_CONNECT_TIMEOUT_S",
+            min(self.connect_timeout_s, self.list_timeout_s, 3.0),
+            minimum=0.1,
+        )
+        self.sync_timeout_s = env_float(
+            "EDGE_SYNC_TIMEOUT_S", max(self.request_timeout_s, 45.0), minimum=1.0
+        )
+        self.health_timeout_s = env_float(
+            "EDGE_HEALTH_TIMEOUT_S", min(self.list_timeout_s, 2.0), minimum=0.1
+        )
+        self.health_connect_timeout_s = env_float(
+            "EDGE_HEALTH_CONNECT_TIMEOUT_S",
+            min(self.connect_timeout_s, self.health_timeout_s, 1.5),
+            minimum=0.1,
+        )
+
+        self.retry_count = env_int("EDGE_HTTP_RETRIES", 3, minimum=1)
         self.trust_env = env_bool("EDGE_HTTP_TRUST_ENV", False)
 
         self._client = httpx.AsyncClient(
@@ -90,18 +117,15 @@ class EdgeInferenceClient:
         return f"{type(exc).__name__} during {method} {url}{': ' + msg if msg else ''}"
 
     def _candidate_paths(self, path: str) -> List[str]:
-        raw = str(path or "").strip() or "/"
+        raw = (path or "").strip()
         raw = raw if raw.startswith("/") else f"/{raw}"
-
-        candidates = [raw]
+        if raw == "/":
+            return ["/"]
         if raw.startswith("/api/"):
-            candidates.append(raw[4:] or "/")
-        elif raw == "/api":
-            candidates.append("/")
-        elif raw != "/":
-            candidates.append(f"/api{raw}")
-            
-        return list(dict.fromkeys(candidates))
+            return [raw, raw[4:]]
+        if raw == "/api":
+            return [raw, "/"]
+        return [raw, f"/api{raw}"]
 
     def _candidate_urls(self, *, device_url: str, path: str) -> List[str]:
         base = device_url.rstrip("/")
@@ -214,6 +238,51 @@ class EdgeInferenceClient:
                 except ValueError:
                     pass
         return out
+
+    async def sync_discovery(self, *, device_url: str) -> Optional[Dict[str, Any]]:
+        """Trigger a camera-discovery sweep on the edge and return its report.
+
+        The Jetson is the source of truth for which cameras physically exist,
+        so a reconcile must ask it to re-scan rather than trust a report that
+        may be up to a sweep interval old.
+
+        Returns the `discovery` section of the edge's `POST /sync` response, or
+        None when the edge does not implement discovery (older firmware) or the
+        sweep could not be reached. A missing report is never fatal: reconcile
+        still has the camera list to work with.
+
+        The timeout is deliberately generous — a sweep does a UDP probe window
+        plus up to a /24 of HTTP probes and routinely takes several seconds.
+        """
+        urls = self._candidate_urls(device_url=device_url, path=self.sync_path)
+        try:
+            r = await self._request(
+                "POST",
+                urls,
+                json_payload={},
+                request_timeout_s=self.sync_timeout_s,
+                ignore_404=True,
+            )
+        except Exception as exc:
+            logger.info(
+                "Edge discovery sync unavailable at %s (continuing without a report): %s",
+                device_url, exc,
+            )
+            return None
+
+        if r is None:
+            # 404 on every candidate path: this edge predates discovery.
+            return None
+
+        try:
+            data = r.json()
+        except Exception:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+        report = data.get("discovery")
+        return report if isinstance(report, dict) else None
 
     async def ensure_pipeline_ready(self, *, device_url: str) -> None:
         h = await self.get_health(device_url=device_url)

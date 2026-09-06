@@ -1,43 +1,45 @@
 # application/repositories/pipeline_repository.py
+"""Pipeline <-> Camera <-> ChannelConfiguration persistence.
+
+Relations are always eager-loaded with `selectinload` (no lazy loading under
+async). Never commits: the caller owns the transaction.
+"""
 
 import uuid
-from typing import List, Optional, Sequence
+from typing import Optional
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from sqlalchemy.exc import IntegrityError
 
-# Adjust this import to wherever your ORM models live.
-# You said you keep them all in database.py and import via core.database in other files.
-from core.database_orm import Camera, ChannelConfiguration, Pipeline, PipelineCamera, Device
+from core.database_orm import Camera, Pipeline
+
+# Cameras plus the two relations every pipeline consumer needs.
+_PIPELINE_LOAD_OPTIONS = (
+    selectinload(Pipeline.cameras).selectinload(Camera.channel_configuration),
+    selectinload(Pipeline.cameras).selectinload(Camera.device),
+)
 
 
 class PipelineRepository:
-    """
-    DB access for Pipeline <-> Cameras <-> ChannelConfiguration.
-
-    Notes:
-    - No lazy loading: queries use selectinload explicitly.
-    - No commits: caller (Manager/service) controls transaction boundaries.
-    """
-
     async def pipeline_exists(self, db: AsyncSession, pipeline_id: uuid.UUID) -> bool:
-        stmt = select(Pipeline).where(Pipeline.id == pipeline_id)
-        row = (await db.execute(stmt)).scalars().first()
+        row = (
+            await db.execute(select(Pipeline.id).where(Pipeline.id == pipeline_id))
+        ).scalar_one_or_none()
         return row is not None
-    
+
     def _attach_channel_configs(self, pipeline: Optional[Pipeline]) -> Optional[Pipeline]:
-        """Helper to attach channel configs and avoid repeating the loop 3 times."""
+        """Expose the pipeline's channel configs as a flat `channel_configurations`
+        attribute, which callers read instead of walking every camera."""
         if pipeline is None:
             return None
-        
-        channel_cfgs = [
-            cam.channel_configuration 
-            for cam in (pipeline.cameras or []) 
+
+        pipeline.channel_configurations = [
+            cam.channel_configuration
+            for cam in (pipeline.cameras or [])
             if cam.channel_configuration is not None
         ]
-        setattr(pipeline, "channel_configurations", channel_cfgs)
         return pipeline
 
     async def upsert_pipeline(
@@ -52,7 +54,6 @@ class PipelineRepository:
         if user_id is None:
             raise ValueError("user_id is required for upsert_pipeline()")
 
-        # 1. Fetch or initialize the pipeline
         if pipeline_id:
             pipeline = await db.get(Pipeline, pipeline_id)
             if pipeline and pipeline.user_id is not None and int(pipeline.user_id) != int(user_id):
@@ -61,38 +62,46 @@ class PipelineRepository:
                 pipeline = Pipeline(id=pipeline_id, user_id=user_id)
                 db.add(pipeline)
         else:
-            q = select(Pipeline).where(Pipeline.user_id == user_id, Pipeline.name == name)
-            pipeline = (await db.execute(q)).scalars().first()
+            by_name = select(Pipeline).where(
+                Pipeline.user_id == user_id, Pipeline.name == name
+            )
+            pipeline = (await db.execute(by_name)).scalars().first()
             if not pipeline:
                 pipeline = Pipeline(user_id=user_id, name=name)
                 db.add(pipeline)
                 try:
-                    await db.flush()  # Catch race condition early
+                    await db.flush()
                 except IntegrityError:
+                    # A concurrent caller inserted the same (user, name) first.
                     await db.rollback()
-                    pipeline = (await db.execute(q)).scalars().first()
-                    if not pipeline: raise
+                    pipeline = (await db.execute(by_name)).scalars().first()
+                    if not pipeline:
+                        raise
 
-        # 2. Apply common updates
         pipeline.user_id = user_id
         pipeline.name = name
         pipeline.is_active = bool(is_active)
 
-        # Flush only — the caller (service/route) owns the transaction.
         await db.flush()
-
         return pipeline
 
-    async def get_full_pipeline(self, db: AsyncSession, pipeline_id: uuid.UUID) -> Optional[Pipeline]:
-        stmt = select(Pipeline).where(Pipeline.id == pipeline_id).options(
-            selectinload(Pipeline.cameras).selectinload(Camera.channel_configuration),
-            selectinload(Pipeline.cameras).selectinload(Camera.device),
+    async def get_full_pipeline(
+        self, db: AsyncSession, pipeline_id: uuid.UUID
+    ) -> Optional[Pipeline]:
+        stmt = (
+            select(Pipeline)
+            .where(Pipeline.id == pipeline_id)
+            .options(*_PIPELINE_LOAD_OPTIONS)
         )
         return self._attach_channel_configs((await db.execute(stmt)).scalar_one_or_none())
-    
-    async def get_pipeline_by_userid(self, db: AsyncSession, user_id: int) -> Optional[Pipeline]:
-        stmt = select(Pipeline).where(Pipeline.user_id == int(user_id), Pipeline.name == "default").options(
-            selectinload(Pipeline.cameras).selectinload(Camera.channel_configuration),
-            selectinload(Pipeline.cameras).selectinload(Camera.device),
-        ).order_by(Pipeline.created_at.asc())
+
+    async def get_pipeline_by_userid(
+        self, db: AsyncSession, user_id: int
+    ) -> Optional[Pipeline]:
+        stmt = (
+            select(Pipeline)
+            .where(Pipeline.user_id == int(user_id), Pipeline.name == "default")
+            .options(*_PIPELINE_LOAD_OPTIONS)
+            .order_by(Pipeline.created_at.asc())
+        )
         return self._attach_channel_configs((await db.execute(stmt)).scalars().first())

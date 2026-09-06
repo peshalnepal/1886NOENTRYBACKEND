@@ -48,6 +48,22 @@ class OrganizationRepository:
     _role_id_cache: Dict[Tuple[str, str], int] = {}
 
     # ------------------------------------------------------------------
+    # Grant query building blocks
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _grants_in_scope(selectable, scope: str):
+        """JOIN a grant query to `roles`, restricted to one role scope."""
+        return selectable.select_from(AccessGrant).join(
+            Role, (Role.id == AccessGrant.role_id) & (Role.scope == scope)
+        )
+
+    def _org_grants(self, selectable):
+        return self._grants_in_scope(selectable, RoleScope.ORG.value)
+
+    def _site_grants(self, selectable):
+        return self._grants_in_scope(selectable, RoleScope.SITE.value)
+
+    # ------------------------------------------------------------------
     # Role resolution
     # ------------------------------------------------------------------
     async def _role_id(self, db: AsyncSession, *, name: str, scope: str) -> int:
@@ -170,12 +186,10 @@ class OrganizationRepository:
     ) -> Optional[AccessGrant]:
         """The user's org-scoped grant for `org_id` (any org role), or None."""
         res = await db.execute(
-            select(AccessGrant)
-            .join(Role, Role.id == AccessGrant.role_id)
+            self._org_grants(select(AccessGrant))
             .where(
                 AccessGrant.user_id == user_id,
                 AccessGrant.org_id == org_id,
-                Role.scope == RoleScope.ORG.value,
             )
             .limit(1)
         )
@@ -184,35 +198,25 @@ class OrganizationRepository:
     async def list_org_members(
         self, db: AsyncSession, *, org_id: int
     ) -> List[Tuple[str, User]]:
-        """Returns `(role_name, user)` pairs for every member of `org_id`."""
+        """`(role_name, user)` for every member of `org_id`, oldest grant first."""
         res = await db.execute(
-            select(Role.name, User)
-            .select_from(AccessGrant)
-            .join(Role, Role.id == AccessGrant.role_id)
+            self._org_grants(select(Role.name, User))
             .join(User, User.id == AccessGrant.user_id)
-            .where(
-                AccessGrant.org_id == org_id,
-                Role.scope == RoleScope.ORG.value,
-            )
+            .where(AccessGrant.org_id == org_id)
             .order_by(AccessGrant.created_at.asc())
         )
-        return [(role_name, u) for (role_name, u) in res.all()]
+        return list(res.all())
 
     async def list_user_orgs(
         self, db: AsyncSession, *, user_id: int
     ) -> List[Tuple[str, Organization]]:
-        """Returns `(role_name, organization)` pairs for the user's orgs."""
+        """`(role_name, organization)` for every org the user belongs to."""
         res = await db.execute(
-            select(Role.name, Organization)
-            .select_from(AccessGrant)
-            .join(Role, Role.id == AccessGrant.role_id)
+            self._org_grants(select(Role.name, Organization))
             .join(Organization, Organization.id == AccessGrant.org_id)
-            .where(
-                AccessGrant.user_id == user_id,
-                Role.scope == RoleScope.ORG.value,
-            )
+            .where(AccessGrant.user_id == user_id)
         )
-        return [(role_name, o) for (role_name, o) in res.all()]
+        return list(res.all())
 
     async def remove_org_membership(
         self, db: AsyncSession, *, user_id: int, org_id: int
@@ -231,13 +235,9 @@ class OrganizationRepository:
 
     async def _count_org_role(self, db: AsyncSession, *, org_id: int, role: str) -> int:
         res = await db.execute(
-            select(func.count())
-            .select_from(AccessGrant)
-            .join(Role, Role.id == AccessGrant.role_id)
-            .where(
+            self._org_grants(select(func.count())).where(
                 AccessGrant.org_id == int(org_id),
                 Role.name == role,
-                Role.scope == RoleScope.ORG.value,
             )
         )
         return int(res.scalar_one() or 0)
@@ -268,12 +268,9 @@ class OrganizationRepository:
         these users (instead of the end user) until one of them approves.
         """
         res = await db.execute(
-            select(AccessGrant.user_id)
-            .join(Role, Role.id == AccessGrant.role_id)
-            .where(
+            self._org_grants(select(AccessGrant.user_id)).where(
                 AccessGrant.org_id == int(org_id),
                 Role.name == OrgRole.OPERATOR.value,
-                Role.scope == RoleScope.ORG.value,
             )
         )
         return [int(uid) for uid in res.scalars().all()]
@@ -293,19 +290,7 @@ class OrganizationRepository:
         CASCADEs handle the deep cleanup.
         """
         # Resolve the role name without lazy-loading the relationship.
-        role_name = (
-            await db.execute(
-                select(Role.name)
-                .select_from(AccessGrant)
-                .join(Role, Role.id == AccessGrant.role_id)
-                .where(
-                    AccessGrant.user_id == user_id,
-                    AccessGrant.org_id == org_id,
-                    Role.scope == RoleScope.ORG.value,
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        role_name = await self.get_org_role_name(db, user_id=user_id, org_id=org_id)
         if role_name is None:
             return {"removed": False, "org_deleted": False, "was_last_admin": False}
 
@@ -338,15 +323,9 @@ class OrganizationRepository:
         `exclude_user_id` answers "is anyone else still here?" — used by the
         last-admin succession check on account deletion.
         """
-        stmt = (
+        stmt = self._org_grants(
             select(func.count(func.distinct(AccessGrant.user_id)))
-            .select_from(AccessGrant)
-            .join(Role, Role.id == AccessGrant.role_id)
-            .where(
-                AccessGrant.org_id == int(org_id),
-                Role.scope == RoleScope.ORG.value,
-            )
-        )
+        ).where(AccessGrant.org_id == int(org_id))
         if exclude_user_id is not None:
             stmt = stmt.where(AccessGrant.user_id != int(exclude_user_id))
         return int((await db.execute(stmt)).scalar_one() or 0)
@@ -356,13 +335,10 @@ class OrganizationRepository:
     ) -> Optional[str]:
         """The user's org-scoped role name, or None if they aren't a member."""
         res = await db.execute(
-            select(Role.name)
-            .select_from(AccessGrant)
-            .join(Role, Role.id == AccessGrant.role_id)
+            self._org_grants(select(Role.name))
             .where(
                 AccessGrant.user_id == int(user_id),
                 AccessGrant.org_id == int(org_id),
-                Role.scope == RoleScope.ORG.value,
             )
             .limit(1)
         )
@@ -484,12 +460,10 @@ class OrganizationRepository:
         self, db: AsyncSession, *, user_id: int, site_uuid: uuid.UUID
     ) -> Optional[AccessGrant]:
         res = await db.execute(
-            select(AccessGrant)
-            .join(Role, Role.id == AccessGrant.role_id)
+            self._site_grants(select(AccessGrant))
             .where(
                 AccessGrant.user_id == user_id,
                 AccessGrant.site_uuid == site_uuid,
-                Role.scope == RoleScope.SITE.value,
             )
             .limit(1)
         )
@@ -498,19 +472,14 @@ class OrganizationRepository:
     async def list_site_members(
         self, db: AsyncSession, *, site_uuid: uuid.UUID
     ) -> List[Tuple[str, User]]:
-        """Returns `(role_name, user)` pairs for every member of a site."""
+        """`(role_name, user)` for every member of a site, oldest grant first."""
         res = await db.execute(
-            select(Role.name, User)
-            .select_from(AccessGrant)
-            .join(Role, Role.id == AccessGrant.role_id)
+            self._site_grants(select(Role.name, User))
             .join(User, User.id == AccessGrant.user_id)
-            .where(
-                AccessGrant.site_uuid == site_uuid,
-                Role.scope == RoleScope.SITE.value,
-            )
+            .where(AccessGrant.site_uuid == site_uuid)
             .order_by(AccessGrant.created_at.asc())
         )
-        return [(role_name, u) for (role_name, u) in res.all()]
+        return list(res.all())
 
     async def remove_site_membership(
         self, db: AsyncSession, *, user_id: int, site_uuid: uuid.UUID

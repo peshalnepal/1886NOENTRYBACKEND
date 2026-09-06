@@ -1,15 +1,18 @@
+"""Azure Blob storage for alert snapshot images."""
+
 import base64
 import binascii
-from datetime import datetime, timedelta, timezone
 import os
 import re
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobSasPermissions, ContentSettings, generate_blob_sas
 from azure.storage.blob.aio import BlobServiceClient
 
+from core.env import env_int
 
 _DATA_URL_RE = re.compile(
     r"^data:(?P<mime>[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+);base64,(?P<data>.+)$",
@@ -22,63 +25,51 @@ _IMAGE_MIME_EXTENSIONS = {
     "image/webp": "webp",
 }
 
+# Payload sub-dicts that may carry the image reference, in priority order.
+_IMAGE_PAYLOAD_SECTIONS = ("extra", "msg")
+
 
 def _parse_connection_string(raw: str) -> Dict[str, str]:
     parts: Dict[str, str] = {}
     for item in str(raw or "").split(";"):
-        if "=" not in item:
-            continue
-        key, value = item.split("=", 1)
-        parts[key.strip().lower()] = value.strip()
+        if "=" in item:
+            key, value = item.split("=", 1)
+            parts[key.strip().lower()] = value.strip()
     return parts
 
 
 def extract_image_storage_key(payload: Any) -> str:
+    """The alert's blob key, from wherever the payload happens to carry it."""
     if not isinstance(payload, dict):
         return ""
 
-    extra = payload.get("extra")
-    if isinstance(extra, dict):
-        key = str(extra.get("image_storage_key") or "").strip()
-        if key:
-            return key
-
-    msg = payload.get("msg")
-    if isinstance(msg, dict):
-        key = str(msg.get("image_storage_key") or "").strip()
-        if key:
-            return key
-
+    for section in _IMAGE_PAYLOAD_SECTIONS:
+        block = payload.get(section)
+        if isinstance(block, dict):
+            key = str(block.get("image_storage_key") or "").strip()
+            if key:
+                return key
     return ""
 
 
 def strip_image_fields(payload: Any) -> Any:
+    """Copy of `payload` with the inline image references removed."""
     if not isinstance(payload, dict):
         return payload
 
     out = dict(payload)
-
-    msg = out.get("msg")
-    if isinstance(msg, dict):
-        msg_copy = dict(msg)
-        msg_copy.pop("image_url", None)
-        msg_copy.pop("image_storage_key", None)
-        out["msg"] = msg_copy
-
-    extra = out.get("extra")
-    if isinstance(extra, dict):
-        extra_copy = dict(extra)
-        extra_copy.pop("image_url", None)
-        extra_copy.pop("image_storage_key", None)
-        extra_copy.pop("thumbnail_url", None)
-        extra_copy.pop("image", None)
-        out["extra"] = extra_copy
-
+    for section, drop_keys in (
+        ("msg", ("image_url", "image_storage_key")),
+        ("extra", ("image_url", "image_storage_key", "thumbnail_url", "image")),
+    ):
+        block = out.get(section)
+        if isinstance(block, dict):
+            out[section] = {k: v for k, v in block.items() if k not in drop_keys}
     return out
 
 
 class AlertImageStorageService:
-    SAS_TTL_HOURS = max(1, int(os.getenv("ALERT_IMAGE_SAS_TTL_HOURS", "720")))
+    SAS_TTL_HOURS = env_int("ALERT_IMAGE_SAS_TTL_HOURS", 720, minimum=1)
 
     def __init__(self) -> None:
         self.connection_string = (

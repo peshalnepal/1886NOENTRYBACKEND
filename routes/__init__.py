@@ -1,5 +1,1 @@
-from . import (camera_routes)
-
-__all__ = [
-    "camera_routes",
-]
+"""FastAPI routers. Each module is imported directly by `main.py`."""
