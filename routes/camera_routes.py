@@ -43,6 +43,7 @@ from application.services.detection_stream import (
     resp_to_detection_out,
     stream_camera_detections,
 )
+from routes._errors import camera_not_found
 from routes._stream_auth import DB_UNAVAILABLE, resolve_stream_user
 from core.schemas import (
     CameraCreateSchema,
@@ -52,6 +53,7 @@ from core.schemas import (
     DetectionOut,
 )
 from application.services.manager import Manager
+from routes._errors import SITE_NOT_FOUND
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/cameras", tags=["cameras"])
@@ -77,7 +79,7 @@ async def _ensure_stream_camera_access(db: AsyncSession, cam: Any, user: User) -
     """Access check for SSE handlers that resolve the user from a token
     (no `OrgContext` dependency available). Returns the owner user id."""
     if cam is None:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
     if bool(getattr(user, "is_platform_admin", False)):
         return _camera_owner_id(cam, int(user.id))
     resolved = await AuthzService.resolve_user_org(db, user=user)
@@ -86,12 +88,12 @@ async def _ensure_stream_camera_access(db: AsyncSession, cam: Any, user: User) -
     org_id, role = resolved
     cam_org = getattr(cam, "org_id", None)
     if cam_org is not None and int(cam_org) != int(org_id):
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
     accessible = await AuthzService.accessible_site_uuids(
         db, user=user, org_id=org_id, role=role
     )
     if accessible is not None and getattr(cam, "site_uuid", None) not in accessible:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
     return _camera_owner_id(cam, int(user.id))
 
 
@@ -102,17 +104,17 @@ async def _ensure_camera_access(db: AsyncSession, cam: Any, ctx: OrgContext) -> 
     Platform admins in super context (ctx.org_id is None) skip both checks.
     """
     if cam is None:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
     if ctx.org_id is None:
         return
     cam_org = getattr(cam, "org_id", None)
     if cam_org is not None and int(cam_org) != int(ctx.org_id):
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
     accessible = await AuthzService.accessible_site_uuids(
         db, user=ctx.user, org_id=ctx.org_id, role=ctx.role
     )
     if accessible is not None and getattr(cam, "site_uuid", None) not in accessible:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
 
 
 def _camera_webrtc_url(cam: Any) -> Optional[str]:
@@ -284,7 +286,7 @@ async def list_cameras(
             db, user=ctx.user, org_id=ctx.org_id, role=ctx.role
         )
         if accessible is not None and site_uuid not in accessible:
-            raise HTTPException(status_code=404, detail="Site not found")
+            raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
 
     repo = ChannelRepository()
 
@@ -327,7 +329,7 @@ async def get_camera(
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
 
     cam, cfg, _pid = full
     await _ensure_camera_access(db, cam, ctx)
@@ -368,7 +370,7 @@ async def get_camera_playback(
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
 
     cam, _cfg, _pid = full
     await _ensure_camera_access(db, cam, ctx)
@@ -435,7 +437,7 @@ async def get_latest_detection(
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
 
     cam, _cfg, _pid = full
     await _ensure_camera_access(db, cam, ctx)
@@ -471,7 +473,7 @@ async def stream_detections_sse(
         repo = ChannelRepository()
         full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
         if not full:
-            raise HTTPException(status_code=404, detail="Camera not found")
+            raise camera_not_found()
         cam, _cfg, _pid = full
         owner_id = await _ensure_stream_camera_access(db, cam, user)
 
@@ -541,7 +543,7 @@ async def latest_detections_for_site(
             db, user=ctx.user, org_id=ctx.org_id, role=ctx.role
         )
         if accessible is not None and site_uuid not in accessible:
-            raise HTTPException(status_code=404, detail="Site not found")
+            raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
 
     cams = await repo.list_cameras(db, site_uuid=site_uuid, org_id=ctx.org_id)
 
@@ -658,7 +660,7 @@ async def edit_camera(
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
     cam, _cfg, _pid = full
     await _ensure_camera_access(db, cam, ctx)
     owner_id = _camera_owner_id(cam, ctx.user.id)
@@ -813,7 +815,7 @@ async def delete_camera(
     repo = ChannelRepository()
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
     cam, _cfg, _pid = full
     await _ensure_camera_access(db, cam, ctx)
     owner_id = _camera_owner_id(cam, ctx.user.id)
@@ -972,7 +974,7 @@ async def snapshot_jpg(
     full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
     if not full:
         logger.warning("Camera %s not found for user %s", camera_uuid, user.id)
-        raise HTTPException(status_code=404, detail="Camera not found")
+        raise camera_not_found()
 
     cam, _cfg, _pid = full
     await _ensure_stream_camera_access(db, cam, user)

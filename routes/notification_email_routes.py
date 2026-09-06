@@ -23,6 +23,7 @@ from dependencies import (
     OrgContext,
 )
 from core.security.roles import Permission
+from routes._errors import SITE_NOT_FOUND
 
 
 def _email_owner_id(site, ctx: OrgContext) -> int:
@@ -83,7 +84,7 @@ async def list_notification_emails(
     )
     if site_uuid is not None:
         if accessible is not None and site_uuid not in accessible:
-            raise HTTPException(status_code=404, detail="Site not found")
+            raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
         target = [site_uuid]
     else:
         org_sites = await site_repo.list_site_uuids(db, org_id=ctx.org_id)

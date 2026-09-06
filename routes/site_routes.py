@@ -53,6 +53,7 @@ from core.schemas import (
     SiteUpdate,
 )
 from core.database import AsyncSessionLocal
+from routes._errors import DEVICE_NOT_FOUND, SITE_NOT_FOUND
 
 logger = logging.getLogger(__name__)
 
@@ -1066,7 +1067,7 @@ async def link_device_to_site(
         db, device_uuid=payload.device_uuid, org_id=ctx.org_id
     )
     if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
+        raise HTTPException(status_code=404, detail=DEVICE_NOT_FOUND)
 
     already = await site_repo.site_device_exists(
         db, site_uuid=site.site_uuid, device_uuid=device.device_uuid
@@ -1220,7 +1221,7 @@ async def get_site_arm_state(
         )
     ).scalar_one_or_none()
     if site is None or bool(site.is_deleted):
-        raise HTTPException(status_code=404, detail="Site not found")
+        raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
     schedule, tz = await _resolve_site_schedule_for_arm(db, site)
     return _effective_arm_state_out(site, schedule, tz, now=datetime.now(timezone.utc))
 
@@ -1262,7 +1263,7 @@ async def set_site_arm_state(
         )
     ).scalar_one_or_none()
     if site is None or bool(site.is_deleted):
-        raise HTTPException(status_code=404, detail="Site not found")
+        raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
 
     want_armed = bool(payload.is_armed)
     schedule, tz = await _resolve_site_schedule_for_arm(db, site)

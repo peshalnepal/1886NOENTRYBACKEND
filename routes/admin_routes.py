@@ -54,6 +54,7 @@ from dependencies import (
     get_manager,
     RequirePermission,
 )
+from routes._errors import ORGANIZATION_NOT_FOUND, SITE_NOT_FOUND, USER_NOT_FOUND
 
 logger = logging.getLogger(__name__)
 
@@ -135,10 +136,10 @@ async def _ensure_site_in_org(
     )
     site = res.scalar_one_or_none()
     if site is None:
-        raise HTTPException(status_code=404, detail="Site not found")
+        raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
     if site.org_id is not None and int(site.org_id) != int(org_id):
         # Treat cross-tenant probes as 404 to avoid leaking existence.
-        raise HTTPException(status_code=404, detail="Site not found")
+        raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
     return site
 
 
@@ -187,7 +188,7 @@ async def create_org_member(
     # Reject if the org does not exist (defence in depth, since the
     # ORG_MANAGE_MEMBERS gate already implies the caller belongs to it).
     if await org_repo.get_by_id(db, org_id) is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
+        raise HTTPException(status_code=404, detail=ORGANIZATION_NOT_FOUND)
 
     try:
         new_user = await user_repo.create_user(
@@ -248,7 +249,7 @@ async def attach_existing_user(
         target = await user_repo.get_by_email(db, str(payload.user_email))
 
     if target is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND)
 
     await org_repo.upsert_org_membership(
         db,
@@ -275,7 +276,7 @@ async def update_member_role(
 ):
     user = await UserRepository().get_by_id(db, user_id)
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND)
 
     org_repo = OrganizationRepository()
     existing = await org_repo.get_org_membership(db, user_id=user_id, org_id=org_id)
@@ -424,7 +425,7 @@ async def grant_site_role(
 
     user = await UserRepository().get_by_id(db, int(payload.user_id))
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND)
 
     try:
         await OrganizationRepository().upsert_site_membership(

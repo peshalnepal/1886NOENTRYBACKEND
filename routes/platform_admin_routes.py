@@ -44,6 +44,7 @@ from core.security.hashing import get_password_hash
 from core.security.roles import OrgRole
 from dependencies import get_async_db, get_current_user, get_manager, require_platform_admin
 from application.services.manager import Manager
+from routes._errors import ORGANIZATION_NOT_FOUND, USER_NOT_FOUND
 
 
 logger = logging.getLogger(__name__)
@@ -230,7 +231,7 @@ async def get_user_detail(user_id: int, db: AsyncSession = Depends(get_async_db)
     """User + every organization they belong to + every site they own."""
     user = await UserRepository().get_by_id(db, user_id)
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND)
 
     org_repo = OrganizationRepository()
     org_rows = await org_repo.list_user_orgs(db, user_id=user_id)
@@ -296,7 +297,7 @@ async def promote_to_platform_admin(
     """Set `is_platform_admin=True` on the given user."""
     user = await UserRepository().get_by_id(db, user_id)
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND)
     user.is_platform_admin = True
     await db.commit()
     await db.refresh(user)
@@ -310,7 +311,7 @@ async def demote_platform_admin(
     """Clear `is_platform_admin` on the given user."""
     user = await UserRepository().get_by_id(db, user_id)
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND)
     user.is_platform_admin = False
     await db.commit()
     await db.refresh(user)
@@ -340,7 +341,7 @@ async def delete_user(
 
     target = await UserRepository().get_by_id(db, user_id)
     if target is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail=USER_NOT_FOUND)
 
     if bool(getattr(target, "is_platform_admin", False)):
         remaining = (
@@ -492,7 +493,7 @@ async def get_organization(
     org_repo = OrganizationRepository()
     org = await org_repo.get_by_id(db, org_id)
     if org is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
+        raise HTTPException(status_code=404, detail=ORGANIZATION_NOT_FOUND)
     members = await org_repo.list_org_members(db, org_id=org_id)
     sites = await org_repo.list_org_sites(db, org_id=org_id)
     return OrgSummary(
@@ -515,7 +516,7 @@ async def update_organization(
     org_repo = OrganizationRepository()
     org = await org_repo.get_by_id(db, org_id)
     if org is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
+        raise HTTPException(status_code=404, detail=ORGANIZATION_NOT_FOUND)
 
     try:
         await org_repo.update_organization(
@@ -542,7 +543,7 @@ async def delete_organization(
     org_repo = OrganizationRepository()
     deleted = await org_repo.delete_organization(db, org_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="Organization not found")
+        raise HTTPException(status_code=404, detail=ORGANIZATION_NOT_FOUND)
     await db.commit()
     return None
 

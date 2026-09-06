@@ -21,6 +21,7 @@ from dependencies import (
     OrgContext,
     RequirePermission,
 )
+from routes._errors import DEVICE_NOT_FOUND
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ device_repo = DeviceRepository()
 async def _get_device_or_404(db: AsyncSession, org_id: int, device_uuid: uuid.UUID) -> Device:
     device = await device_repo.get_device(db, device_uuid=device_uuid, org_id=org_id)
     if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
+        raise HTTPException(status_code=404, detail=DEVICE_NOT_FOUND)
     return device
 
 
