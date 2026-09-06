@@ -42,6 +42,7 @@ from dependencies import (
     OrgContext,
 )
 from core.coercions import as_utc
+from routes._stream_auth import resolve_stream_user as _resolve_stream_user
 from core.security.roles import Permission
 from application.services.notification import NotificationService
 
@@ -81,52 +82,6 @@ def _sse(data: str, event: Optional[str] = None) -> str:
     if event:
         return f"event: {event}\ndata: {data}\n\n"
     return f"data: {data}\n\n"
-
-
-def _extract_bearer_token(auth_header: str, access_token: Optional[str]) -> str:
-    token = ""
-
-    if auth_header.lower().startswith("bearer "):
-        token = auth_header.split(" ", 1)[1].strip()
-
-    if not token:
-        token = str(access_token or "").strip()
-
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-
-    return token
-
-
-async def _resolve_stream_user(
-    *,
-    auth_header: str,
-    access_token: Optional[str],
-    cache: UserSnapshotCache,
-    session_factory: async_sessionmaker[AsyncSession],
-) -> CachedUserSnapshot:
-    token = _extract_bearer_token(auth_header, access_token)
-
-    try:
-        payload = decode_access_token(token)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-
-    raw_user_id = payload.get("user_id") or payload.get("sub")
-    try:
-        user_id = int(raw_user_id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
-    try:
-        user = await cache.get(session_factory=session_factory, user_id=user_id)
-    except UserSnapshotLookupError:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    return user
 
 
 # -------------------------------------------------------------------

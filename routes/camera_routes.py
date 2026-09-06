@@ -43,7 +43,7 @@ from application.services.detection_stream import (
     resp_to_detection_out,
     stream_camera_detections,
 )
-from core.security.tokens import decode_access_token
+from routes._stream_auth import DB_UNAVAILABLE, resolve_stream_user
 from core.schemas import (
     CameraCreateSchema,
     CameraEditSchema,
@@ -163,39 +163,17 @@ async def _resolve_stream_user(
     request: Request,
     access_token: Optional[str],
 ) -> CachedUserSnapshot:
-    auth_header = request.headers.get("authorization", "")
-    token = ""
-    if auth_header.lower().startswith("bearer "):
-        token = auth_header.split(" ", 1)[1].strip()
-    if not token:
-        token = str(access_token or "").strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-
-    try:
-        payload = decode_access_token(token)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc))
-
-    raw_user_id = payload.get("user_id") or payload.get("sub")
-    try:
-        user_id = int(raw_user_id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
+    """Request-shaped wrapper over the shared stream-auth resolver."""
     sf = _session_factory_from_app(request)
     if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise HTTPException(status_code=503, detail=DB_UNAVAILABLE)
+    return await resolve_stream_user(
+        auth_header=request.headers.get("authorization", ""),
+        access_token=access_token,
+        cache=get_user_snapshot_cache(request),
+        session_factory=sf,
+    )
 
-    try:
-        user = await get_user_snapshot_cache(request).get(
-            session_factory=sf, user_id=user_id
-        )
-    except UserSnapshotLookupError:
-        raise HTTPException(status_code=503, detail="Database not available")
-    if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
-    return user
 
 def _session_factory_from_app(request: Request):
     sf = getattr(request.app.state, "session_factory", None)
@@ -486,7 +464,7 @@ async def stream_detections_sse(
 ):
     sf = _session_factory_from_app(request)
     if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise HTTPException(status_code=503, detail=DB_UNAVAILABLE)
 
     user = await _resolve_stream_user(request=request, access_token=access_token)
     async with sf() as db:
@@ -522,7 +500,7 @@ async def stream_all_detections_sse(
 ):
     sf = _session_factory_from_app(request)
     if sf is None:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise HTTPException(status_code=503, detail=DB_UNAVAILABLE)
 
     user = await _resolve_stream_user(request=request, access_token=access_token)
     pipeline = await manager.get_activepipeline(user_id=user.id)
