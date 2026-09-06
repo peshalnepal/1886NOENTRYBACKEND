@@ -5,7 +5,7 @@ import logging
 import os
 import secrets
 import smtplib
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from email.mime.text import MIMEText
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -35,6 +35,7 @@ from core.schemas import (
     SignupVerifyRequest,
 )
 from core.security.hashing import get_password_hash, verify_password
+from core.coercions import as_utc
 from core.security.tokens import create_access_token
 from dependencies import get_async_db, get_current_user
 from routes.auth.oauth import generate_otp, hash_otp, verify_otp_hash
@@ -42,12 +43,6 @@ from routes.auth.oauth import generate_otp, hash_otp, verify_otp_hash
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
-
-
-def _as_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 
 OTP_TTL_SECONDS = env_int("OTP_TTL_SECONDS", 600, minimum=60)
@@ -229,7 +224,7 @@ async def signup_request_code(
     active_verification = await verify_repo.get_latest_active(db, email)
     now = utc_now()
     if active_verification is not None and active_verification.sent_at is not None:
-        age = (now - _as_utc(active_verification.sent_at)).total_seconds()
+        age = (now - as_utc(active_verification.sent_at)).total_seconds()
         if age < OTP_RESEND_COOLDOWN_SECONDS:
             retry_after = OTP_RESEND_COOLDOWN_SECONDS - int(age)
             raise HTTPException(
@@ -507,7 +502,7 @@ async def password_forgot(
     verify_repo = EmailVerificationRepository()
     active = await verify_repo.get_latest_active(db, email, purpose=PURPOSE_PASSWORD_RESET)
     if active is not None and active.sent_at is not None:
-        age = (now - _as_utc(active.sent_at)).total_seconds()
+        age = (now - as_utc(active.sent_at)).total_seconds()
         if age < OTP_RESEND_COOLDOWN_SECONDS:
             retry_after = OTP_RESEND_COOLDOWN_SECONDS - int(age)
             raise HTTPException(

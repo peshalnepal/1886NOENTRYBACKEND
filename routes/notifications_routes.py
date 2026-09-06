@@ -41,6 +41,7 @@ from dependencies import (
     RequirePermission,
     OrgContext,
 )
+from core.coercions import as_utc
 from core.security.roles import Permission
 from application.services.notification import NotificationService
 
@@ -209,12 +210,6 @@ def _to_out(n: Notification) -> NotificationOut:
         sent_at=n.sent_at,
         status=str(n.status),
     )
-
-
-def _as_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 
 _OBJECT_CLASS_ALIASES: Dict[str, str] = {
@@ -817,7 +812,7 @@ async def detections_over_time(
         needs_payload_filter=needs_payload_filter,
         roi_only=bool(roi_only),
         class_filter=class_filter,
-        as_utc_fn=_as_utc,
+        as_utc_fn=as_utc,
         is_roi_fn=_is_roi_notification,
         extract_classes_fn=_extract_object_classes,
     )

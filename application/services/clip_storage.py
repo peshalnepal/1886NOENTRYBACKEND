@@ -17,11 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.repositories.notification_repository import CameraContext
 from application.services.overlay_normalize import (
-    _append_overlay_detection,
     normalize_overlay_frame_dict as _normalize_overlay_frame,
 )
 from application.services.storage_common import parse_connection_string as _parse_connection_string
-from core.coercions import coerce_positive_int as _coerce_positive_int
 from core.database_orm import VideoRecord
 from core.env import env_float, env_int
 
