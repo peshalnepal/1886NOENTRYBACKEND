@@ -2,7 +2,7 @@ from typing import Literal, Optional, Tuple
 
 from pydantic import Field
 
-from application.models.vision_config import VisionModelConfig, VisionTask
+from domain.vision_config import VisionModelConfig, VisionTask
 
 class YoloModelConfig(VisionModelConfig):
     """

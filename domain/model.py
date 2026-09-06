@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from application.models.vision_config import VisionModelConfig
+from domain.vision_config import VisionModelConfig
 from domain.events import ChannelEvent, RTSPEvent
 
 
