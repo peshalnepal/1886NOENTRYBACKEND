@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy import select as _sa_select
 
+from core.coercions import gen_code, is_blank
 from core.database_orm import AccessGrant, Role, Site, SiteSettings, Notification
 from core.security.roles import Permission, RoleScope
 from dependencies import (
@@ -61,13 +62,6 @@ router = APIRouter(prefix="/sites", tags=["sites"])
 # -----------------------
 # Helpers
 # -----------------------
-def _is_blank(s: Optional[str]) -> bool:
-    return s is None or (isinstance(s, str) and s.strip() == "")
-
-def _gen_code(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:6]}"
-
-
 def _normalize_trigger_mode(value: Optional[str]) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in SITE_PRERECORD_TRIGGER_MODES:
@@ -722,8 +716,8 @@ async def create_site(
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SITES)),
 ):
     site_code = payload.site_code
-    if _is_blank(site_code):
-        site_code = _gen_code("site")
+    if is_blank(site_code):
+        site_code = gen_code("site")
 
     # Resolve target org: per-tenant callers use ctx.org_id; platform-admin
     # super context (org_id is None) must pass org_id in the payload.
@@ -781,8 +775,8 @@ async def update_site(
     data = payload.model_dump(exclude_unset=True)
 
     # If they included site_code but it’s blank -> regenerate
-    if "site_code" in data and _is_blank(data.get("site_code")):
-        data["site_code"] = _gen_code("site")
+    if "site_code" in data and is_blank(data.get("site_code")):
+        data["site_code"] = gen_code("site")
 
     # Apply patch
     update_fields = {k: v for k, v in data.items() if v is not None}

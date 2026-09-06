@@ -24,6 +24,7 @@ from application.channels.channel_config import VideoChannelConfig
 from application.dtos import CameraUpdateDTO, CameraUpsertDTO
 from application.repositories._helpers import as_uuid as _as_uuid
 from application.repositories.device_repository import DeviceRepository
+from core.coercions import coerce_playback_mode, coerce_trigger_mode
 from core.database_orm import (
     Camera,
     ChannelConfiguration,
@@ -52,29 +53,6 @@ SUNDAY_TO_SATURDAY = [6, 0, 1, 2, 3, 4, 5]
 
 DEFAULT_START_TIME = time(0, 0, 0)
 DEFAULT_END_TIME = time(23, 59, 59)
-
-TRIGGER_MODES = ("inherit", "roi_enter", "any_detection")
-PLAYBACK_MODES = ("inherit", "always", "never")
-
-
-def _coerce_trigger_mode(raw: Any) -> str:
-    """Normalize a per-camera notification trigger to a valid tri-state."""
-    value = str(raw).strip() if isinstance(raw, str) else ("" if raw is None else str(raw))
-    return value if value in TRIGGER_MODES else "inherit"
-
-
-def _coerce_playback_mode(raw: Any) -> str:
-    """Normalize a per-camera playback override to a valid tri-state.
-
-    Legacy rows stored a bool here, so True/False still map to always/never.
-    """
-    if raw is True:
-        return "always"
-    if raw is False:
-        return "never"
-    value = str(raw).strip() if raw is not None else ""
-    return value if value in PLAYBACK_MODES else "inherit"
-
 
 class ChannelRepository:
     """Camera + ChannelConfiguration + pipeline-membership consistency.
@@ -423,8 +401,8 @@ class ChannelRepository:
         has_roi = "roi" in d
         has_trigger_mode = "notification_trigger_mode" in d
         has_playback = "camera_playback_enabled" in d
-        trigger_mode = _coerce_trigger_mode(d.get("notification_trigger_mode"))
-        playback_mode = _coerce_playback_mode(d.get("camera_playback_enabled"))
+        trigger_mode = coerce_trigger_mode(d.get("notification_trigger_mode"))
+        playback_mode = coerce_playback_mode(d.get("camera_playback_enabled"))
 
         cam = await self._get_camera_by_uuid(db, cam_uuid) if cam_uuid else None
 

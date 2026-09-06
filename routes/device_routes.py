@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from application.dtos import DeviceCreateDTO, DeviceUpdateDTO
 from application.repositories.device_repository import DeviceRepository
 from application.services.manager import EdgeDeviceUnavailableError, Manager
+from core.coercions import gen_code, is_blank
 from core.database_orm import Device
 from core.schemas import DeviceCreate, DeviceOut, DeviceUpdate, EdgeReconcileOut
 from core.security.roles import Permission
@@ -26,14 +27,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/devices", tags=["devices"])
 
 device_repo = DeviceRepository()
-
-
-def _is_blank(s: Optional[str]) -> bool:
-    return s is None or (isinstance(s, str) and s.strip() == "")
-
-
-def _gen_code(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:6]}"
 
 
 async def _get_device_or_404(db: AsyncSession, org_id: int, device_uuid: uuid.UUID) -> Device:
@@ -66,8 +59,8 @@ async def create_device(
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_DEVICES)),
 ):
     device_code = payload.device_code
-    if _is_blank(device_code):
-        device_code = _gen_code("dev")
+    if is_blank(device_code):
+        device_code = gen_code("dev")
 
     target_org_id = ctx.org_id if ctx.org_id is not None else payload.org_id
     if target_org_id is None:
@@ -113,8 +106,8 @@ async def update_device(
 
     data = payload.model_dump(exclude_unset=True)
     # An explicitly blanked device_code means "regenerate it".
-    if "device_code" in data and _is_blank(data.get("device_code")):
-        data["device_code"] = _gen_code("dev")
+    if "device_code" in data and is_blank(data.get("device_code")):
+        data["device_code"] = gen_code("dev")
 
     update_fields = {k: v for k, v in data.items() if v is not None}
     if update_fields:

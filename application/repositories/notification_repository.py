@@ -15,6 +15,7 @@ from application.dtos import (
     SitePrerecordSettingsDTO,
 )
 from application.repositories._helpers import as_uuid as _as_uuid, normalize_uuid_list
+from core.coercions import coerce_playback_mode, coerce_trigger_mode
 from core.database_orm import (
     Camera,
     Site,
@@ -41,24 +42,6 @@ def _normalize_trigger_mode(raw: Any) -> str:
     if value == "any_detection":
         return "any_detection"
     return "roi_enter"
-
-
-def _coerce_trigger_mode(raw: Any) -> str:
-    value = str(raw or "").strip().lower()
-    if value in ("roi_enter", "any_detection", "inherit"):
-        return value
-    return "inherit"
-
-
-def _coerce_playback_mode(raw: Any) -> str:
-    if raw is True:
-        return "always"
-    if raw is False:
-        return "never"
-    value = str(raw or "").strip().lower()
-    if value in ("always", "never", "inherit"):
-        return value
-    return "inherit"
 
 
 class NotificationRepository:
@@ -109,8 +92,8 @@ class NotificationRepository:
             camera_name=camera_name or camera_code,
             device_uuid=device_uuid,
             device_name=device_name,
-            notification_trigger_mode=_coerce_trigger_mode(trigger_mode),
-            camera_playback_enabled=_coerce_playback_mode(playback_enabled),
+            notification_trigger_mode=coerce_trigger_mode(trigger_mode),
+            camera_playback_enabled=coerce_playback_mode(playback_enabled),
         )
 
     async def get_camera_context(
