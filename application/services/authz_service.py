@@ -48,9 +48,6 @@ def _permission_name(permission: Union[Permission, str]) -> str:
 
 
 class AuthzService:
-    # ------------------------------------------------------------------
-    # Platform
-    # ------------------------------------------------------------------
     @staticmethod
     def ensure_platform_admin(user: User) -> None:
         """Raise 403 unless the user holds the platform-admin flag."""
@@ -60,9 +57,6 @@ class AuthzService:
                 detail="Platform admin privileges required.",
             )
 
-    # ------------------------------------------------------------------
-    # Organization
-    # ------------------------------------------------------------------
     @staticmethod
     async def get_org_role(
         db: AsyncSession, *, user_id: int, org_id: int
@@ -179,9 +173,6 @@ class AuthzService:
         ).scalars().all()
         return {r if isinstance(r, uuid.UUID) else uuid.UUID(str(r)) for r in rows}
 
-    # ------------------------------------------------------------------
-    # Site
-    # ------------------------------------------------------------------
     @staticmethod
     async def _get_site_org_id(
         db: AsyncSession, site_uuid: uuid.UUID
@@ -213,9 +204,6 @@ class AuthzService:
         )
         return res.scalar_one_or_none()
 
-    # ------------------------------------------------------------------
-    # Permissions (fine-grained ACL surface)
-    # ------------------------------------------------------------------
     @classmethod
     async def has_permission(
         cls,

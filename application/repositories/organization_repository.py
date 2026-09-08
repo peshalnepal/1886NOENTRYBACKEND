@@ -40,6 +40,7 @@ from core.database_orm import (
     utc_now,
 )
 from core.security.roles import OrgRole, RoleScope, SiteRole
+from application.repositories._helpers import model_patch
 
 
 class OrganizationRepository:
@@ -47,9 +48,6 @@ class OrganizationRepository:
     # startup and never change id, so a process-lifetime cache is safe.
     _role_id_cache: Dict[Tuple[str, str], int] = {}
 
-    # ------------------------------------------------------------------
-    # Grant query building blocks
-    # ------------------------------------------------------------------
     @staticmethod
     def _grants_in_scope(selectable, scope: str):
         """JOIN a grant query to `roles`, restricted to one role scope."""
@@ -63,9 +61,6 @@ class OrganizationRepository:
     def _site_grants(self, selectable):
         return self._grants_in_scope(selectable, RoleScope.SITE.value)
 
-    # ------------------------------------------------------------------
-    # Role resolution
-    # ------------------------------------------------------------------
     async def _role_id(self, db: AsyncSession, *, name: str, scope: str) -> int:
         """Resolve the `roles.id` for a (name, scope) pair, with caching."""
         key = (name, scope)
@@ -84,9 +79,6 @@ class OrganizationRepository:
         self._role_id_cache[key] = int(role_id)
         return int(role_id)
 
-    # ------------------------------------------------------------------
-    # Organizations
-    # ------------------------------------------------------------------
     async def create_organization(
         self, db: AsyncSession, dto: OrganizationCreateDTO
     ) -> Organization:
@@ -130,7 +122,7 @@ class OrganizationRepository:
     async def update_organization(
         self, db: AsyncSession, org_id: int, dto: OrganizationUpdateDTO
     ) -> None:
-        values = {k: v for k, v in dto.model_dump(exclude_unset=True).items() if v is not None}
+        values = model_patch(dto, drop_none=True)
         if "slug" in values:
             values["slug"] = values["slug"].strip().lower()
         if not values:
@@ -148,9 +140,7 @@ class OrganizationRepository:
         )
         return res.rowcount or 0
 
-    # ------------------------------------------------------------------
-    # Org memberships (org-scoped access grants)
-    # ------------------------------------------------------------------
+
     @staticmethod
     def _validate_org_role(role: str) -> str:
         # Raises ValueError when the value is not a valid OrgRole.
@@ -396,9 +386,7 @@ class OrganizationRepository:
                 deleted.append(int(org_id))
         return deleted
 
-    # ------------------------------------------------------------------
-    # Site memberships (site-scoped access grants)
-    # ------------------------------------------------------------------
+
     @staticmethod
     def _validate_site_role(role: str) -> str:
         return SiteRole(role).value
@@ -494,9 +482,6 @@ class OrganizationRepository:
         )
         return res.rowcount or 0
 
-    # ------------------------------------------------------------------
-    # Convenience queries used by routes
-    # ------------------------------------------------------------------
     async def list_org_sites(
         self, db: AsyncSession, *, org_id: int, include_deleted: bool = False
     ) -> List[Site]:

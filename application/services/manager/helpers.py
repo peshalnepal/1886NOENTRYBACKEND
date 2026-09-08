@@ -1,7 +1,4 @@
-"""Module-level helpers and constants for the manager package.
-
-Extracted verbatim from the former monolithic application/services/manager.py.
-"""
+"""Module-level helpers and constants for the manager package."""
 
 from __future__ import annotations
 
@@ -35,6 +32,13 @@ JETSON_PATCH_KEYS = {
     "camera_uuid",
     "channel_id",
 }
+
+
+def _camera_config_json(cam: Any) -> Dict[str, Any]:
+    """Return a camera's persisted channel configuration as a plain mapping."""
+    channel_config = getattr(cam, "channel_configuration", None)
+    configuration = getattr(channel_config, "configuration", None)
+    return dict(configuration) if isinstance(configuration, dict) else {}
 
 
 def _only_jetson_config(patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -121,10 +125,8 @@ def build_video_channel_config(
 ) -> "VideoChannelConfig":
     """Build a runtime ``VideoChannelConfig`` from a persisted ``Camera`` row.
 
-    This is the single place that maps a DB camera + resolved schedule into the
-    in-memory channel config. It used to be copy-pasted into ``_add_channel``,
-    ``_edit_channel``, ``_create_pipeline_unlocked`` and
-    ``sync_site_schedule_runtime``.
+    The single place that maps a DB camera + resolved schedule into the
+    in-memory channel config, shared by the create/edit/load/schedule-sync paths.
 
     ``include_capture_fields=False`` lets capture fields (sample_fps etc.) pass
     through ``runtime_overrides`` instead of being set explicitly — used on the

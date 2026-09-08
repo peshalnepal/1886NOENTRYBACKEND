@@ -1,4 +1,3 @@
-# application/repositories/device_repository.py
 """
 Device-centric persistence.
 
@@ -10,13 +9,13 @@ caller (service / route) owns the transaction boundary.
 """
 
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.dtos import DeviceCreateDTO, DeviceUpdateDTO
-from application.repositories._helpers import as_uuid as _as_uuid
+from application.repositories._helpers import as_uuid as _as_uuid, model_patch
 from core.database_orm import Camera, Device, SiteDevice
 
 
@@ -190,7 +189,7 @@ class DeviceRepository:
         dto: DeviceUpdateDTO,
     ) -> int:
         """Update the Device columns set on `dto`. Returns affected row count."""
-        values: Dict[str, Any] = dto.model_dump(exclude_unset=True)
+        values: Dict[str, Any] = model_patch(dto)
         if not values:
             return 0
         if "device_url" in values:

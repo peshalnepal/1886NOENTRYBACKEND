@@ -431,9 +431,6 @@ async def me(
     return await _to_user_out_with_orgs(db, current_user)
 
 
-# =====================================================================
-# Forgot password
-# =====================================================================
 def _build_reset_email_body(user_name: str, code: str) -> str:
     return (
         f"Hello {user_name},\n\n"

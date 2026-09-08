@@ -42,9 +42,36 @@ def _device_owner_id(device: Device, ctx: OrgContext) -> int:
     falling back to the acting admin."""
     return int(device.user_id) if device.user_id is not None else int(ctx.user.id)
 
-# -----------------------
-# Routes
-# -----------------------
+
+async def _cleanup_device_runtime(
+    manager: Manager,
+    db: AsyncSession,
+    *,
+    device_uuid: uuid.UUID,
+    owner_id: int,
+) -> None:
+    """Best-effort runtime teardown with bounded manager calls."""
+    try:
+        active_pipeline = await asyncio.wait_for(
+            manager.get_activepipeline(user_id=owner_id),
+            timeout=5.0,
+        )
+        await asyncio.wait_for(
+            manager.cleanup_device_resources(
+                db,
+                device_uuid=device_uuid,
+                active=active_pipeline,
+            ),
+            timeout=10.0,
+        )
+    except Exception:
+        logger.warning(
+            "Best-effort device cleanup failed for %s; proceeding with DB delete.",
+            device_uuid,
+            exc_info=True,
+        )
+
+
 @router.get("", response_model=List[DeviceOut])
 async def list_devices(
     db: AsyncSession = Depends(get_async_db),
@@ -134,21 +161,12 @@ async def delete_device(
 
     # Best-effort cleanup — DB delete must succeed even if manager/edge is down.
     if manager is not None:
-        try:
-            active_pipeline = await asyncio.wait_for(
-                manager.get_activepipeline(user_id=owner_id), timeout=5.0,
-            )
-            await asyncio.wait_for(
-                manager.cleanup_device_resources(
-                    db, device_uuid=device_uuid, active=active_pipeline,
-                ),
-                timeout=10.0,
-            )
-        except Exception:
-            logger.warning(
-                "Best-effort device cleanup failed for %s; proceeding with DB delete.",
-                device_uuid, exc_info=True,
-            )
+        await _cleanup_device_runtime(
+            manager,
+            db,
+            device_uuid=device_uuid,
+            owner_id=owner_id,
+        )
 
     await device_repo.delete_device(db, device_uuid=device.device_uuid)
     await db.commit()

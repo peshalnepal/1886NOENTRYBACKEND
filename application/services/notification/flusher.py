@@ -1,7 +1,4 @@
-"""Notification batch inserter, WebSocket publisher, and email digest scheduler.
-
-Extracted from the former `_service_flush.py` mixin.
-"""
+"""Notification batch inserter, hub publisher, and email digest scheduler."""
 
 from __future__ import annotations
 
@@ -382,11 +379,9 @@ class NotificationFlusher:
         if not self._session_factory:
             return False
 
-        # 1. Pre-calculate site-level operator data
         distinct_sites = list({item.ctx.site_uuid for item in items})
         operator_ids_by_site = await self._operator_ids_for_sites(distinct_sites)
 
-        # 2. Materialize images concurrently in batches
         IMAGE_UPLOAD_CONCURRENCY = 10
         materialized: List[Tuple[Dict[str, Any], Optional[str], Optional[str]]] = []
         for batch_start in range(0, len(items), IMAGE_UPLOAD_CONCURRENCY):
@@ -402,18 +397,19 @@ class NotificationFlusher:
                 else:
                     materialized.append(r)
 
-        # 3. Prepare creation DTOs and update items efficiently
         site_groups: Dict[uuid.UUID, List[int]] = defaultdict(list)
         create_rows: List[NotificationCreateDTO] = []
 
         for idx, item in enumerate(items):
             stored_extra, stored_url, stored_key = materialized[idx]
             
-            # Determine operator presence for this specific site
+            # An operator on the site's org means the alert is born `pending`
+            # and is visible ONLY in that operator's queue — never in the end
+            # user's notification feed — until it is approved.
             operator_ids = operator_ids_by_site.get(item.ctx.site_uuid) or []
             approval_status = "pending" if operator_ids else "approved"
-            
-            # Gather message updates to avoid multiple model_copy calls
+
+            # Gathered up front so the message needs a single model_copy.
             msg_updates = {}
             if stored_url:
                 msg_updates["image_url"] = stored_url
@@ -425,7 +421,6 @@ class NotificationFlusher:
                 item = BufferedNotification(msg=updated_msg, ctx=item.ctx, extra_payload=stored_extra)
                 items[idx] = item
 
-            # Prepare payload for DB
             msg_payload = item.msg.model_dump()
             site_groups[item.ctx.site_uuid].append(idx)
             
@@ -446,7 +441,6 @@ class NotificationFlusher:
                 )
             )
 
-        # 4. Persist to Database
         async def _do_create(_db):
             return await self._repo.create_notifications(_db, dtos=create_rows)
 
@@ -458,7 +452,6 @@ class NotificationFlusher:
             logger.exception("Failed to persist buffered notifications user=%s count=%s", user_id, len(items))
             return False
 
-        # 5. Publish to Hub & Trigger Clip Finalization
         clip_finalize_targets: List[Tuple[int, BufferedNotification]] = []
         notification_ids_by_site: Dict[uuid.UUID, List[int]] = defaultdict(list)
         
@@ -473,7 +466,9 @@ class NotificationFlusher:
             operator_ids = operator_ids_by_site.get(item.ctx.site_uuid) or []
             approval_status = "pending" if operator_ids else "approved"
             
-            # Single model_copy to prepare the published message
+            # `approval_status` rides on the published message because the SSE
+            # feed carries it: a pending alert is delivered ONLY to the org's
+            # operators, and getAlerts filters pending out of every user feed.
             published_msg = item.msg.model_copy(update={
                 "db_id": int(row_id),
                 "approval_status": approval_status
@@ -498,7 +493,6 @@ class NotificationFlusher:
                 name=f"clip_finalize:{notification_id}",
             )
 
-        # 6. Process Emails
         if not self.email:
             return True
 
@@ -512,15 +506,16 @@ class NotificationFlusher:
         sent_at = datetime.now(timezone.utc)
 
         for site_uuid, indices in site_groups.items():
-            # Skip email if this site requires operator approval
+            # Operator-gated sites send no email here: the alert is still
+            # pending, so the site recipients only hear about it (opt-in) once
+            # an operator approves — see `email_approved_notifications`.
             if operator_ids_by_site.get(site_uuid):
                 continue
-                
+
             recipients = recipients_by_site.get(site_uuid, [])
             if not recipients:
                 continue
 
-            # Only grab messages for rows that were successfully created
             site_messages = [items[idx].msg for idx in indices if idx < len(rows) and getattr(rows[idx], "id", None)]
             site_notif_ids = notification_ids_by_site.get(site_uuid, [])
             
@@ -534,7 +529,6 @@ class NotificationFlusher:
                 logger.exception("Buffered email digest send failed user=%s site=%s count=%s", user_id, site_uuid, len(site_messages))
                 failed_ids.extend(site_notif_ids)
 
-        # 7. Update Email Status in DB
         if sent_ids or failed_ids:
             async def _do_updates(_db):
                 if sent_ids:
@@ -556,6 +550,11 @@ class NotificationFlusher:
         notification_ids: List[int],
         site_uuids: List[uuid.UUID],
     ) -> None:
+        """Email just-approved alerts to the sites' opted-in recipients.
+
+        This is the ONLY email path for operator-gated alerts: nothing goes out
+        while an alert is pending, so approval is what releases it.
+        """
         if not self.email or not notification_ids or not self._session_factory:
             return
 
@@ -569,7 +568,6 @@ class NotificationFlusher:
                 approval_status="approved",
             )
 
-        # 1. Group cleanly by a tuple of (owner_id, site_uuid)
         grouped_rows: Dict[Tuple[int, uuid.UUID], List[Any]] = defaultdict(list)
         for r in rows:
             grouped_rows[(int(r.user_id), r.site_uuid)].append(r)
@@ -578,9 +576,10 @@ class NotificationFlusher:
         failed_ids: List[int] = []
         sent_at = datetime.now(timezone.utc)
 
-        # 2. Iterate flatly instead of nested loops
         for (owner_id, site_uuid), site_rows in grouped_rows.items():
-            # Note: _get_recipients_for_sites_cached takes a list of sites, so we wrap it
+            # Recipients are SITE-owned, not user-owned: the operator's approval
+            # delivers the alert by email to whoever the site opted in, not to
+            # the approving operator or the pipeline owner.
             recipients_by_site = await self._get_recipients_for_sites_cached(
                 user_id=owner_id, site_uuids=[site_uuid]
             )

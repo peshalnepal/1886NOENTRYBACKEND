@@ -56,9 +56,6 @@ router = APIRouter(
 )
 
 
-# =====================================================================
-# Schemas
-# =====================================================================
 class UserSummary(BaseModel):
     """Compact view of a user, used in cross-tenant listings."""
 
@@ -167,9 +164,6 @@ class UpdateOrgRequest(BaseModel):
     is_active: Optional[bool] = None
 
 
-# =====================================================================
-# Helpers
-# =====================================================================
 def _to_user_summary(u: User) -> UserSummary:
     return UserSummary(
         id=int(u.id),
@@ -216,9 +210,6 @@ def _to_camera_summary(c: Camera) -> CameraSummary:
     )
 
 
-# =====================================================================
-# Users
-# =====================================================================
 @router.get("/users", response_model=List[UserSummary])
 async def list_all_users(db: AsyncSession = Depends(get_async_db)):
     """Every user account in the system."""
@@ -363,9 +354,6 @@ async def delete_user(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# =====================================================================
-# Organizations
-# =====================================================================
 @router.get("/organizations", response_model=List[OrgSummary])
 async def list_organizations(db: AsyncSession = Depends(get_async_db)):
     """Every organization, enriched with member + site counts."""
@@ -548,9 +536,6 @@ async def delete_organization(
     return None
 
 
-# =====================================================================
-# Cross-tenant resource listings
-# =====================================================================
 @router.get("/sites", response_model=List[SiteSummary])
 async def list_all_sites(
     org_id: Optional[int] = None,

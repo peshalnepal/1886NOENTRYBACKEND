@@ -1,8 +1,7 @@
 """Shared building blocks used by more than one application service.
 
-These were previously copy-pasted into both ``ModelPipeline`` and
-``NotificationService``. They are kept here so there is exactly one
-implementation of each.
+``ModelPipeline`` and ``NotificationService`` both need these, so there is
+exactly one implementation of each here.
 """
 
 from application.services.common.background import BackgroundTasks, fire_and_forget

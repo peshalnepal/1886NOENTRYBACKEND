@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 from azure.core.exceptions import ResourceNotFoundError
-from azure.storage.blob import BlobSasPermissions, ContentSettings, generate_blob_sas
+from azure.storage.blob import ContentSettings
 from azure.storage.blob.aio import BlobServiceClient
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +19,10 @@ from application.repositories.notification_repository import CameraContext
 from application.services.overlay_normalize import (
     normalize_overlay_frame_dict as _normalize_overlay_frame,
 )
-from application.services.storage_common import parse_connection_string as _parse_connection_string
+from application.services.storage_common import (
+    parse_connection_string as _parse_connection_string,
+    signed_blob_url,
+)
 from core.database_orm import VideoRecord
 from core.env import env_float, env_int
 
@@ -252,18 +255,14 @@ def extract_notification_clip_external_ids(payload: Any) -> List[str]:
     """
     if not isinstance(payload, dict):
         return []
-    ids: List[str] = []
-    clips = payload.get("clip")
-    if isinstance(clips, dict):
-        ext = str(clips.get("external_id") or "").strip()
-        if ext:
-            ids.append(ext)
-    return list(dict.fromkeys(ids))
+    clip = payload.get("clip")
+    if not isinstance(clip, dict):
+        return []
+    external_id = str(clip.get("external_id") or "").strip()
+    return [external_id] if external_id else []
 
 
 class EventClipService:
-    # Clip layout: PRE_EVENT_S before the event + POST_EVENT_S after = CLIP_DURATION_S total.
-    # Default: 1 min 30 sec of pre-roll + 30 sec of post-roll = 2 min total.
     PRE_EVENT_S = 90
     POST_EVENT_S = 30
     CLIP_DURATION_S = PRE_EVENT_S + POST_EVENT_S
@@ -280,17 +279,11 @@ class EventClipService:
         self.container_name = (os.getenv("VIDEO_CLIP_BLOB_CONTAINER") or "event-clips").strip() or "event-clips"
 
         capture_enabled_raw = os.getenv("VIDEO_CLIP_CAPTURE_ENABLED", "").strip().lower()
-        capture_enabled = (
-            capture_enabled_raw not in {"0", "false", "no", "off"}
-            if capture_enabled_raw
-            else True
-        )
+        capture_enabled = capture_enabled_raw not in {"0", "false", "no", "off"}
         self.storage_enabled = bool(self.connection_string)
         self.enabled = bool(capture_enabled and self.playback_base_url)
 
-        # Env overrides for the class defaults. Pre/post-roll are the source of
-        # truth for the clip layout; the total duration is always derived from
-        # them so the event stays anchored at the PRE_EVENT_S mark.
+        # Derive duration from pre/post-roll so the event stays at the pre-roll boundary.
         self.PRE_EVENT_S = env_int("VIDEO_CLIP_PRE_EVENT_S", self.PRE_EVENT_S)
         self.POST_EVENT_S = env_int("VIDEO_CLIP_POST_EVENT_S", self.POST_EVENT_S)
         self.CLIP_DURATION_S = self.PRE_EVENT_S + self.POST_EVENT_S
@@ -346,14 +339,10 @@ class EventClipService:
             except (TypeError, ValueError, OSError, OverflowError):
                 event_time = now
 
-        # Anchor the window on the event itself: PRE_EVENT_S of context before the
-        # trigger frame, then POST_EVENT_S after so viewers see what happened next.
         start_time = event_time - timedelta(seconds=self.PRE_EVENT_S)
         end_time = event_time + timedelta(seconds=self.POST_EVENT_S)
 
-        # If the post-event tail hasn't been recorded yet, clamp to "now" so we
-        # still return a valid window; the caller waits before invoking, so this
-        # path should be rare.
+        # Playback cannot include footage that has not been recorded yet.
         if end_time > now:
             end_time = now
             if start_time > end_time:
@@ -505,18 +494,14 @@ class EventClipService:
         return f"clips/{camera_uuid}/{day}/{external_id}.mp4"
 
     def _signed_url(self, *, blob_name: str, blob_url: str) -> str:
-        if not self._sas_account_name or not self._sas_account_key:
-            return blob_url
-
-        token = generate_blob_sas(
-            account_name=self._sas_account_name,
-            container_name=self.container_name,
+        return signed_blob_url(
+            blob_url=blob_url,
             blob_name=blob_name,
+            container_name=self.container_name,
+            account_name=self._sas_account_name,
             account_key=self._sas_account_key,
-            permission=BlobSasPermissions(read=True),
-            expiry=datetime.now(timezone.utc) + timedelta(hours=self.SAS_TTL_HOURS),
+            ttl_hours=self.SAS_TTL_HOURS,
         )
-        return f"{blob_url}?{token}" if token else blob_url
 
     async def _upload_blob(self, *, blob_name: str, payload: bytes) -> str:
         blob_service = await self._get_blob_service()
@@ -649,7 +634,7 @@ class EventClipService:
             row.overlay_payload = merged
             await db.commit()
             return merged
-              
+
     async def capture_pre_event_clip(
         self,
         *,
@@ -674,20 +659,8 @@ class EventClipService:
             if time.monotonic() < self._playback_unavailable_until:
                 return None
 
-
-            # Wait long enough for MediaMTX to flush the POST_EVENT_S tail of the
-            # recording (segments are written on a fixed cadence — see
-            # recordSegmentDuration in main-prod.bicep). The +2s slack covers the
-            # segment-boundary rounding so /list reports the full tail before we
-            # call /get. This wait now runs inside the background finalize task,
-            # so it does not block notification persistence / web / email.
-            #
-            # IMPORTANT: the wait MUST happen before _get_capture_window(), because
-            # that method clamps end_time to "now". The capture is kicked off right
-            # after the event, so if we computed the window first, end_time would be
-            # clamped from event+POST_EVENT_S back to ~event (no post-roll), leaving
-            # the event jammed against the very end of the clip. Sleeping first lets
-            # "now" advance past event+POST_EVENT_S so the full tail survives.
+            # Wait for the post-roll plus 2s of segment-flush slack. Compute the
+            # window afterwards: it clamps to now and would otherwise lose the tail.
             if event_ts_ms is not None:
                 event_time = datetime.fromtimestamp(float(event_ts_ms) / 1000.0, tz=timezone.utc)
                 tail_ready_at = event_time + timedelta(seconds=self.POST_EVENT_S + 2)
@@ -729,71 +702,38 @@ class EventClipService:
                     )
                     return None
 
-                if not self.storage_enabled:
-                    recording_url = self._build_playback_clip_url(
+                storage_key = ""
+                record_kind = "successful" if self.storage_enabled else "playback-backed"
+                if self.storage_enabled:
+                    payload = await self._download_clip(
                         path=path,
                         start_time=clip_start,
                         duration_s=duration_s,
                     )
+                    if not payload:
+                        return None
+
+                    storage_key = self._build_storage_key(
+                        camera_uuid=camera_key,
+                        start_time=clip_start,
+                        external_id=external_id,
+                    )
                     try:
-                        await self._save_video_record(
-                            camera_uuid=camera_key,
-                            external_id=external_id,
-                            start_time=clip_start,
-                            end_time=clip_end,
-                            duration_s=duration_s,
-                            status="completed",
-                            storage_key="",
-                            recording_url=recording_url,
-                            overlay_payload=overlay_payload,
-                            requires_approval=requires_approval,
+                        recording_url = await self._upload_blob(
+                            blob_name=storage_key,
+                            payload=payload,
                         )
                     except Exception:
-                        logger.exception(
-                            "Failed to persist playback-backed video_record camera=%s external_id=%s",
+                        logger.warning(
+                            "Blob upload failed for clip camera=%s path=%s external_id=%s; falling back to direct playback URL",
                             camera_key,
+                            path,
                             external_id,
+                            exc_info=True,
                         )
+                        storage_key = ""
 
-                    result = ClipCaptureResult(
-                        external_id=external_id,
-                        storage_key="",
-                        recording_url=recording_url,
-                        status="completed",
-                        start_time=clip_start,
-                        end_time=clip_end,
-                        duration=duration_s,
-                        path=path,
-                    )
-                    return result.to_payload()
-
-                payload = await self._download_clip(
-                    path=path,
-                    start_time=clip_start,
-                    duration_s=duration_s,
-                )
-                if not payload:
-                    return None
-
-                storage_key = self._build_storage_key(
-                    camera_uuid=camera_key,
-                    start_time=clip_start,
-                    external_id=external_id,
-                )
-                try:
-                    recording_url = await self._upload_blob(
-                        blob_name=storage_key,
-                        payload=payload,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Blob upload failed for clip camera=%s path=%s external_id=%s; falling back to direct playback URL",
-                        camera_key,
-                        path,
-                        external_id,
-                        exc_info=True,
-                    )
-                    storage_key = ""
+                if not storage_key:
                     recording_url = self._build_playback_clip_url(
                         path=path,
                         start_time=clip_start,
@@ -815,7 +755,8 @@ class EventClipService:
                     )
                 except Exception:
                     logger.exception(
-                        "Failed to persist successful video_record camera=%s external_id=%s",
+                        "Failed to persist %s video_record camera=%s external_id=%s",
+                        record_kind,
                         camera_key,
                         external_id,
                     )

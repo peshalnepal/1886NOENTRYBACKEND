@@ -1,10 +1,9 @@
-"""Shared site trigger-mode resolver.
+"""Shared site trigger-mode and arm-state resolvers.
 
-``ModelPipeline`` and ``NotificationService`` both read
-``SiteSettings.config`` to decide whether a site emits all notifications
-("any_detection") or only ROI-enter alerts ("roi_enter"), each with its own
-TTL cache. The two implementations were identical apart from the fallback
-default, which is now a constructor argument.
+Reads ``SiteSettings.config`` to decide whether a site emits all notifications
+("any_detection") or only ROI-enter alerts ("roi_enter"). Shared by
+``ModelPipeline`` and ``NotificationService``, which differ only in the fallback
+default — hence the constructor argument.
 """
 
 from __future__ import annotations

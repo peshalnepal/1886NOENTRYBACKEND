@@ -1,9 +1,8 @@
 """Shared camera-context resolver.
 
-Both ``ModelPipeline`` and ``NotificationService`` needed the same thing:
-resolve user/site/device/camera names for a camera_uuid, with a TTL cache,
-single-flight de-duplication of concurrent lookups, and a concurrency cap on
-DB sessions. That logic lived twice; it now lives here once.
+Resolves user/site/device/camera names for a camera_uuid, with a TTL cache,
+single-flight de-duplication of concurrent lookups, and a concurrency cap on DB
+sessions. Shared by ``ModelPipeline`` and ``NotificationService``.
 """
 
 from __future__ import annotations

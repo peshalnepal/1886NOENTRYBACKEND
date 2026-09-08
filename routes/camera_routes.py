@@ -1,5 +1,3 @@
-# agents/api/routes/camera_routes.py
-
 import asyncio
 import json
 import logging
@@ -54,6 +52,7 @@ from core.schemas import (
 )
 from application.services.manager import Manager
 from routes._errors import SITE_NOT_FOUND
+from routes._runtime_cleanup import cleanup_camera_resources
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/cameras", tags=["cameras"])
@@ -272,10 +271,7 @@ async def list_cameras(
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
     site_uuid: uuid.UUID = None,  # keep query param; if None -> 422 below
 ):
-    """
-    List cameras from Azure DB for a site.
-    Uses camera.webrtc_url for playback in the frontend.
-    """
+    """List a site's cameras. `webrtc_url` is what the frontend plays."""
     if site_uuid is None:
         raise HTTPException(status_code=422, detail="site_uuid query param is required")
 
@@ -375,15 +371,13 @@ async def get_camera_playback(
     cam, _cfg, _pid = full
     await _ensure_camera_access(db, cam, ctx)
 
-    # Validate camera has required fields
     source_url = getattr(cam, "source_url", None)
     camera_code = getattr(cam, "camera_code", None)
     if not camera_code:
         raise HTTPException(status_code=409, detail="Camera code not set")
     if not source_url:
         raise HTTPException(status_code=409, detail="RTSP URL not configured")
-    
-    # Provision stream in MediaMTX if not already done
+
     try:
         webrtc_client = WebRTCGatewayClient()
         webrtc_url = await webrtc_client.ensure_stream(
@@ -599,8 +593,7 @@ async def create_camera(
             raise HTTPException(status_code=500, detail="Operation failed to create camera record")
 
         cam_out = result.cameras[0]
-        
-        # Provision WebRTC stream in MediaMTX after camera creation
+
         camera_code = getattr(cam_out, "camera_code", None)
         source_url = getattr(cam_out, "source_url", None)
         webrtc_url = None
@@ -754,35 +747,14 @@ async def _cleanup_camera_runtime(
                 exc_info=True,
             )
 
-    for dev_url in device_url_targets:
-        try:
-            await manager.edge.delete_camera(
-                device_url=dev_url, camera_uuid=str(camera_uuid)
-            )
-        except Exception as exc:
-            logger.warning(
-                "[Camera Delete] Edge delete failed cam=%s url=%s: %s",
-                camera_uuid,
-                dev_url,
-                exc,
-            )
-
-    if camera_code:
-        try:
-            await manager.webrtc.delete_stream(stream_key=str(camera_code))
-        except Exception as exc:
-            logger.warning(
-                "[Camera Delete] WebRTC delete failed cam=%s code=%s: %s",
-                camera_uuid,
-                camera_code,
-                exc,
-            )
-
-    if active_pipeline is not None:
-        try:
-            await active_pipeline.remove_channel(camera_uuid)
-        except Exception as exc:
-            logger.warning("[Camera Delete] Pipeline evict failed cam=%s: %s", camera_uuid, exc)
+    await cleanup_camera_resources(
+        manager,
+        camera_uuid=camera_uuid,
+        camera_code=camera_code,
+        device_urls=device_url_targets,
+        pipeline=active_pipeline,
+        log_prefix="[Camera Delete]",
+    )
 
 
 

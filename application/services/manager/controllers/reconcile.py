@@ -1,7 +1,4 @@
-"""Manager device reconcile loops + per-device retry logic.
-
-Extracted from the former monolithic application/services/manager.py.
-"""
+"""Manager device reconcile loops + per-device retry logic."""
 
 from __future__ import annotations
 
@@ -15,6 +12,7 @@ from application.repositories.device_repository import normalize_device_url
 
 from application.services.manager.helpers import (
     _edge_health_ready,
+    _camera_config_json,
     _only_jetson_config,
 )
 from application.services.manager.types import EdgeDeviceUnavailableError
@@ -127,9 +125,7 @@ class DeviceReconciler:
         dry_run: bool = False,
         delete_unknown: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Wrapper around reconcile_device_edge_simple with exponential backoff retry.
-        """
+        """Reconcile one device, retrying with exponential backoff."""
         last_exception = None
         for attempt in range(1, self._state.edge_retry_max_attempts + 1):
             try:
@@ -142,7 +138,6 @@ class DeviceReconciler:
             except Exception as e:
                 last_exception = e
                 if attempt < self._state.edge_retry_max_attempts:
-                    # Exponential backoff: base * (2 ^ (attempt-1))
                     wait_ms = self._state.edge_retry_base_ms * (2 ** (attempt - 1))
                     logger.warning(
                         "Device reconcile attempt %d/%d failed for %s, retrying in %dms: %s",
@@ -192,12 +187,7 @@ class DeviceReconciler:
                 db, device_uuids=device_uuids, include_config=True,
             )
             for cam in cams:
-                cfg = (
-                    cam.channel_configuration.configuration or {}
-                    if getattr(cam, "channel_configuration", None)
-                    and getattr(cam.channel_configuration, "configuration", None)
-                    else {}
-                )
+                cfg = _camera_config_json(cam)
                 schedule_state = await self._schedule_resolver.resolve_runtime_schedule(
                     db,
                     cam=cam,
@@ -239,7 +229,7 @@ class DeviceReconciler:
             # passed one (background reconciles pass user_id=None).
             device_owner_id = getattr(dev, "user_id", None)
 
-            # 2. Find all logical "peer" devices sharing this exact physical URL.
+            # Peer devices are the logical rows sharing this exact physical URL.
             # Scoped to the owning org: cameras from another org must never be
             # provisioned onto this box just because the URLs collide.
             peer_devices = await self._state.device_repo.list_devices(
@@ -268,9 +258,8 @@ class DeviceReconciler:
             device_uuids=reconcile_device_uuids,
         )
 
-        # --- WebRTC stream provisioning (independent of edge device) ---
-        # Always provision WHEP streams in MediaMTX so live view works even
-        # when the Jetson edge device is unreachable.
+        # WHEP streams are provisioned in MediaMTX unconditionally, so live view
+        # keeps working even when the Jetson edge device is unreachable.
         try:
             webrtc_list = await self._state.webrtc.list_webrtc_cameras()
         except Exception as e:
@@ -312,7 +301,6 @@ class DeviceReconciler:
                     logger.warning("WebRTC delete_stream failed during reconcile for %s: %s", cu, e)
                     webrtc_errors.append(f"Failed to remove stream {cu}: {e}")
 
-        # --- Edge device reconcile ---
         # `device_url` stays the normalized value computed above; re-reading the
         # raw column here would send un-normalized URLs to the edge client and
         # desync it from the peer lookup that built `desired_set`.
@@ -403,7 +391,6 @@ class DeviceReconciler:
                     e,
                     exc_info=True,
                 )
-                # Even though edge is unreachable, return WebRTC results so they aren't lost
                 raise EdgeDeviceUnavailableError(device_url, e) from e
         except Exception as e:
             logger.warning(
@@ -473,7 +460,7 @@ class DeviceReconciler:
             if cam is None:
                 out["errors"].append(f"Camera not found in DB during reconcile: {cu}")
                 continue
-            cfg = (cam.channel_configuration.configuration or {}) if cam.channel_configuration else {}
+            cfg = _camera_config_json(cam)
             payload = {
                 **_only_jetson_config(cfg),
                 # Explicit fields last so they always win over whatever is in channel config
@@ -514,9 +501,10 @@ class DeviceReconciler:
         dry_run: bool = False,
         delete_unknown: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Reconcile every device for the user.
-        Useful at startup/after edge reboot so Jetson gets re-hydrated from DB state.
+        """Reconcile every device for the user.
+
+        Run at startup and after an edge reboot so the Jetson is re-hydrated
+        from DB state.
         """
         uid = int(user_id) if user_id is not None else None
         async with self._state.session_factory() as db:

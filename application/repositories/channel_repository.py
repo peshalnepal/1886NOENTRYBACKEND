@@ -1,4 +1,3 @@
-# application/repositories/channel_repository.py
 """
 Camera + ChannelConfiguration persistence.
 
@@ -22,7 +21,7 @@ from sqlalchemy.orm import selectinload
 
 from application.channels.channel_config import VideoChannelConfig
 from application.dtos import CameraUpdateDTO, CameraUpsertDTO
-from application.repositories._helpers import as_uuid as _as_uuid
+from application.repositories._helpers import as_uuid as _as_uuid, model_patch
 from application.repositories.device_repository import DeviceRepository
 from core.coercions import coerce_playback_mode, coerce_trigger_mode
 from core.database_orm import (
@@ -60,9 +59,7 @@ class ChannelRepository:
     Every camera must have exactly one device assigned.
     """
 
-    # ------------------------------------------------------------------
-    # Reads
-    # ------------------------------------------------------------------
+
     @staticmethod
     def _with_relations(stmt, *, include_config: bool, include_device: bool):
         """Eager-load the optional camera relations (never lazy under async)."""
@@ -268,9 +265,7 @@ class ChannelRepository:
         ).scalars().all()
         return [int(uid) for uid in rows]
 
-    # ------------------------------------------------------------------
-    # Writes
-    # ------------------------------------------------------------------
+
     async def update_camera(
         self,
         db: AsyncSession,
@@ -279,7 +274,7 @@ class ChannelRepository:
         dto: CameraUpdateDTO,
     ) -> int:
         """Update the Camera columns set on `dto`. Returns affected row count."""
-        values: Dict[str, Any] = dto.model_dump(exclude_unset=True)
+        values: Dict[str, Any] = model_patch(dto)
         if not values:
             return 0
         result = await db.execute(
@@ -509,9 +504,6 @@ class ChannelRepository:
 
         return cam, cfg_json, tz
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
     @staticmethod
     def _optional_uuid(value: Any) -> Optional[uuid.UUID]:
         if not value:

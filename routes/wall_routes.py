@@ -1,4 +1,3 @@
-# routes/wall_routes.py
 """
 Custom walls: org-owned, ordered camera sets that may span multiple sites, and
 the share-link lifecycle that publishes one for public no-login viewing.

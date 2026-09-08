@@ -61,31 +61,15 @@ class WebRTCGatewayClient:
     VP8/VP9/AV1; e.g. H265/MJPEG sources can be recorded but not live-viewed
     over WebRTC.)
 
-    WHEP (WebRTC HTTP Egress Protocol) Requirements:
-      - MediaMTX must have WHEP protocol enabled
-      - Streams are accessed via: {WEBRTC_PUBLIC_BASE_URL}/{stream_key}/whep
-      - The frontend will POST an SDP offer to establish P2P WebRTC connection
-    
+    Streams are read at {WEBRTC_PUBLIC_BASE_URL}/{stream_key}/whep, where the
+    frontend POSTs an SDP offer. MediaMTX must have WHEP enabled and STUN
+    configured.
+
     Two operational modes:
       1) Admin API available -> provisions streams via /v3/config/paths/add
-      2) No admin API -> derives stable public WHEP URLs
-    
-    Required Environment Variables:
-      - WEBRTC_PUBLIC_BASE_URL: Base URL for public WHEP access (e.g., https://mtx.example.com)
-        If not set, defaults to http://localhost:8889
-      - WEBRTC_ADMIN_API_URL: MediaMTX admin API URL (via Caddy reverse proxy)
-        Defaults to https://noentrymtxfdxidm.centralus.azurecontainer.io
-      - WEBRTC_ADMIN_API_ENABLED: Set to 'false' to skip stream provisioning (default: true)
-      - MTX_API_USER or MEDIAMTX_API_USER: Admin API username (default: api)
-      - MTX_API_PASS or MEDIAMTX_API_PASS: Admin API password (default: api_pass_123)
-      - WEBRTC_ADMIN_TIMEOUT_S: Request timeout in seconds (default: 15)
-      - WEBRTC_ADMIN_CONNECT_TIMEOUT_S: Connection timeout in seconds (default: 5)
-      - WEBRTC_WARN_INTERVAL_S: Throttle warnings to once per N seconds (default: 60)
-    
-    MediaMTX Configuration Required:
-      - WHEP protocol must be enabled in MediaMTX config
-      - Ensure environment has proper STUN servers configured
-      - Example rtspTransport: "tcp" for reliability
+      2) No admin API -> derives stable public WHEP URLs without provisioning
+
+    Configured by the WEBRTC_*/MTX_API_* environment variables read in __init__.
     """
 
     def __init__(self):
@@ -351,11 +335,8 @@ class WebRTCGatewayClient:
         return out
 
     async def list_webrtc_cameras(self, *, include_active: bool = True) -> List[Dict[str, Any]]:
-        """
-        Your "camera list" for the MediaMTX server:
-        - Uses config list as the source of truth (configured paths)
-        - Optionally merges in runtime stats (active readers/viewers)
-        """
+        """The gateway's camera list: configured paths (the source of truth),
+        optionally merged with runtime stats (active readers/viewers)."""
         cfg_paths = await self.list_configured_paths()
 
         active_by_name: Dict[str, Dict[str, Any]] = {}

@@ -174,9 +174,6 @@ async def download_approved_alerts_report(
     )
 
 
-# ---------------------------------------------------------------------------
-# Report archive (any org member): browse, filter, download
-# ---------------------------------------------------------------------------
 report_repo = ReportRepository()
 
 
@@ -283,9 +280,6 @@ async def view_archived_report(
     )
 
 
-# ---------------------------------------------------------------------------
-# Daily schedule (org admins): when to email the report each day
-# ---------------------------------------------------------------------------
 schedule_repo = ReportScheduleRepository()
 
 

@@ -61,9 +61,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-# =====================================================================
-# Schemas
-# =====================================================================
 class MemberOut(BaseModel):
     user_id: int
     user_name: str
@@ -124,9 +121,6 @@ class GrantSiteRoleRequest(BaseModel):
     role: SiteRole
 
 
-# =====================================================================
-# Helpers
-# =====================================================================
 async def _ensure_site_in_org(
     db: AsyncSession, *, org_id: int, site_uuid: uuid.UUID
 ) -> Site:
@@ -152,9 +146,6 @@ def _member_out(user: User, role: str) -> MemberOut:
     )
 
 
-# =====================================================================
-# Organization members
-# =====================================================================
 @router.get(
     "/orgs/{org_id}/members",
     response_model=List[MemberOut],
@@ -370,9 +361,6 @@ async def remove_member(
     )
 
 
-# =====================================================================
-# Sites within the organization
-# =====================================================================
 @router.get(
     "/orgs/{org_id}/sites",
     response_model=List[AdminSiteOut],

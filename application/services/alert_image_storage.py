@@ -5,14 +5,17 @@ import binascii
 import os
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
-from azure.storage.blob import BlobSasPermissions, ContentSettings, generate_blob_sas
+from azure.storage.blob import ContentSettings
 from azure.storage.blob.aio import BlobServiceClient
 
-from application.services.storage_common import parse_connection_string as _parse_connection_string
+from application.services.storage_common import (
+    parse_connection_string as _parse_connection_string,
+    signed_blob_url,
+)
 from core.env import env_int
 
 _DATA_URL_RE = re.compile(
@@ -172,18 +175,14 @@ class AlertImageStorageService:
         return f"alerts/{camera_uuid}/{day}/{token}.{ext}"
 
     def _signed_url(self, *, blob_name: str, blob_url: str) -> str:
-        if not self._sas_account_name or not self._sas_account_key:
-            return blob_url
-
-        token = generate_blob_sas(
-            account_name=self._sas_account_name,
-            container_name=self.container_name,
+        return signed_blob_url(
+            blob_url=blob_url,
             blob_name=blob_name,
+            container_name=self.container_name,
+            account_name=self._sas_account_name,
             account_key=self._sas_account_key,
-            permission=BlobSasPermissions(read=True),
-            expiry=datetime.now(timezone.utc) + timedelta(hours=self.SAS_TTL_HOURS),
+            ttl_hours=self.SAS_TTL_HOURS,
         )
-        return f"{blob_url}?{token}" if token else blob_url
 
     async def _upload_blob(
         self,

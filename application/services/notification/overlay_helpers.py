@@ -1,8 +1,8 @@
 """Frame/overlay normalization helpers used by NotificationService.
 
-Extracted verbatim from the former monolithic application/services/notification.py.
-These helpers normalize detection overlays into a canonical dict shape that the
-clip-history, prerecord, and email pipelines can consume safely.
+These normalize the detection overlays arriving from the Jetson edge devices into
+a canonical dict shape that the clip-history, prerecord, and email pipelines can
+consume safely.
 """
 
 from __future__ import annotations

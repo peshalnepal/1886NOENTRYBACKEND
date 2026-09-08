@@ -1,7 +1,4 @@
-"""Clip history, overlay payload, and prerecord manager.
-
-Extracted from the former `_service_clip.py` and `_service_prerecord.py` mixins.
-"""
+"""Clip history, overlay payload, and prerecord manager."""
 
 from __future__ import annotations
 
@@ -146,14 +143,12 @@ class ClipManager:
         if frame is None:
             return
 
-        # Per-camera FIFO ring buffer of the most recent detection frames. The
-        # deque's `maxlen` (CLIP_OVERLAY_HISTORY_MAX_FRAMES_PER_CAMERA, default
-        # 10800 = 60*60*3) evicts the OLDEST frame automatically when a new one is
-        # appended, so retention is bounded by COUNT, not wall-clock time. A
-        # count-based buffer is robust to the low, variable per-camera detection
-        # cadence (a single Jetson round-robins many cameras), guaranteeing a
-        # clip's PRE/POST window can always be reconstructed from history. Boxes
-        # are extracted from this buffer in _clip_overlay_frames_for_window.
+        # Per-camera FIFO ring buffer of the most recent detection frames: the
+        # deque's `maxlen` evicts the OLDEST frame on append, so retention is
+        # bounded by COUNT, not wall-clock time. Count-based is deliberate — a
+        # single Jetson round-robins many cameras, so the per-camera cadence is
+        # low and variable and a time-bounded buffer could not guarantee a
+        # clip's PRE/POST window is reconstructable.
         async with self._overlay_history_lock:
             bucket = self._overlay_history_by_camera.get(str(camera_uuid))
             if bucket is None:
@@ -207,6 +202,15 @@ class ClipManager:
         return result
 
     async def _clip_overlay_frames_for_window(self, *, camera_uuid: str, start_time: Optional[datetime], end_time: Optional[datetime]) -> List[Dict[str, Any]]:
+        """Overlay frames whose timestamps fall inside the clip's PRE/POST window.
+
+        The window is anchored on the clip's own start/end times, which derive
+        from the Jetson's wall clock — the same clock that stamps `frame_ts_ms`
+        on every buffered frame. Both sides therefore share one time base. If a
+        Jetson's clock skews against the backend's, the boxes still line up with
+        the video, but the window will not match backend-side timestamps, so
+        never anchor this comparison on backend `now`.
+        """
         if start_time is None or end_time is None:
             return []
 
@@ -283,13 +287,13 @@ class ClipManager:
             except Exception:
                 logger.exception("Failed finalizing clip overlay camera=%s external_id=%s", camera_uuid, external_id)
 
-        # NOTE: intentionally do NOT prune the overlay history here. Multiple
-        # alerts can fire on the same camera with overlapping clip windows, and a
-        # later clip's PRE_EVENT portion overlaps this clip's window. Trimming
-        # through `end_time` would delete the box history that the overlapping
-        # clip still needs, leaving it with only its post-event tail (or a single
-        # trigger-frame box). The per-camera deque already self-bounds on append
-        # via the TTL cutoff and `maxlen` (see record_detection_overlay_frame),
+        # Looks wrong, is deliberate: the overlay history is NOT pruned here.
+        # Multiple alerts can fire on the same camera with overlapping clip
+        # windows, and a later clip's PRE_EVENT portion overlaps this one's.
+        # Trimming through `end_time` would delete box history that the
+        # overlapping clip still needs, leaving it with only its post-event tail
+        # (or a single trigger-frame box). The per-camera deque already
+        # self-bounds on append via `maxlen` (see record_detection_overlay_frame),
         # so memory stays bounded without destroying frames in-flight clips need.
 
         finalized = dict(clip)

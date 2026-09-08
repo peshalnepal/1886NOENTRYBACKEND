@@ -55,20 +55,17 @@ class ReportScheduleRepository:
             row = OrganizationReportSchedule(org_id=int(org_id))
             db.add(row)
 
-        if is_enabled is not None:
-            row.is_enabled = bool(is_enabled)
-        if send_hour is not None:
-            row.send_hour = int(send_hour)
-        if send_minute is not None:
-            row.send_minute = int(send_minute)
-        if timezone is not None:
-            row.timezone = str(timezone)
-        if window_hours is not None:
-            row.window_hours = int(window_hours)
-        if operator_approved_only is not None:
-            row.operator_approved_only = bool(operator_approved_only)
-        if last_sent_on is not None:
-            row.last_sent_on = str(last_sent_on)
+        for field, value, converter in (
+            ("is_enabled", is_enabled, bool),
+            ("send_hour", send_hour, int),
+            ("send_minute", send_minute, int),
+            ("timezone", timezone, str),
+            ("window_hours", window_hours, int),
+            ("operator_approved_only", operator_approved_only, bool),
+            ("last_sent_on", last_sent_on, str),
+        ):
+            if value is not None:
+                setattr(row, field, converter(value))
 
         await db.flush()
         return row

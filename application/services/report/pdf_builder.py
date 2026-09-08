@@ -98,9 +98,6 @@ def _escape_pdf_text(s: str) -> bytes:
     return bytes(out)
 
 
-# ---------------------------------------------------------------------------
-# JPEG handling
-# ---------------------------------------------------------------------------
 def _jpeg_info(data: bytes) -> Optional[Tuple[int, int, int]]:
     """Return ``(width, height, components)`` for raw JPEG bytes, or None."""
     if len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
@@ -244,7 +241,6 @@ class PDFReport:
     def content_width(self) -> float:
         return PAGE_W - 2 * MARGIN
 
-    # -- page management ---------------------------------------------------
     def new_page(self) -> None:
         self._cur = _Page()
         self._pages.append(self._cur)
@@ -259,7 +255,6 @@ class PDFReport:
         if self.y < MARGIN:
             self.new_page()
 
-    # -- primitives --------------------------------------------------------
     def _draw_line_op(
         self, s: str, x: float, baseline: float, size: float, bold: bool, color: Color
     ) -> None:
@@ -382,7 +377,6 @@ class PDFReport:
         self._cur.links.append((x, baseline - 3, x + w, baseline + size, url))
         self.y -= lead + 2.0
 
-    # -- branded layout helpers ---------------------------------------------
     def _fill_round_rect(self, x: float, y: float, w: float, h: float, r: float, color: Color) -> None:
         """Fill a rounded rectangle (used to compose the logo hand)."""
         r = min(r, w / 2.0, h / 2.0)
@@ -594,7 +588,6 @@ class PDFReport:
             self._cur.links.append((MARGIN, bottom, MARGIN + draw_w, bottom + draw_h, link_url))
         self.y -= draw_h + 8.0
 
-    # -- serialization -----------------------------------------------------
     def render(self) -> bytes:
         objects: List[bytes] = []  # 1-indexed; objects[i] is object (i+1)
 

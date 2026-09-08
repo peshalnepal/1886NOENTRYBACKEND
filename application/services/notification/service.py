@@ -115,8 +115,6 @@ class NotificationService:
             except Exception:
                 logger.exception("%s shutdown failed", label)
 
-    # --- Facade API for ModelPipeline and Routes ---
-    
     async def enqueue_notification(self, msg: NotificationMessage, ctx: CameraContext, extra_payload: Optional[Dict[str, Any]] = None) -> None:
         await self.flusher.enqueue(msg, ctx, extra_payload)
 

@@ -1,4 +1,3 @@
-# application/services/pipeline.py
 """The cloud-side detection pipeline.
 
 It never ingests RTSP or streams frames itself: it keeps a registry of camera
@@ -14,7 +13,8 @@ import random
 import time
 import uuid as _uuid
 from dataclasses import dataclass, replace
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Set, Tuple
+from itertools import chain
+from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Protocol, Set, Tuple
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 SessionFactory = Callable[[], AsyncSession]
 TaskSpawner = Callable[[Awaitable[Any], str], asyncio.Task]
+
+
 @dataclass(frozen=True)
 class ObjDetectResponse:
     camera_uuid: str
@@ -132,7 +134,7 @@ def _overlay_payload_from_resp(
     tracked_bases: Set[Tuple[Any, ...]] = set()
     untracked_indexes: Dict[Tuple[Any, ...], int] = {}
 
-    for raw_detection in list(resp.detections or ()) + list(fallback_detections or ()):
+    for raw_detection in chain(resp.detections or (), fallback_detections or ()):
         _append_overlay_detection(
             detections,
             raw_detection,
@@ -227,11 +229,10 @@ class InMemoryObjDetectStore:
             async with self._lock:
                 resp = self._latest.get(key)
                 evt.clear()
-            if resp is not None:
-                if resp.frame_ts_ms > after_ts_ms:
-                    return resp
-                if resp.frame_ts_ms == after_ts_ms and resp.frame_seq > after_seq:
-                    return resp
+            if resp is not None and (resp.frame_ts_ms, resp.frame_seq) > (
+                after_ts_ms, after_seq
+            ):
+                return resp
 
 
 class DetectionHub:
@@ -303,6 +304,7 @@ class ModelPipeline:
         self._clock_skew_floor_ms: Dict[str, float] = {}
         self._clock_skew_floor_reset_s: Dict[str, float] = {}
         self._clock_skew_last_warn_s: Dict[str, float] = {}
+        self._missing_frame_size_warn_s: Dict[str, float] = {}
 
         self._tracker = MultiCameraByteTrack(**(tracker_cfg or {}))
         self._nms_iou = env_float("DETECTION_NMS_IOU", 0.55, minimum=0.0)
@@ -372,10 +374,6 @@ class ModelPipeline:
         for ch in (channels or []):
             self._channels[ch.key()] = ch
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     async def start(self) -> None:
         async with self._lock:
             if self._started:
@@ -403,18 +401,24 @@ class ModelPipeline:
             self._clock_skew_floor_ms.clear()
             self._clock_skew_floor_reset_s.clear()
             self._clock_skew_last_warn_s.clear()
+            self._missing_frame_size_warn_s.clear()
             self._roi_cache.clear()
 
-        for t in tasks:
-            if t and not t.done():
-                t.cancel()
-        for t in tasks:
+        await self._stop_pollers(tasks)
+
+    @staticmethod
+    async def _stop_pollers(tasks: Iterable[asyncio.Task]) -> None:
+        tasks = list(tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
             try:
-                await t
+                await task
             except asyncio.CancelledError:
                 pass
             except Exception:
-                logger.exception("Poller task failed during shutdown")
+                logger.exception("Poller task failed during cleanup: %s", task.get_name())
 
     async def add_channel(self, ch: VideoChannel) -> None:
         key = ch.key()
@@ -448,13 +452,7 @@ class ModelPipeline:
         self._ctx_resolver.invalidate(key)
 
         if old_task and not old_task.done():
-            old_task.cancel()
-            try:
-                await old_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Old poller failed during edit camera=%s", key)
+            await self._stop_pollers([old_task])
 
         if started:
             self._ensure_poller(key, ch)
@@ -469,6 +467,7 @@ class ModelPipeline:
             self._clock_skew_floor_ms.pop(key, None)
             self._clock_skew_floor_reset_s.pop(key, None)
             self._clock_skew_last_warn_s.pop(key, None)
+            self._missing_frame_size_warn_s.pop(key, None)
             # Cooldown keys are (camera_uuid, cls_name), so drop by prefix.
             for cooldown_key in [
                 k for k in self._last_detection_summary_s if k[0] == key
@@ -479,17 +478,10 @@ class ModelPipeline:
             await self.detect_store.forget(key)
         self._ctx_resolver.invalidate(key)
         self._tracker.remove_camera(key)
-        self._roi_engine.reset_camera(key)
-        self._roi_cache.pop(key, None)
+        self.invalidate_camera_roi_state(key)
 
         if t and not t.done():
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Poller failed during remove camera=%s", key)
+            await self._stop_pollers([t])
 
         return True
 
@@ -500,10 +492,6 @@ class ModelPipeline:
                 self._stream_loop(key, ch),
                 f"stream_jetson_detection:{key}",
             )
-
-    # ------------------------------------------------------------------
-    # Registry accessors and cache invalidation
-    # ------------------------------------------------------------------
 
     def list_channel_ids(self) -> List[str]:
         return list(self._channels.keys())
@@ -548,10 +536,6 @@ class ModelPipeline:
 
     def invalidate_site_arm_state(self, site_uuid: str) -> None:
         self._arm_state_resolver.invalidate(str(site_uuid))
-
-    # ------------------------------------------------------------------
-    # Ingestion
-    # ------------------------------------------------------------------
 
     async def _stream_loop(self, key: str, ch: VideoChannel) -> None:
         backoff_s = 0.5
@@ -687,16 +671,8 @@ class ModelPipeline:
         prev_ts, prev_seq = self._last_seen.get(key, (0, -1))
         cur_ts, cur_seq = int(resp.frame_ts_ms), int(resp.frame_seq)
 
-        if cur_ts > prev_ts:
-            return True
-        if cur_ts == prev_ts and cur_seq > prev_seq:
-            return True
-        if cur_ts == prev_ts and cur_seq == prev_seq:
-            return False
-
-        regressed = (cur_ts < prev_ts) or (cur_ts == prev_ts and cur_seq < prev_seq)
-        if not regressed:
-            return False
+        if (cur_ts, cur_seq) >= (prev_ts, prev_seq):
+            return (cur_ts, cur_seq) != (prev_ts, prev_seq)
 
         # Regressed after a gap: assume the Jetson restarted, so accept the frame
         # and re-anchor rather than stalling forever.
@@ -755,15 +731,26 @@ class ModelPipeline:
             direction,
         )
 
+    def _warn_missing_frame_size(self, key: str) -> None:
+        """ROI needs frame dimensions to place the polygon; without them alerts
+        stop silently, which is indistinguishable from a misconfigured zone."""
+        now_s = time.monotonic()
+        last = self._missing_frame_size_warn_s.get(key, 0.0)
+        if (now_s - last) < 300.0:
+            return
+        self._missing_frame_size_warn_s[key] = now_s
+        logger.warning(
+            "Detection payload has no frame_w/frame_h camera=%s — ROI alerts are "
+            "disabled for this camera until the edge reports frame dimensions.",
+            key,
+        )
+
     async def _process_detection_payload(
         self, key: str, ch: VideoChannel, payload: Dict[str, Any]
-    ) -> None:
+    ) -> bool:
         resp = self._payload_to_resp(payload, ch)
-        if resp is None:
-            return
-
-        if not self._is_new_detection(key, resp):
-            return
+        if resp is None or not self._is_new_detection(key, resp):
+            return False
 
         self._monitor_clock_skew(key, int(resp.frame_ts_ms))
 
@@ -777,15 +764,21 @@ class ModelPipeline:
         track_events = tuple(tracker_out.get("events", []) or [])
 
         alerts: List[Dict[str, Any]] = []
-        if resp.frame_w and resp.frame_h and tracks:
-            alerts = self._roi_engine.process(
-                camera_uuid=str(resp.camera_uuid),
-                frame_w=int(resp.frame_w),
-                frame_h=int(resp.frame_h),
-                tracks=list(tracks),
-                rois=await self._fetch_rois(str(resp.camera_uuid)),
-                ts_ms=int(resp.frame_ts_ms),
-            )
+        if tracks:
+            if resp.frame_w and resp.frame_h:
+                alerts = self._roi_engine.process(
+                    camera_uuid=str(resp.camera_uuid),
+                    frame_w=int(resp.frame_w),
+                    frame_h=int(resp.frame_h),
+                    tracks=list(tracks),
+                    rois=await self._fetch_rois(str(resp.camera_uuid)),
+                    ts_ms=int(resp.frame_ts_ms),
+                    frame_interval_s=self._tracker.frame_interval_s(
+                        str(resp.camera_uuid)
+                    ),
+                )
+            else:
+                self._warn_missing_frame_size(key)
 
         resp2 = replace(
             resp,
@@ -808,10 +801,9 @@ class ModelPipeline:
                 self._post_publish_work(resp2, ch),
                 f"detection_post_publish:{key}",
             )
+        return True
 
-    # ------------------------------------------------------------------
     # Post-publish work (off the hot path)
-    # ------------------------------------------------------------------
 
     async def _post_publish_work(
         self, resp: ObjDetectResponse, ch: VideoChannel
@@ -962,18 +954,20 @@ class ModelPipeline:
         )
         return site_mode == "any_detection"
 
-    def _interesting_detection_classes(self, resp: ObjDetectResponse) -> List[str]:
-        cls_names: List[str] = []
-        for det in list(resp.detections or ()):
+    def _interesting_detections(
+        self, resp: ObjDetectResponse
+    ) -> Iterator[Tuple[str, Dict[str, Any]]]:
+        for det in resp.detections or ():
             if not isinstance(det, dict):
                 continue
             cls_name = str(det.get("cls_name") or "").strip()
-            if not cls_name:
-                continue
-            if self.interesting_classes and cls_name not in self.interesting_classes:
-                continue
-            cls_names.append(cls_name)
-        return sorted(set(cls_names))
+            if cls_name and (
+                not self.interesting_classes or cls_name in self.interesting_classes
+            ):
+                yield cls_name, det
+
+    def _interesting_detection_classes(self, resp: ObjDetectResponse) -> List[str]:
+        return sorted({cls_name for cls_name, _ in self._interesting_detections(resp)})
 
     def _reserve_detection_summary_alert(
         self, camera_uuid: str, cls_names: List[str]
@@ -992,10 +986,6 @@ class ModelPipeline:
             return True
 
         return False
-
-    # ------------------------------------------------------------------
-    # ROI lookup
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_roi_points(raw: Any) -> List[Tuple[float, float]]:
@@ -1108,10 +1098,6 @@ class ModelPipeline:
             # Short negative cache so a database outage does not re-query every frame.
             return self._cache_rois(camera_uuid, [], self._roi_cache_error_ttl_s)
 
-    # ------------------------------------------------------------------
-    # Snapshots
-    # ------------------------------------------------------------------
-
     def _device_fetch_semaphore(self, device_url: Optional[str]) -> asyncio.Semaphore:
         key = str(device_url or "").strip().lower()
         sem = self._device_fetch_limits.get(key)
@@ -1157,10 +1143,6 @@ class ModelPipeline:
         data_url = self._image_bytes_to_data_url(*snapshot)
         return {"image_url": data_url} if data_url else None
 
-    # ------------------------------------------------------------------
-    # Notification emission
-    # ------------------------------------------------------------------
-
     async def _publish_and_persist(
         self,
         *,
@@ -1190,28 +1172,26 @@ class ModelPipeline:
             task_name,
         )
 
-    async def _emit_detail_notification(
+    async def _emit_notification(
         self,
         resp: ObjDetectResponse,
         ctx: CameraContext,
         *,
-        overlay_source: Dict[str, Any],
         alert_id: str,
         title: str,
         body: str,
         alert_type: str,
-        cls_name: str,
+        cls_names: List[str],
         conf: float,
+        overlay_source: Optional[Dict[str, Any]] = None,
         track_id: Optional[int] = None,
         roi_id: Optional[str] = None,
-        image_url: Optional[str] = None,
         extra_payload: Optional[Dict[str, Any]] = None,
         persist_extra: Optional[Dict[str, Any]] = None,
         task_name: str,
     ) -> None:
-        """Shared body for ROI-entry and item-detected notifications."""
         overlay_payload = _overlay_payload_from_resp(
-            resp, fallback_detections=[overlay_source]
+            resp, fallback_detections=[overlay_source] if overlay_source is not None else None
         )
 
         msg = NotificationMessage(
@@ -1224,7 +1204,7 @@ class ModelPipeline:
             title=title,
             body=body,
             alert_type=alert_type,
-            cls_names=[cls_name],
+            cls_names=cls_names,
             max_conf=conf,
             frame_w=overlay_payload.get("frame_w"),
             frame_h=overlay_payload.get("frame_h"),
@@ -1234,7 +1214,7 @@ class ModelPipeline:
             track_id=track_id,
             device_name=ctx.device_name,
             camera_name=ctx.camera_name,
-            image_url=image_url,
+            image_url=str((extra_payload or {}).get("image_url") or "").strip() or None,
         )
 
         await self._publish_and_persist(
@@ -1265,7 +1245,6 @@ class ModelPipeline:
             )
             return False
 
-        image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
         emitted = False
 
         for a in alerts:
@@ -1273,7 +1252,7 @@ class ModelPipeline:
             title, body = _humanize_roi_alert(a.get("cls_name"), ctx)
             raw_track_id = a.get("track_id")
 
-            await self._emit_detail_notification(
+            await self._emit_notification(
                 resp,
                 ctx,
                 overlay_source=a,
@@ -1284,11 +1263,10 @@ class ModelPipeline:
                 title=title,
                 body=body,
                 alert_type="roi_enter",
-                cls_name=cls_name,
+                cls_names=[cls_name],
                 conf=float(a.get("conf", 0.0) or 0.0),
                 track_id=int(raw_track_id) if raw_track_id is not None else None,
                 roi_id=str(a.get("roi_id", "")),
-                image_url=image_url,
                 extra_payload=extra_payload,
                 persist_extra={"alert": a},
                 task_name=f"persist_roi_alert:{cam_uuid}",
@@ -1331,7 +1309,6 @@ class ModelPipeline:
             )
             return False
 
-        image_url = str((extra_payload or {}).get("image_url") or "").strip() or None
         emitted = False
 
         for track_id in confirmed_ids:
@@ -1343,7 +1320,7 @@ class ModelPipeline:
             conf = float(tr.get("conf", 0.0) or 0.0)
             title, body = _humanize_item_detected(cls_name, conf, ctx)
 
-            await self._emit_detail_notification(
+            await self._emit_notification(
                 resp,
                 ctx,
                 overlay_source=tr,
@@ -1351,10 +1328,9 @@ class ModelPipeline:
                 title=title,
                 body=body,
                 alert_type="item_detected",
-                cls_name=cls_name,
+                cls_names=[cls_name],
                 conf=conf,
                 track_id=track_id,
-                image_url=image_url,
                 extra_payload=extra_payload,
                 persist_extra={"track": tr, "event": "track_confirmed"},
                 task_name=f"persist_track_confirmed:{cam_uuid}:{track_id}",
@@ -1377,17 +1353,10 @@ class ModelPipeline:
         classes: List[str] = []
         max_conf = 0.0
 
-        for d in list(resp.detections or ()):
-            if not isinstance(d, dict):
-                continue
-            cls_name = str(d.get("cls_name") or "").strip()
-            if not cls_name:
-                continue
-            if self.interesting_classes and cls_name not in self.interesting_classes:
-                continue
-            max_conf = max(max_conf, float(d.get("conf", 0.0) or 0.0))
+        for cls_name, detection in self._interesting_detections(resp):
+            max_conf = max(max_conf, float(detection.get("conf", 0.0) or 0.0))
             classes.append(cls_name)
-            filtered.append(d)
+            filtered.append(detection)
 
         if not filtered:
             return
@@ -1404,33 +1373,15 @@ class ModelPipeline:
         uniq_classes = sorted(set(classes))
         classes_text = ", ".join(uniq_classes)
         verb = "is" if len(uniq_classes) == 1 else "are"
-        overlay_payload = _overlay_payload_from_resp(resp)
-
-        msg = NotificationMessage(
-            user_id=int(ctx.user_id),
-            id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-summary",
-            ts_ms=int(resp.frame_ts_ms),
-            camera_uuid=cam_uuid,
-            site_uuid=str(ctx.site_uuid),
-            site_name=ctx.site_name,
+        await self._emit_notification(
+            resp,
+            ctx,
+            alert_id=f"{cam_uuid}-{resp.frame_ts_ms}-{resp.frame_seq}-summary",
             title=f"Detection: {classes_text}",
             body=f"{int(max_conf * 100)}% chance that {classes_text} {verb} being detected",
             alert_type="detection_summary",
             cls_names=uniq_classes,
-            max_conf=float(max_conf),
-            frame_w=overlay_payload.get("frame_w"),
-            frame_h=overlay_payload.get("frame_h"),
-            frame_seq=overlay_payload.get("frame_seq"),
-            detections=list(overlay_payload.get("detections") or []),
-            device_name=ctx.device_name,
-            camera_name=ctx.camera_name,
-            image_url=str((extra_payload or {}).get("image_url") or "").strip() or None,
-        )
-
-        await self._publish_and_persist(
-            ctx=ctx,
-            msg=msg,
-            overlay_payload=overlay_payload,
+            conf=float(max_conf),
             extra_payload=extra_payload,
             persist_extra={"detections": filtered[:20], "event": "detection_summary"},
             task_name=f"persist_detection_summary:{cam_uuid}",

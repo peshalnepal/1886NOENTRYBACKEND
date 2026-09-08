@@ -1,29 +1,22 @@
 """Adoption of edge-discovered cameras into the cloud as real Camera rows.
 
 The Jetson is the source of truth for which cameras physically exist: its
-discovery sweep finds Hikvision cameras on the LAN, mints a UUID for each and
-starts decoding immediately. Until this controller existed, that was where the
-story ended — the cloud saw those UUIDs in the reconcile diff, deliberately
-skipped deleting them, and logged "not yet registered in the cloud" forever.
+discovery sweep finds Hikvision cameras on the LAN, mints a real UUID for each
+and starts decoding immediately. Reconcile must therefore never delete an
+edge-discovered camera — it adopts it instead.
 
 A camera with no `Camera` row has no site, no org, no camera_code, and so no
-MediaMTX stream, no live view, no notification recipients and no schedule. It
-also can never enter `desired_set`, so every subsequent reconcile re-derives it
-as unadopted and repeats the warning.
+MediaMTX stream, no live view, no notification recipients and no schedule, and
+can never enter `desired_set`. Adoption closes that loop by creating the Camera
++ ChannelConfiguration rows through the SAME path a manually-created camera
+takes (`Manager.update_pipeline` -> `ChannelController.add_channel`), so an
+adopted camera is indistinguishable from a hand-added one afterwards.
 
-Adoption closes that loop. For each discovered camera it creates the Camera +
-ChannelConfiguration rows through the SAME path a manually-created camera takes
-(`Manager.update_pipeline` -> `ChannelController.add_channel`), so a discovered
-camera is indistinguishable from a hand-added one afterwards: it gets a
-camera_code, a WHEP stream, a pipeline channel and an edge upsert.
-
-Identity, not URL, is the dedupe key
-------------------------------------
-The edge's roster identity ("serial:…" > "mac:…" > "ip:…") is stored in the
-camera's channel configuration under `discovery_identity`. That is what makes
-re-adoption idempotent across DHCP moves: the same physical camera keeps its
-identity when its IP changes, so a second sweep links to the existing row
-instead of creating a duplicate camera pointed at the same stream.
+Identity, not URL, is the dedupe key: the edge's roster identity
+("serial:…" > "mac:…" > "ip:…") is stored in the camera's channel configuration
+under `discovery_identity`. That is what makes re-adoption idempotent across
+DHCP moves — the same physical camera keeps its identity when its IP changes, so
+a second sweep links to the existing row instead of creating a duplicate.
 """
 
 from __future__ import annotations
@@ -39,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.database_orm import Site, SiteDevice
 from domain.events import ChannelCreateEvent
 from application.services.manager.controllers._state import ManagerState
+from application.services.manager.helpers import _camera_config_json
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +65,6 @@ class CameraAdopter:
         # cold-start retry. Injecting it keeps adoption on the exact code path
         # the manual create route uses, with no circular import.
         self._update_pipeline = update_pipeline
-
-    # ------------------------------------------------------------------
-    # Roster parsing
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _roster_entries(discovery_report: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -113,10 +103,6 @@ class CameraAdopter:
                 return f"Camera {value}"
         return "Discovered camera"
 
-    # ------------------------------------------------------------------
-    # Lookups
-    # ------------------------------------------------------------------
-
     async def _sites_for_device(
         self, db: AsyncSession, *, device_uuid: uuid.UUID
     ) -> List[uuid.UUID]:
@@ -130,10 +116,6 @@ class CameraAdopter:
             )
         ).scalars().all()
         return list(dict.fromkeys(rows))
-
-    # ------------------------------------------------------------------
-    # Existing-camera matching
-    # ------------------------------------------------------------------
 
     async def _existing_index(
         self, db: AsyncSession, *, device_uuids: List[uuid.UUID]
@@ -153,10 +135,7 @@ class CameraAdopter:
         by_host: Dict[str, Any] = {}
 
         for cam in cams:
-            cfg = {}
-            chan_cfg = getattr(cam, "channel_configuration", None)
-            if chan_cfg is not None and getattr(chan_cfg, "configuration", None):
-                cfg = chan_cfg.configuration or {}
+            cfg = _camera_config_json(cam)
 
             identity = str(cfg.get("discovery_identity") or "").strip()
             if identity:
@@ -169,10 +148,6 @@ class CameraAdopter:
                 by_host[host] = cam
 
         return by_identity, by_host
-
-    # ------------------------------------------------------------------
-    # Adoption
-    # ------------------------------------------------------------------
 
     async def adopt_discovered_cameras(
         self,

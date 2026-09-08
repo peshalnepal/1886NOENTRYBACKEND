@@ -1,7 +1,4 @@
-"""WebSocket-like in-process notification hub.
-
-Extracted verbatim from the former monolithic application/services/notification.py.
-"""
+"""In-process notification hub: per-user queues fed by the flusher, drained by SSE."""
 
 from __future__ import annotations
 
@@ -9,6 +6,22 @@ import asyncio
 from typing import Dict, Iterable, List, Set
 
 from application.services.notification.types import NotificationMessage
+
+
+def _put_latest(
+    queue: asyncio.Queue[NotificationMessage], msg: NotificationMessage
+) -> None:
+    try:
+        queue.put_nowait(msg)
+        return
+    except asyncio.QueueFull:
+        pass
+
+    try:
+        queue.get_nowait()
+        queue.put_nowait(msg)
+    except Exception:
+        pass
 
 
 class WebNotificationHub:
@@ -58,14 +71,4 @@ class WebNotificationHub:
                 subs.extend(self._subs_by_user.get(uid, set()))
 
         for q in subs:
-            try:
-                q.put_nowait(msg)
-            except asyncio.QueueFull:
-                try:
-                    _ = q.get_nowait()
-                except Exception:
-                    pass
-                try:
-                    q.put_nowait(msg)
-                except Exception:
-                    pass
+            _put_latest(q, msg)

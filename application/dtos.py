@@ -1,4 +1,3 @@
-# application/dtos.py
 """
 Data Transfer Objects.
 
@@ -37,9 +36,6 @@ class _DTO(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="ignore")
 
 
-# =====================================================================
-# Camera / Channel
-# =====================================================================
 class CameraUpsertDTO(_DTO):
     """
     Input for `ChannelRepository.upsert_camera_from_channel_config`.
@@ -86,9 +82,6 @@ class CameraUpdateDTO(_DTO):
     device_uuid: Optional[uuid.UUID] = None
 
 
-# =====================================================================
-# Device
-# =====================================================================
 class DeviceCreateDTO(_DTO):
     """Input for `DeviceRepository.create_device`."""
     org_id: int
@@ -108,9 +101,6 @@ class DeviceUpdateDTO(_DTO):
     is_enabled: Optional[bool] = None
 
 
-# =====================================================================
-# Site / SiteSettings
-# =====================================================================
 class SiteCreateDTO(_DTO):
     """Input for `SiteRepository.create_site`."""
     org_id: int
@@ -141,9 +131,6 @@ class SiteSettingsUpsertDTO(_DTO):
     is_enabled: bool = True
 
 
-# =====================================================================
-# Notification / NotificationEmail
-# =====================================================================
 class NotificationCreateDTO(_DTO):
     """Input for `NotificationRepository.create_notification(s)`."""
     user_id: int
@@ -168,9 +155,6 @@ class NotificationEmailCreateDTO(_DTO):
     is_enabled: bool = True
 
 
-# =====================================================================
-# User
-# =====================================================================
 class UserCreateDTO(_DTO):
     """Input for `UserRepository.create_user`."""
     user_name: str
@@ -188,9 +172,6 @@ class UserProfileUpdateDTO(_DTO):
     email: Optional[str] = None
 
 
-# =====================================================================
-# Organization / Membership
-# =====================================================================
 class OrganizationCreateDTO(_DTO):
     """Input for `OrganizationRepository.create_organization`.
 
@@ -236,9 +217,6 @@ class SiteMembershipUpsertDTO(_DTO):
     role: str
 
 
-# =====================================================================
-# Inter-function value objects
-# =====================================================================
 class CameraContextDTO(_DTO):
     """
     Resolved user/site/device/camera identity for a single camera.
@@ -264,9 +242,6 @@ class SitePrerecordSettingsDTO(_DTO):
     trigger_mode: str = "roi_enter"
 
 
-# =====================================================================
-# Reports
-# =====================================================================
 class ReportCreateDTO(_DTO):
     """Input for `ReportRepository.create` — one archived report PDF."""
     org_id: int

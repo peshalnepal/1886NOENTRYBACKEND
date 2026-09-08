@@ -19,9 +19,7 @@ from application.channels.channel_config import VideoChannelConfig
 from core.source_url import is_supported_source_url
 
 
-# -------------------------
 # ROI Schema
-# -------------------------
 class ROISchema(BaseModel):
     """Region of Interest polygon for detection alerts."""
     model_config = ConfigDict(extra="forbid")
@@ -108,18 +106,14 @@ def _normalize_schedule_fields(model: BaseModel) -> BaseModel:
     return model
 
 
-# -------------------------
 # Shared / base shapes
-# -------------------------
 
 class CameraCreateSchema(BaseModel):
-    """
-    Payload for POST /cameras
+    """Payload for POST /cameras.
 
-    Important:
-    - webrtc_url is NOT accepted here (server provisions it)
-    - device_uuid may be omitted when the site has exactly one linked device;
-      the backend will auto-link the camera to that device
+    `webrtc_url` is NOT accepted here (the server provisions it). `device_uuid`
+    may be omitted when the site has exactly one linked device — the backend
+    auto-links the camera to it.
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -146,7 +140,6 @@ class CameraCreateSchema(BaseModel):
         description="Per-camera clip recording override. 'inherit' = use site default (prerecord list).",
     )
 
-    # ROI for detection alerts (optional)
     roi: Optional[ROISchema] = None
 
     sample_fps: float = Field(default=5.0, ge=0.1)
@@ -176,27 +169,18 @@ class CameraCreateSchema(BaseModel):
         return _normalize_schedule_fields(self)
 
 
-# -------------------------
 # Edit/Patch
-# -------------------------
 
 class CameraEditSchema(BaseModel):
-    """
-    Payload for PATCH /cameras/{camera_uuid}
-
-    Rules:
-    - All fields optional: patch semantics
-    - Explicitly forbids webrtc_url (immutable/server-managed)
-    - If you also want to forbid device_url from client, keep it out entirely.
-    """
+    """Payload for PATCH /cameras/{camera_uuid} — patch semantics, so every
+    field is optional and an omitted field is left unchanged."""
     model_config = ConfigDict(extra="forbid")
 
-    # Allowed patches
     # Backward compatibility: older clients may still send user_id on PATCH.
-    # It is ignored by edit flow.
+    # It is ignored by the edit flow.
     user_id: Optional[int] = Field(default=None, ge=1)
     site_uuid: Optional[uuid.UUID] = None
-    device_uuid: Optional[uuid.UUID] = None  # allow re-assign device if you want
+    device_uuid: Optional[uuid.UUID] = None
 
     source_url: Optional[str] = Field(default=None, min_length=1)
     device_url: Optional[str] = Field(default=None, min_length=1)
@@ -216,7 +200,6 @@ class CameraEditSchema(BaseModel):
         description="Per-camera clip recording override. 'inherit' = use site default (prerecord list). Omit on PATCH to leave unchanged.",
     )
 
-    # ROI for detection alerts (optional)
     roi: Optional[ROISchema] = None
 
     sample_fps: Optional[float] = Field(default=None, ge=0.1)
@@ -245,15 +228,10 @@ class CameraEditSchema(BaseModel):
         return _normalize_schedule_fields(self)
 
 
-# -------------------------
 # DB output models
-# -------------------------
 
 class CameraSchema(BaseModel):
-    """
-    Response model for GET /cameras
-    Mirrors what you build in list_cameras().
-    """
+    """Response model for GET /cameras."""
     model_config = ConfigDict(extra="forbid")
 
     camera_uuid: uuid.UUID
@@ -281,9 +259,7 @@ class CameraSchema(BaseModel):
 
 
 class CameraWithConfigSchema(CameraSchema):
-    """
-    Response model for GET /cameras/{camera_uuid} and POST/PATCH responses.
-    """
+    """Response model for GET /cameras/{camera_uuid} and POST/PATCH responses."""
     configuration: Dict[str, Any] = Field(default_factory=dict)
     timezone: Optional[str] = None
 
@@ -293,9 +269,7 @@ class CameraPlaybackSchema(BaseModel):
     webrtc_url: str
 
 
-# -------------------------
 # Site schedule helpers / constants
-# -------------------------
 SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER = "roi_enter"
 SITE_PRERECORD_TRIGGER_MODE_ANY_DETECTION = "any_detection"
 SITE_PRERECORD_TRIGGER_MODES = {
@@ -775,7 +749,7 @@ class BulkClipDeleteResponse(BaseModel):
 
 # --- Auth schemas ---
 class AuthOrgMembershipOut(BaseModel):
-    """One row from the user's org_memberships, used by the frontend
+    """One of the user's org-scoped access grants, used by the frontend
     to decide which Admin / Platform Admin tabs to render."""
 
     org_id: int
@@ -869,9 +843,7 @@ class PasswordResetConfirm(_NormalizedEmailMixin, _DigitCodeMixin, _MinPasswordM
     new_password: SecretStr
 
 
-# -------------------------
 # Custom walls
-# -------------------------
 
 # Bounds how many streams a single share link can fan out to a media server that
 # has no per-viewer limits of its own.

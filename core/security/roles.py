@@ -11,24 +11,24 @@ The system uses three distinct scopes:
        independent of any specific organization.
 
   2. Organization scope -> `OrgRole`
-       Maps a user to an organization (tenant). Stored in
-       `org_memberships`. The Operator role is intentionally
+       Maps a user to an organization (tenant), via an org-scoped
+       `access_grants` row. The Operator role is intentionally
        organization-scoped: an operator is the first reviewer of
        AI camera alerts for *all* sites within their org.
 
   3. Site scope -> `SiteRole`
-       Maps a user to a single site inside an organization. Stored
-       in `site_memberships`. Drives day-to-day permissions such as
-       arming/disarming and viewing approved alerts.
+       Maps a user to a single site inside an organization, via a
+       site-scoped `access_grants` row. Drives day-to-day permissions
+       such as arming/disarming and viewing approved alerts.
 
 Important invariants enforced by the application layer (see
 `AuthzService`):
 
-  * A `SiteMembership` only makes sense if the user also has an
-    `OrgMembership` for the site's organization. The membership
-    repository validates this before insert.
+  * A site grant only makes sense if the user also holds an org grant
+    for the site's organization. The repository validates this before
+    insert.
   * Org Admins implicitly have full access to every site in their
-    organization, even without an explicit `SiteMembership` row.
+    organization, even without an explicit site grant.
   * Platform Admins bypass all org/site checks.
 """
 from __future__ import annotations
@@ -59,7 +59,7 @@ class OrgRole(str, Enum):
                   and approves/rejects them. May also generate and
                   send reports to site members.
     * MEMBER    - a plain organization member. Site-level access
-                  must be granted via a `SiteMembership` row.
+                  must be granted via a site-scoped access grant.
     """
 
     ADMIN = "admin"
@@ -69,7 +69,7 @@ class OrgRole(str, Enum):
 
 class SiteRole(str, Enum):
     """
-    Site-level role assigned via `site_memberships`.
+    Site-level role assigned via a site-scoped `access_grants` row.
 
     * ADMIN      - can edit the site, its cameras and its members.
                    Identical to an Org Admin's implicit access but
@@ -87,9 +87,6 @@ class SiteRole(str, Enum):
     READ_ONLY = "read_only"
 
 
-# =========================================================================
-# Permission catalog (ACL-style RBAC)
-# =========================================================================
 class RoleScope(str, Enum):
     """The context a role applies to. Stored on `roles.scope`.
 
@@ -109,7 +106,6 @@ class Permission(str, Enum):
     `AuthzService.has_permission`.
     """
 
-    # --- Organization scope ---
     ORG_READ = "org:read"
     ORG_MANAGE_MEMBERS = "org:manage_members"
     ORG_MANAGE_SITES = "org:manage_sites"
@@ -120,7 +116,6 @@ class Permission(str, Enum):
     REPORTS_SEND = "reports:send"
     WALL_MANAGE = "wall:manage"
 
-    # --- Site scope ---
     SITE_READ = "site:read"
     SITE_ARM_DISARM = "site:arm_disarm"
     SITE_MANAGE = "site:manage"

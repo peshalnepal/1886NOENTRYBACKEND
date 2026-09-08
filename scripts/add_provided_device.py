@@ -10,7 +10,6 @@ async def add_device():
         device_url = "http://initialsecurity.dvrlists.com:19030"
         name = "Initial Security Device"
         
-        # Check if exists
         from sqlalchemy import select
         q = select(Device).where(Device.device_url == device_url)
         existing = (await db.execute(q)).scalar_one_or_none()

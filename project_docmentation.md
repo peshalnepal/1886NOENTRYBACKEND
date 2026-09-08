@@ -1,6 +1,6 @@
 # 1886NOENTRY Backend — Project Documentation
 
-> Comprehensive technical breakdown of the FastAPI backend (excluding `tensort/` and `tensorrt_test/`).
+> Comprehensive technical breakdown of the FastAPI backend (excluding `tensort/`, the Jetson edge service).
 > Traces every layer (entry point → core → domain → application → routes), every key class, and the end-to-end flows that tie them together. Up to date as of the 2026-05-11 refactor pass ([Section 10](#10-refactoring-notes--history)).
 
 ---
@@ -57,7 +57,7 @@ core/database.py       ── DatabaseManager (engine, sessions, migrations)
 
 Cross-cutting:
 - **domain/** — pure dataclasses / Pydantic events used as transport between layers
-- **application/channels/** & **application/models/** — pipeline building blocks (video channels, YOLO model adapter)
+- **application/channels/** — pipeline building blocks (video channels). Detection runs on the Jetson edge, not here.
 - **dependencies.py** — FastAPI `Depends` factories
 - **Shared helpers** — [core/env.py](core/env.py) (env-var parsers), [application/services/overlay_normalize.py](application/services/overlay_normalize.py) (overlay/detection normalization, used by domain, services, and routes), [routes/_background.py](routes/_background.py) (bg-task + blob-cleanup helpers)
 
@@ -114,7 +114,7 @@ Cross-cutting:
 
 ### Other top-level files
 
-There are no loose `.py` files at `Backend/` root other than [main.py](main.py) and [dependencies.py](dependencies.py). Earlier the root also held `utils.py`, `dto.py`, `verify_fix.py`, and an `Updated/` folder of abandoned drafts — these were all removed during the refactor (see [Section 10](#10-refactoring-notes--history)). DTOs are now split into the folders that own them ([application/models/vision_config.py](application/models/vision_config.py), [application/channels/channel_config.py](application/channels/channel_config.py)).
+There are no loose `.py` files at `Backend/` root other than [main.py](main.py) and [dependencies.py](dependencies.py). Earlier the root also held `utils.py`, `dto.py`, `verify_fix.py`, and an `Updated/` folder of abandoned drafts — these were all removed during the refactor (see [Section 10](#10-refactoring-notes--history)). DTOs are now split into the folders that own them ([application/channels/channel_config.py](application/channels/channel_config.py), [application/dtos.py](application/dtos.py)).
 
 ---
 
@@ -216,17 +216,10 @@ Pure data-shape definitions (Pydantic / dataclasses). No I/O, no DB.
 | `AlertRaisedEvent` | ROI/zone triggered by a tracked detection |
 | `ClipRequestEvent` / `ClipReadyEvent` | Pre-record clip flow |
 
-### [domain/model.py](domain/model.py)
-`VisionModel` Protocol — `async infer(rtsp_ev) -> ChannelEvent`. Implementations live in [application/models/](application/models/).
-
-### [domain/model_pipeline.py](domain/model_pipeline.py)
-`ObjDetectResponse` dataclass ([L39-L62](domain/model_pipeline.py#L39-L62)) — uniform shape returned from polling/streaming detection (detections, pose, tracks, alerts, inference_ms, error reason).
-
 ### [domain/channel.py](domain/channel.py)
 `Channel` abstract base — bidirectional event stream contract, implemented by `VideoChannel`.
 
-### [domain/template.py](domain/template.py)
-`Template` — pipeline blueprint: id + list of channel configs + optional model_cfg. Consumed by `PipelineBuilder`.
+> `ObjDetectResponse` — the uniform shape returned from streaming detection (detections, pose, tracks, alerts, inference_ms, error reason) — now lives in [application/services/pipeline.py](application/services/pipeline.py).
 
 ---
 
@@ -376,7 +369,7 @@ class NotificationService(
 
 #### [overlay_normalize.py](application/services/overlay_normalize.py) — shared overlay helpers
 
-Consolidates 6 helpers + `_coerce_int` that previously existed in 4 different files (`domain/model_pipeline.py`, `application/services/notification.py`, `application/services/clip_storage.py`, `routes/clips_routes.py`). Imported by all 4 of those files plus the new [notification/overlay_helpers.py](application/services/notification/overlay_helpers.py).
+Consolidates 6 helpers + `_coerce_int` that previously existed in 4 different files (`domain/model_pipeline.py`, `application/services/notification.py`, `application/services/clip_storage.py`, `routes/clips_routes.py`). Now imported by [pipeline.py](application/services/pipeline.py), [clip_storage.py](application/services/clip_storage.py), [routes/clips_routes.py](routes/clips_routes.py) and [notification/overlay_helpers.py](application/services/notification/overlay_helpers.py).
 
 Exports:
 - `_coerce_int(value)` — `int(value)` with `TypeError`/`ValueError` → `None`.
@@ -437,21 +430,11 @@ Polls the Jetson for the latest detection JSON per camera.
 - `fetch_detection_json()` — GET `detection/{camera_uuid}/latest`, parses detections/tracks/alerts, retries with backoff.
 - `_device_reachable` flag — drives exponential backoff in `Manager`.
 
-### 5.4 Models — `application/models/`
+### 5.4 Detection — on the Jetson edge, not here
 
-#### [vision_config.py](application/models/vision_config.py)
-`VisionTask` enum (`object_detection`, `pose_estimation`, `multi_task`) and `VisionModelConfig` Pydantic model — the vendor-agnostic shape used by [domain/model.py](domain/model.py)'s `VisionModel` Protocol. Previously lived in the root-level `dto.py`.
+The backend runs no inference of its own. Each Jetson (see `tensort/`) decodes its cameras, runs TensorRT detection, and pushes results to the backend, which consumes those detection streams and applies tracking and ROI rules in [application/services/pipeline.py](application/services/pipeline.py).
 
-#### [yolo_config.py](application/models/yolo_config.py)
-`YoloModelConfig` (extends `VisionModelConfig`) — task, device, imgsz, conf, iou, allowed_labels, plus YOLO-specific `det_weights`, `pose_weights`, `half`, `allowed_det_labels`, `skeleton_label`, `remote_url`, `keypoints_format`.
-
-#### [yolo_model.py](application/models/yolo_model.py)
-`YoloMultiTaskModel` implements the `VisionModel` Protocol. `infer()` calls the Jetson `/v1/detect|/v1/pose|/v1/multitask` endpoints and returns `DetectionsProducedEvent` or an inference-failure event. Throttles pose at a configurable interval when running multi-task.
-
-### 5.5 Builder — `application/builder/`
-
-#### [pipeline_builder.py](application/builder/pipeline_builder.py)
-`PipelineBuilder.create(template)` — instantiates a `VideoChannel` per channel config, optionally loads `YoloMultiTaskModel`, returns a `ModelPipeline`.
+The former local-inference layer — `application/models/` (`YoloMultiTaskModel`, `YoloModelConfig`, `VisionModelConfig`/`VisionTask`), the `VisionModel` Protocol in `domain/model.py`, `domain/template.py`, and the `tensorrt_test/` scratch copy — was removed once detection moved to the edge.
 
 ---
 
@@ -708,7 +691,7 @@ Six passes against the working tree, each verifiable independently. No public AP
 - Archived `Backend/Updated/` (5 abandoned drafts predating current code) to `/home/peshal/1886NOENTRY/_archive/Updated_2026-05-11/`.
 - Deleted: `Backend/utils.py` (no importer), `Backend/verify_fix.py` (one-off mock test, not in `tests/`), `Backend/core/utils.py` (empty file).
 - Deleted `Backend/dto.py`. Its contents moved to their respective folders:
-  - `VisionTask`, `VisionModelConfig` → [application/models/vision_config.py](application/models/vision_config.py)
+  - `VisionTask`, `VisionModelConfig` → `application/models/vision_config.py` (later moved to `domain/vision_config.py`, then removed with the rest of the local-inference layer)
   - `ChannelConfig` (abstract) → folded into [application/channels/channel_config.py](application/channels/channel_config.py)
   - Orphan `SignupRequestCode` / `SignupConfirm` / `LoginRequest` (signup.py had its own real versions) → removed
   - Duplicate `utc_now()` (canonical lives in [core/database_orm.py](core/database_orm.py)) → removed

@@ -1,9 +1,7 @@
 """Background-task helpers.
 
-Previously each service spawned ``asyncio.create_task`` directly (or had its
-own private ``_fire_and_forget``). A bare ``create_task`` whose result is not
-referenced anywhere can be garbage-collected mid-flight, so tasks are tracked
-in a set until they finish.
+A bare ``asyncio.create_task`` whose result is not referenced anywhere can be
+garbage-collected mid-flight, so tasks are tracked in a set until they finish.
 """
 
 from __future__ import annotations
@@ -19,21 +17,27 @@ logger = logging.getLogger(__name__)
 _BACKGROUND_TASKS: Set[asyncio.Task] = set()
 
 
+async def _run_safely(coro: Awaitable, *, name: Optional[str]) -> None:
+    try:
+        await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Background task failed name=%s", name)
+
+
+def _track_task(
+    coro: Awaitable, tasks: Set[asyncio.Task], *, name: Optional[str]
+) -> asyncio.Task:
+    task = asyncio.create_task(_run_safely(coro, name=name), name=name)
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
+
+
 def fire_and_forget(coro: Awaitable, *, name: Optional[str] = None) -> asyncio.Task:
     """Run ``coro`` detached, logging (never raising) any exception."""
-
-    async def _runner() -> None:
-        try:
-            await coro
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Background task failed name=%s", name)
-
-    task = asyncio.create_task(_runner(), name=name)
-    _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TASKS.discard)
-    return task
+    return _track_task(coro, _BACKGROUND_TASKS, name=name)
 
 
 class BackgroundTasks:
@@ -47,18 +51,7 @@ class BackgroundTasks:
         self._tasks: Set[asyncio.Task] = set()
 
     def spawn(self, coro: Awaitable, *, name: Optional[str] = None) -> asyncio.Task:
-        async def _runner() -> None:
-            try:
-                await coro
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Background task failed name=%s", name)
-
-        task = asyncio.create_task(_runner(), name=name)
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-        return task
+        return _track_task(coro, self._tasks, name=name)
 
     async def shutdown(self) -> None:
         tasks = list(self._tasks)

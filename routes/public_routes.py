@@ -1,4 +1,3 @@
-# routes/public_routes.py
 """
 Public, UNAUTHENTICATED endpoints for published camera walls.
 
@@ -11,7 +10,7 @@ Security notes for anyone editing this file:
   * Never return a `CameraSchema`. It requires `source_url`, which can embed RTSP
     credentials. Public responses use `PublicWallCameraSchema` and nothing else.
   * Never call `manager.get_activepipeline()`. It *creates and starts* a pipeline,
-    which would let an anonymous request spin up model inference on the GPU box.
+    which would let an anonymous request spin up edge-device work.
     Only `get_loaded_pipeline()` (a plain registry lookup) is safe here.
   * Every failure path returns the same 404 with the same detail, so a caller
     cannot tell "expired" from "revoked" from "never existed".

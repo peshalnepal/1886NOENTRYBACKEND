@@ -1,7 +1,4 @@
-"""Manager site-schedule loading + runtime sync.
-
-Extracted from the former monolithic application/services/manager.py.
-"""
+"""Manager site-schedule loading + runtime sync."""
 
 from __future__ import annotations
 
@@ -17,7 +14,7 @@ from application.channels.channel_config import VideoChannelConfig
 from application.channels.channel import VideoChannel
 from core.database_orm import Camera
 
-from application.services.manager.helpers import build_video_channel_config
+from application.services.manager.helpers import _camera_config_json, build_video_channel_config
 from application.services.manager.controllers._state import ManagerState
 
 logger = logging.getLogger(__name__)
@@ -164,9 +161,7 @@ class ScheduleResolver:
             site_schedule_cache: Dict[str, Dict[str, Any]] = {}
 
             for cam in cams:
-                cfg_json = {}
-                if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None):
-                    cfg_json = cam.channel_configuration.configuration or {}
+                cfg_json = _camera_config_json(cam)
 
                 use_site_schedule = bool(
                     cfg_json.get("use_site_schedule", getattr(cam, "use_site_schedule", True))

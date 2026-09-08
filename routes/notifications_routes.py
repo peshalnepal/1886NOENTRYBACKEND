@@ -365,9 +365,10 @@ async def notifications_stream(
     user_snapshot_cache: UserSnapshotCache = Depends(get_user_snapshot_cache),
     session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
 ):
-    """
-    User-scoped notifications SSE stream.
-    Authentication can be provided via Authorization header or access_token query param.
+    """User-scoped notifications SSE stream.
+
+    EventSource cannot set headers, so the token may also arrive as the
+    `access_token` query param.
     """
     user = await _resolve_stream_user(
         auth_header=request.headers.get("authorization", ""),

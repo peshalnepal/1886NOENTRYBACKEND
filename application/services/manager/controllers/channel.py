@@ -1,7 +1,4 @@
-"""Manager channel CRUD controllers.
-
-Extracted from the former monolithic application/services/manager.py.
-"""
+"""Manager channel CRUD controllers."""
 
 from __future__ import annotations
 
@@ -141,7 +138,8 @@ class ChannelController:
         patch["channel_id"] = cam_uuid
         camera_code = f"{camera_code_prefix}-{cam_uuid.hex[:8]}"
 
-        # 1. Validate ownership and find device FIRST (before creating stream)
+        # Ownership + device must be validated BEFORE the WebRTC stream is
+        # created, so a rejected request never leaves an orphan stream behind.
         site = await self._state.site_repo.get_site(
             db, site_uuid=site_uuid, user_id=int(user_id), raise_if_missing=False
         )
@@ -175,10 +173,10 @@ class ChannelController:
         device_uuid = dev.device_uuid
         patch["device_uuid"] = device_uuid
 
-        # 2. Create WebRTC stream NOW
         webrtc_url = await self._state.webrtc.ensure_stream(stream_key=str(camera_code), source_url=str(source_url))
 
-        # 3. Upsert to DB, wrapped in try/except to rollback stream on failure
+        # The stream exists before the row does, so a failed upsert must tear it
+        # back down or MediaMTX keeps a stream no camera row references.
         try:
             cam, cfg_json, tz = await self._state.channel_repo.upsert_camera_from_channel_config(
                 db,
@@ -305,7 +303,7 @@ class ChannelController:
         if old_dev is not None and not getattr(old_dev, "device_url", None):
             raise ValueError(f"Assigned device has no device_url for camera {cam_uuid}")
 
-        # Determine new device: requested > preserve old > auto-pick
+        # Device resolution precedence: requested > preserve old > auto-pick.
         requested_device_uuid = patch.get("device_uuid")
         if requested_device_uuid is not None:
             requested_device_uuid = require_uuid(requested_device_uuid, "device_uuid")
@@ -316,10 +314,8 @@ class ChannelController:
             if site_devices and new_dev.device_uuid not in [d.device_uuid for d in site_devices]:
                 raise ValueError(f"Device {requested_device_uuid} is not linked to site {cam_db.site_uuid}.")
         elif old_dev is not None:
-            # PRESERVE: Keep existing device if not changing
             new_dev = old_dev
         else:
-            # AUTO-PICK: Try if exactly 1 device in site
             site_devices = await self._state.device_repo.list_devices(db, site_uuid=cam_db.site_uuid, user_id=user_id)
             if len(site_devices) == 1:
                 new_dev = site_devices[0]
@@ -329,7 +325,6 @@ class ChannelController:
                 
         new_device_uuid = new_dev.device_uuid
         patch["device_uuid"] = new_device_uuid
-        # merge config json
         merged_cfg: Dict[str, Any] = {}
         if chan_cfg_db and getattr(chan_cfg_db, "configuration", None):
             merged_cfg.update(chan_cfg_db.configuration or {})

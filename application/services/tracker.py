@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import time
 import numpy as np
 
-# Optional Hungarian (best). If missing, we fallback to greedy.
 try:
     from scipy.optimize import linear_sum_assignment  # type: ignore
     _HAS_SCIPY = True
@@ -16,21 +15,9 @@ except Exception:
 BBox = np.ndarray
 
 
-# Classes the detector routinely confuses with one another. A four-wheeled
-# vehicle flips between "car" and "truck" (and "bus", where enabled) from frame
-# to frame depending on viewing angle and how much of it is visible — the label
-# is unstable, the object is not. Two consequences, both visible as "the same
-# car tracked twice":
-#
-#   * one frame can carry BOTH a car box and a truck box on one vehicle, which
-#     class-scoped NMS will not suppress;
-#   * across frames the flip breaks same-class association, so the track id
-#     ping-pongs 1,2,1,2 as each label spawns its own track.
-#
-# Grouping them makes both paths treat the labels as interchangeable. Only
-# genuinely confusable classes belong here: "person" and "motorcycle" are never
-# mistaken for a car in a way that should merge their boxes, and grouping them
-# would hide a pedestrian standing beside a vehicle.
+# Labels the detector flips between on one object. Only add genuinely
+# confusable classes — grouping "person" with a vehicle would merge a pedestrian
+# standing beside a car into it.
 CONFUSABLE_CLASS_GROUPS: Tuple[Tuple[str, ...], ...] = (
     ("car", "truck", "bus", "van"),
 )
@@ -43,12 +30,7 @@ _CLASS_GROUP: Dict[str, int] = {
 
 
 def _same_object_class(a: str, b: str) -> bool:
-    """
-    True when two class labels could plausibly describe the same object.
-
-    Confusable classes share a group token; everything else compares by raw
-    name, so unrelated classes still never match each other.
-    """
+    """True when two labels could plausibly describe the same object."""
     if a == b:
         return True
     ga, gb = _CLASS_GROUP.get(a), _CLASS_GROUP.get(b)
@@ -70,16 +52,11 @@ def _iou(a: BBox, b: BBox) -> float:
 
 
 def _assign(cost: np.ndarray) -> List[Tuple[int, int]]:
-    """
-    Return list of (row, col) assignment pairs minimizing cost.
-    Uses Hungarian if available, else greedy.
-    """
+    """(row, col) pairs minimizing cost. Hungarian if scipy is present, else greedy."""
     if cost.size == 0:
         return []
 
-    # Hungarian (and the greedy sort) break on NaN/inf, which can sneak in from
-    # a malformed IoU computation. Replace any non-finite cost with a large but
-    # finite "forbidden" value so the solver simply avoids that pairing.
+    # Both solvers break on NaN/inf; 1e6 reads as "forbidden" instead.
     if not np.all(np.isfinite(cost)):
         cost = np.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)
 
@@ -87,7 +64,6 @@ def _assign(cost: np.ndarray) -> List[Tuple[int, int]]:
         r, c = linear_sum_assignment(cost)
         return list(zip(r.tolist(), c.tolist()))
 
-    # greedy fallback
     pairs = [(i, j, float(cost[i, j])) for i in range(cost.shape[0]) for j in range(cost.shape[1])]
     pairs.sort(key=lambda x: x[2])
     used_r, used_c = set(), set()
@@ -101,14 +77,10 @@ def _assign(cost: np.ndarray) -> List[Tuple[int, int]]:
     return out
 
 def _sanitize_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Defensively normalize raw detections before tracking.
+    """Drop malformed detections and normalize the rest.
 
-    Detections arrive from an external pipeline, so a single malformed entry
-    (missing key, wrong shape, NaN/inf coords, degenerate or inverted box)
-    should not crash the tracker for the whole frame. Bad entries are dropped;
-    good ones are returned with a guaranteed-valid float32 ``bbox`` (x1<=x2,
-    y1<=y2), a clamped ``conf`` and a string ``cls_name``.
+    Guarantees a float32 bbox with x1<=x2, y1<=y2, a clamped conf and a string
+    cls_name, so one bad entry from the edge cannot crash the whole frame.
     """
     if not detections:
         return []
@@ -148,28 +120,12 @@ def nms_payload_detections(
     overlap_thr: float = 0.70,
     size_ratio_thr: float = 0.65,
 ) -> List[Dict[str, Any]]:
-    """
-    Greedy NMS over raw edge detections, in the wire format they arrive in.
+    """Greedy NMS over raw edge detections, in their wire format.
 
-    Operates on the payload shape (``{"box": {"x1","y1","x2","y2"}, "cls_name",
-    "conf"}``) rather than the tracker's internal float32 bbox, so it can run at
-    ingestion — BEFORE the payload fans out to the drawn overlay and the tracker
-    separately. Deduping inside the tracker alone fixes the track ids but not
-    the picture: the live overlay draws the raw edge boxes too (see
-    ``_overlay_payload_from_resp``), so a leaked duplicate stays visible.
-
-    Suppression uses the same two-part test as ``_dedupe_detections`` plus a
-    plain-IoU arm:
-
-      * ``iou_thr``    — classic NMS: heavy mutual overlap.
-      * ``overlap_thr`` + ``size_ratio_thr`` — catches the offset duplicate that
-        plain IoU misses (IoU ~0.49) without merging two occluding vehicles
-        (IoU ~0.60), by additionally requiring the boxes be similar in size.
-
-    Only same-class boxes suppress each other, and the highest-confidence box in
-    a cluster survives. Entries whose box cannot be parsed are passed through
-    untouched rather than dropped — this is a de-duplication pass, not a
-    validation pass; the tracker's ``_sanitize_detections`` owns that.
+    Runs at ingestion, before the payload fans out to the overlay and the tracker
+    separately, so a leaked duplicate is kept out of both. Highest confidence in
+    a cluster survives; only same-class boxes suppress each other. Unparseable
+    boxes pass through — validation belongs to ``_sanitize_detections``.
     """
     if not isinstance(detections, list) or len(detections) < 2:
         return list(detections) if isinstance(detections, list) else []
@@ -231,15 +187,11 @@ def nms_payload_detections(
 
 
 def _overlap_min(a: BBox, b: BBox) -> Tuple[float, float]:
-    """
-    Return (intersection / smaller area, smaller area / larger area).
+    """Return (intersection / smaller area, smaller area / larger area).
 
-    Plain IoU cannot separate a leaked duplicate from two heavily-occluded
-    vehicles: a loose duplicate scores ~0.49 while two cars overlapping in
-    perspective score ~0.60. Intersection-over-smaller-area plus a size-
-    similarity ratio does separate them — a duplicate is both mostly-contained
-    AND about the same size, whereas a small box nested inside a much larger one
-    (a car inside a truck's box) is contained but very different in size.
+    Plain IoU cannot separate a loose duplicate (~0.49) from two occluding
+    vehicles (~0.60); adding a size-similarity ratio does, since a duplicate is
+    both mostly-contained AND about the same size.
     """
     x1 = max(float(a[0]), float(b[0]))
     y1 = max(float(a[1]), float(b[1]))
@@ -260,35 +212,13 @@ def _dedupe_detections(
     overlap_thr: float = 0.70,
     size_ratio_thr: float = 0.65,
 ) -> List[Dict[str, Any]]:
-    """
-    Collapse near-duplicate boxes on the same object into one detection.
+    """Collapse near-duplicate boxes on one object into a single detection.
 
-    The edge runs its own NMS, but a leaked duplicate still reaches us: two
-    boxes on one vehicle, offset by a few pixels. Association has no reason to
-    reject either (both overlap a track well), so the second box spawns a second
-    track and the object is drawn with TWO ids at once, indefinitely — the
-    "multiple boxes on a car that hasn't moved" symptom. No amount of gate or
-    confirmation tuning fixes this: it is a duplicate *input*, faithfully
-    tracked twice.
-
-    Second line of defence. ``nms_payload_detections`` normally suppresses these
-    at ingestion (see ModelPipeline._payload_to_resp), which also keeps the
-    duplicate out of the DRAWN overlay — something this pass cannot do, because
-    by here the overlay has already been built from the raw payload. This stays
-    because ByteTrackLite is public and may be fed detections that never went
-    through that path.
-
-    A pair is a duplicate only if it is BOTH mostly-overlapping (by
-    ``_overlap_min``) AND similar in size. Both conditions are needed:
-
-      * overlap alone merges a car detected inside a truck's larger box;
-      * size alone merges two same-model cars parked side by side.
-
-    Only same-class pairs are considered, so a person standing in front of a car
-    is never merged. Thresholds stay deliberately conservative — two vehicles
-    heavily occluding each other are geometrically indistinguishable from a
-    loose duplicate, and drawing two boxes on one car is a far milder failure
-    than dropping a real vehicle. Highest confidence wins, as in NMS.
+    Second line of defence behind ``nms_payload_detections``, for callers that
+    feed ByteTrackLite directly. A pair must be BOTH mostly-overlapping AND
+    similar in size: overlap alone merges a car inside a truck's box, size alone
+    merges two cars parked side by side. Thresholds stay conservative — two boxes
+    on one car is a milder failure than dropping a real vehicle.
     """
     if len(detections) < 2:
         return detections
@@ -308,7 +238,7 @@ def _dedupe_detections(
             kept.append(i)
     if len(kept) == len(detections):
         return detections
-    return [detections[i] for i in sorted(kept)]       # restore input order
+    return [detections[i] for i in sorted(kept)]
 
 
 def _xyxy_to_cxcyah(b: BBox) -> np.ndarray:
@@ -334,47 +264,34 @@ class Track:
     score: float
     start_ts: float
     last_ts: float
-    last_update_ts: float
 
     hits: int = 1
     misses: int = 0
     confirmed: bool = False
 
-    # Confidence-weighted vote per observed label. Within a confusable group the
-    # per-frame label is unstable (a van reads "car" on one frame and "truck" on
-    # the next), so reporting whatever the FIRST frame happened to say freezes a
-    # coin-flip for the life of the track — and cls_name drives ROI class
-    # filtering and the notification text. Voting reports the label the evidence
-    # actually favours, and lets it change as more frames arrive.
+    # Confidence-weighted votes per label; cls_name follows the running winner
+    # rather than whichever label the first frame carried.
     cls_votes: Dict[str, float] = field(default_factory=dict)
 
-    # velocity is now 3D: [vcx, vcy, vh]. Aspect ratio is held constant — see predict().
+    # [vcx, vcy, vh]. Aspect ratio is held constant — see predict().
     vel: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
 
     def predict(self, now_ts: float, max_dt: float = 0.5) -> BBox:
-        # dt is clamped so a noisy velocity estimate can't fling the predicted
-        # box across the frame. ``max_dt`` is supplied by the tracker and scales
-        # with the observed frame interval: at 0.1-0.25 FPS we still extrapolate
-        # ~one frame ahead instead of the old fixed 0.15s, which made prediction
-        # a no-op for slow/irregular streams.
+        # Clamped so a noisy velocity can't fling the box across the frame.
         dt = min(max(1e-3, now_ts - self.last_ts), max(1e-3, max_dt))
         state = _xyxy_to_cxcyah(self.bbox)
         state[0] += self.vel[0] * dt
         state[1] += self.vel[1] * dt
-        # Advance height by vh*dt (aspect 'a' is held constant). Floor the height
-        # so a shrinking object over a long (up to ~2s) frame interval can't push
-        # the predicted box to zero/negative height — that would produce an
-        # inverted, degenerate box and a garbage IoU, dropping the track.
+        # Floored: a shrinking object over a long interval would otherwise give
+        # an inverted box and a garbage IoU.
         state[3] = max(1e-3, state[3] + self.vel[2] * dt)
         return _cxcyah_to_xyxy(state)
 
     def vote_class(self, cls_name: str, det_score: float) -> None:
-        """
-        Record one label observation and adopt the running winner.
+        """Record one label observation and adopt the running winner.
 
-        Confidence-weighted so a hesitant 0.3 "truck" does not outweigh repeated
-        confident "car" readings. Only called for labels that already passed the
-        association class check, so a track never drifts to an unrelated class.
+        Only called for labels that passed the association class check, so a
+        track never drifts to an unrelated class.
         """
         name = str(cls_name)
         if not self.cls_votes:
@@ -382,17 +299,12 @@ class Track:
         self.cls_votes[name] = self.cls_votes.get(name, 0.0) + max(1e-6, float(det_score))
         self.cls_name = max(self.cls_votes.items(), key=lambda kv: kv[1])[0]
 
-    def update(self, det_bbox: BBox, det_score: float, now_ts: float, alpha: float = 0.4, max_dt: float = 0.5) -> None:
-        # Estimate velocity over the *actual* elapsed time, not the prediction
-        # clamp. When a track is re-matched after coasting through several misses,
-        # the real gap can far exceed max_dt; dividing the displacement by the
-        # clamped (smaller) dt used to inflate the velocity and fling the next
-        # prediction across the frame. For steady FPS (elapsed <= max_dt) this is
-        # identical to before. ``max_dt`` is kept for call-site compatibility.
+    def update(self, det_bbox: BBox, det_score: float, now_ts: float, alpha: float = 0.4) -> None:
+        # Over ACTUAL elapsed time, not predict()'s clamp: dividing by the
+        # smaller clamped dt would inflate velocity after a coast.
         elapsed = max(1e-3, now_ts - self.last_ts)
         old = _xyxy_to_cxcyah(self.bbox)
         new = _xyxy_to_cxcyah(det_bbox)
-        # [vcx, vcy, vh] — no va, aspect is held constant by predict().
         new_vel = np.array([
             (new[0] - old[0]) / elapsed,
             (new[1] - old[1]) / elapsed,
@@ -402,81 +314,34 @@ class Track:
         self.bbox = det_bbox
         self.score = float(det_score)
         self.last_ts = now_ts
-        self.last_update_ts = now_ts
         self.hits += 1
         self.misses = 0
 
     def on_miss(self, decay: float = 0.9) -> None:
         self.misses += 1
-        # Damp velocity: confidence in the extrapolation drops with each miss.
         self.vel *= decay
 
 
 class ByteTrackLite:
-    """
-    ByteTrack-style (no ReID):
-      - split detections into high / low confidence
-      - stage1: match tracks with high-conf dets
-      - stage2: match remaining tracks with low-conf dets (helps with flicker)
-      - create new tracks from unmatched high-conf dets
-      - confirm after min_hits
+    """ByteTrack-style association (no ReID), IoU-first.
 
-    Frame-rate robustness
-    ---------------------
-    The delivered rate per camera varies by two orders of magnitude: a camera
-    on a dedicated pipeline sees ~8-10 FPS (dt ~0.1s), while one Jetson
-    round-robining ~20 cameras delivers ~0.1-0.25 FPS (dt ~4-10s). Every
-    time-based threshold therefore self-tunes to the *observed* inter-frame
-    interval (an EMA of dt) instead of assuming a fixed rate:
-
-      * The staleness budget scales with the interval. A fixed 0.1s budget used
-        to purge every track on the very next frame, so nothing ever survived
-        long enough to confirm.
-      * Velocity prediction extrapolates ~one frame ahead rather than a fixed
-        0.15s.
-      * The center-distance fallback stays dormant at high rates (IoU alone is
-        reliable when objects move less than their own size per frame) and
-        enables itself automatically once the interval crosses
-        ``assoc_dist_min_interval``.
-      * Confirmation is bounded by ``confirm_max_s`` as well as ``min_hits``,
-        so a slow camera does not need min_hits*dt (12s at 0.25 FPS) before it
-        can draw anything.
+    Delivered frame rate varies by two orders of magnitude — ~10 FPS on a
+    dedicated pipeline, ~0.1-0.25 FPS when one Jetson round-robins 20 cameras —
+    so every time-based threshold self-tunes to the observed interval.
 
     NOTE: low_th must stay at or above the edge's CONF filter (see
-    Backend/tensort/.env.example). If the Jetson filters at a HIGHER confidence
-    than low_th, the stage-2 rescue band is empty and a briefly-dimmer detection
-    drops the track instead of re-linking it — visible as boxes blinking out.
-
-    Association is IoU-first, with a center-distance fallback that engages only
-    on slow streams (see ``assoc_center_dist``). By default the public output is
-    realtime-only: tracks that did not match a detection on the current frame
-    are kept only inside the tracker, never emitted as drawable boxes. This
-    prevents old bboxes from trailing fast-moving objects while still allowing
-    callers to raise ``max_misses`` for short internal occlusion tolerance.
+    Backend/tensort/.env.example), or the stage-2 rescue band is empty and a
+    briefly-dimmer detection drops the track instead of re-linking it.
     """
     def __init__(
         self,
         high_th: float = 0.5,
-        # Matches the edge CONF filter (0.20) so the stage-2 rescue band
-        # [low_th, high_th) actually receives detections.
-        low_th: float = 0.20,
+        low_th: float = 0.20,          # keep >= the edge CONF filter
         min_iou_high: float = 0.40,
         min_iou_low: float = 0.20,
-        # ~3 frames (~300ms) to confirm at 10 FPS — still fast, but rejects the
-        # 1-2 frame noise that the lower edge threshold lets through. On a slow
-        # camera this is capped by confirm_max_s below, because 3 frames at one
-        # frame per 4s would mean a 12s wait before anything is drawable.
         min_hits: int = 3,
-        # Upper bound, in seconds, on how long a track may stay tentative. A
-        # track that has been matched at least twice and has existed for this
-        # long is confirmed even if it has not reached min_hits yet. At 10 FPS
-        # min_hits is reached in ~0.3s so this never triggers; at 0.25 FPS it is
-        # what makes a box appear at all. Two hits is still required, so a
-        # single spurious detection never confirms.
-        confirm_max_s: float = 1.5,
-        # ~0.8-1.0s of occlusion/flicker tolerance at 10 FPS. This is the main
-        # anti-ID-churn knob; 4 frames was ~0.4s and dropped tracks too eagerly.
-        max_misses: int = 8,
+        confirm_max_s: float = 1.5,    # tentative-track age cap; still needs 2 hits
+        max_misses: int = 8,           # main anti-ID-churn knob
         max_stale_s: Optional[float] = None,
         stale_frames: float = 8.0,
         predict_horizon_frames: float = 1.5,
@@ -485,21 +350,9 @@ class ByteTrackLite:
         assoc_center_dist: bool = True,
         assoc_dist_scale: float = 2.5,
         assoc_dist_min_interval: float = 0.25,
-        # Extra distance budget per second of elapsed time, as a multiple of
-        # object size. A size-only gate ignores how long the object had to move:
-        # at one frame per 4s a car crosses far more than a few car-lengths, so
-        # the gate could never reach it and a new id was minted every frame.
-        assoc_dist_per_s: float = 1.5,
-        # Hard ceiling on the gate, as a multiple of object size, so the
-        # time-scaled term above cannot grow without bound on a very long gap
-        # and start linking genuinely unrelated objects across the frame.
-        assoc_dist_max_scale: float = 12.0,
-        # Collapse same-class detections that both overlap this much (as a
-        # fraction of the SMALLER box) and are at least dedupe_size_ratio as
-        # similar in size, so a duplicate box leaked past the edge's NMS does
-        # not spawn a second track on an object that already has one.
-        # Set dedupe_overlap to 0 to disable.
-        dedupe_overlap: float = 0.70,
+        assoc_dist_per_s: float = 1.5,      # gate widens with time to move
+        assoc_dist_max_scale: float = 12.0, # ceiling, or it links unrelated objects
+        dedupe_overlap: float = 0.70,       # 0 disables dedupe
         dedupe_size_ratio: float = 0.65,
     ) -> None:
         self.high_th = float(high_th)
@@ -508,31 +361,15 @@ class ByteTrackLite:
         self.min_iou_low = float(min_iou_low)
         self.min_hits = int(min_hits)
         self.confirm_max_s = float(confirm_max_s)
-        # max_misses = 0: drop a track as soon as it misses a frame. Raise it
-        # only if you want short internal occlusion tolerance. Public output
-        # still suppresses missed tracks unless emit_coasting_tracks=True.
         self.max_misses = int(max_misses)
-        # max_stale_s: absolute-time staleness budget. Leave as None (default) to
-        # derive it from the observed frame interval so the tracker self-tunes to
-        # whatever (possibly very low / irregular) FPS each camera delivers. Set
-        # an explicit value only to hard-override that behaviour.
+        # None derives the staleness budget from the observed frame interval.
         self.max_stale_s = float(max_stale_s) if max_stale_s is not None else None
-        # How many frames a track may coast (when deriving max_stale_s) and how
-        # far ahead predict() may extrapolate, both measured in frame intervals.
         self.stale_frames = float(stale_frames)
         self.predict_horizon_frames = float(predict_horizon_frames)
         self.match_same_class = bool(match_same_class)
         self.emit_coasting_tracks = bool(emit_coasting_tracks)
-        # Center-distance association fallback for low / irregular FPS. Pure IoU
-        # association silently fails once an object moves more than its own size
-        # between frames: with velocity still zero on the first re-match, the
-        # predicted box equals the old box, IoU drops below min_iou, and a new ID
-        # is spawned every frame so velocity is never learned. When the observed
-        # interval is >= assoc_dist_min_interval (i.e. the stream is slow enough
-        # that IoU alone is unreliable) we additionally allow matching by center
-        # distance, gated to assoc_dist_scale * object-size. IoU matches always
-        # cost less than distance matches, so high-FPS behaviour is unchanged and
-        # association quality is preserved; this only rescues the slow-FPS case.
+        # Rescues low FPS, where an object moves more than its own size between
+        # frames and IoU alone spawns a new id every frame.
         self.assoc_center_dist = bool(assoc_center_dist)
         self.assoc_dist_scale = float(assoc_dist_scale)
         self.assoc_dist_min_interval = float(assoc_dist_min_interval)
@@ -544,26 +381,19 @@ class ByteTrackLite:
         self._next_id = 1
         self._tracks: List[Track] = []
 
-        # Observed inter-frame interval (EMA, seconds) and the timestamp of the
-        # previous update(), used to make all thresholds frame-rate adaptive.
         self._dt_ema: Optional[float] = None
         self._last_now_ts: Optional[float] = None
 
     def _frame_interval(self) -> float:
-        """Best estimate of the current inter-frame interval (seconds)."""
+        """Observed inter-frame interval in seconds, 0.0 until known."""
         return float(self._dt_ema) if self._dt_ema is not None else 0.0
 
     def _should_confirm(self, t: Track, now_ts: float) -> bool:
-        """
-        Whether a tentative track has earned confirmation.
+        """Whether a tentative track has earned confirmation.
 
-        Frame count alone (``min_hits``) assumes a steady frame rate. One Jetson
-        round-robining ~20 cameras delivers ~0.25 FPS per camera, where 3 hits
-        is a 12-second wait — and since only confirmed tracks are drawn, the
-        overlay stayed empty for objects that had been tracked the whole time.
-        The age-based path confirms a track that has survived long enough,
-        while still requiring a second sighting so one-frame noise never
-        confirms.
+        min_hits alone assumes a steady rate; at 0.25 FPS three hits is a 12s
+        wait and only confirmed tracks are drawn. The age path still requires a
+        second sighting, so one-frame noise never confirms.
         """
         if t.hits >= self.min_hits:
             return True
@@ -576,14 +406,11 @@ class ByteTrackLite:
         if self.max_stale_s is not None:
             stale_budget = self.max_stale_s
         else:
-            # Allow ~stale_frames frames of coasting, with a 1.5x jitter margin
-            # and a small floor so high-FPS streams still behave sensibly. This
-            # is the key low-FPS fix: a fixed 0.1s budget purged every track on
-            # the next frame (5-10s later) before it could ever confirm.
+            # ~stale_frames of coasting, plus a jitter margin and a floor.
             stale_budget = max(0.5, interval * self.stale_frames * 1.5)
         kept: List[Track] = []
         for t in self._tracks:
-            stale_s = now_ts - t.last_update_ts
+            stale_s = now_ts - t.last_ts
             if stale_s > stale_budget:
                 continue
             if t.misses > self.max_misses:
@@ -596,35 +423,25 @@ class ByteTrackLite:
         if not np.isfinite(now_ts):
             now_ts = time.time()
 
-        # Drop malformed detections up front so a single bad entry can't crash
-        # the frame, and so downstream code can assume valid float32 bboxes.
+        # Dedupe before association, or the extra box becomes a second track.
         detections = _sanitize_detections(detections)
-        # Then collapse duplicate boxes on one object, before association gets a
-        # chance to promote the extra box into a second track.
         if self.dedupe_overlap > 0.0:
             detections = _dedupe_detections(
                 detections, self.dedupe_overlap, self.dedupe_size_ratio
             )
 
-        # Track the observed inter-frame interval so every time-based threshold
-        # self-tunes to the actual delivery rate (which for a Jetson cycling
-        # through ~20 cameras can be one frame every 4-10s). The pipeline only
-        # forwards forward-progressing frames, so dt is normally positive; guard
-        # anyway against the rare Jetson-restart timestamp regression.
+        # Guard against a Jetson-restart timestamp regression.
         if self._last_now_ts is not None:
             raw_dt = now_ts - self._last_now_ts
             if raw_dt > 0:
                 self._dt_ema = raw_dt if self._dt_ema is None else (0.7 * self._dt_ema + 0.3 * raw_dt)
         self._last_now_ts = now_ts
 
-        # Seed the interval estimate from the gap that is about to be matched,
-        # BEFORE association runs. _frame_interval() is otherwise still 0.0 on
-        # the first re-match, so use_dist stayed off for exactly the frame where
-        # a cold track (velocity still zero, hence a predicted box equal to the
-        # old one) needs the distance fallback most. On a slow camera that lost
-        # the object's very first re-match and started the churn cycle.
+        # Seed before association runs: otherwise the interval is still 0.0 on
+        # the first re-match, exactly when a cold track (zero velocity, so no
+        # useful prediction) needs the distance fallback most.
         if self._dt_ema is None and self._tracks:
-            gap = now_ts - max(t.last_update_ts for t in self._tracks)
+            gap = now_ts - max(t.last_ts for t in self._tracks)
             if gap > 0:
                 self._dt_ema = gap
 
@@ -633,8 +450,6 @@ class ByteTrackLite:
         lo = [d for d in detections if self.low_th <= float(d["conf"]) < self.high_th]
 
         events: List[Tuple[str, int]] = []
-        # Extrapolate/update up to ~predict_horizon_frames of motion (bounded by
-        # the observed interval) rather than a fixed sub-second window.
         max_track_dt = max(0.15, self._frame_interval() * self.predict_horizon_frames)
         pred = [t.predict(now_ts, max_track_dt) for t in self._tracks]
 
@@ -644,33 +459,21 @@ class ByteTrackLite:
         matched_track_idxs: set = set()
         live_track_ids: set[int] = set()
 
-        # Enable the center-distance fallback only once the stream is slow enough
-        # that IoU alone is unreliable. Below this interval (fast streams) the
-        # behaviour is byte-for-byte the old pure-IoU association.
         use_dist = self.assoc_center_dist and self._frame_interval() >= self.assoc_dist_min_interval
-        # cost layout:  IoU match  -> [0, 1-min_iou]  (< 1, always preferred)
-        #               dist match -> [1, 1.5)        (only when use_dist)
-        #               forbidden  -> 1e6
+        # cost:  IoU [0, 1-min_iou) | distance [1, 1.5) | forbidden 1e6
         #
-        # _ACCEPT must sit strictly ABOVE the top of the distance band. It used
-        # to be 1.6 while the distance cost was 1 + dist/gate (range [1, 2)),
-        # which silently rejected every pairing with dist > 0.6*gate: the gate
-        # admitted a pair and the accept test then threw it away. The effective
-        # gate was 60% of the configured one, so a car moving more than
-        # 0.6*assoc_dist_scale*size per frame got a brand-new id EVERY frame,
-        # never reached min_hits, and never confirmed — no box was ever drawn.
-        # Scaling the distance band to [1, 1.5) makes a match anywhere inside
-        # the gate acceptable, so assoc_dist_scale is now the only gate.
+        # _ACCEPT must stay at the TOP of the distance band so the gate is the
+        # only rejection test; lower it and pairings the gate admitted are
+        # silently discarded, narrowing the effective gate.
         _ACCEPT = 1.5
 
         def _match(track_idxs, det_idxs, det_list, min_iou):
-            """Hungarian match between a subset of tracks and a subset of detections."""
+            """Hungarian match between a subset of tracks and detections."""
             if not track_idxs or not det_idxs:
                 return []
             track_idxs = list(track_idxs)
             det_idxs = list(det_idxs)
-            # 1e6 = "impossible pair" — safer than 1.0, which Hungarian could
-            # still pick as a locally optimal assignment.
+            # 1e6, not 1.0: Hungarian could pick 1.0 as locally optimal.
             cost = np.full((len(track_idxs), len(det_idxs)), 1e6, dtype=np.float32)
             for ii, ti in enumerate(track_idxs):
                 t = self._tracks[ti]
@@ -678,10 +481,9 @@ class ByteTrackLite:
                 pcx = 0.5 * (float(pb[0]) + float(pb[2]))
                 pcy = 0.5 * (float(pb[1]) + float(pb[3]))
                 ph = float(pb[3]) - float(pb[1])
-                # Per-track elapsed time: a track that has been coasting through
-                # misses has had longer to move than one matched last frame, so
-                # it earns a proportionally wider gate below.
-                gap_s = max(0.0, now_ts - t.last_update_ts)
+                # A track coasting through misses had longer to move, so it
+                # earns a proportionally wider gate below.
+                gap_s = max(0.0, now_ts - t.last_ts)
                 for jj, dj in enumerate(det_idxs):
                     d = det_list[dj]
                     if self.match_same_class and not _same_object_class(
@@ -694,9 +496,6 @@ class ByteTrackLite:
                         continue
                     if not use_dist:
                         continue                                                          # pure-IoU regime: reject
-                    # Low/zero overlap but the stream is slow: fall back to center
-                    # distance so a fast object (or a zero-velocity cold start) can
-                    # still be linked instead of spawning a fresh ID every frame.
                     db = d["bbox"]
                     dcx = 0.5 * (float(db[0]) + float(db[2]))
                     dcy = 0.5 * (float(db[1]) + float(db[3]))
@@ -707,10 +506,8 @@ class ByteTrackLite:
                     ratio = dh / ph
                     if ratio < 0.5 or ratio > 2.0:                                        # very different scales
                         continue
-                    # Gate grows with the time the object had to move, capped at
-                    # assoc_dist_max_scale * size. Size alone is not enough: the
-                    # same car is a 200px gate at 10 FPS and needs ~800px after a
-                    # 4s round-robin gap.
+                    # Size alone is not enough: the same car needs a ~200px gate
+                    # at 10 FPS and ~800px after a 4s round-robin gap.
                     size = 0.5 * (dw + dh)
                     scale = min(
                         self.assoc_dist_scale + self.assoc_dist_per_s * gap_s,
@@ -721,10 +518,6 @@ class ByteTrackLite:
                         continue
                     dist = float(np.hypot(dcx - pcx, dcy - pcy))
                     if dist < gate:
-                        # [1, 1.5): always worse than any IoU match (< 1), and
-                        # always below _ACCEPT so the gate above is the only
-                        # rejection test. Closer candidates still cost less, so
-                        # Hungarian keeps picking the best pairing.
                         cost[ii, jj] = 1.0 + 0.5 * (dist / gate)
             matches = []
             for ii, jj in _assign(cost):
@@ -740,7 +533,7 @@ class ByteTrackLite:
             matched_track_idxs.add(ti)
             unmatched_hi.discard(dj)
             self._tracks[ti].vote_class(hi[dj]["cls_name"], float(hi[dj]["conf"]))
-            self._tracks[ti].update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts, max_dt=max_track_dt)
+            self._tracks[ti].update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts)
             live_track_ids.add(self._tracks[ti].track_id)
 
         # ─── Stage 1b: tentative tracks ↔ remaining high-conf detections ───
@@ -749,7 +542,7 @@ class ByteTrackLite:
             unmatched_hi.discard(dj)
             t = self._tracks[ti]
             t.vote_class(hi[dj]["cls_name"], float(hi[dj]["conf"]))
-            t.update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts, max_dt=max_track_dt)
+            t.update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts)
             live_track_ids.add(t.track_id)
             if self._should_confirm(t, now_ts):
                 t.confirmed = True
@@ -764,13 +557,13 @@ class ByteTrackLite:
             t = self._tracks[ti]
             was_confirmed = t.confirmed
             t.vote_class(lo[dj]["cls_name"], float(lo[dj]["conf"]))
-            t.update(lo[dj]["bbox"], float(lo[dj]["conf"]), now_ts, max_dt=max_track_dt)
+            t.update(lo[dj]["bbox"], float(lo[dj]["conf"]), now_ts)
             live_track_ids.add(t.track_id)
             if (not was_confirmed) and self._should_confirm(t, now_ts):
                 t.confirmed = True
                 events.append(("track_confirmed", t.track_id))
 
-        # ─── Tracks that got nothing this frame: bump misses, decay velocity ───
+        # ─── Unmatched tracks: bump misses, decay velocity ───
         for ti in range(len(self._tracks)):
             if ti not in matched_track_idxs:
                 self._tracks[ti].on_miss()
@@ -787,19 +580,16 @@ class ByteTrackLite:
                 score=float(d["conf"]),
                 start_ts=now_ts,
                 last_ts=now_ts,
-                last_update_ts=now_ts,
             ))
             live_track_ids.add(tid)
             events.append(("track_created", tid))
 
-        # Apply the miss/stale budget before returning. Without this, a track
-        # that just missed is emitted for one extra frame and can be drawn
-        # beside the newly-created track for a fast object that jumped ahead.
+        # Before returning, or a just-missed track is emitted for one extra
+        # frame beside the new track of the object that jumped ahead.
         self._purge(now_ts)
 
-        # Output only tracks backed by a detection on this update. Coasting
-        # tracks keep their previous bbox, so emitting them is the visible stale
-        # box bug for fast objects that jumped to a new location.
+        # Coasting tracks keep their old bbox, so emitting them leaves a stale
+        # box behind a fast-moving object.
         out_tracks = []
         for t in self._tracks:
             if not self.emit_coasting_tracks and t.track_id not in live_track_ids:
@@ -813,13 +603,9 @@ class ByteTrackLite:
                 "hits": t.hits,
                 "misses": t.misses,
                 "age_s": now_ts - t.start_ts,
-                "last_seen_s": now_ts - t.last_update_ts,
+                "last_seen_s": now_ts - t.last_ts,
             })
         return {"events": events, "tracks": out_tracks}
-
-# --------------------------
-# ROI + Alerting (notify on confirmed + ROI enter)
-# --------------------------
 
 @dataclass(frozen=True)
 class ROI:
@@ -834,10 +620,10 @@ class ROI:
     
     
 def _bbox_anchor(b: List[float], mode: str) -> Tuple[float, float]:
-    """Pick the point on the bbox that represents 'where the object is'."""
+    """The point on the bbox representing where the object is."""
     x1, y1, x2, y2 = b
     if mode == "center":
-        return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)  # geometric center
+        return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
     return ((x1 + x2) * 0.5, max(y1, y2))
 
 def _point_in_poly(x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
@@ -927,59 +713,110 @@ def _bbox_intersects_poly(b: List[float], poly: List[Tuple[float, float]]) -> bo
     return False
 
 
-def _contain_rect(outer_w: float, outer_h: float, inner_aspect: float) -> Tuple[float, float, float, float]:
-    outer_aspect = float(outer_w) / max(float(outer_h), 1e-9)
-    if outer_aspect > inner_aspect:
-        active_h = float(outer_h)
-        active_w = active_h * inner_aspect
-        offset_x = (float(outer_w) - active_w) / 2.0
-        offset_y = 0.0
-    else:
-        active_w = float(outer_w)
-        active_h = active_w / max(inner_aspect, 1e-9)
-        offset_x = 0.0
-        offset_y = (float(outer_h) - active_h) / 2.0
-    return offset_x, offset_y, active_w, active_h
-
-
 def _roi_points_px(roi: ROI, frame_w: int, frame_h: int) -> List[Tuple[float, float]]:
+    """Project ROI points into pixel coordinates of the current frame.
+
+    Normalized points are fractions of the FULL frame, so scaling by the live
+    frame size is the whole conversion — do NOT add a letterbox remap.
+    roi.frame_w/frame_h are provenance, used only to rescale pixel ROIs.
+    """
     if not roi.normalized:
+        if roi.frame_w and roi.frame_h:
+            sx = float(frame_w) / max(float(roi.frame_w), 1e-9)
+            sy = float(frame_h) / max(float(roi.frame_h), 1e-9)
+            if sx != 1.0 or sy != 1.0:
+                return [(float(px) * sx, float(py) * sy) for (px, py) in roi.points]
         return roi.points
-    if roi.frame_w and roi.frame_h and (int(roi.frame_w) != int(frame_w) or int(roi.frame_h) != int(frame_h)):
-        src_w = float(roi.frame_w)
-        src_h = float(roi.frame_h)
-        dst_w = float(frame_w)
-        dst_h = float(frame_h)
-        dst_aspect = dst_w / max(dst_h, 1e-9)
-        offset_x, offset_y, active_w, active_h = _contain_rect(src_w, src_h, dst_aspect)
-        out: List[Tuple[float, float]] = []
-        for (px, py) in roi.points:
-            src_x = float(px) * src_w
-            src_y = float(py) * src_h
-            dst_x_norm = (src_x - offset_x) / max(active_w, 1e-9)
-            dst_y_norm = (src_y - offset_y) / max(active_h, 1e-9)
-            out.append(
-                (
-                    max(0.0, min(1.0, dst_x_norm)) * dst_w,
-                    max(0.0, min(1.0, dst_y_norm)) * dst_h,
-                )
-            )
-        return out
     return [(px * frame_w, py * frame_h) for (px, py) in roi.points]
 
 
 class ROIAlertEngine:
+    """Alerts when a confirmed track enters an ROI (edge trigger).
+
+    A dropped frame and a re-minted track id both look like a fresh entry, so
+    repeats are suppressed three ways: state retires on a TTL rather than on
+    absence, leaving needs exit_grace_s of continuous outside readings, and a
+    recent alert for the same class in the same place blocks the next.
     """
-    Emits alert when:
-      - track is confirmed AND
-      - track enters ROI (edge trigger)
-    Also avoids repeat notifications per (camera_uuid, roi_id, track_id).
-    """
-    def __init__(self) -> None:
+
+    def __init__(
+        self,
+        state_ttl_s: float = 30.0,
+        exit_grace_s: float = 10.0,
+        realert_cooldown_s: float = 60.0,
+        realert_iou: float = 0.3,
+    ) -> None:
         self._in_roi: Dict[Tuple[str, str, int], bool] = {}
         self._inside_streak: Dict[Tuple[str, str, int], int] = {}
-        self._outside_streak: Dict[Tuple[str, str, int], int] = {}
+        self._last_seen_s: Dict[Tuple[str, str, int], float] = {}
+        self._last_inside_s: Dict[Tuple[str, str, int], float] = {}
+        # Keyed WITHOUT track_id, so a re-identified object does not re-alert.
+        self._recent_alerts: Dict[Tuple[str, str, str], List[Tuple[float, List[float]]]] = {}
+        # Retire on a timer, NOT on absence from `tracks`: only tracks matched
+        # this frame are emitted, so absence would re-arm the edge trigger.
+        self.state_ttl_s = float(state_ttl_s)
+        self.exit_grace_s = float(exit_grace_s)
+        self.realert_cooldown_s = float(realert_cooldown_s)
+        self.realert_iou = float(realert_iou)
 
+    def _entry_threshold(self, roi: ROI, frame_interval_s: float) -> int:
+        """Consecutive inside-frames needed to trigger.
+
+        enter_after_n assumes frames are close together. At one frame every
+        4-10s, requiring two means the object must stay 8s+ and be detected on
+        both — a vehicle driving through never alerts.
+        """
+        n = int(roi.enter_after_n)
+        if n <= 1:
+            return 1
+        if frame_interval_s >= 1.0:
+            return 1
+        return n
+
+    def _recently_alerted(
+        self, camera_uuid: str, roi_id: str, cls_name: str, bbox: Any, now_s: float
+    ) -> bool:
+        """Whether an equivalent alert already fired here recently.
+
+        Track ids are not stable, so this matches on (class, place, time)
+        instead: a car in the zone alerts once however many ids it is given.
+        """
+        if self.realert_cooldown_s <= 0.0:
+            return False
+        key = (camera_uuid, roi_id, str(cls_name))
+        recent = self._recent_alerts.get(key)
+        if not recent:
+            return False
+        cutoff = now_s - self.realert_cooldown_s
+        try:
+            box = np.asarray(bbox, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            return False
+        if box.size != 4:
+            return False
+        for (ts, prev_box) in recent:
+            if ts < cutoff:
+                continue
+            if _iou(box, np.asarray(prev_box, dtype=np.float32)) >= self.realert_iou:
+                return True
+        return False
+
+    def _record_alert(
+        self, camera_uuid: str, roi_id: str, cls_name: str, bbox: Any, now_s: float
+    ) -> None:
+        if self.realert_cooldown_s <= 0.0:
+            return
+        key = (camera_uuid, roi_id, str(cls_name))
+        try:
+            box = [float(v) for v in np.asarray(bbox, dtype=np.float32).reshape(-1)]
+        except (TypeError, ValueError):
+            return
+        if len(box) != 4:
+            return
+        cutoff = now_s - self.realert_cooldown_s
+        kept = [(ts, b) for (ts, b) in self._recent_alerts.get(key, []) if ts >= cutoff]
+        kept.append((now_s, box))
+        self._recent_alerts[key] = kept[-16:]
 
     def process(
         self,
@@ -989,15 +826,15 @@ class ROIAlertEngine:
         tracks: List[Dict[str, Any]],
         rois: List[ROI],
         ts_ms: Optional[int] = None,
+        frame_interval_s: float = 0.0,
     ) -> List[Dict[str, Any]]:
         alerts: List[Dict[str, Any]] = []
         ts_ms = int(ts_ms if ts_ms is not None else time.time() * 1000)
-
-        # set of track_ids alive this frame for this camera — used for cleanup at the end
-        active_ids = {int(t["track_id"]) for t in tracks}
+        now_s = ts_ms / 1000.0
 
         for roi in rois:
             poly = _roi_points_px(roi, frame_w, frame_h)
+            enter_after_n = self._entry_threshold(roi, frame_interval_s)
 
             for t in tracks:
                 if not t.get("confirmed", False):
@@ -1007,31 +844,39 @@ class ROIAlertEngine:
 
                 track_id = int(t["track_id"])
                 key = (camera_uuid, roi.roi_id, track_id)
+                self._last_seen_s[key] = now_s
 
                 if roi.anchor == "bbox":
-                    raw_inside = _bbox_intersects_poly(t["bbox"], poly)   # any-overlap
+                    raw_inside = _bbox_intersects_poly(t["bbox"], poly)
                 else:
                     ax, ay = _bbox_anchor(t["bbox"], roi.anchor)
                     raw_inside = _point_in_poly(ax, ay, poly)
 
-                in_streak = self._inside_streak.get(key, 0)
-                out_streak = self._outside_streak.get(key, 0)
                 if raw_inside:
-                    in_streak += 1
-                    out_streak = 0
+                    in_streak = self._inside_streak.get(key, 0) + 1
+                    self._last_inside_s[key] = now_s
                 else:
-                    out_streak += 1
                     in_streak = 0
                 self._inside_streak[key] = in_streak
-                self._outside_streak[key] = out_streak
+
                 prev_inside = self._in_roi.get(key, False)
                 if prev_inside:
-                    inside = out_streak < roi.enter_after_n
+                    # Time-based, never frame-based: a box jittering off the
+                    # polygon edge for one frame must not re-arm the trigger.
+                    since_inside = now_s - self._last_inside_s.get(key, now_s)
+                    inside = raw_inside or since_inside < self.exit_grace_s
                 else:
-                    inside = in_streak >= roi.enter_after_n
+                    inside = in_streak >= enter_after_n
                 self._in_roi[key] = inside
 
                 if inside and not prev_inside:
+                    if self._recently_alerted(
+                        camera_uuid, roi.roi_id, t["cls_name"], t["bbox"], now_s
+                    ):
+                        continue
+                    self._record_alert(
+                        camera_uuid, roi.roi_id, t["cls_name"], t["bbox"], now_s
+                    )
                     alerts.append({
                         "type": "roi_enter",
                         "ts_ms": ts_ms,
@@ -1042,21 +887,41 @@ class ROIAlertEngine:
                         "conf": float(t["conf"]),
                         "bbox": t["bbox"],
                     })
-        self._in_roi = {k: v for k, v in self._in_roi.items()
-                        if k[0] != camera_uuid or k[2] in active_ids}
-        self._inside_streak = {k: v for k, v in self._inside_streak.items()
-                               if k[0] != camera_uuid or k[2] in active_ids}
-        self._outside_streak = {k: v for k, v in self._outside_streak.items()
-                                if k[0] != camera_uuid or k[2] in active_ids}
 
+        self._expire_state(camera_uuid, now_s)
         return alerts
 
+    def _expire_state(self, camera_uuid: str, now_s: float) -> None:
+        if self.state_ttl_s > 0.0:
+            cutoff = now_s - self.state_ttl_s
+            stale = [
+                k
+                for k, seen in self._last_seen_s.items()
+                if k[0] == camera_uuid and seen < cutoff
+            ]
+            for k in stale:
+                self._last_seen_s.pop(k, None)
+                self._in_roi.pop(k, None)
+                self._inside_streak.pop(k, None)
+                self._last_inside_s.pop(k, None)
+
+        if self.realert_cooldown_s > 0.0:
+            alert_cutoff = now_s - self.realert_cooldown_s
+            for k in [k for k in self._recent_alerts if k[0] == camera_uuid]:
+                kept = [(ts, b) for (ts, b) in self._recent_alerts[k] if ts >= alert_cutoff]
+                if kept:
+                    self._recent_alerts[k] = kept
+                else:
+                    self._recent_alerts.pop(k, None)
+
     def reset_camera(self, camera_uuid: str) -> None:
-        """Wipe all ROI state for a camera (use on stream restart / reconfig)."""
+        """Wipe ROI state for a camera, on stream restart or reconfig."""
         cam = str(camera_uuid)
         self._in_roi = {k: v for k, v in self._in_roi.items() if k[0] != cam}
         self._inside_streak = {k: v for k, v in self._inside_streak.items() if k[0] != cam}
-        self._outside_streak = {k: v for k, v in self._outside_streak.items() if k[0] != cam}
+        self._last_seen_s = {k: v for k, v in self._last_seen_s.items() if k[0] != cam}
+        self._last_inside_s = {k: v for k, v in self._last_inside_s.items() if k[0] != cam}
+        self._recent_alerts = {k: v for k, v in self._recent_alerts.items() if k[0] != cam}
 
 
 
@@ -1092,6 +957,11 @@ class MultiCameraByteTrack:
 
         return self._trackers[cam].update(dets, ts_s=ts_s)
     
+    def frame_interval_s(self, camera_uuid: str) -> float:
+        """Observed inter-frame interval for one camera, 0.0 if not yet known."""
+        tr = self._trackers.get(str(camera_uuid))
+        return tr._frame_interval() if tr is not None else 0.0
+
     def remove_camera(self, camera_uuid: str) -> None:
         self._trackers.pop(str(camera_uuid), None)
 

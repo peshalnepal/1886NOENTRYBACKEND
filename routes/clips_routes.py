@@ -61,11 +61,10 @@ async def _fetch_owned_clips(
 
 
 async def _delete_clip_blobs_background(blob_keys: List[str]) -> None:
-    """Background task: delete Azure Blob Storage objects for removed clips.
+    """Delete the blobs behind removed clips.
 
-    Runs AFTER db.commit() so the HTTP response is never blocked by Azure
-    Storage round-trips. Uses parallel deletion (10 concurrent) instead of
-    sequential to maximize throughput: 5000 blobs in 50s vs 500s.
+    Runs AFTER db.commit() so the response is never blocked by storage
+    round-trips, 10 at a time — sequential deletes cost ~10x as long.
     """
     unique_keys = list(dict.fromkeys(k for k in blob_keys if k))
     if not unique_keys:
@@ -81,7 +80,6 @@ async def _delete_clip_blobs_background(blob_keys: List[str]) -> None:
         logger.info("[Clip Blob Cleanup] starting parallel deletion of %d blobs", len(unique_keys))
         for i in range(0, len(unique_keys), batch_size):
             batch = unique_keys[i : i + batch_size]
-            # Run up to 10 concurrent blob deletes
             tasks = [svc.delete_blob(blob_name=k) for k in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -151,7 +149,6 @@ async def _batch_delete_clips(
                 ]
                 all_blob_keys.extend(batch_blob_keys)
 
-                # Delete this batch
                 result = await db.execute(
                     delete(VideoRecord).where(VideoRecord.id.in_(batch_ids))
                 )
@@ -188,11 +185,8 @@ async def _delete_clip_records(
     if not clips:
         return 0
 
-    # Extract clip IDs for batched deletion
     clip_ids = [int(clip.id) for clip in clips if hasattr(clip, "id")]
 
-    # Delete clips in batches to prevent table lock exhaustion
-    # This returns immediately after all DB commits are done
     try:
         total_deleted, blob_keys = await _batch_delete_clips(clip_ids=clip_ids)
     except Exception as exc:

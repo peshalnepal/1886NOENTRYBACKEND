@@ -1,11 +1,7 @@
-"""Manager package.
+"""Manager package: pipeline + edge-device orchestration.
 
-Re-exports the public surface that used to be importable from the former
-``application.services.manager`` module. Existing imports such as::
-
-    from application.services.manager import Manager, EdgeDeviceUnavailableError
-
-continue to work unchanged.
+Re-exports the public surface (`Manager` and its DTOs/exceptions) so callers
+import from the package rather than from individual controller modules.
 """
 
 from application.services.manager.service import Manager

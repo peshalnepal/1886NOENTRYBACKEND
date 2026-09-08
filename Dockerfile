@@ -17,23 +17,17 @@ WORKDIR /app
 # ----------
 # OS deps
 # - curl: healthcheck / debugging
-# - libgl1, libglib2.0-0: common runtime deps for OpenCV wheels even in headless contexts
-# - libxcb1 + X libs: prevents "libxcb.so.1" crash if opencv-python sneaks in
-# - gcc/build-essential: keep only if you truly need builds (safe to keep for now)
+# - gcc/build-essential: for wheels without a prebuilt binary
 # ----------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc build-essential curl \
-    libgl1 libglib2.0-0 \
-    libxcb1 libx11-6 libxext6 libxrender1 libsm6 \
     && rm -rf /var/lib/apt/lists/*
 
 # 1) Install Python deps first (better layer caching)
 COPY requirements.txt .
 
 RUN pip install --upgrade pip \
-    && pip install -r requirements.txt \
-    && pip uninstall -y opencv-python || true \
-    && pip install --no-cache-dir --no-deps --force-reinstall opencv-python-headless==4.10.0.84
+    && pip install -r requirements.txt
 
 # 2) Copy app code
 COPY . .

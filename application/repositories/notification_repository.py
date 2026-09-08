@@ -1,5 +1,3 @@
-# application/repositories/notification_repository.py
-
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -283,7 +281,6 @@ class NotificationRepository:
 
         note_text = str(text or "").strip()
         action_text = str(action or "").strip()
-        # Keep only the non-empty structured attributes.
         clean_attrs: Dict[str, Any] = {}
         if isinstance(attributes, dict):
             for key, value in attributes.items():
@@ -366,9 +363,7 @@ class NotificationRepository:
             db, notification_ids=notification_ids, status=status
         )
 
-    # ------------------------------------------------------------------
-    # Notification reads / lifecycle
-    # ------------------------------------------------------------------
+
     def _notification_conditions(
         self,
         *,
@@ -558,9 +553,7 @@ class NotificationRepository:
         await db.flush()
         return result.rowcount or 0
 
-    # ------------------------------------------------------------------
-    # Operator approval workflow
-    # ------------------------------------------------------------------
+
     async def set_approval(
         self,
         db: AsyncSession,
@@ -821,9 +814,7 @@ class NotificationRepository:
             )
         ).first()
 
-    # ------------------------------------------------------------------
-    # NotificationEmail CRUD
-    # ------------------------------------------------------------------
+
     async def list_notification_email_rows(
         self,
         db: AsyncSession,

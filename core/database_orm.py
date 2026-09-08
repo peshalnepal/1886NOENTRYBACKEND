@@ -1,4 +1,3 @@
-# database.py
 import re
 import uuid
 from datetime import datetime, timezone
@@ -34,17 +33,12 @@ except Exception:
 Base = declarative_base()
 
 
-# -------------------------
 # GUID (cross-db UUID)
-# -------------------------
 class GUIDType(TypeDecorator):
-    """
-    Platform-independent GUID type.
+    """Platform-independent GUID type.
 
-    - MySQL: BINARY(16)
-    - MSSQL: UNIQUEIDENTIFIER
-    - PostgreSQL: UUID
-    - Others: CHAR(36)
+    MySQL: BINARY(16) · MSSQL: UNIQUEIDENTIFIER · PostgreSQL: UUID ·
+    others: CHAR(36).
     """
     impl = CHAR(36)
     cache_ok = True
@@ -85,9 +79,7 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-# -------------------------
 # Deep mutable JSON helpers
-# -------------------------
 class DeepMutableDict(MutableDict):
     def __init__(self, *args, **kwargs):
         self._root = kwargs.pop("_root", self)
@@ -150,9 +142,7 @@ def sanitize_to_snake_case(name: str) -> str:
     return s2.lower()
 
 
-# =========================
 # USER
-# =========================
 
 class User(Base):
     __tablename__ = "users"
@@ -189,7 +179,6 @@ class User(Base):
         passive_deletes=True,
     )
 
-    # stored notification events
     notifications = relationship(
         "Notification",
         back_populates="user",
@@ -199,9 +188,7 @@ class User(Base):
     )
 
 
-# =========================
 # SITE
-# =========================
 class Site(Base):
     __tablename__ = "sites"
 
@@ -279,17 +266,13 @@ class Site(Base):
     )
     
     
-# =========================
 # DEVICE
-# =========================
 class Device(Base):
-    """
-    A Jetson/edge device. Belongs to a user (not owned by a site directly).
+    """A Jetson/edge device, owned by an organization (not by a site directly).
 
-    device_url = base URL for inference API (e.g. http://10.0.0.5:8080)
-
-    - Can be linked to multiple sites (M:N)
-    - Can be linked to multiple cameras (M:N)
+    `device_url` is the base URL of its inference API (e.g. http://10.0.0.5:8080).
+    A device links to many sites (M:N) and hosts many cameras (1:N, via
+    `camera.device_uuid`).
     """
     __tablename__ = "devices"
 
@@ -318,7 +301,6 @@ class Device(Base):
     user = relationship("User", back_populates="devices", foreign_keys=[user_id])
     creator = relationship("User", foreign_keys=[created_by])
     organization = relationship("Organization",secondary="org_devices", back_populates="devices",passive_deletes=True)
-    # Device <-> Sites (M:N)
     sites = relationship(
         "Site",
         secondary="site_devices",
@@ -326,8 +308,6 @@ class Device(Base):
         passive_deletes=True,
     )
 
-    # Device <-> Cameras (M:N)
-    # Device 1 -> N Cameras (one device can run many cameras)
     cameras = relationship(
         "Camera",
         back_populates="device",
@@ -338,16 +318,13 @@ class Device(Base):
         UniqueConstraint("user_id", "device_code", name="uq_device_user_device_code"),
     )
 
-# =========================
 # ORGANIZATION <-> DEVICE association
-# =========================
 
 class OrganizationDevice(Base):
-    """
-    Link table: orgs <-> devices (M:N)
+    """Link table: orgs <-> devices (M:N).
 
-    Deleting an org removes these rows (CASCADE) but does NOT delete devices.
-    Deleting a device removes these rows (CASCADE).
+    Deleting either side removes these rows (CASCADE) but never deletes the
+    device itself.
     """
     __tablename__ = "org_devices"
 
@@ -361,15 +338,12 @@ class OrganizationDevice(Base):
     __table_args__ = (
         UniqueConstraint("org_id", "device_uuid", name="uq_org_device_pair"),
     )
-# =========================
 # SITE <-> DEVICE association
-# =========================
 class SiteDevice(Base):
-    """
-    Link table: sites <-> devices (M:N)
+    """Link table: sites <-> devices (M:N).
 
-    Deleting a site removes these rows (CASCADE) but does NOT delete devices.
-    Deleting a device removes these rows (CASCADE).
+    Deleting either side removes these rows (CASCADE) but never deletes the
+    device itself.
     """
     __tablename__ = "site_devices"
 
@@ -385,9 +359,7 @@ class SiteDevice(Base):
     )
 
 
-# =========================
 # SITE SETTINGS
-# =========================
 class SiteSettings(Base):
     __tablename__ = "site_settings"
 
@@ -423,9 +395,7 @@ class SiteSettings(Base):
         ),
     )
 
-# =========================
 # CAMERA
-# =========================
 class Camera(Base):
     __tablename__ = "camera"
 
@@ -500,9 +470,7 @@ class Camera(Base):
         UniqueConstraint("user_id", "camera_code", name="uq_camera_user_camera_code"),
     )
 
-# =========================
 # PIPELINE
-# =========================
 class Pipeline(Base):
     __tablename__ = "pipelines"
 
@@ -541,9 +509,7 @@ class PipelineCamera(Base):
     )
 
 
-# =========================
 # CHANNEL CONFIG
-# =========================
 class ChannelConfiguration(Base):
     __tablename__ = "channel_configurations"
 
@@ -576,9 +542,7 @@ class ChannelConfiguration(Base):
     )
     
 
-# =========================
 # VIDEO RECORD
-# =========================
 class VideoRecord(Base):
     __tablename__ = "video_record"
     __table_args__ = (
@@ -621,10 +585,8 @@ class VideoRecord(Base):
 
 
 class Notification(Base):
-    """
-    Stores notification events received for a user's specific site
-    (optionally linked to camera/device).
-    """
+    """A notification event for a user's site, optionally tied to a
+    camera/device."""
     __tablename__ = "notification"
     __table_args__ = (
         Index("ix_notif_user_visible_detected", "user_id", "visible", "detected_at"),
@@ -669,9 +631,7 @@ class Notification(Base):
     device = relationship("Device")
     
 class NotificationEmail(Base):
-    """
-    Emails that should receive notifications for a specific site.
-    """
+    """Emails that should receive notifications for a specific site."""
     __tablename__ = "notification_emails"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -695,9 +655,7 @@ class NotificationEmail(Base):
         UniqueConstraint("site_uuid", "email", name="uq_notif_email_site_email"),
     )
 
-# =========================
 # EMAIL VERIFICATION
-# =========================
 
 class EmailVerification(Base):
     __tablename__ = "email_verifications"
@@ -719,9 +677,7 @@ class EmailVerification(Base):
     user_agent = Column(String(512), nullable=True)
     additional_data = Column(String(2048), nullable=True)
     
-# =========================
 # SYSTEM SETTINGS
-# =========================
 class SystemSettings(Base):
     __tablename__ = "system_settings"
 
@@ -733,9 +689,7 @@ class SystemSettings(Base):
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
-# =========================
 # SIGNUP TEMP DATA
-# =========================
 class SignupTempData(Base):
     __tablename__ = "signup_temp_data"
 
@@ -746,16 +700,11 @@ class SignupTempData(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used = Column(Boolean, default=False)
 class Organization(Base):
-    """
-    Top-level tenant container.
+    """Top-level tenant container; only a Platform Admin may create or delete one.
 
-    Everything that belongs to an organization (sites, devices,
-    cameras, users) is reachable from this row. A Platform Admin
-    is the only actor permitted to create or delete organizations.
-
-    `owner_user_id` points at the first Org Admin that was created
-    together with the organization. It is informational only; an
-    organization can have many Org Admins via org-scoped `access_grants`.
+    `owner_user_id` points at the first Org Admin bootstrapped with the org. It
+    is informational only — an organization can have many Org Admins via
+    org-scoped `access_grants`.
     """
 
     __tablename__ = "organizations"
@@ -764,8 +713,6 @@ class Organization(Base):
     name = Column(String(255), nullable=False)
     slug = Column(String(64), nullable=False, unique=True, index=True)
 
-    # Optional pointer to the user that was bootstrapped as the
-    # initial Org Admin. Set NULL if that user is later deleted.
     owner_user_id = Column(
         Integer,
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -790,9 +737,7 @@ class Organization(Base):
     # explicitly (lazy="raise"); cascade is declared on AccessGrant.organization.
 
 
-# =========================================================================
 # ORGANIZATION REPORT ARCHIVE
-# =========================================================================
 class OrganizationReport(Base):
     """A generated alert-report PDF, archived so members can browse/download.
 
@@ -845,9 +790,7 @@ class OrganizationReport(Base):
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
 
 
-# =========================================================================
 # ORGANIZATION REPORT SCHEDULE
-# =========================================================================
 class OrganizationReportSchedule(Base):
     """Per-organization daily schedule for the approved-alerts PDF report.
 
@@ -896,22 +839,15 @@ class OrganizationReportSchedule(Base):
     )
 
 
-# =========================================================================
 # RBAC: ROLES / PERMISSIONS / ACCESS GRANTS
-# =========================================================================
-# These three tables replace the old `org_memberships` and
-# `site_memberships` tables with a single ACL-style model:
+# A single ACL-style model replacing the old `org_memberships` /
+# `site_memberships` tables: "User X holds Role Y in Context Z (an org or a
+# site)". A Role carries Permissions via `role_permissions`; that catalog is
+# seeded from `core.security.roles.ROLE_PERMISSIONS` during DB init.
 #
-#   "User X holds Role Y in Context Z (an org or a site)."
-#
-# A Role carries a set of Permissions (via `role_permissions`). The role
-# catalog and the role->permission mapping are seeded from
-# `core.security.roles.ROLE_PERMISSIONS` during DB initialization.
-#
-# All relationships use lazy="raise" so authorization code must resolve
-# them with explicit JOINs (no implicit lazy loading under async).
+# All relationships use lazy="raise" so authorization code must resolve them
+# with explicit JOINs — implicit lazy loading breaks under async.
 
-# Many-to-many: roles <-> permissions
 role_permissions = Table(
     "role_permissions",
     Base.metadata,
@@ -1031,9 +967,7 @@ class AccessGrant(Base):
     )
 
 
-# =========================
 # CUSTOM WALLS
-# =========================
 class Wall(Base):
     """A named, ordered set of cameras spanning any number of sites in one org.
 

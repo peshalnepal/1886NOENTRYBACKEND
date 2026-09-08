@@ -73,6 +73,19 @@ class VideoChannel:
     def _detection_enabled(self) -> bool:
         return getattr(self.config, "detection_enabled", True) is not False
 
+    def _request_timeout(self, *, minimum: float = 0.0) -> httpx.Timeout:
+        timeout_s = max(
+            minimum,
+            float(getattr(self.config, "request_timeout_s", 3.0) or 3.0),
+        )
+        return httpx.Timeout(
+            timeout_s,
+            connect=min(3.0, timeout_s),
+            read=timeout_s,
+            write=timeout_s,
+            pool=timeout_s,
+        )
+
     def snapshot_urls(self) -> List[str]:
         base = str(self.config.device_url or "").rstrip("/")
         if not base:
@@ -101,15 +114,7 @@ class VideoChannel:
         for url in urls:
             attempted += 1
             try:
-                timeout_s = float(getattr(self.config, "request_timeout_s", 3.0) or 3.0)
-                t = httpx.Timeout(
-                    timeout_s,
-                    connect=min(3.0, timeout_s),
-                    read=timeout_s,
-                    write=timeout_s,
-                    pool=timeout_s,
-                )
-                r = await _http.get(url, timeout=t)
+                r = await _http.get(url, timeout=self._request_timeout())
                 if r.status_code in (404, 405):
                     last_err_sig = f"http:{r.status_code}:{url}"
                     continue
@@ -163,19 +168,10 @@ class VideoChannel:
             try:
                 # Jetson SSE emits keepalive comments every ~1s, so a finite
                 # read timeout is okay and helps detect dead sockets.
-                timeout_s = max(15.0, float(getattr(self.config, "request_timeout_s", 3.0) or 3.0))
-                t = httpx.Timeout(
-                    timeout_s,
-                    connect=min(3.0, timeout_s),
-                    read=timeout_s,
-                    write=timeout_s,
-                    pool=timeout_s,
-                )
-
                 async with _http.stream(
                     "GET",
                     url,
-                    timeout=t,
+                    timeout=self._request_timeout(minimum=15.0),
                     headers={"Accept": "text/event-stream"},
                 ) as r:
                     if r.status_code in (404, 405):
@@ -246,14 +242,7 @@ class VideoChannel:
         if not self.config.device_url:
             return None
 
-        timeout_s = float(self.config.request_timeout_s or 3.0)
-        timeout = httpx.Timeout(
-            timeout_s,
-            connect=min(3.0, timeout_s),
-            read=timeout_s,
-            write=timeout_s,
-            pool=timeout_s,
-        )
+        timeout = self._request_timeout()
 
         for url in self.snapshot_urls():
             try:

@@ -1,7 +1,4 @@
-"""Manager cleanup paths (user, device, site).
-
-Extracted from the former monolithic application/services/manager.py.
-"""
+"""Manager cleanup paths (user, device, site)."""
 
 from __future__ import annotations
 

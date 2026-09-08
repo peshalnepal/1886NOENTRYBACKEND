@@ -1,11 +1,7 @@
-"""Notification package.
+"""Notification package: hub, flusher, clip manager, deleter and email notifier.
 
-Re-exports the public surface that used to be importable from the former
-``application.services.notification`` module. Existing imports such as::
-
-    from application.services.notification import NotificationService
-
-continue to work unchanged.
+Re-exports the public surface so callers import from the package rather than
+from individual modules.
 """
 
 from application.services.notification.email_notifier import EmailNotifier

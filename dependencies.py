@@ -24,9 +24,6 @@ security = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 
 
-# -------------------------------------------------------------------
-# database
-# -------------------------------------------------------------------
 def get_db():
     if not db_manager.SessionLocal:
         raise RuntimeError("Sync database has not been initialized.")
@@ -44,9 +41,6 @@ async def get_async_db() -> AsyncSession:
         yield session
 
 
-# -------------------------------------------------------------------
-# app singletons / shared services
-# -------------------------------------------------------------------
 def _require_app_state(request: Request, attr_name: str, detail: str) -> Any:
     value = getattr(request.app.state, attr_name, None)
     if value is None:
@@ -120,9 +114,6 @@ def get_alert_blob_cleanup_tasks(request: Request) -> set:
     return _app_state_default(request, "alert_blob_cleanup_tasks", set)
 
 
-# -------------------------------------------------------------------
-# auth
-# -------------------------------------------------------------------
 def _auth_error(detail: str = "Could not validate credentials") -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,

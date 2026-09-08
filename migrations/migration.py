@@ -1,6 +1,4 @@
 """
-migrate.py
-----------
 Migrates an existing database (old ORM) to the new schema (new ORM).
 
 Self-contained: it first brings the *schema* up to the new ORM, then seeds
@@ -11,7 +9,9 @@ member) or site-level (admin / arm_disarm / read_only), and a role's powers
 come from the `role_permissions` links to the `permissions` catalog
 (site:read, org:manage_sites, …).
 
-Schema bring-up (idempotent, checks existence first):
+Schema bring-up (idempotent, checks existence first). `create_all` only creates
+whole missing tables — it NEVER ALTERs an existing one — so column additions on
+pre-existing tables must be done by hand, each guarded by information_schema:
   - creates any missing tables from the ORM metadata (organizations, roles,
     permissions, role_permissions, access_grants, …)
   - adds any missing columns the new ORM introduced on existing tables
@@ -63,15 +63,13 @@ log = logging.getLogger(__name__)
 
 
 
-# ---------------------------------------------------------------------------
-# ✏️  Edit these to match your environment
-# ---------------------------------------------------------------------------
-DB_HOST     = "noentry-mysql-4ep54c.mysql.database.azure.com"
-DB_PORT     = 3306
-DB_NAME     = "appdb"
-DB_USER     = "mysqladmin"
-DB_PASSWORD = "ChangeThis_AdminPassword_2026!"          # ← fill in before running
-# ---------------------------------------------------------------------------
+# Connection comes from the environment (or --url). Never hardcode a password
+# here: this file is committed.
+DB_HOST     = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT     = int(os.getenv("DB_PORT", "3306"))
+DB_NAME     = os.getenv("DB_NAME", "appdb")
+DB_USER     = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
  
 def build_url(host, port, name, user, password):
@@ -110,10 +108,6 @@ def unique_slug(conn, base: str) -> str:
         counter += 1
  
  
-# ---------------------------------------------------------------------------
-# Schema bring-up (create missing tables + columns)
-# ---------------------------------------------------------------------------
-
 def _table_exists(conn, table: str) -> bool:
     return (
         conn.execute(
@@ -186,7 +180,6 @@ def ensure_schema(engine, dry_run: bool = False):
             "MySQL cannot roll back DDL. Only the data backfill is rolled back."
         )
 
-    # 1. Tables — create only the ones that don't exist yet.
     from core.database_orm import Base
 
     before = set(Base.metadata.tables.keys())
@@ -199,7 +192,6 @@ def ensure_schema(engine, dry_run: bool = False):
     else:
         log.info("Schema: all ORM tables already exist.")
 
-    # 2. Columns — add any the new ORM expects on pre-existing tables.
     with engine.begin() as conn:
         for table, column, ddl in _NEW_COLUMNS:
             if not _table_exists(conn, table):
@@ -229,10 +221,6 @@ def ensure_schema(engine, dry_run: bool = False):
                 log.warning("Schema: could not add FK sites.org_id: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# RBAC catalog seed (roles / permissions / role_permissions)
-# ---------------------------------------------------------------------------
-
 def seed_rbac_catalog(conn):
     """Idempotently seed the roles / permissions / role_permissions tables.
 
@@ -247,7 +235,6 @@ def seed_rbac_catalog(conn):
     """
     from core.security.roles import PERMISSION_DESCRIPTIONS, ROLE_PERMISSIONS
 
-    # 1. permissions — atomic privileges like "site:read", "org:manage_sites".
     for perm_name, perm_desc in PERMISSION_DESCRIPTIONS.items():
         conn.execute(
             text(
@@ -258,9 +245,8 @@ def seed_rbac_catalog(conn):
             {"n": perm_name, "d": perm_desc},
         )
 
-    # 2. roles — one row per distinct (name, scope). The same name (e.g.
-    #    "admin") exists in both the "org" and "site" scope with different
-    #    powers, so uniqueness is on the (name, scope) pair.
+    # The same name (e.g. "admin") exists in both the "org" and "site" scope
+    # with different powers, so uniqueness is on the (name, scope) pair.
     role_keys = set(ROLE_PERMISSIONS.keys())
     for (role_name, scope) in role_keys:
         conn.execute(
@@ -272,8 +258,6 @@ def seed_rbac_catalog(conn):
             {"n": role_name, "s": scope, "d": f"{scope} role: {role_name}"},
         )
 
-    # 3. role -> permission links (the many-to-many that says what each
-    #    role can actually do).
     link_rules = 0
     for (role_name, scope), perms in ROLE_PERMISSIONS.items():
         for perm in perms:
@@ -294,10 +278,6 @@ def seed_rbac_catalog(conn):
         len(PERMISSION_DESCRIPTIONS), len(role_keys), link_rules,
     )
 
-
-# ---------------------------------------------------------------------------
-# Site-role normalization
-# ---------------------------------------------------------------------------
 
 def _downgrade_site_roles(conn, now):
     """Reduce site grants to ``read_only`` for everyone who is not an admin.
@@ -391,20 +371,15 @@ def _downgrade_site_roles(conn, now):
     )
 
 
-# ---------------------------------------------------------------------------
-# Main backfill
-# ---------------------------------------------------------------------------
- 
 def run_seed(db_url: str, dry_run: bool = False):
     engine = create_engine(db_url, echo=False)
     now = utc_now()
 
-    # ── Schema first: create missing tables + columns before any data ───
+    # Schema first: create missing tables + columns before any data.
     ensure_schema(engine, dry_run=dry_run)
 
     with engine.begin() as conn:
 
-        # ── 0. Ensure the role/permission catalog exists ────────────────
         # The backfill below resolves role ids by (name, scope); seed the
         # catalog first so those lookups never silently no-op.
         seed_rbac_catalog(conn)
@@ -421,7 +396,6 @@ def run_seed(db_url: str, dry_run: bool = False):
  
             log.info("  [user %d] %s", user_id, user_name)
  
-            # ── 1. Organization ──────────────────────────────────────────
             existing_mem = conn.execute(
                 text("""
                     SELECT g.id, g.org_id
@@ -464,7 +438,6 @@ def run_seed(db_url: str, dry_run: bool = False):
                 )
                 log.info("    + org access grant created  role=admin")
  
-            # ── 2. Link sites to org ─────────────────────────────────────
             updated = conn.execute(
                 text("""
                     UPDATE sites
@@ -479,7 +452,8 @@ def run_seed(db_url: str, dry_run: bool = False):
             else:
                 log.info("    ✓ all sites already linked to org %d — skipped", org_id)
  
-            # ── 3. Site access grant (role=admin) for every site ─────────
+            # Every site the user owns gets a site-scoped admin grant; the
+            # normalization pass below then reduces it where appropriate.
             sites = conn.execute(
                 text("SELECT site_uuid FROM sites WHERE user_id = :uid"),
                 {"uid": user_id},
@@ -519,8 +493,8 @@ def run_seed(db_url: str, dry_run: bool = False):
             if sm_skipped:
                 log.info("    ✓ %d site access grant(s) already exist — skipped", sm_skipped)
 
-        # ── 4. Normalize site roles by each holder's org standing ────────
-        #   admin / platform admin -> kept as-is, everyone else -> read_only
+        # Normalize site roles by each holder's org standing:
+        # admin / platform admin -> kept as-is, everyone else -> read_only.
         _downgrade_site_roles(conn, now)
 
         if dry_run:
@@ -529,11 +503,8 @@ def run_seed(db_url: str, dry_run: bool = False):
     log.info("Seed complete ✓")
  
  
-# ---------------------------------------------------------------------------
-# Summary query (runs after apply to confirm)
-# ---------------------------------------------------------------------------
- 
 def print_summary(db_url: str):
+    """Post-apply verification: one row per user with their org, role and counts."""
     engine = create_engine(db_url, echo=False)
     with engine.connect() as conn:
         rows = conn.execute(text("""
@@ -569,14 +540,10 @@ def print_summary(db_url: str):
                  r.org_role, r.site_count, r.site_grants)
  
  
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
- 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backfill orgs from existing users")
     parser.add_argument("--url", default=None,
-                        help="Override hardcoded DB config with a full SQLAlchemy URL.")
+                        help="Full SQLAlchemy URL; overrides the DB_* env vars.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be done and roll back.")
     args = parser.parse_args()

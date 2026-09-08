@@ -1,4 +1,3 @@
-# database_core.py
 import asyncio
 import logging
 import os
@@ -157,7 +156,6 @@ class DatabaseManager:
         if not all([host, port, database, uid, pwd]):
             raise ValueError("Incomplete MySQL connection string. Missing one of: Server, Port, Database, User/Uid, Password/Pwd")
 
-        # Prefer native MySQL drivers for SQLAlchemy
         sync_url = f"mysql+pymysql://{urllib.parse.quote(uid)}:{urllib.parse.quote(pwd)}@{host}:{port}/{database}"
         async_url = f"mysql+aiomysql://{urllib.parse.quote(uid)}:{urllib.parse.quote(pwd)}@{host}:{port}/{database}"
 
@@ -852,19 +850,9 @@ class DatabaseManager:
                 except Exception as exc:
                     logger.warning("Skipping organization_reports.report_uuid migration: %s", exc)
 
-            # ------------------------------------------------------------------
-            # Multi-tenant RBAC migration (MySQL).
-            #
-            # create_all already creates the new tables on fresh DBs. For
-            # existing databases we:
-            #   * add `users.is_platform_admin` if missing
-            #   * add `sites.org_id` if missing
-            # The RBAC tables `organizations`, `roles`, `permissions`,
-            # `role_permissions` and `access_grants` are created by
-            # create_all; the legacy `org_memberships`/`site_memberships`
-            # tables are migrated into `access_grants` and dropped further
-            # down in this method.
-            # ------------------------------------------------------------------
+            # Multi-tenant RBAC migration (MySQL). create_all builds the RBAC
+            # tables on fresh DBs; existing DBs need the added columns
+            # (users.is_platform_admin, sites.org_id, …) backfilled here.
             if dialect_name.startswith("mysql"):
                 try:
                     has_platform_admin = (
@@ -1077,11 +1065,9 @@ class DatabaseManager:
                     logger.warning("Skipping notification.approval_status migration: %s", exc)
 
                 # --- unified RBAC: seed catalog + migrate memberships --------
-                # create_all builds `roles`/`permissions`/`role_permissions`/
-                # `access_grants` on fresh DBs. Here we idempotently seed the
-                # role+permission catalog, then migrate any legacy
-                # `org_memberships`/`site_memberships` rows into `access_grants`
-                # and drop those tables.
+                # Idempotently seed the role+permission catalog, then migrate
+                # any legacy `org_memberships`/`site_memberships` rows into
+                # `access_grants` and drop those tables.
                 try:
                     from core.security.roles import (
                         PERMISSION_DESCRIPTIONS,
@@ -1225,9 +1211,8 @@ class DatabaseManager:
                 except Exception as exc:
                     logger.warning("Skipping org_id backfill: %s", exc)
 
-        # Seed a dev user if DB is empty. The dev user is also flagged as
-        # the platform admin so the new `/api/platform/...` endpoints are
-        # usable out of the box.
+        # Seed a dev user if the DB is empty, flagged as platform admin so the
+        # `/api/platform/...` endpoints are usable out of the box.
         async with self.AsyncSessionLocal() as db:
             existing = (await db.execute(select(User.id).limit(1))).scalar_one_or_none()
             if existing is None:
@@ -1275,9 +1260,7 @@ class DatabaseManager:
                 await asyncio.sleep(retry_delay_s)
 
 
-# --- Global Instance and Session Makers ---
-# Create a single instance of the manager.
-# This instance will be created once when the module is first imported.
+# Process-wide manager + session makers, built once on first import.
 db_manager = DatabaseManager(os.getenv("DATABASE_URL", "Driver={MySQL ODBC 8.0 Unicode Driver};Server=127.0.0.1;Port=3306;Database=appdb;User=appuser;Password=AppUser@2025!;Option=3;"))
 async_engine = db_manager.async_engine
 SessionLocal = db_manager.SessionLocal

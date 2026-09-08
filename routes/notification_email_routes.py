@@ -1,7 +1,4 @@
-# routes/notification_email_routes.py
-"""
-API routes for managing user notification emails.
-"""
+"""Notification-email (alert recipient) management routes."""
 import uuid
 from typing import List, Optional
 

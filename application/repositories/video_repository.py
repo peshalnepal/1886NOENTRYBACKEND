@@ -1,4 +1,3 @@
-# application/repositories/video_repository.py
 """
 VideoRecord persistence.
 

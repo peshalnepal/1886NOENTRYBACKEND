@@ -83,7 +83,6 @@ class _AlertEntry:
     image_url: Optional[str]
     clip_url: Optional[str]
     approved_at: Optional[datetime]
-    # Fetched + normalized snapshot for the in-table thumbnail.
     image_jpeg: Optional[Tuple[bytes, int, int, int]] = None
 
 
@@ -123,14 +122,10 @@ class PdfReportGenerator:
         self._report_repo = ReportRepository()
 
         self._max_alerts = env_int("REPORT_MAX_ALERTS", 500, minimum=1)
-        # Event-snapshot thumbnails embedded in the table's Image column.
         self._max_images = env_int("REPORT_MAX_IMAGES", 300, minimum=0)
         self._image_fetch_concurrency = env_int("REPORT_IMAGE_FETCH_CONCURRENCY", 8, minimum=1)
         self._image_fetch_timeout_s = env_float("REPORT_IMAGE_FETCH_TIMEOUT_S", 15.0, minimum=1.0)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     async def generate_and_send(
         self,
         *,
@@ -378,9 +373,6 @@ class PdfReportGenerator:
             )
             return None
 
-    # ------------------------------------------------------------------
-    # Data extraction
-    # ------------------------------------------------------------------
     def _entry_from_row(
         self,
         row: Any,
@@ -522,9 +514,6 @@ class PdfReportGenerator:
                 unique.append(addr)
         return unique
 
-    # ------------------------------------------------------------------
-    # Event snapshot fetching (for the in-table thumbnails)
-    # ------------------------------------------------------------------
     async def _attach_images(self, entries: List[_AlertEntry]) -> None:
         if self._max_images <= 0:
             return
@@ -567,7 +556,7 @@ class PdfReportGenerator:
             except Exception:
                 return None
 
-        if url.startswith("http://") or url.startswith("https://"):
+        if url.startswith(("http://", "https://")):
             try:
                 resp = await client.get(url)
                 if resp.status_code == 200 and resp.content:
@@ -578,9 +567,6 @@ class PdfReportGenerator:
 
         return None
 
-    # ------------------------------------------------------------------
-    # PDF rendering
-    # ------------------------------------------------------------------
     def _render_pdf(
         self,
         *,
@@ -595,12 +581,10 @@ class PdfReportGenerator:
         doc = PDFReport()
         type_label = _REPORT_TYPE_LABELS.get(report_type, "Alert Report")
 
-        # --- Branded header (logo + wordmark) + centered title ---
         doc.brand_header(right_text=self._fmt_dt(datetime.now(timezone.utc)) + " UTC")
         doc.title_center(type_label.upper())
 
-        # --- Report info block (label/value rows). No organization name by
-        # request; the report is identified by its stable Report ID instead. ---
+        # Identify reports by their stable ID rather than the organization name.
         doc.field_row("Report ID", report_uuid)
         doc.field_row("Prepared for", prepared_for)
         doc.field_row("Reporting window", self._fmt_window(start, end))
@@ -748,9 +732,6 @@ class PdfReportGenerator:
                 return cl[:1].upper() + cl[1:]
         return ""
 
-    # ------------------------------------------------------------------
-    # Email bodies
-    # ------------------------------------------------------------------
     def _subject(self, result: ReportResult) -> str:
         prefix = "[1886NOENTRY][URGENT]" if result.report_type == "urgent" else "[1886NOENTRY]"
         label = _REPORT_TYPE_LABELS.get(result.report_type, "Alert Report")
@@ -808,9 +789,6 @@ class PdfReportGenerator:
 </body></html>
 """
 
-    # ------------------------------------------------------------------
-    # Formatting helpers
-    # ------------------------------------------------------------------
     @staticmethod
     def _fmt_dt(dt: Optional[datetime]) -> str:
         if not isinstance(dt, datetime):

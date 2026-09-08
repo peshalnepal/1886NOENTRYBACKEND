@@ -27,8 +27,7 @@ Request flow: **HTTP → route → DTO → repository / service → ORM → MySQ
     tables need manual migration code here (`migrations/` holds helpers).
   - `config.py`, `env.py`, `security/` (hashing, JWT tokens, roles + permission catalog).
 - **`domain/`** — vendor-agnostic domain layer: `events.py` (Pydantic pipeline
-  events: `RTSPEvent`, `DetectionsProducedEvent`, …), `model.py` (`VisionModel`
-  Protocol port), `channel.py`, `template.py`.
+  events: `RTSPEvent`, `DetectionsProducedEvent`, …) and `channel.py`.
 - **`application/`** — application layer:
   - `dtos.py` — internal DTOs (repo inputs / service-to-service), deliberately
     separate from HTTP schemas. Convention: `*CreateDTO` / `*UpdateDTO` /
@@ -42,7 +41,9 @@ Request flow: **HTTP → route → DTO → repository / service → ORM → MySQ
     device orchestration, app singleton), `notification/` (hub / flusher / email
     / clip), `authz_service.py`, plus pipeline, tracker, edge inference, clip &
     image storage, retention, webrtc/stream gateways, caches.
-  - `models/` — vision model configs/impl (YOLO); `channels/` — `VideoChannelConfig` + runtime.
+  - `channels/` — `VideoChannelConfig` + runtime. There is no local inference
+    layer: detection runs on the Jetson edge (`tensort/`) and the backend
+    consumes its detection streams.
 - **`interface/`** — currently empty placeholder.
 
 ## Auth & RBAC

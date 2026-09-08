@@ -7,10 +7,6 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 
-# =========================================================
-# Base Event System
-# =========================================================
-
 class Event(BaseModel):
     """Base class for every event.
 
@@ -27,10 +23,6 @@ class ChannelEvent(Event):
     event_type: str = "ChannelEvent"
     channel_id: Optional[uuid.UUID] = None
 
-
-# =========================================================
-# RTSP / Video Pipeline Events
-# =========================================================
 
 EncodedFormat = Literal["raw", "jpeg", "png", "h264", "h265"]
 
@@ -70,8 +62,6 @@ class ChannelConnectedEvent(ChannelEvent):
     device_url: Optional[str] = None
     webrtc_url: Optional[str] = None
 
-
-
 class ChannelDisconnectedEvent(ChannelEvent):
     event_type: str = "ChannelDisconnectedEvent"
     camera_uuid: str
@@ -109,9 +99,6 @@ VideoChannelEvent = Union[
     ChannelRemoveEvent,
     ChannelEditEvent,
 ]
-# =========================================================
-# Detection + Alerts
-# =========================================================
 
 class DetectionBox(BaseModel):
     x1: int
@@ -132,6 +119,7 @@ class DetectionItem(BaseModel):
     conf: float
     box: DetectionBox
     box_norm: Optional[BoxNorm] = None
+
 
 class PoseKeypoint(BaseModel):
     x: float
@@ -193,10 +181,6 @@ class AlertRaisedEvent(ChannelEvent):
     frame_seq: int
     rule_id: Optional[str] = None
 
-
-# =========================================================
-# Clip events
-# =========================================================
 
 class ClipRequestEvent(ChannelEvent):
     """Request the last `window_ms` of footage for a camera."""

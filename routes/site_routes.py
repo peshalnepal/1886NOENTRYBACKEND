@@ -1,4 +1,3 @@
-# routes/sites.py
 import asyncio
 import logging
 import uuid
@@ -54,6 +53,7 @@ from core.schemas import (
 )
 from core.database import AsyncSessionLocal
 from routes._errors import DEVICE_NOT_FOUND, SITE_NOT_FOUND
+from routes._runtime_cleanup import cleanup_camera_resources
 
 logger = logging.getLogger(__name__)
 
@@ -266,29 +266,14 @@ async def _cleanup_cameras_background(
         cam_uuid = cam["camera_uuid"]
         cam_code = cam.get("camera_code")
 
-        for dev_url in cam.get("device_urls") or []:
-            try:
-                await manager.edge.delete_camera(
-                    device_url=dev_url, camera_uuid=str(cam_uuid)
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[Cleanup] Edge delete failed cam=%s url=%s: %s", cam_uuid, dev_url, exc
-                )
-
-        if cam_code:
-            try:
-                await manager.webrtc.delete_stream(stream_key=str(cam_code))
-            except Exception as exc:
-                logger.warning(
-                    "[Cleanup] WebRTC delete failed cam=%s code=%s: %s", cam_uuid, cam_code, exc
-                )
-
-        if active_pipeline is not None:
-            try:
-                await active_pipeline.remove_channel(cam_uuid)
-            except Exception as exc:
-                logger.warning("[Cleanup] Pipeline evict failed cam=%s: %s", cam_uuid, exc)
+        await cleanup_camera_resources(
+            manager,
+            camera_uuid=cam_uuid,
+            camera_code=cam_code,
+            device_urls=cam.get("device_urls") or [],
+            pipeline=active_pipeline,
+            log_prefix="[Cleanup]",
+        )
 
     logger.info("[Cleanup] COMPLETE for %s cameras", len(cleanup_targets))
 
@@ -503,7 +488,7 @@ async def list_site_devices(
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
-    # Access check via Site, then fetch devices linked to the site.
+    # Loading the site is the access check.
     site_repo = SiteRepository()
     await site_repo.get_site(
         db, org_id=ctx.org_id, site_uuids=await _site_scope(db, ctx), site_uuid=site_uuid
@@ -524,7 +509,7 @@ async def get_site_settings(
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
-    # Fetch site (access check) + settings.
+    # Loading the site is the access check.
     site_repo = SiteRepository()
     site = await site_repo.get_site(
         db, org_id=ctx.org_id, site_uuids=await _site_scope(db, ctx), site_uuid=site_uuid
@@ -775,11 +760,10 @@ async def update_site(
 
     data = payload.model_dump(exclude_unset=True)
 
-    # If they included site_code but it’s blank -> regenerate
+    # An explicitly blanked site_code means "regenerate it".
     if "site_code" in data and is_blank(data.get("site_code")):
         data["site_code"] = gen_code("site")
 
-    # Apply patch
     update_fields = {k: v for k, v in data.items() if v is not None}
     if update_fields:
         await site_repo.update_site(

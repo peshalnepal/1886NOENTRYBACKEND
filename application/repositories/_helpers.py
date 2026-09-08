@@ -6,7 +6,7 @@ Keeping a single definition avoids the copies drifting apart over time.
 from __future__ import annotations
 
 import uuid
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 def as_uuid(value: Any) -> Optional[uuid.UUID]:
@@ -53,3 +53,11 @@ def normalize_uuid_list(values: Any) -> List[uuid.UUID]:
         seen.add(key)
         out.append(parsed)
     return out
+
+
+def model_patch(model: Any, *, drop_none: bool = False) -> Dict[str, Any]:
+    """Return fields explicitly supplied to a Pydantic update model."""
+    values = model.model_dump(exclude_unset=True)
+    if drop_none:
+        values = {key: value for key, value in values.items() if value is not None}
+    return values

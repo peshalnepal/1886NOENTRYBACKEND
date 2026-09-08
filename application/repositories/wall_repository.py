@@ -1,4 +1,3 @@
-# application/repositories/wall_repository.py
 """
 Custom wall persistence.
 

@@ -2,7 +2,7 @@
 
 Consolidates `_env_bool` / `_env_int` / `_env_float` previously duplicated
 across main.py, routes/auth/signup.py, application/services/edgeinference.py,
-application/services/notification.py, application/channels/channel.py,
+application/services/notification/service.py, application/channels/channel.py,
 application/repositories/verify_repository.py, and core/database.py.
 """
 

@@ -28,7 +28,6 @@ from application.services.report.pdf_report_service import PdfReportGenerator
 
 logger = logging.getLogger(__name__)
 
-# Type of the zero-arg factory that yields a configured PdfReportGenerator.
 GeneratorFactory = Callable[[], PdfReportGenerator]
 
 

@@ -5,9 +5,8 @@ tracker output, ROI alerts) into a uniform overlay schema, and accumulate
 them with dedup rules suitable for rendering.
 
 Public entry point used externally:
-  - _append_overlay_detection (consumed by domain/model_pipeline.py,
-    application/services/notification.py, application/services/clip_storage.py,
-    routes/clips_routes.py)
+  - _append_overlay_detection (consumed by application/services/pipeline.py,
+    application/services/notification/overlay_helpers.py, routes/clips_routes.py)
 
 Everything else is internal and may change freely.
 """
@@ -18,8 +17,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.coercions import coerce_positive_int
 
-
-# --------------------------------- access ----------------------------------
 
 class _Source:
     """Uniform read access to either a dict or an attribute-bag object."""
@@ -44,8 +41,6 @@ class _Source:
                 return v
         return None
 
-
-# --------------------------------- boxes -----------------------------------
 
 _BOX_KEYS = ("x1", "y1", "x2", "y2")
 _NORM_KEYS = ("x", "y", "w", "h")
@@ -88,8 +83,6 @@ def _normalize_box_norm(raw: Any) -> Optional[Dict[str, float]]:
         return None
 
 
-# ------------------------------ detections ---------------------------------
-
 def _normalize_overlay_detection(raw: Any) -> Optional[Dict[str, Any]]:
     """Normalize a single detection to the overlay schema, or None if no box."""
     if raw is None:
@@ -124,17 +117,13 @@ def _normalize_overlay_detection(raw: Any) -> Optional[Dict[str, Any]]:
     return out
 
 
-# ---------------------------- dedup base key -------------------------------
-
 def _overlay_detection_base_key(d: Dict[str, Any]) -> Tuple[Any, ...]:
     """Identity of a detection ignoring its track_id."""
     box = d["box"]
     return (d["cls_name"], d["conf"], box["x1"], box["y1"], box["x2"], box["y2"])
 
 
-# ---------------- public API: procedural dedup append ----------------------
-# Signature and behavior are deliberately unchanged — this function is
-# imported by multiple modules. Do not modify without updating all callers.
+# Imported by several modules; changing the signature requires updating them all.
 
 def _append_overlay_detection(
     detections: List[Dict[str, Any]],

@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.dtos import UserCreateDTO, UserProfileUpdateDTO
+from application.repositories._helpers import model_patch
 from core.database_orm import User, utc_now
 
 
@@ -73,9 +74,7 @@ class UserRepository:
         self, db: AsyncSession, user_id: int, dto: UserProfileUpdateDTO
     ) -> None:
         """Update the User columns set on `dto`."""
-        values = {
-            k: v for k, v in dto.model_dump(exclude_unset=True).items() if v is not None
-        }
+        values = model_patch(dto, drop_none=True)
         if "email" in values:
             values["email"] = self.normalize_email(values["email"])
         if values:

@@ -1,7 +1,4 @@
-"""Pydantic models and dataclasses used across the notification package.
-
-Extracted verbatim from the former monolithic application/services/notification.py.
-"""
+"""Pydantic models and dataclasses used across the notification package."""
 
 from __future__ import annotations
 

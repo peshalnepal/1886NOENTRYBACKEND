@@ -1,7 +1,4 @@
-"""SMTP email notifier — single-message and digest renderers.
-
-Extracted verbatim from the former monolithic application/services/notification.py.
-"""
+"""SMTP email notifier — single-message, digest, and report-attachment senders."""
 
 from __future__ import annotations
 

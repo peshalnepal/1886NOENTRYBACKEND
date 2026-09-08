@@ -1,4 +1,3 @@
-# application/repositories/pipeline_repository.py
 """Pipeline <-> Camera <-> ChannelConfiguration persistence.
 
 Relations are always eager-loaded with `selectinload` (no lazy loading under

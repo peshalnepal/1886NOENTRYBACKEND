@@ -222,7 +222,7 @@ class EdgeInferenceClient:
             r = await self._request(
                 "GET", urls, request_timeout_s=self.list_timeout_s, connect_timeout_s=self.list_connect_timeout_s
             )
-            data = r.json() if r else {}  # Convert to JSON exactly where it's needed
+            data = r.json() if r else {}
         except Exception as exc:
             health = await self.get_health(device_url=device_url)
             raise EdgeCameraInventoryError(str(exc), health=health, cause=exc) from exc

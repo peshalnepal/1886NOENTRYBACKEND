@@ -1,7 +1,4 @@
-"""Notification deleter with bulk SQL hide support.
-
-Extracted from the former `_service_deletion.py` mixin.
-"""
+"""Notification deleter with bulk SQL hide support."""
 
 from __future__ import annotations
 
@@ -250,7 +247,7 @@ class NotificationDeleter:
                 pass
                 
             if su is not None or cu is not None:
-                # Fast bulk-SQL path! No more memory limits.
+                # Bulk-SQL path: hides by filter without loading ids into memory.
                 await self._bulk_hide_notifications_by_filter(user_id=int(user_id), site_uuid=su, camera_uuid=cu)
                 return {"ok": True, "bulk": True}
 

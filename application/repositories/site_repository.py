@@ -1,4 +1,3 @@
-# application/repositories/site_repository.py
 """
 Site + SiteSettings + SiteDevice persistence.
 
@@ -40,9 +39,7 @@ logger = logging.getLogger(__name__)
 class SiteRepository:
     """All persistence for Site, SiteSettings and the SiteDevice link table."""
 
-    # ------------------------------------------------------------------
-    # Site reads
-    # ------------------------------------------------------------------
+
     def _scoped_query(
         self,
         selectable,
@@ -130,9 +127,6 @@ class SiteRepository:
         )
         return list((await db.execute(stmt)).scalars().all())
 
-    # ------------------------------------------------------------------
-    # Site writes
-    # ------------------------------------------------------------------
     async def create_site(self, db: AsyncSession, *, dto: SiteCreateDTO) -> Site:
         """Insert a new Site from a `SiteCreateDTO`. Flush only; caller commits."""
         site = Site(
@@ -179,9 +173,7 @@ class SiteRepository:
         await db.flush()
         return result.rowcount or 0
 
-    # ------------------------------------------------------------------
-    # SiteSettings
-    # ------------------------------------------------------------------
+
     async def get_site_settings(
         self, db: AsyncSession, *, site_uuid: uuid.UUID
     ) -> Optional[SiteSettings]:
@@ -238,9 +230,7 @@ class SiteRepository:
         await db.flush()
         return row
 
-    # ------------------------------------------------------------------
-    # SiteDevice link table
-    # ------------------------------------------------------------------
+
     async def site_device_exists(
         self, db: AsyncSession, *, site_uuid: uuid.UUID, device_uuid: uuid.UUID
     ) -> bool:
@@ -287,9 +277,7 @@ class SiteRepository:
         await db.flush()
         return result.rowcount or 0
 
-    # ------------------------------------------------------------------
-    # Site-graph deletion
-    # ------------------------------------------------------------------
+
     async def delete_site_graph_batched(
         self,
         session_factory,  # callable returning an AsyncSession context manager
@@ -352,9 +340,6 @@ class SiteRepository:
         logger.info("[Site Delete] FOREGROUND COMPLETE")
         return stats, alert_blob_keys, clip_blob_keys
 
-    # ------------------------------------------------------------------
-    # Deletion internals
-    # ------------------------------------------------------------------
     async def _batch_delete(
         self,
         session_factory,
@@ -434,9 +419,7 @@ class SiteRepository:
             session_factory, delete(table).where(where_clause)
         )
 
-    # ------------------------------------------------------------------
-    # User-account deletion helpers
-    # ------------------------------------------------------------------
+
     async def list_video_record_keys_for_cameras(
         self,
         session_factory,

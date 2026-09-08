@@ -589,9 +589,6 @@ class VideoChannelConfig(BaseModel, ChannelConfig):
 
         return self
 
-    # -----------------------------
-    # Helpers (optional but useful)
-    # -----------------------------
     def to_patch_dict(self) -> Dict[str, Any]:
         """
         For edit operations: returns only fields that were actually provided by the client,

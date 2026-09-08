@@ -40,7 +40,6 @@ def parse_odbc_conn_str(odbc: str) -> Dict[str, str]:
             continue
         k, v = part.split("=", 1)
         out[k.strip().lower()] = v.strip()
-    # aliases
     if "user" in out and "uid" not in out:
         out["uid"] = out["user"]
     if "password" in out and "pwd" not in out:
@@ -200,7 +199,6 @@ def ensure_constraint(
 
 
 def ensure_notification_emails(cur, db_name: str) -> None:
-    # Create base table (if it never existed)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS notification_emails (
@@ -218,7 +216,8 @@ def ensure_notification_emails(cur, db_name: str) -> None:
         """
     )
 
-    # Add missing columns if upgrading from legacy schema
+    # CREATE TABLE above only helps a fresh DB; an existing table needs each
+    # new column added by hand, guarded by information_schema.
     ensure_column(
         cur,
         db_name,

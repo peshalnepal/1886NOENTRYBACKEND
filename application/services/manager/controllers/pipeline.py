@@ -1,7 +1,4 @@
-"""Manager pipeline lifecycle + background tasks.
-
-Extracted from the former monolithic application/services/manager.py.
-"""
+"""Manager pipeline lifecycle + background tasks."""
 
 from __future__ import annotations
 
@@ -13,7 +10,7 @@ from application.channels.channel import VideoChannel
 from domain.events import ChannelCreateEvent, ChannelEditEvent, ChannelRemoveEvent, VideoChannelEvent
 from application.services.pipeline import ModelPipeline
 
-from application.services.manager.helpers import build_video_channel_config
+from application.services.manager.helpers import _camera_config_json, build_video_channel_config
 from application.services.manager.types import CameraOut, PipelineUpdateResult
 from application.repositories._helpers import require_uuid
 from application.services.manager.controllers._state import ManagerState
@@ -48,6 +45,18 @@ class PipelineController:
 
         return False
 
+    def _clear_loaded_pipeline(self, uid: int) -> None:
+        """Forget a pipeline whose database row is no longer available."""
+        self._state.pipelines_by_user.pop(uid, None)
+        self._state.pipeline_id_by_user.pop(uid, None)
+
+    @staticmethod
+    def _event_type(ev: VideoChannelEvent) -> str:
+        event_type = getattr(ev, "event_type", None)
+        if event_type is None and isinstance(ev, dict):
+            event_type = ev.get("event_type")
+        return str(event_type or "").lower()
+
     def _invalidate_camera_roi_state(self, camera_uuid: uuid.UUID, notification_service: Optional[Any]) -> None:
         cam = str(camera_uuid)
 
@@ -72,12 +81,12 @@ class PipelineController:
 
     async def _create_pipeline_unlocked(self, uid: int, notification_service: Optional[Any]) -> ModelPipeline:
         async with self._state.session_factory() as db:
-            pipline_name=f"{str(uid)}_pipeline" if uid else "default"
+            pipeline_name=f"{str(uid)}_pipeline" if uid else "default"
             pipeline_row = await self._state.pipeline_repo.upsert_pipeline(
                 db,
                 user_id=uid,
                 pipeline_id=None,
-                name=pipline_name,
+                name=pipeline_name,
                 is_active=True,
             )
             pid = pipeline_row.id
@@ -141,9 +150,7 @@ class PipelineController:
                     if not d_url or not d_uuid:
                         raise ValueError(f"Camera {cam.camera_uuid} has invalid device assignment.")
 
-                    cfg_json = {}
-                    if getattr(cam, "channel_configuration", None) and getattr(cam.channel_configuration, "configuration", None):
-                        cfg_json = cam.channel_configuration.configuration or {}
+                    cfg_json = _camera_config_json(cam)
                     schedule_state = await self._schedule_resolver.resolve_runtime_schedule(
                         db,
                         cam=cam,
@@ -168,10 +175,8 @@ class PipelineController:
         return mp
 
     async def create_pipeline(self, user_id: int | None, notification_service: Optional[Any]) -> ModelPipeline:
-        """
-        Creates (loads) the user's default pipeline and builds a config-only ModelPipeline.
-        """
-        uid = int(user_id or 1) # Will be passed from default_user_id
+        """Load (or create) the user's pipeline row and build its ModelPipeline."""
+        uid = int(user_id or 1)
 
         user_lock = self._state.get_user_lock(uid)
         async with user_lock:
@@ -202,15 +207,15 @@ class PipelineController:
 
         uid = int(user_id or default_user_id)
 
-        # get active pipeline OUTSIDE any Manager lock
+        # Resolved OUTSIDE any manager lock: get_activepipeline takes the
+        # per-user lock itself, so holding one here would deadlock.
         model_pipeline = await self.get_activepipeline(uid, notification_service, default_user_id)
 
         model_pipeline_pid = getattr(model_pipeline, "pipeline_id", None) or self._state.pipeline_id_by_user.get(uid)
         if not model_pipeline_pid:
             user_lock = self._state.get_user_lock(uid)
             async with user_lock:
-                self._state.pipelines_by_user.pop(uid, None)
-                self._state.pipeline_id_by_user.pop(uid, None)
+                self._clear_loaded_pipeline(uid)
             model_pipeline = await self.get_activepipeline(uid, notification_service, default_user_id)
             model_pipeline_pid = getattr(model_pipeline, "pipeline_id", None)
 
@@ -237,8 +242,7 @@ class PipelineController:
                     )
                     user_lock = self._state.get_user_lock(uid)
                     async with user_lock:
-                        self._state.pipelines_by_user.pop(uid, None)
-                        self._state.pipeline_id_by_user.pop(uid, None)
+                        self._clear_loaded_pipeline(uid)
 
                     if attempt == 1:
                         model_pipeline = await self.get_activepipeline(uid, notification_service, default_user_id)
@@ -254,10 +258,7 @@ class PipelineController:
                 roi_reset_camera_ids: Set[uuid.UUID] = set()
 
                 for ev in (channel_events or []):
-                    et = getattr(ev, "event_type", None)
-                    if et is None and isinstance(ev, dict):
-                        et = ev.get("event_type")
-                    et_norm = str(et or "").lower()
+                    et_norm = self._event_type(ev)
 
                     if et_norm == "create_channel" or isinstance(ev, ChannelCreateEvent):
                         cams, evs = await self._channel_ctrl.add_channel(
@@ -273,7 +274,7 @@ class PipelineController:
                     elif et_norm == "remove_channel" or isinstance(ev, ChannelRemoveEvent):
                         cams, evs = await self._channel_ctrl.remove_channel(db, pid=pid, ev=ev, user_id=uid, model_pipeline=model_pipeline)
                     else:
-                        logger.warning("Event type not matched: %s", et)
+                        logger.warning("Event type not matched: %s", et_norm)
                         continue
 
                     cameras_out.extend(cams)
