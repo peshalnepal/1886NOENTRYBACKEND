@@ -70,6 +70,9 @@ class EdgeInferenceClient:
         self.delete_path = os.getenv("EDGE_DELETE_PATH", "/cameras/{camera_uuid}")
         self.list_path = os.getenv("EDGE_LIST_PATH", self.add_path)
         self.sync_path = os.getenv("EDGE_SYNC_PATH", "/sync")
+        self.discovery_report_path = os.getenv(
+            "EDGE_DISCOVERY_REPORT_PATH", "/discovery/report"
+        )
         self.api_key = os.getenv("EDGE_API_KEY")
 
         self.request_timeout_s = env_float("EDGE_TIMEOUT_S", 15.0, minimum=0.1)
@@ -283,6 +286,44 @@ class EdgeInferenceClient:
             return None
         report = data.get("discovery")
         return report if isinstance(report, dict) else None
+
+    async def fetch_discovery_report(
+        self, *, device_url: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read the edge's most recent sweep without triggering a new one.
+
+        The Jetson already sweeps on its own interval, so the cached report is
+        at most one interval old and returns immediately. `sync_discovery`
+        forces a fresh scan and takes seconds, which is why it is not used for
+        routine inventory refreshes.
+
+        Returns None when the edge has never completed a sweep (404), predates
+        discovery, or cannot be reached — never fatal, because stale inventory
+        is better than none.
+        """
+        urls = self._candidate_urls(
+            device_url=device_url, path=self.discovery_report_path
+        )
+        try:
+            r = await self._request(
+                "GET", urls, request_timeout_s=self.list_timeout_s, ignore_404=True
+            )
+        except Exception as exc:
+            logger.info(
+                "Edge discovery report unavailable at %s (continuing without it): %s",
+                device_url, exc,
+            )
+            return None
+
+        if r is None:
+            return None
+
+        try:
+            data = r.json()
+        except Exception:
+            return None
+
+        return data if isinstance(data, dict) else None
 
     async def ensure_pipeline_ready(self, *, device_url: str) -> None:
         h = await self.get_health(device_url=device_url)

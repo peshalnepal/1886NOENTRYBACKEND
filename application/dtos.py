@@ -101,6 +101,28 @@ class DeviceUpdateDTO(_DTO):
     is_enabled: Optional[bool] = None
 
 
+class InventoryEntryDTO(_DTO):
+    """One camera as a device reported it.
+
+    Device-owned facts only. Site, camera code, ROI and schedule are cloud
+    policy and are never read from a report, so they have no place here.
+    """
+    discovery_identity: str
+    ip_address: Optional[str] = None
+    mac_address: Optional[str] = None
+    serial_number: Optional[str] = None
+    model: Optional[str] = None
+    firmware: Optional[str] = None
+    device_name: Optional[str] = None
+    source_url: Optional[str] = None
+    edge_camera_uuid: Optional[str] = None
+    is_present: bool = True
+    consecutive_misses: int = 0
+    first_seen_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    missing_since: Optional[datetime] = None
+
+
 class SiteCreateDTO(_DTO):
     """Input for `SiteRepository.create_site`."""
     org_id: int

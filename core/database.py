@@ -1178,6 +1178,38 @@ class DatabaseManager:
                 except Exception as exc:
                     logger.warning("Skipping site_memberships migration: %s", exc)
 
+                # --- backfill camera inventory from existing cameras ---------
+                # Without this every already-adopted camera would look like an
+                # unknown one on the next sweep and be added a second time.
+                # Discovered cameras carry their identity in the channel config;
+                # hand-created ones have none and are correctly absent, since no
+                # device ever reported them.
+                try:
+                    await conn.execute(
+                        text(
+                            "INSERT IGNORE INTO camera_inventory "
+                            "  (device_uuid, discovery_identity, source_url, ip_address, "
+                            "   model, serial_number, device_name, is_present, "
+                            "   site_uuid, camera_uuid, state, last_reported_at, "
+                            "   created_at, updated_at) "
+                            "SELECT c.device_uuid, "
+                            "       JSON_UNQUOTE(JSON_EXTRACT(cc.configuration, '$.discovery_identity')), "
+                            "       c.source_url, "
+                            "       JSON_UNQUOTE(JSON_EXTRACT(cc.configuration, '$.discovery_ip')), "
+                            "       JSON_UNQUOTE(JSON_EXTRACT(cc.configuration, '$.discovery_model')), "
+                            "       JSON_UNQUOTE(JSON_EXTRACT(cc.configuration, '$.discovery_serial')), "
+                            "       JSON_UNQUOTE(JSON_EXTRACT(cc.configuration, '$.discovery_name')), "
+                            "       1, c.site_uuid, c.camera_uuid, 'added', NOW(), NOW(), NOW() "
+                            "FROM camera c "
+                            "JOIN channel_configurations cc ON cc.camera_uuid = c.camera_uuid "
+                            "WHERE c.device_uuid IS NOT NULL "
+                            "  AND JSON_EXTRACT(cc.configuration, '$.discovery_identity') IS NOT NULL"
+                        )
+                    )
+                    logger.info("Backfilled camera inventory from discovery provenance.")
+                except Exception as exc:
+                    logger.warning("Skipping camera inventory backfill: %s", exc)
+
                 # --- backfill org_id from access grants ----------------------
                 # Idempotent: only touches rows where org_id is still NULL.
                 try:

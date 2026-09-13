@@ -359,6 +359,87 @@ class SiteDevice(Base):
     )
 
 
+# CAMERA INVENTORY
+INVENTORY_AVAILABLE = "available"
+INVENTORY_ADDED = "added"
+INVENTORY_REMOVED = "removed"
+
+
+class CameraInventory(Base):
+    """Every camera a device has reported, whether or not it is in a site.
+
+    This outlives the `Camera` row on purpose. Deleting a camera deletes its
+    channel, so without a separate record the next discovery sweep sees
+    unregistered hardware and adds it straight back. Inventory is what lets a
+    removal stick: the row survives with `state=removed`, and adoption checks
+    it before creating anything.
+
+    `site_uuid` is the read gate. NULL means the camera belongs to no site yet
+    — it was reported but never added, or it was taken out of one. `state`
+    separates the two cases that both leave `site_uuid` NULL:
+
+        available  reported, not added, free to add
+        added      linked to `site_uuid`, running as `camera_uuid`
+        removed    taken out by a user; sweeps must skip it until re-added
+
+    Keyed by (device, discovery_identity), never by source URL: a camera keeps
+    its identity across a DHCP move while its URL changes.
+    """
+    __tablename__ = "camera_inventory"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    device_uuid = Column(
+        GUID, ForeignKey("devices.device_uuid", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # "serial:<n>" preferred, then "mac:<n>", then "ip:<n>" — set by the edge.
+    discovery_identity = Column(String(255), nullable=False, index=True)
+
+    # --- what the device reports ---
+    ip_address = Column(String(45), nullable=True, index=True)
+    mac_address = Column(String(32), nullable=True)
+    serial_number = Column(String(128), nullable=True, index=True)
+    model = Column(String(128), nullable=True)
+    firmware = Column(String(128), nullable=True)
+    device_name = Column(String(255), nullable=True)
+    # May embed credentials, so it is never returned by the API.
+    source_url = Column(Text, nullable=True)
+    # The UUID the edge provisioned this camera into, when it adopted one.
+    edge_camera_uuid = Column(String(64), nullable=True, index=True)
+
+    is_present = Column(Boolean, nullable=False, default=True)
+    consecutive_misses = Column(Integer, nullable=False, default=0)
+    first_seen_at = Column(DateTime(timezone=True), nullable=True)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)
+    missing_since = Column(DateTime(timezone=True), nullable=True)
+    last_reported_at = Column(DateTime(timezone=True), default=utc_now)
+
+    # --- what the cloud decides ---
+    # SET NULL, not CASCADE: deleting a site must not erase the record that
+    # this camera exists, only the fact that it was filed there.
+    site_uuid = Column(
+        GUID, ForeignKey("sites.site_uuid", ondelete="SET NULL"), nullable=True, index=True
+    )
+    camera_uuid = Column(
+        GUID, ForeignKey("camera.camera_uuid", ondelete="SET NULL"), nullable=True, index=True
+    )
+    state = Column(
+        String(16), nullable=False, default=INVENTORY_AVAILABLE,
+        server_default=INVENTORY_AVAILABLE, index=True,
+    )
+
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    device = relationship("Device")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "device_uuid", "discovery_identity", name="uq_inventory_device_identity"
+        ),
+    )
+
+
 # SITE SETTINGS
 class SiteSettings(Base):
     __tablename__ = "site_settings"

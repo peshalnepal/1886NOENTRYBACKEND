@@ -5,7 +5,6 @@ from datetime import datetime, time as dt_time, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy import select as _sa_select
@@ -16,6 +15,7 @@ from core.security.roles import Permission, RoleScope
 from dependencies import (
     get_async_db,
     get_manager,
+    get_manager_optional,
     RequirePermission,
     OrgContext,
 )
@@ -33,10 +33,19 @@ from application.services.clip_storage import (
     EventClipService,
     extract_notification_clip_storage_keys as _extract_notification_clip_storage_keys,
 )
-from application.services.webrtcgateway import resolve_camera_webrtc_url
+from routes._camera_serializers import (
+    camera_webrtc_url as _camera_webrtc_url,
+    camera_with_config_out as _camera_with_config_out,
+)
+from application.services.inventory_service import InventoryService
 from core.schemas import (
+    ArmStateOut,
     CameraWithConfigSchema,
     DeviceOut,
+    InventoryAddRequest,
+    InventoryAddResponse,
+    InventoryAddResult,
+    InventoryCameraOut,
     LinkDeviceRequest,
     SITE_PRERECORD_TRIGGER_MODES,
     SITE_PRERECORD_TRIGGER_MODE_ROI_ENTER,
@@ -50,6 +59,7 @@ from core.schemas import (
     SiteSettingsOut,
     SiteSettingsUpdate,
     SiteUpdate,
+    SetArmRequest,
 )
 from core.database import AsyncSessionLocal
 from routes._errors import DEVICE_NOT_FOUND, SITE_NOT_FOUND
@@ -83,24 +93,17 @@ def _time_to_schedule_str(value: Any, default: dt_time) -> str:
     return dt_time.fromisoformat(str(value)).strftime("%H:%M:%S")
 
 
-def _default_site_schedule_payload(timezone_name: Optional[str]) -> Dict[str, Any]:
-    return {
-        "timezone": str(timezone_name or "UTC"),
-        "day_of_week": list(SUNDAY_TO_SATURDAY),
-        "start_time": "00:00:00",
-        "end_time": "23:59:59",
-        "schedule": VideoChannelConfig.default_schedule(),
-    }
+_FULL_WEEK_WINDOW: Dict[str, Any] = {
+    "day_of_week": list(SUNDAY_TO_SATURDAY),
+    "start_time": "00:00:00",
+    "end_time": "23:59:59",
+}
 
 
 def _primary_schedule_window_payload(schedule: List[Dict[str, Any]]) -> Dict[str, Any]:
     windows = VideoChannelConfig.schedule_windows(schedule)
     if not windows:
-        return {
-            "day_of_week": list(SUNDAY_TO_SATURDAY),
-            "start_time": "00:00:00",
-            "end_time": "23:59:59",
-        }
+        return dict(_FULL_WEEK_WINDOW)
 
     template = windows[0]
     return {
@@ -136,7 +139,11 @@ def _site_schedule_payload_from_row(
             ]
 
     if not schedule:
-        return _default_site_schedule_payload(config.get("timezone") or fallback_timezone)
+        return {
+            **_FULL_WEEK_WINDOW,
+            "timezone": str(config.get("timezone") or fallback_timezone or "UTC"),
+            "schedule": VideoChannelConfig.default_schedule(),
+        }
 
     primary = _primary_schedule_window_payload(schedule)
 
@@ -388,19 +395,6 @@ def _serialize_site_settings(
     )
 
 
-def _camera_out_to_response(cam_out) -> CameraWithConfigSchema:
-    """Shared with camera_routes so both create paths return the same shape."""
-    from routes.camera_routes import _camera_with_config_out
-
-    return _camera_with_config_out(
-        cam_out,
-        webrtc_url=resolve_camera_webrtc_url(
-            camera_code=getattr(cam_out, "camera_code", None),
-            stored_url=getattr(cam_out, "webrtc_url", None),
-        ),
-    )
-
-
 # -----------------------
 # Org-scope helpers
 # -----------------------
@@ -472,7 +466,7 @@ async def list_sites(
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
-    site_repo=SiteRepository()
+    site_repo = SiteRepository()
     sites = await site_repo.get_sites(
         db,
         org_id=ctx.org_id,
@@ -526,7 +520,7 @@ async def create_site_camera(
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_CAMERAS)),
     manager: Manager = Depends(get_manager),
 ):
-    site_repo=SiteRepository()
+    site_repo = SiteRepository()
     site = await site_repo.get_site(db, org_id=ctx.org_id, site_uuid=site_uuid)
     owner_id = _owner_id(site, ctx)
 
@@ -566,7 +560,8 @@ async def create_site_camera(
         )
         if not result or not result.cameras:
             raise HTTPException(status_code=500, detail="Operation failed to create camera record")
-        return _camera_out_to_response(result.cameras[0])
+        cam_out = result.cameras[0]
+        return _camera_with_config_out(cam_out, webrtc_url=_camera_webrtc_url(cam_out))
     except HTTPException:
         raise
     except Exception as exc:
@@ -579,9 +574,9 @@ async def update_site_settings(
     payload: SiteSettingsUpdate,
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SITES)),
-    manager: Manager = Depends(get_manager),
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
-    site_repo=SiteRepository()
+    site_repo = SiteRepository()
     site = await site_repo.get_site(db, org_id=ctx.org_id, site_uuid=site_uuid)
     owner_id = _owner_id(site, ctx)
     row = await site_repo.get_site_settings(db, site_uuid=site.site_uuid)
@@ -659,24 +654,31 @@ async def update_site_settings(
         ),
     )
     await db.commit()
+
+    notif_svc = getattr(manager, "notification_service", None) if manager else None
     if payload.multi_camera_prerecord is not None:
         try:
-            svc = getattr(manager, "_notification_service", None) if manager else None
-            if svc is not None and hasattr(svc, "invalidate_prerecord_eligible_cache"):
-                svc.invalidate_prerecord_eligible_cache()
+            if hasattr(notif_svc, "invalidate_prerecord_eligible_cache"):
+                notif_svc.invalidate_prerecord_eligible_cache()
         except Exception:
-            pass
-        await _invalidate_site_camera_mode_cache(db=db, site_uuid=site.site_uuid)
+            logger.warning(
+                "Failed to invalidate prerecord-eligible cache site=%s",
+                site.site_uuid,
+                exc_info=True,
+            )
     if payload.notification is not None:
         try:
-            svc = getattr(manager, "_notification_service", None) if manager else None
-            if svc is not None and hasattr(svc, "invalidate_site_trigger_mode_cache"):
-                svc.invalidate_site_trigger_mode_cache(str(site.site_uuid))
+            if hasattr(notif_svc, "invalidate_site_trigger_mode_cache"):
+                notif_svc.invalidate_site_trigger_mode_cache(str(site.site_uuid))
             pipeline = manager.get_loaded_pipeline(user_id=owner_id) if manager else None
-            if pipeline is not None and hasattr(pipeline, "invalidate_site_trigger_mode_cache"):
+            if hasattr(pipeline, "invalidate_site_trigger_mode_cache"):
                 pipeline.invalidate_site_trigger_mode_cache(str(site.site_uuid))
         except Exception:
-            pass
+            logger.warning(
+                "Failed to invalidate site trigger-mode cache site=%s",
+                site.site_uuid,
+                exc_info=True,
+            )
     await db.refresh(row)
     if payload.schedule is not None and manager is not None:
         try:
@@ -738,7 +740,7 @@ async def get_site(
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
 ):
-    site_repo=SiteRepository()
+    site_repo = SiteRepository()
     site = await site_repo.get_site(
         db, org_id=ctx.org_id, site_uuids=await _site_scope(db, ctx), site_uuid=site_uuid
     )
@@ -751,9 +753,9 @@ async def update_site(
     payload: SiteUpdate,
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SITES)),
-    manager:Manager = Depends(get_manager),
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
-    site_repo=SiteRepository()
+    site_repo = SiteRepository()
     site = await site_repo.get_site(db, org_id=ctx.org_id, site_uuid=site_uuid)
     owner_id = _owner_id(site, ctx)
 
@@ -814,7 +816,7 @@ async def delete_site(
     site_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SITES)),
-    manager: Manager = Depends(get_manager),
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
     """Delete a site and everything attached to it.
 
@@ -845,25 +847,26 @@ async def delete_site(
         org_id=ctx.org_id,
     )
 
-    camera_uuids = [row["camera_uuid"] for row in camera_rows]
-    cam_to_urls: Dict[uuid.UUID, set[str]] = {}
-    cam_to_code: Dict[uuid.UUID, Optional[str]] = {}
+    # One row per camera/device pair, so fold duplicate camera rows into a
+    # single entry carrying every device_url seen for that camera.
+    snapshot_by_uuid: Dict[uuid.UUID, dict] = {}
     for row in camera_rows:
         cam_uuid_key = row["camera_uuid"]
-        cam_to_code[cam_uuid_key] = row.get("camera_code")
+        entry = snapshot_by_uuid.setdefault(
+            cam_uuid_key,
+            {
+                "camera_uuid": cam_uuid_key,
+                "camera_code": row.get("camera_code"),
+                "device_urls": [],
+            },
+        )
+        entry["camera_code"] = row.get("camera_code")
         url = str(row.get("device_url") or "").strip()
-        bucket = cam_to_urls.setdefault(cam_uuid_key, set())
-        if url:
-            bucket.add(url)
+        if url and url not in entry["device_urls"]:
+            entry["device_urls"].append(url)
 
-    cam_snapshot = [
-        {
-            "camera_uuid": cam_uuid_key,
-            "camera_code": cam_to_code.get(cam_uuid_key),
-            "device_urls": list(cam_to_urls.get(cam_uuid_key) or ()),
-        }
-        for cam_uuid_key in camera_uuids
-    ]
+    camera_uuids = list(snapshot_by_uuid)
+    cam_snapshot = list(snapshot_by_uuid.values())
     logger.info("[Site Delete] Snapshotted %s cameras", len(cam_snapshot))
 
     # 1. Close the reconcile race window before touching anything external.
@@ -1030,7 +1033,7 @@ async def link_device_to_site(
     discover: bool = True,
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SITES)),
-    manager: Optional[Manager] = Depends(get_manager),
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
     """Link a device to a site and pull in the cameras it can see.
 
@@ -1043,7 +1046,7 @@ async def link_device_to_site(
     link itself is the durable part and a later Sync will pick up the cameras.
     Pass `discover=false` to link without sweeping.
     """
-    site_repo=SiteRepository()
+    site_repo = SiteRepository()
     site = await site_repo.get_site(db, org_id=ctx.org_id, site_uuid=site_uuid)
 
     device_repo = DeviceRepository()
@@ -1066,6 +1069,16 @@ async def link_device_to_site(
 
     if not discover or manager is None:
         return result
+
+    # Record what the device can see before adopting, so the sweep below can
+    # tell a genuinely new camera from one the user removed earlier.
+    refresh = await InventoryService(manager=manager).refresh_from_device(
+        db, device_uuid=device.device_uuid, device_url=device.device_url
+    )
+    if refresh["fetched"]:
+        await db.commit()
+    else:
+        await db.rollback()
 
     # The link must be committed before the sweep runs: adoption resolves the
     # target site through site_devices, so an uncommitted link would look like
@@ -1107,6 +1120,70 @@ async def link_device_to_site(
     return result
 
 
+@router.get("/{site_uuid}/inventory", response_model=List[InventoryCameraOut])
+async def list_site_inventory(
+    site_uuid: uuid.UUID,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
+):
+    """Cameras reported by the devices linked to this site.
+
+    Scoped to linked devices, so it can never expose another site's hardware,
+    and carries no connection credentials.
+    """
+    site_repo = SiteRepository()
+    site = await site_repo.get_site(db, org_id=ctx.org_id, site_uuid=site_uuid)
+
+    rows = await InventoryService().describe_for_site(db, site_uuid=site.site_uuid)
+    return [InventoryCameraOut(**row) for row in rows]
+
+
+@router.post("/{site_uuid}/inventory/add", response_model=InventoryAddResponse)
+async def add_inventory_cameras(
+    site_uuid: uuid.UUID,
+    payload: InventoryAddRequest,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_CAMERAS)),
+    manager: Manager = Depends(get_manager),
+):
+    """Add reported cameras to this site, creating a channel for each.
+
+    The only path that clears a previous removal: a camera comes back because
+    someone asked for it, never because a sweep found the hardware again.
+    """
+    site_repo = SiteRepository()
+    site = await site_repo.get_site(db, org_id=ctx.org_id, site_uuid=site_uuid)
+
+    device_repo = DeviceRepository()
+    device = await device_repo.get_device(
+        db, device_uuid=payload.device_uuid, org_id=ctx.org_id
+    )
+    if not device:
+        raise HTTPException(status_code=404, detail=DEVICE_NOT_FOUND)
+
+    if not await site_repo.site_device_exists(
+        db, site_uuid=site.site_uuid, device_uuid=device.device_uuid
+    ):
+        raise HTTPException(
+            status_code=409, detail="Device is not linked to this site."
+        )
+
+    owner_id = int(device.user_id) if device.user_id is not None else int(ctx.user.id)
+    results = await InventoryService(manager=manager).add_to_site(
+        db,
+        site_uuid=site.site_uuid,
+        device_uuid=device.device_uuid,
+        discovery_identities=payload.discovery_identities,
+        user_id=owner_id,
+    )
+    await db.commit()
+
+    return InventoryAddResponse(
+        site_uuid=site.site_uuid,
+        results=[InventoryAddResult(**row) for row in results],
+    )
+
+
 @router.delete("/{site_uuid}/devices/{device_uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def unlink_device_from_site(
     site_uuid: uuid.UUID,
@@ -1114,7 +1191,7 @@ async def unlink_device_from_site(
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_SITES)),
 ):
-    site_repo=SiteRepository()
+    site_repo = SiteRepository()
     site = await site_repo.get_site(db, org_id=ctx.org_id, site_uuid=site_uuid)
 
     channel_repo = ChannelRepository()
@@ -1137,19 +1214,15 @@ async def unlink_device_from_site(
 # =====================================================================
 # Arm / disarm
 # =====================================================================
-class ArmStateOut(BaseModel):
-    site_uuid: uuid.UUID
-    is_armed: bool
-    # Whether a temporary user override is currently in force (vs. following the
-    # schedule), and when it auto-clears (next schedule boundary; null = no
-    # boundary, so the override is permanent until changed).
-    override_active: bool = False
-    override_until: Optional[datetime] = None
-
-
-class SetArmRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    is_armed: bool
+async def _live_site_or_404(db: AsyncSession, site_uuid: uuid.UUID) -> Site:
+    """Load a site for the arm routes, which are gated by a site-scoped
+    permission rather than by the org-scoped repository lookup."""
+    site = (
+        await db.execute(_sa_select(Site).where(Site.site_uuid == site_uuid).limit(1))
+    ).scalar_one_or_none()
+    if site is None or bool(site.is_deleted):
+        raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
+    return site
 
 
 async def _resolve_site_schedule_for_arm(
@@ -1185,6 +1258,41 @@ def _effective_arm_state_out(
     )
 
 
+async def _refresh_site_arm_runtime(
+    *,
+    manager: Manager,
+    user_id: int,
+    site_uuid: uuid.UUID,
+    device_uuids: List[uuid.UUID],
+) -> None:
+    """Push a fresh arm/disarm decision to the live runtime.
+
+    1. Invalidate the pipeline's per-site arm cache so the notification gate
+       flips on the next frame instead of after the TTL.
+    2. Fire a best-effort edge reconcile for the site's devices so detection is
+       torn down (disarm) or brought back up (arm) on the Jetson immediately.
+
+    The DB (`arm_override` + schedule) remains authoritative; the periodic edge
+    reconcile loop will converge anyway, so any failure here is non-fatal.
+    """
+    try:
+        pipeline = manager.get_loaded_pipeline(user_id=int(user_id))
+        if pipeline is not None and hasattr(pipeline, "invalidate_site_arm_state"):
+            pipeline.invalidate_site_arm_state(str(site_uuid))
+    except Exception:
+        logger.warning(
+            "Failed to invalidate arm-state cache site=%s", site_uuid, exc_info=True
+        )
+
+    if device_uuids:
+        asyncio.create_task(
+            manager.reconcile_devices_best_effort(
+                user_id=int(user_id),
+                device_uuids=list(device_uuids),
+            )
+        )
+
+
 @router.get(
     "/{site_uuid}/arm",
     response_model=ArmStateOut,
@@ -1199,13 +1307,7 @@ async def get_site_arm_state(
     Read-only site members can hit this endpoint to see the flag but
     cannot mutate it; see `PATCH` below for that.
     """
-    site = (
-        await db.execute(
-            _sa_select(Site).where(Site.site_uuid == site_uuid).limit(1)
-        )
-    ).scalar_one_or_none()
-    if site is None or bool(site.is_deleted):
-        raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
+    site = await _live_site_or_404(db, site_uuid)
     schedule, tz = await _resolve_site_schedule_for_arm(db, site)
     return _effective_arm_state_out(site, schedule, tz, now=datetime.now(timezone.utc))
 
@@ -1241,13 +1343,7 @@ async def set_site_arm_state(
     reconcile loop tears cameras down on the Jetson when disarmed) and
     notifications (the pipeline suppresses alerts when disarmed).
     """
-    site = (
-        await db.execute(
-            _sa_select(Site).where(Site.site_uuid == site_uuid).limit(1)
-        )
-    ).scalar_one_or_none()
-    if site is None or bool(site.is_deleted):
-        raise HTTPException(status_code=404, detail=SITE_NOT_FOUND)
+    site = await _live_site_or_404(db, site_uuid)
 
     want_armed = bool(payload.is_armed)
     schedule, tz = await _resolve_site_schedule_for_arm(db, site)
@@ -1311,38 +1407,3 @@ async def set_site_arm_state(
         int(ctx.user.id),
     )
     return _effective_arm_state_out(site, schedule, tz, now=now)
-
-
-async def _refresh_site_arm_runtime(
-    *,
-    manager: Manager,
-    user_id: int,
-    site_uuid: uuid.UUID,
-    device_uuids: List[uuid.UUID],
-) -> None:
-    """Push a fresh arm/disarm decision to the live runtime.
-
-    1. Invalidate the pipeline's per-site arm cache so the notification gate
-       flips on the next frame instead of after the TTL.
-    2. Fire a best-effort edge reconcile for the site's devices so detection is
-       torn down (disarm) or brought back up (arm) on the Jetson immediately.
-
-    The DB (`arm_override` + schedule) remains authoritative; the periodic edge
-    reconcile loop will converge anyway, so any failure here is non-fatal.
-    """
-    try:
-        pipeline = manager.get_loaded_pipeline(user_id=int(user_id))
-        if pipeline is not None and hasattr(pipeline, "invalidate_site_arm_state"):
-            pipeline.invalidate_site_arm_state(str(site_uuid))
-    except Exception:
-        logger.warning(
-            "Failed to invalidate arm-state cache site=%s", site_uuid, exc_info=True
-        )
-
-    if device_uuids:
-        asyncio.create_task(
-            manager.reconcile_devices_best_effort(
-                user_id=int(user_id),
-                device_uuids=list(device_uuids),
-            )
-        )

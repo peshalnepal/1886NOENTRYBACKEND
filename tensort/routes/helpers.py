@@ -37,13 +37,16 @@ def require_source(url) -> bool:
 
 def runtime_status(include_stats: bool) -> Dict[str, Any]:
     runtime = get_runtime()
+    stats = runtime.get_stats()
+    ready = bool(runtime.pipeline is not None and runtime.loop is not None
+                 and stats.get("inference_ready", False))
     payload = {
-        "ok": True,
+        "ok": ready,
         "service": "jetson-tensort",
-        "pipeline_ready": bool(runtime.pipeline is not None and runtime.loop is not None),
+        "pipeline_ready": ready,
     }
     if include_stats:
-        payload["stats"] = runtime.get_stats()
+        payload["stats"] = stats
 
     # Surfaced on both / and /health so the cloud can tell a Jetson that is
     # actively discovering from one where the scanner died, without a second

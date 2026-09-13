@@ -60,7 +60,10 @@ class DatabaseManager:
         logger.info("SQLite database (async + sync) initialized successfully")
 
     def initialize_tables(self):
-        from database_orm import Base
+        if __package__:
+            from .database_orm import Base
+        else:
+            from database_orm import Base
         try:
             self._migrate_rtsp_url_to_source_url()
             Base.metadata.create_all(bind=self.sync_engine)

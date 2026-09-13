@@ -1,4 +1,5 @@
 # video_channel_config.py
+import math
 
 
 class VideoChannelConfig(object):
@@ -104,8 +105,8 @@ class VideoChannelConfig(object):
         if not self.camera_uuid and not self.source_url:
             raise ValueError("source_url is required when camera_uuid is not provided (new camera).")
 
-        if self.sample_fps <= 0.0:
-            raise ValueError("sample_fps must be > 0")
+        if not math.isfinite(self.sample_fps) or self.sample_fps <= 0.0:
+            raise ValueError("sample_fps must be finite and > 0")
 
         if self.reconnect_base_ms < 100:
             raise ValueError("reconnect_base_ms must be >= 100")

@@ -188,7 +188,11 @@ class DiscoveryService(object):
             if state.get("recovered"):
                 recovered.append(dev.to_dict())
 
-            if not state.get("is_new"):
+            # Retry a previously seen camera whose admission failed (for
+            # example because all eight slots were occupied at the last scan).
+            row = state.get("row")
+            needs_adoption = state.get("is_new") or (row is not None and not row.get("camera_uuid"))
+            if not needs_adoption:
                 continue
 
             if not self.auto_add:

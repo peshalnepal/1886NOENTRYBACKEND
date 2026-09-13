@@ -6,9 +6,11 @@ import logging
 from flask import Blueprint, jsonify, Response
 
 try:
+    from limits import CameraCapacityError
     from routes.helpers import json_body, require_source
     from routes.runtime_ref import get_runtime
 except Exception:
+    from ..limits import CameraCapacityError
     from .helpers import json_body, require_source
     from .runtime_ref import get_runtime
 
@@ -58,6 +60,10 @@ def add_camera():
     try:
         out = get_runtime().add_camera(source_url, cfg)
         return jsonify(out), 201
+    except CameraCapacityError as e:
+        return jsonify({"error": str(e)}), 409
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         logger.exception("add_camera failed: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -87,6 +93,10 @@ def patch_camera(camera_uuid):
         return jsonify(out)
     except KeyError:
         return jsonify({"error": "Camera not found"}), 404
+    except CameraCapacityError as e:
+        return jsonify({"error": str(e)}), 409
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         logger.exception("patch_camera failed: %s", e)
         return jsonify({"error": str(e)}), 500

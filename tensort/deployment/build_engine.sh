@@ -5,8 +5,8 @@
 # architecture and one TensorRT version — an engine built on a dev box (or on a
 # different Jetson model) will fail to deserialize here.
 #
-#   ./deployment/build_engine.sh                 # yolo26s, batch 1..10, 640px
-#   MODEL=yolo26n ./deployment/build_engine.sh   # roll back to the small model
+#   ./deployment/build_engine.sh                 # yolo26m, batch 1..8, 640px
+#   MODEL=yolo26n ./deployment/build_engine.sh   # smaller/faster; lower accuracy
 #   MAX_BATCH=6 ./deployment/build_engine.sh     # fewer cameras
 #
 # Use deployment/setup_orin.sh instead if you also want the venv, systemd unit
@@ -27,10 +27,12 @@ HERE="$(cd "$(dirname "$SELF")" && pwd)"
 APP_DIR="$(cd "${HERE}/.." && pwd)"   # the tensort/ folder — all paths below are relative to it
 cd "$APP_DIR"
 
-MODEL="${MODEL:-yolo26s}"
-MAX_BATCH="${MAX_BATCH:-10}"
+MODEL="${MODEL:-yolo26m}"
+MAX_BATCH="${MAX_BATCH:-8}"
 OPT_BATCH="${OPT_BATCH:-${MAX_BATCH}}"
 IMG_SZ="${IMG_SZ:-640}"
+[[ "$MAX_BATCH" =~ ^[1-8]$ ]] || { echo "MAX_BATCH must be between 1 and 8"; exit 1; }
+[[ "$OPT_BATCH" =~ ^[1-8]$ ]] && (( OPT_BATCH <= MAX_BATCH )) || { echo "OPT_BATCH must be between 1 and MAX_BATCH"; exit 1; }
 WORKSPACE_MB="${WORKSPACE_MB:-3072}"
 ONNX="models/${MODEL}.onnx"
 ENGINE="models/${MODEL}.engine"
@@ -38,6 +40,11 @@ TRTEXEC="${TRTEXEC:-/usr/src/tensorrt/bin/trtexec}"
 
 [ -f "$ONNX" ] || { echo "ERROR: ${ONNX} not found. Export it first:"; \
   echo "  yolo export model=models/${MODEL}.pt format=onnx dynamic=True imgsz=${IMG_SZ} simplify=True nms=False"; exit 1; }
+
+# yolo26m/s export with dynamic height and width as well as batch. trtexec needs
+# every dynamic axis pinned in the shape profiles below, which the *Shapes flags
+# already do (3x${IMG_SZ}x${IMG_SZ}). The engine is therefore fixed at IMG_SZ,
+# which is exactly what the service asserts against at startup.
 [ -x "$TRTEXEC" ] || { echo "ERROR: trtexec not found at ${TRTEXEC} — is this a Jetson with JetPack installed?"; exit 1; }
 
 # A static-batch ONNX silently yields max_batch=1 and cross-camera batching does

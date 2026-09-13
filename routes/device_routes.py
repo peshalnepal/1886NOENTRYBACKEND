@@ -9,15 +9,27 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from application.dtos import DeviceCreateDTO, DeviceUpdateDTO
+from application.repositories.channel_repository import ChannelRepository
 from application.repositories.device_repository import DeviceRepository
 from application.services.manager import EdgeDeviceUnavailableError, Manager
 from core.coercions import gen_code, is_blank
 from core.database_orm import Device
-from core.schemas import DeviceCreate, DeviceOut, DeviceUpdate, EdgeReconcileOut
+from application.services.inventory_service import InventoryService
+from core.schemas import (
+    DeviceCameraOut,
+    DeviceCamerasOut,
+    DeviceCreate,
+    DeviceOut,
+    DeviceUpdate,
+    EdgeReconcileOut,
+    InventoryCameraOut,
+    InventoryRefreshOut,
+)
 from core.security.roles import Permission
 from dependencies import (
     get_async_db,
     get_manager,
+    get_manager_optional,
     OrgContext,
     RequirePermission,
 )
@@ -52,10 +64,17 @@ async def _cleanup_device_runtime(
 ) -> None:
     """Best-effort runtime teardown with bounded manager calls."""
     try:
-        active_pipeline = await asyncio.wait_for(
-            manager.get_activepipeline(user_id=owner_id),
-            timeout=5.0,
+        active_pipeline = manager.get_loaded_pipeline(user_id=owner_id)
+    except Exception:
+        logger.warning(
+            "Could not inspect loaded pipeline for device=%s; "
+            "channel eviction limited to the DB snapshot",
+            device_uuid,
+            exc_info=True,
         )
+        active_pipeline = None
+
+    try:
         await asyncio.wait_for(
             manager.cleanup_device_resources(
                 db,
@@ -154,7 +173,7 @@ async def delete_device(
     device_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_DEVICES)),
-    manager: Optional[Manager] = Depends(get_manager),
+    manager: Optional[Manager] = Depends(get_manager_optional),
 ):
     device = await _get_device_or_404(db, ctx.org_id, device_uuid)
     owner_id = _device_owner_id(device, ctx)
@@ -171,6 +190,90 @@ async def delete_device(
     await device_repo.delete_device(db, device_uuid=device.device_uuid)
     await db.commit()
     return None
+
+@router.get("/{device_uuid}/cameras", response_model=DeviceCamerasOut)
+async def list_device_cameras(
+    device_uuid: uuid.UUID,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
+    manager: Optional[Manager] = Depends(get_manager_optional),
+):
+    """The cameras the device currently has loaded, read from the device itself.
+
+    A live read with no cloud copy: an unreachable device reports `reachable`
+    false rather than an error, so the caller can tell "no cameras" apart from
+    "could not ask".
+    """
+    device = await _get_device_or_404(db, ctx.org_id, device_uuid)
+    if manager is None:
+        return DeviceCamerasOut(device_uuid=device.device_uuid, reachable=False)
+
+    try:
+        loaded = await manager.edge.list_cameras(device_url=device.device_url)
+    except Exception:
+        logger.warning(
+            "Could not list cameras on device=%s", device.device_uuid, exc_info=True
+        )
+        return DeviceCamerasOut(device_uuid=device.device_uuid, reachable=False)
+
+    known = {
+        str(cam.camera_uuid): cam
+        for cam in await ChannelRepository().list_cameras(
+            db, device_uuid=device.device_uuid
+        )
+    }
+    cameras = [
+        DeviceCameraOut(
+            camera_uuid=uuid.UUID(camera_uuid),
+            name=getattr(known.get(camera_uuid), "name", None),
+            site_uuid=getattr(known.get(camera_uuid), "site_uuid", None),
+            known_to_cloud=camera_uuid in known,
+        )
+        for camera_uuid in sorted(loaded)
+    ]
+    return DeviceCamerasOut(
+        device_uuid=device.device_uuid, reachable=True, cameras=cameras
+    )
+
+
+@router.post("/{device_uuid}/inventory/refresh", response_model=InventoryRefreshOut)
+async def refresh_device_inventory(
+    device_uuid: uuid.UUID,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_DEVICES)),
+    manager: Optional[Manager] = Depends(get_manager_optional),
+):
+    """Ask the device what cameras it can see, and store the answer."""
+    device = await _get_device_or_404(db, ctx.org_id, device_uuid)
+
+    summary = await InventoryService(manager=manager).refresh_from_device(
+        db, device_uuid=device.device_uuid, device_url=device.device_url
+    )
+    if not summary["fetched"]:
+        await db.rollback()
+        return InventoryRefreshOut(
+            fetched=False,
+            detail="Device did not answer; stored inventory is unchanged.",
+        )
+
+    await db.commit()
+    return InventoryRefreshOut(**summary)
+
+
+@router.get("/{device_uuid}/inventory", response_model=List[InventoryCameraOut])
+async def list_device_inventory(
+    device_uuid: uuid.UUID,
+    db: AsyncSession = Depends(get_async_db),
+    ctx: OrgContext = Depends(RequirePermission(Permission.ORG_READ)),
+):
+    """Every camera this device has reported, added or not."""
+    device = await _get_device_or_404(db, ctx.org_id, device_uuid)
+
+    rows = await InventoryService().describe_for_device(
+        db, device_uuid=device.device_uuid
+    )
+    return [InventoryCameraOut(**row) for row in rows]
+
 
 @router.post("/{device_uuid}/edge/reconcile", response_model=EdgeReconcileOut)
 async def reconcile_edge_cameras(

@@ -11,6 +11,7 @@ import asyncio
 import logging
 import time
 import threading
+from fractions import Fraction
 
 import cv2
 
@@ -92,6 +93,15 @@ class VideoChannel():
         self._cap = None
         self._stopping = False
         self._cap_lock = threading.Lock()
+        # Coalesce before scheduling on asyncio: Queue(1) alone cannot bound
+        # call_soon_threadsafe's pending callbacks when the loop is busy.
+        self._handoff_lock = threading.Lock()
+        self._pending_frame = None
+        self._handoff_scheduled = False
+        self._capture_backend = None
+        self._connected = False
+        self._handoff_dropped = 0
+        self._frames_emitted = 0
         
     @staticmethod
     def _url_scheme(url):
@@ -124,19 +134,29 @@ class VideoChannel():
                 )
             else:
                 conv = ""
-        return conv + "videoconvert ! video/x-raw,format=BGR ! appsink drop=true sync=false max-buffers=1"
+        fps = Fraction(str(self.config.sample_fps)).limit_denominator(1000)
+        rate = "videorate drop-only=true ! video/x-raw,framerate={}/{} ! ".format(fps.numerator, fps.denominator)
+        # Limit CPU color conversion to the requested inference rate. Hardware
+        # scaling remains before videorate to bring NVMM into system memory.
+        prefix = conv + rate if hw else rate + conv
+        return prefix + "videoconvert ! video/x-raw,format=BGR ! appsink drop=true sync=false max-buffers=1"
+
+    @staticmethod
+    def _gst_quote(value):
+        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
     def _build_rtsp_pipeline(self, url, decoder):
         """RTSP fast path: depay/parse H.264 + (HW or CPU) decode."""
         lat = int(self.config.gst_latency_ms)
         proto = self.config.rtsp_transport
-        q = "queue max-size-buffers=1 leaky=downstream ! "
+        # Never drop compressed RTP packets before depay/decode: doing so
+        # corrupts reference frames until the camera sends another keyframe.
+        url = self._gst_quote(url)
 
         if decoder == "nvv4l2decoder":
             return (
                 "rtspsrc location={url} latency={lat} protocols={proto} "
                 "drop-on-latency=true do-retransmission=false ! "
-                + q +
                 "rtph264depay ! "
                 "h264parse config-interval=1 ! "
                 "video/x-h264,stream-format=byte-stream,alignment=au ! "
@@ -147,7 +167,6 @@ class VideoChannel():
         return (
             "rtspsrc location={url} latency={lat} protocols={proto} "
             "drop-on-latency=true do-retransmission=false ! "
-            + q +
             "rtph264depay ! h264parse config-interval=1 ! "
             "{dec} ! "
             + self._gst_appsink_tail(hw=False)
@@ -163,7 +182,7 @@ class VideoChannel():
         """
         q = "queue max-size-buffers=1 leaky=downstream ! "
         return (
-            'uridecodebin uri="{url}" ! '.format(url=url)
+            'uridecodebin uri={url} ! '.format(url=self._gst_quote(url))
             + q
             + self._gst_appsink_tail(hw=hw)
         )
@@ -182,10 +201,8 @@ class VideoChannel():
             if endpoint.lower().startswith(prefix):
                 endpoint = target + endpoint[len(prefix):]
                 break
-        q = "queue max-size-buffers=1 leaky=downstream ! "
         return (
-            'whepsrc whep-endpoint="{ep}" ! '.format(ep=endpoint)
-            + q
+            'whepsrc whep-endpoint={ep} ! '.format(ep=self._gst_quote(endpoint))
             + "decodebin ! "
             + self._gst_appsink_tail(hw=hw)
         )
@@ -197,9 +214,9 @@ class VideoChannel():
         cands = []
         if scheme in ("rtsp", "rtsps"):
             cands.append(("rtsp-nvv4l2decoder", self._build_rtsp_pipeline(url, self.config.gst_decoder)))
-            cands.append(("rtsp-avdec_h264", self._build_rtsp_pipeline(url, "avdec_h264")))
             # Generic fallback also covers H.265 / non-H264 RTSP cameras.
             cands.append(("rtsp-uridecodebin-hw", self._build_uridecodebin_pipeline(url, hw=True)))
+            cands.append(("rtsp-avdec_h264", self._build_rtsp_pipeline(url, "avdec_h264")))
             cands.append(("rtsp-uridecodebin-cpu", self._build_uridecodebin_pipeline(url, hw=False)))
         elif scheme in ("whep", "wheps", "webrtc"):
             cands.append(("whep-hw", self._build_whep_pipeline(url, hw=True)))
@@ -218,10 +235,11 @@ class VideoChannel():
             for name, gst in self._gst_candidates():
                 cap = None
                 try:
-                    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+                    cap = self._capture_with_timeout(gst, cv2.CAP_GSTREAMER)
                 except Exception:
                     cap = None
                 if cap is not None and cap.isOpened():
+                    self._capture_backend = name
                     logger.info(
                         "[%s] opened %s source via gstreamer pipeline=%s",
                         self.config.camera_uuid, scheme, name,
@@ -240,7 +258,7 @@ class VideoChannel():
 
         # OpenCV/FFmpeg generic capture (decode_backend="opencv" or gst fallback).
         try:
-            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            cap = self._capture_with_timeout(url, cv2.CAP_FFMPEG)
         except Exception:
             cap = cv2.VideoCapture(url)
 
@@ -249,7 +267,23 @@ class VideoChannel():
         except Exception:
             pass
 
+        self._capture_backend = "opencv-ffmpeg"
         return cap
+
+    @staticmethod
+    def _capture_with_timeout(source, backend):
+        # Open-only properties must be passed at construction, not cap.set().
+        if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC") and hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+            return cv2.VideoCapture(source, backend, [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+            ])
+        return cv2.VideoCapture(source, backend)
+
+    def status(self):
+        return {"connected": self._connected, "backend": self._capture_backend,
+                "frames_emitted": self._frames_emitted, "handoff_dropped": self._handoff_dropped,
+                "sample_fps": self.config.sample_fps}
 
     def _maybe_resize(self, frame):
         if self.config.resize is None:
@@ -298,7 +332,27 @@ class VideoChannel():
             return
         if self._stop_thread_evt.is_set():
             return
-        self._loop.call_soon_threadsafe(self._put_latest, ev)
+        with self._handoff_lock:
+            if self._pending_frame is not None:
+                self._handoff_dropped += 1
+            self._pending_frame = ev
+            if self._handoff_scheduled:
+                return
+            self._handoff_scheduled = True
+        try:
+            self._loop.call_soon_threadsafe(self._drain_handoff)
+        except RuntimeError:
+            with self._handoff_lock:
+                self._pending_frame = None
+                self._handoff_scheduled = False
+
+    def _drain_handoff(self):
+        with self._handoff_lock:
+            ev = self._pending_frame
+            self._pending_frame = None
+            self._handoff_scheduled = False
+        if ev is not None:
+            self._put_latest(ev)
 
     def _worker(self):
         backoff_ms = int(self.config.reconnect_base_ms)
@@ -315,12 +369,13 @@ class VideoChannel():
                     raise RuntimeError("Failed to open video source")
 
                 logger.info("[%s] connected", self.config.camera_uuid)
+                self._connected = True
 
                 backoff_ms = int(self.config.reconnect_base_ms)
 
                 sample_fps = float(self.config.sample_fps)
-                emit_interval_ms = int(1000.0 / sample_fps) if sample_fps > 0 else 0
-                last_emit_ms = 0
+                emit_interval_s = 1.0 / sample_fps
+                next_emit = 0.0
 
                 while not self._stop_thread_evt.is_set():
                     grabbed = False
@@ -334,10 +389,13 @@ class VideoChannel():
 
                     ts_ms = int(time.time() * 1000)
 
-                    if emit_interval_ms and (ts_ms - last_emit_ms) < emit_interval_ms:
+                    now = time.monotonic()
+                    if self._capture_backend == "opencv-ffmpeg" and now < next_emit:
                         continue
 
-                    last_emit_ms = ts_ms
+                    # Keep the phase despite scheduler jitter, but never catch
+                    # up by emitting a burst after a blocked read.
+                    next_emit = max(next_emit + emit_interval_s, now + emit_interval_s * 0.5)
 
                     ok, frame = cap.retrieve()
                     if not ok or frame is None:
@@ -345,6 +403,7 @@ class VideoChannel():
 
                     frame = self._maybe_resize(frame)
                     self._seq += 1
+                    self._frames_emitted += 1
 
                     self._push_from_thread(
                         RTSPEvent(
@@ -358,6 +417,7 @@ class VideoChannel():
                     )
 
             except Exception as e:
+                self._connected = False
                 logger.warning(
                     "[%s] disconnected: %s (retry in %dms)",
                     self.config.camera_uuid, e, backoff_ms,
@@ -400,14 +460,15 @@ class VideoChannel():
             yield item
 
     async def stop(self):
-        # idempotent
-        if getattr(self, "_stopping", False):
-            return
+        # Repeated calls still join a thread whose earlier stop timed out.
         self._stopping = True
 
         cam = getattr(self.config, "camera_uuid", None) or getattr(self.config, "channel_id", "unknown")
         logger.info(f"[{cam}] Stopping channel thread...")
         self._stop_thread_evt.set()
+        self._connected = False
+        with self._handoff_lock:
+            self._pending_frame = None
         if self._loop:
             self._loop.call_soon_threadsafe(self._put_latest, _DONE)
 
@@ -423,7 +484,7 @@ class VideoChannel():
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, t.join, 6.0)
             if t.is_alive():
-                logger.warning("[%s] Channel thread did not stop within 6s", cam)
+                raise RuntimeError("Camera {} capture thread did not stop within 6s".format(cam))
 
         if t and not t.is_alive():
             self._thread = None

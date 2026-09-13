@@ -9,12 +9,12 @@
 # only the build remotely.
 #
 #   ./deployment/build_engine_remote.sh peshal@jetson.local
-#   MODEL=yolo26n ./deployment/build_engine_remote.sh peshal@192.168.1.50
+#   MODEL=yolo26m ./deployment/build_engine_remote.sh peshal@192.168.1.50
 #
 # Env:
 #   REMOTE_DIR   path to tensort/ on the Jetson (default ~/1886NOENTRY/Backend/tensort)
-#   MODEL        model basename (default yolo26s)
-#   MAX_BATCH    engine max batch (default 10)
+#   MODEL        model basename (default yolo26m)
+#   MAX_BATCH    engine max batch (default 8)
 #   FETCH=1      copy the finished .engine back here for archiving
 set -euo pipefail
 
@@ -33,8 +33,8 @@ HERE="$(cd "$(dirname "$SELF")" && pwd)"
 APP_DIR="$(cd "${HERE}/.." && pwd)"   # the tensort/ folder
 cd "$APP_DIR"
 
-MODEL="${MODEL:-yolo26s}"
-MAX_BATCH="${MAX_BATCH:-10}"
+MODEL="${MODEL:-yolo26m}"
+MAX_BATCH="${MAX_BATCH:-8}"
 IMG_SZ="${IMG_SZ:-640}"
 REMOTE_DIR="${REMOTE_DIR:-~/1886NOENTRY/Backend/tensort}"
 ONNX="models/${MODEL}.onnx"

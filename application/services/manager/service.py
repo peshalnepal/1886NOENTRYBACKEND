@@ -237,6 +237,26 @@ class Manager:
             dry_run=dry_run,
         )
 
+    async def create_camera_from_inventory(
+        self,
+        *,
+        site_uuid: uuid.UUID,
+        device_uuid: uuid.UUID,
+        user_id: int,
+        entry: Dict[str, Any],
+    ) -> uuid.UUID:
+        """Create a camera from a stored inventory row into an explicit site.
+
+        The entry point the inventory service uses, so it never has to know
+        how channels are built.
+        """
+        return await self._adopt_ctrl.create_from_inventory(
+            site_uuid=site_uuid,
+            device_uuid=device_uuid,
+            user_id=user_id,
+            entry=entry,
+        )
+
     # --- Cleanup delegation ---
     
     async def cleanup_user_resources(

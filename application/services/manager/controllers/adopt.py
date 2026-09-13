@@ -29,6 +29,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from application.repositories.inventory_repository import InventoryRepository
 from core.database_orm import Site, SiteDevice
 from domain.events import ChannelCreateEvent
 from application.services.manager.controllers._state import ManagerState
@@ -201,11 +202,24 @@ class CameraAdopter:
 
             site_uuid = site_uuids[0]
             by_identity, by_host = await self._existing_index(db, device_uuids=targets)
+            # A camera the user removed must stay removed. The existing index
+            # is built from live Camera rows, so a deleted camera is invisible
+            # to it and would be re-created on every sweep; inventory is what
+            # remembers the decision after the row is gone.
+            blocked = await InventoryRepository().blocked_identities(
+                db, device_uuids=targets
+            )
 
         for entry in entries:
             identity = str(entry.get("identity") or "").strip()
             source_url = str(entry.get("source_url") or "").strip()
             host = _host_of(source_url)
+
+            if identity and identity in blocked and identity not in by_identity:
+                out["skipped"].append(
+                    {"identity": identity, "source_url": source_url, "reason": "removed_by_user"}
+                )
+                continue
 
             existing = by_identity.get(identity) if identity else None
             if existing is None and host:
@@ -265,6 +279,27 @@ class CameraAdopter:
             )
 
         return out
+
+    async def create_from_inventory(
+        self,
+        *,
+        site_uuid: uuid.UUID,
+        device_uuid: uuid.UUID,
+        user_id: int,
+        entry: Dict[str, Any],
+    ) -> uuid.UUID:
+        """Create one camera from an inventory row into an explicit site.
+
+        The site is passed in rather than derived, which is the difference from
+        `adopt_discovered_cameras`: that path re-resolves the site per sweep
+        and cannot act on a camera the user is adding by hand.
+        """
+        return await self._create_camera(
+            entry=entry,
+            site_uuid=site_uuid,
+            device_uuid=device_uuid,
+            user_id=user_id,
+        )
 
     async def _create_camera(
         self,

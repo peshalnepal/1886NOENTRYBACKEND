@@ -316,6 +316,19 @@ class LinkDeviceRequest(BaseModel):
     device_uuid: uuid.UUID
 
 
+class ArmStateOut(BaseModel):
+    site_uuid: uuid.UUID
+    is_armed: bool
+    override_active: bool = False
+    override_until: Optional[datetime] = None
+
+
+class SetArmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    is_armed: bool
+
+
 class SiteCameraCreate(BaseModel):
     device_uuid: uuid.UUID
     # The single camera source URL: rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt.
@@ -477,6 +490,90 @@ class DeviceOut(BaseModel):
     name: Optional[str] = None
     device_code: Optional[str] = None
     is_enabled: bool
+
+
+class InventoryCameraOut(BaseModel):
+    """One inventory camera as the API exposes it.
+
+    `source` is the connection URL with any credentials stripped; the raw
+    `source_url` is never returned.
+    """
+
+    discovery_identity: str
+    device_uuid: uuid.UUID
+    # NULL until the camera is added to a site; cleared again on removal.
+    site_uuid: Optional[uuid.UUID] = None
+    camera_uuid: Optional[uuid.UUID] = None
+    # available | added | removed
+    state: str
+
+    display_name: Optional[str] = None
+    ip_address: Optional[str] = None
+    mac_address: Optional[str] = None
+    serial_number: Optional[str] = None
+    model: Optional[str] = None
+    firmware: Optional[str] = None
+    source: Optional[str] = None
+
+    is_present: bool = True
+    first_seen_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    missing_since: Optional[datetime] = None
+
+
+class InventoryRefreshOut(BaseModel):
+    """Result of asking a device for its camera list."""
+
+    fetched: bool
+    created: int = 0
+    updated: int = 0
+    marked_offline: int = 0
+    detail: Optional[str] = None
+
+
+class InventoryAddRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_uuid: uuid.UUID
+    discovery_identities: List[str] = Field(..., min_length=1, max_length=200)
+
+
+class InventoryAddResult(BaseModel):
+    """Per-camera outcome, so one failure stays visible among successes."""
+
+    discovery_identity: str
+    ok: bool
+    # added | already_added | not_in_inventory | no_source_url | failed
+    outcome: str
+    camera_uuid: Optional[uuid.UUID] = None
+    detail: Optional[str] = None
+
+
+class InventoryAddResponse(BaseModel):
+    site_uuid: uuid.UUID
+    results: List[InventoryAddResult] = Field(default_factory=list)
+
+
+class DeviceCameraOut(BaseModel):
+    """One camera the device currently has loaded."""
+
+    camera_uuid: uuid.UUID
+    name: Optional[str] = None
+    site_uuid: Optional[uuid.UUID] = None
+    # False when the device runs a camera the cloud has no row for.
+    known_to_cloud: bool = True
+
+
+class DeviceCamerasOut(BaseModel):
+    """A device's live camera list.
+
+    `reachable` false means the device could not be asked, which is different
+    from an empty list — that would mean it answered with no cameras.
+    """
+
+    device_uuid: uuid.UUID
+    reachable: bool
+    cameras: List[DeviceCameraOut] = Field(default_factory=list)
 
 
 # --- Report archive schemas ---

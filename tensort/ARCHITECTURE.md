@@ -1,312 +1,165 @@
-# tensort — Jetson edge inference service
+# Jetson Orin Nano 8 GB inference service
 
-This is the service that runs **on the Jetson**. It pulls RTSP (and WHEP/SRT/RTMP/HTTP)
-video from cameras, runs YOLO object detection on a TensorRT engine, and streams
-detection results to the cloud backend over Server-Sent Events.
+This service decodes camera streams, runs YOLO detection, and sends detection
+metadata to the cloud over SSE. Tracking, recordings, and alerts live in the
+cloud backend.
 
-It does **not** track objects, store clips, or decide what an alert is — the cloud
-does all of that. This box's only job is: *frames in, boxes out, as steadily as
-possible.*
+The supported ceiling is **eight enabled cameras**. Start at **3 detection FPS
+per camera**, using `yolo26m`, FP16, 640-pixel model input, and low-resolution
+camera substreams. This is a commissioning target, not a measured throughput
+claim. `yolo26m` is the accuracy-first model — roughly 2–2.5x the compute of
+`yolo26s` — so the per-camera frame rate is traded for detection quality; drop
+to `yolo26n` if a site needs the frame rate back. Resolution, codec, scene density, power mode, cooling, and JetPack all
+influence capacity. Eight 1080p or 4K main streams cost much more to decode even
+when inference samples only five frames per second.
 
----
+## Frame path
 
-## 1. The whole picture in one diagram
-
-```
- CAMERA 1 ──┐
- CAMERA 2 ──┤   [capture thread per camera]        [event loop thread]
- CAMERA N ──┘    GStreamer/OpenCV decode                  │
-                 sample_fps gate                          │
-                        │                                 │
-                        └── asyncio.Queue(1) ──────────────┤
-                            (keep newest)                  │
-                                                           ▼
-                                                    ╔════════════╗
-                                                    ║ FramePool  ║  one deque
-                                                    ║            ║  per camera
-                                                    ╚════════════╝
-                                                           │
-                                          get_batch(10)  ◄──┤ waits for a free
-                                          round-robin       │ worker slot FIRST
-                                                           ▼
-                                             [inference worker thread]
-                                              letterbox → pinned buffer
-                                              ONE TensorRT call (B,3,640,640)
-                                              parse detections
-                                                           │
-                                       future resolved ────┤
-                                                           ▼
-                                                    Broadcaster
-                                                           │
-                                              SSE  ────────┴──────► CLOUD
-                                                                    (tracker,
-                                                                     alerts)
+```text
+8 capture threads -> latest-frame handoff -> per-camera FIFO FramePool
+                  -> one ordered GPU worker -> detections -> SSE
+                                             -> bounded JPEG worker
 ```
 
-Threads that exist at runtime:
+Each capture thread retains at most one frame awaiting its event-loop callback;
+the asyncio output queue also defaults to one frame. The shared FramePool holds
+16 frames, discards frames older than 700 ms, and evicts the oldest frame from
+the camera holding the largest backlog when full. Batches draw one frame from
+each ready camera before taking a second from any camera. A missing camera never
+holds up the others.
 
-| Thread | Count | What it does |
-|---|---|---|
-| Flask/Werkzeug | several | HTTP requests + holds SSE connections open |
-| `pipeline-loop` | 1 | the asyncio event loop; owns the FramePool and dispatch |
-| `VideoChannel-<id>` | one per camera | blocking decode loop, cannot be async |
-| `trt-infer-worker-N` | 1 (default) | owns the CUDA context + TensorRT engine |
+The dispatcher waits for worker queue capacity before collecting a batch. One
+batch can execute and one can wait. There is one TensorRT worker regardless of
+legacy `INFER_NUM_WORKERS` settings: this keeps a camera's results ordered and
+avoids duplicating engine memory and CUDA contexts on one GPU. Camera replacement
+invalidates old results so a removed/reconfigured camera cannot refill the cache.
 
-The GPU work happens on a worker thread, not the event loop, because TensorRT and
-PyCUDA calls block. The CUDA context is **thread-local** — this is why the engine
-is built inside the worker thread and must never be shared across threads.
+TensorRT resolves output shapes at the profile's maximum batch and the configured
+image size before allocating reusable pinned host/device buffers. Frames are
+letterboxed directly into the input buffer. The batch parser reads output buffer
+views before the next inference overwrites them, avoiding another output copy.
+Initialization must succeed before the runtime becomes ready. A static batch-one
+engine is supported, but `/health` reports that actual limit.
 
----
+Snapshots use one encoding thread and at most one pending job per camera. Slow
+SSE clients discard their oldest queued message when full. Both paths stay
+bounded when consumers cannot keep up.
 
-## 2. Files
+## Files
 
-| File | Role |
+| File | Responsibility |
 |---|---|
-| `main.py` | Flask app + HTTP routes; starts the pipeline in a background thread; restores cameras from the DB on boot |
-| `pipeline.py` | `FramePool`, `SimpleInferencePipeline` (dispatch), `InferenceWorker`, `Broadcaster` |
-| `trt_infer.py` | `TRTEngine` (TensorRT bindings), `YoloV8DetTRT` (letterbox + parse), `build_default()` |
-| `channels/channel.py` | `VideoChannel` — one camera's decode thread and reconnect logic; emits `RTSPEvent` (connect/disconnect are log lines, not events) |
-| `channels/channel_config.py` | per-camera settings object |
-| `database.py`, `database_orm.py` | local SQLite; remembers cameras across restarts |
-| `deployment/setup_orin.sh` | builds the TensorRT engine **on the device** and installs the systemd unit |
-| `models/*.engine` | the compiled engine — device-specific, never copy between machines |
+| `main.py` | Load environment and create the Flask application |
+| `runtime.py` | Serialize camera mutations, enforce capacity, persist/restore cameras |
+| `limits.py` | Shared ceiling of eight enabled cameras |
+| `pipeline.py` | Frame pool, ordered inference queue, results and snapshot cache |
+| `channels/channel.py` | Capture, GStreamer pipelines, reconnect and frame handoff |
+| `trt_infer.py` | CUDA ownership, TensorRT buffers, YOLO preprocessing/postprocessing |
+| `service.py`, `discovery.py` | Camera discovery and adoption |
+| `deployment/setup_orin.sh` | Device setup and local engine build |
 
----
+## Capture and deployment
 
-## 3. Frame path, step by step
+Use JetPack's OpenCV with GStreamer support. Do not install `opencv-python` on
+the Jetson: its wheel can shadow that build. The runtime sets OpenCV's CPU thread
+count to one to avoid nested thread pools across eight cameras.
 
-### 3.1 Capture (`channels/channel.py`)
+RTSP tries hardware decode before CPU fallbacks. Compressed packets are never
+intentionally dropped before the decoder; decoded frames can be dropped safely.
+GStreamer `videorate` limits BGR conversion to the sample rate. Hardware scaling
+still happens before that gate, and the original stream is still decoded in
+full, so camera substreams are the main way to reduce decode load. Generic
+`uridecodebin` selects its decoder automatically; the `*-hw` backend name reports
+the selected pipeline, not proof of which decoder it auto-plugged.
 
-Each camera gets a thread running `_worker()`. It tries a list of GStreamer
-pipelines in order and keeps the first that opens — hardware decode
-(`nvv4l2decoder`) first, then software (`avdec_h264`), then a plain
-`cv2.VideoCapture` fallback.
+`DEFAULT_RESIZE_W/H` defaults to 640x360. GStreamer scales to those exact dimensions;
+choose dimensions matching the camera aspect ratio (640x480 for 4:3 sources), or
+set per-camera `resize` explicitly. The OpenCV fallback fits inside those bounds.
+Detection coordinates always refer to the emitted frame size.
 
-The important detail is the FPS gate:
-
-```python
-grabbed = cap.grab()                       # decode, but do not convert
-if (ts_ms - last_emit_ms) < emit_interval_ms:
-    continue                               # skip: no BGR conversion
-ok, frame = cap.retrieve()                 # only now pay the conversion cost
-```
-
-`grab()`-without-`retrieve()` is what makes `DEFAULT_SAMPLE_FPS` cheap: the stream
-is still decoded at its native rate (you cannot skip that with RTSP), but frames
-you do not want never get converted to a numpy array.
-
-The frame is handed to the event loop via `call_soon_threadsafe` into an
-`asyncio.Queue(maxsize=1)` that **keeps the newest** frame. A camera that outruns
-the loop drops its own stale frames here rather than backing up.
-
-### 3.2 FramePool (`pipeline.py`) — the part that was redesigned
-
-The pool holds a FIFO deque of pending frames **per camera**.
-
-```
-_frames = {
-  "cam-1": deque([f1, f2, f3, f4]),   # busy camera, several frames waiting
-  "cam-2": deque([f9]),
-  "cam-3": deque([f7]),
-}
-```
-
-**Adding a frame** (`put`): drop anything older than `FRAME_MAX_AGE_MS`, evict if
-the pool is at `FRAME_POOL_CAP`, then append. Cameras are created lazily, so a
-newly added camera starts contributing immediately with no registration step.
-
-**Eviction rule** when the pool is full:
-
-1. Frames older than `FRAME_MAX_AGE_MS` are always dropped first. A stale
-   detection is rejected by the cloud tracker anyway, so inferring it wastes a
-   GPU slot.
-2. Otherwise the camera holding the **most** frames loses its **oldest** frame.
-   A camera that has hogged the pool pays for the newcomer's frame; quiet
-   cameras are never charged.
-3. If every camera holds exactly one frame, nobody is over-represented, so the
-   **globally oldest** frame goes.
-
-**Drawing a batch** (`get_batch`): round-robin, oldest camera first. Every camera
-with a pending frame contributes one before any camera contributes a second.
-This is what makes per-camera detection FPS roughly equal under load instead of
-first-come-first-served. It returns whatever is pooled — **it never waits for all
-cameras**, so one dead camera cannot stall the other nine.
-
-The linger (`INFER_BATCH_LINGER_MS`, 10 ms) is only a top-up window used when the
-pool is underfilled — idle or cold start. In steady state the pool has already
-accumulated frames while the GPU was busy with the previous batch.
-
-### 3.3 Dispatch (`_pump_inference`)
-
-```python
-while not closing:
-    while not pool.has_capacity():         # ← wait for a worker slot FIRST
-        await worker_free_event
-    events = await frame_pool.get_batch(max_batch, linger)
-    ... build futures ...
-    worker_pool.submit_batch(job)
-```
-
-Waiting for capacity *before* drawing frames is the key inversion. It means the
-FramePool — not the dispatcher — decides what to drop, so shedding is per-camera
-and fair.
-
-### 3.4 Inference worker (`InferenceWorker._run` → `trt_infer.py`)
-
-One thread, one CUDA context, one engine. For each batch:
-
-1. **Letterbox each frame directly into the engine's pinned input buffer.**
-   `TRTEngine.input_view` is a `(max_batch, 3, H, W)` view over pinned memory;
-   `_fill_row()` writes frame *i* into row *i*. One copy per frame.
-2. `infer_prepared(b)` — set the dynamic batch shape, one H2D copy, one
-   `execute_async_v3`, one D2H copy, synchronise.
-3. Parse each row back to its own camera's coordinates (each frame keeps its own
-   scale + padding, so cameras of different resolutions batch together fine).
-
-Results are pushed back to the loop with `call_soon_threadsafe`, which resolves
-each frame's future in order.
-
-### 3.5 Output
-
-`_handle_result` runs synchronously in the future's done-callback: it updates
-`_latest`, counts stats, and calls `Broadcaster.broadcast()`, which is a
-`put_nowait` into each SSE subscriber's queue. Only the JPEG snapshot encode is
-offloaded to an executor, because `cv2.imencode` is genuinely slow.
-
----
-
-## 4. Why detections used to flicker
-
-Five separate causes, all fixed:
-
-| Cause | Effect | Fix |
-|---|---|---|
-| Whole-batch drops when overloaded | Every camera's box vanished at the same instant | Dispatcher waits for capacity; the pool sheds per-camera instead |
-| Watchdog discarded late results | GPU finished the work, the result was thrown away, camera got a gap | A late result is now still delivered (`_deliver_result`) |
-| Failure events broadcast to the cloud | Tracker read "no objects" and aged every track on that camera | Failures are counted and logged, not broadcast (`EMIT_FAILED_EVENTS=false`) |
-| Edge `CONF=0.30` vs tracker `low_th=0.3` | A dimming object fell out of the tracker's rescue band entirely and lost its ID | Edge filters at `0.20`, below the tracker's `low_th` |
-| `EMIT_EMPTY_DETECTIONS=false` | Tracker never saw "object gone" frames, so tracks coasted and boxes lingered | Defaults to `true` everywhere |
-
-The last two live on **both** sides of the wire — the edge's `CONF` and the cloud
-tracker's `low_th` are coupled. If you raise `CONF` above `low_th`, the flicker
-comes back. There is a regression test for this
-(`Backend/tests/test_tracker_flicker_recovery.py`).
-
----
-
-## 5. Configuration
-
-`.env` is read two ways: systemd passes it via `EnvironmentFile`, and `main.py`
-also calls `load_dotenv()` so `python3 main.py` behaves identically. Variables
-already set in the environment always win.
-
-The knobs that matter most, in order:
-
-| Variable | Meaning |
-|---|---|
-| `DEFAULT_SAMPLE_FPS` | Frames analysed per camera per second. **The main lever.** Never set it above what the GPU can drain. |
-| `INFER_MAX_BATCH` | Frames per GPU call. Must be ≤ the engine's `maxShapes` batch. |
-| `DET_ENGINE` / `IMG_SZ` | Which engine, and its input size. `IMG_SZ` must match what the engine was built with — the service now refuses to start on a mismatch. |
-| `CONF` | Detection threshold. Keep **≤ the cloud tracker's `low_th` (0.20)**. |
-| `FRAME_POOL_CAP` / `FRAME_MAX_AGE_MS` | Pool depth and staleness cutoff. |
-| `EMIT_EMPTY_DETECTIONS` | Keep `true` — the tracker needs empty frames to age tracks. |
-| `INFER_NUM_WORKERS` | Keep at 1. On one GPU, several CUDA contexts time-slice and fragment batches. |
-
-See `.env.example` for the complete annotated list.
-
-### Reading `/health`
-
-| Field | What it tells you |
-|---|---|
-| `infer_ok`, `infer_fail` | successful vs failed frames |
-| `pool_depth` | frames currently waiting for the GPU |
-| `pool_evicted_total` | **climbing steadily = cameras outrunning the GPU.** Lower `DEFAULT_SAMPLE_FPS`. |
-| `pool_expired_total` | frames dropped for being older than `FRAME_MAX_AGE_MS` |
-| `max_batch` | what the **engine** actually accepts — if this says 1, batching is off and you need a dynamic-batch engine |
-| `inflight_count` | frames handed to the GPU and not yet returned |
-
----
-
-## 6. The engine
-
-A TensorRT engine is **built for one device and one TensorRT version**. It cannot
-be copied from another machine. `deployment/setup_orin.sh` builds it on the box.
-
-The ONNX must be exported with a **dynamic batch axis** or batching silently
-does nothing (`max_batch` in `/health` will read 1):
-
-```bash
-yolo export model=yolo26s.pt format=onnx dynamic=True imgsz=640 simplify=True
-```
-
-Then the script runs `trtexec` with `--fp16` and min/opt/max shapes of
-1 / `OPT_BATCH` / `MAX_BATCH`.
-
-### Throughput gate — do this before trusting a target FPS
-
-```bash
-sudo /usr/src/tensorrt/bin/trtexec \
-  --loadEngine=models/yolo26s.engine --shapes=images:10x3x640x640
-```
-
-Aggregate images/sec = `10 × 1000 / (GPU Compute Mean ms)`. Divide by your camera
-count to get the per-camera FPS the hardware can actually sustain, then set
-`DEFAULT_SAMPLE_FPS` at or below it. yolo26s at 640 on an Orin Nano is expected
-around 65–100 img/s, i.e. roughly 6.5–10 FPS across 10 cameras — **measure yours**
-rather than assuming. If it falls short, either lower the FPS or switch
-`DET_ENGINE` back to `yolo26n.engine`.
-
-### Two boards, two branches
-
-`main` targets the original Jetson Nano (TensorRT 8, fixed batch=1, ~25–40 fps
-*total* across all cameras). `orin-nano` targets the Orin Nano (TensorRT 10,
-dynamic batching). The engines and code paths are **not interchangeable**.
-
----
-
-## 7. Testing
-
-Off-device (no GPU, runs on any dev machine):
+Use a JetPack release for this board that provides **TensorRT 10**; check the
+installed version rather than assuming every JetPack 6 release does. Build the
+engine on the actual device. Engines supplied in `models/` must be rebuilt for
+the target GPU and TensorRT version. Export ONNX with a dynamic batch axis, then:
 
 ```bash
 cd Backend/tensort
-python3 tests/test_frame_pool.py      # eviction, fairness, staleness
-python3 tests/test_dispatch.py        # late results, failure gating, sweeper
+MODEL=yolo26m MAX_BATCH=8 ./deployment/build_engine.sh
+# Full install instead:
+# MODEL=yolo26m MAX_BATCH=8 ./deployment/setup_orin.sh
 ```
 
-Cloud-side, from `Backend/`:
+`.env.example` contains the recommended starting settings. On upgrade, existing
+`.env` and stored per-camera FPS/resize settings are retained: update both as
+needed. The setup script updates engine path, input size and batch size to match
+its build. `MAX_CAMERAS` can lower the ceiling but cannot raise it above eight.
+POST or PATCH enabling a ninth camera returns HTTP 409. Disabled configurations
+do not consume a slot. On restore, excess enabled rows stay on disk and are
+logged as skipped. Discovery retries unadopted cameras after capacity becomes free.
+
+## Verify eight-camera capacity on the device
+
+1. Select the appropriate power mode using `sudo nvpmodel -q` and the board's
+   documented modes; use adequate cooling. Observe `tegrastats` during testing.
+2. Run the engine/preprocessing diagnostic using a representative camera image:
+
+   ```bash
+   .venv_trt/bin/python tests/diag_batch.py frame.jpg 8 --seconds 15
+   ```
+
+   This checks batch rows and reports preprocessing + inference + parsing FPS.
+   It excludes stream decoding and network delivery. Leave at least 25% headroom
+   over the desired aggregate rate (40 FPS for eight cameras at five FPS).
+3. Add all eight real streams, wait for initialization/warm-up, then run:
+
+   ```bash
+   .venv_trt/bin/python deployment/check_capacity.py --cameras 8 --fps 5 --seconds 120
+   ```
+
+   The check measures per-camera result rates, sampled frame age, failures,
+   connectivity, and frame-pool drops through `/health`. A pass applies only to
+   that run. Repeat for at least 30 minutes in representative busy scenes and
+   verify SSE delivery/overlays from the cloud. Unplug one camera and confirm
+   the other seven continue; reconnect it and confirm recovery.
+4. If rates fall short or drops grow, reduce each camera's `sample_fps`, reduce
+   source resolution/rate, and check decoder fallback and thermal throttling.
+   Raising queue depth increases latency; it does not increase GPU throughput.
+
+## Health fields
+
+Statistics are under `stats` in `/health`.
+
+| Field | Meaning |
+|---|---|
+| `inference_ready` | Engine initialized and pipeline running |
+| `max_cameras`, `channel_count` | Configured ceiling and enabled channels |
+| `engine_max_batch`, `max_batch` | Engine capacity and effective dispatch batch limit |
+| `capture` | Per-camera connection, selected pipeline, sample rate, capture/handoff counters |
+| `cameras` | Per-camera successful results, last result time, sampled frame age and sequence |
+| `pool_depth`, `pool_capacity` | Bounded backlog |
+| `pool_evicted_total`, `pool_expired_total` | Capacity and stale-frame drops |
+| `infer_fail`, `infer_dropped` | Failed inference and refused worker jobs |
+| `snapshot_pending` | At most one pending JPEG per active camera generation |
+
+Empty detection events remain enabled so the cloud tracker can age tracks.
+Inference failures are counted and normally withheld from SSE. Keep `CONF` low
+enough for the cloud tracker's low-confidence association (default 0.20).
+
+## Off-device verification
+
+The test files run separately because older suites install import stubs globally.
+No GPU is required. Discovery's integration tests need permission to bind a local
+HTTP server; route tests additionally need Flask.
 
 ```bash
-PYTHONPATH=$PWD python3 tests/test_tracker_flicker_recovery.py
-PYTHONPATH=$PWD python3 tests/test_tracker_fast_motion.py
+python3 tests/test_frame_pool.py
+python3 tests/test_dispatch.py
+python3 tests/test_cross_class_dedupe.py
+python3 tests/test_orin_capacity.py
+python3 tests/test_trt_shapes.py
+python3 tests/test_discovery.py
 ```
 
-On-device, in this order:
-
-1. Build the engine, run the throughput gate above.
-2. `python3 tests/diag_batch.py <image> 10` — all 10 rows must produce identical
-   detections, which proves dynamic batching and the pinned-buffer preprocessing
-   are both correct.
-3. Start with one camera; confirm `infer_ok` climbs and `pool_evicted_total` ≈ 0.
-4. Scale to ten; confirm per-camera result rates are roughly **equal** (that is
-   the fairness guarantee) and `pool_evicted_total` is stable.
-5. Watch `tegrastats` for GPU utilisation and memory headroom.
-
----
-
-## 8. Gotchas worth knowing
-
-- **Never `pip install opencv-python` on a Jetson.** The wheel has no GStreamer
-  support and silently kills hardware decode. Use the JetPack system OpenCV
-  (`requirements-jetson.txt` explains this).
-- **The engine is not portable.** Rebuild on the target device after any JetPack
-  or TensorRT upgrade.
-- **`IMG_SZ` must match the engine.** The service now fails fast at startup
-  instead of raising on every frame.
-- **One worker is correct on one GPU.** More workers means more CUDA contexts
-  time-slicing the same silicon and smaller batches.
-- **Per-camera frame order is load-bearing.** The cloud drops out-of-order
-  `frame_seq`, so the pool's FIFO-per-camera property must be preserved by
-  anything that touches batching.
-- **`self._seq` resets to 0 when a channel restarts**, which the cloud reads as a
-  Jetson restart. Expect a brief tracker adjustment after a camera reconnects.
+The code uses the TensorRT 10 API; the legacy `setup_nano.sh` does not make this
+revision compatible with TensorRT 8. Use a compatible legacy revision for the
+original Jetson Nano.

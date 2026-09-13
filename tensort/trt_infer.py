@@ -178,8 +178,49 @@ def box_norm_xyxy(x1, y1, x2, y2, W, H):
     }
 
 
+def _same_object_class(a, b):
+    vehicles = {"car", "truck", "bus", "van"}
+    return a == b or (a in vehicles and b in vehicles)
+
+
+def suppress_cross_class_duplicates(detections, iou_threshold=0.55,
+                                    overlap_threshold=0.70, size_ratio_threshold=0.65):
+    """Keep the strongest box among overlapping, confusable vehicle labels.
+
+    Preserve unrelated classes and differently sized objects inside a box.
+    Return survivors in input order, keeping the event schema unchanged.
+    """
+    if len(detections) < 2:
+        return detections
+    kept = []
+    for index in sorted(range(len(detections)), key=lambda i: detections[i]["conf"], reverse=True):
+        candidate = detections[index]
+        box = candidate["box"]
+        area = max(0, box["x2"] - box["x1"]) * max(0, box["y2"] - box["y1"])
+        duplicate = False
+        for previous in kept:
+            winner = detections[previous]
+            if not _same_object_class(candidate["cls_name"], winner["cls_name"]):
+                continue
+            other = winner["box"]
+            other_area = max(0, other["x2"] - other["x1"]) * max(0, other["y2"] - other["y1"])
+            if min(area, other_area) <= 0:
+                continue
+            intersection = (max(0, min(box["x2"], other["x2"]) - max(box["x1"], other["x1"])) *
+                            max(0, min(box["y2"], other["y2"]) - max(box["y1"], other["y1"])))
+            iou = intersection / (area + other_area - intersection)
+            overlap = intersection / min(area, other_area)
+            size_ratio = min(area, other_area) / max(area, other_area)
+            if iou >= iou_threshold or (overlap >= overlap_threshold and size_ratio >= size_ratio_threshold):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(index)
+    return [detections[i] for i in sorted(kept)]
+
+
 # -----------------------------
-# FIX 1: TRTEngine — double-buffered CUDA streams
+# TensorRT engine: one stream and reusable pinned buffers
 # -----------------------------
 
 class TRTEngine(object):
@@ -206,7 +247,7 @@ class TRTEngine(object):
         outputs = engine.infer_prepared(b)              # GPU, (B,...) outputs
     """
 
-    def __init__(self, engine_path: str, device_id: int = 0):
+    def __init__(self, engine_path: str, device_id: int = 0, input_chw=None):
         if not os.path.exists(engine_path):
             raise FileNotFoundError(engine_path)
 
@@ -221,8 +262,11 @@ class TRTEngine(object):
             self._runtime = trt.Runtime(self._trt_logger)
             with open(engine_path, "rb") as f:
                 self.engine = self._runtime.deserialize_cuda_engine(f.read())
-
+            if self.engine is None:
+                raise RuntimeError("Cannot deserialize engine; rebuild it on this Jetson with its installed TensorRT")
             self.context = self.engine.create_execution_context()
+            if self.context is None:
+                raise RuntimeError("Cannot create TensorRT execution context")
 
             # TensorRT 10 name-based tensor I/O API.
             self.tensor_names = []
@@ -240,6 +284,8 @@ class TRTEngine(object):
                 self._dtypes[i] = trt.nptype(self.engine.get_tensor_dtype(name))
                 self._decl_shapes[i] = tuple(int(d) for d in self.engine.get_tensor_shape(name))
                 if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                    if self.input_index is not None:
+                        raise RuntimeError("Expected a single image input")
                     self.input_index = i
                     self.input_name = name
                 else:
@@ -250,24 +296,40 @@ class TRTEngine(object):
                 raise RuntimeError("No input tensor found.")
 
             in_decl = self._decl_shapes[self.input_index]
+            if len(in_decl) != 4:
+                raise RuntimeError("Expected NCHW input, got {}".format(in_decl))
             self._dynamic = any(d < 0 for d in in_decl)
 
             if self._dynamic:
                 # profile 0's MAX shape gives the largest batch the engine accepts
                 _min, _opt, _max = self.engine.get_tensor_profile_shape(self.input_name, 0)
                 self.max_batch = int(tuple(_max)[0])
+                if int(_min[0]) != 1:
+                    raise RuntimeError("Engine profile must accept batch 1 for partial camera batches")
+                self._fixed_chw = tuple(input_chw or _opt[1:])
+                if any(not int(lo) <= int(dim) <= int(hi)
+                       for lo, dim, hi in zip(_min[1:], self._fixed_chw, _max[1:])):
+                    raise RuntimeError("IMG_SZ does not fit the engine input profile")
             else:
                 self.max_batch = int(in_decl[0])
-
-            # C,H,W are the fixed (non-batch) input dims.
-            self._fixed_chw = tuple(int(x) for x in in_decl[1:])
+                self._fixed_chw = tuple(int(x) for x in in_decl[1:])
+                if self.max_batch != 1:
+                    raise RuntimeError("Fixed engines must have batch 1; rebuild with dynamic batch 1..8")
+            if self._fixed_chw[0] != 3 or any(d <= 0 for d in self._fixed_chw):
+                raise RuntimeError("Expected concrete RGB input dimensions, got {}".format(self._fixed_chw))
+            if np.dtype(self._dtypes[self.input_index]) not in (np.dtype(np.float32), np.dtype(np.float16)):
+                raise RuntimeError("Expected floating-point image input")
             self._in_row_size = int(np.prod(self._fixed_chw)) if self._fixed_chw else 1
 
-            # Resolve a MAX shape per tensor (dynamic batch dim -> max_batch) so
-            # the single allocation below is large enough for any B <= max_batch.
+            # Ask TensorRT to resolve all dimensions at the selected spatial
+            # size. Dynamic output axes can represent anchors, not just batch.
+            if not self.context.set_input_shape(self.input_name, (self.max_batch,) + self._fixed_chw):
+                raise RuntimeError("TensorRT rejected the maximum input shape")
             self._max_sizes = {}     # index -> element count at max batch
             for i in range(self.engine.num_io_tensors):
-                resolved = tuple(self.max_batch if d < 0 else d for d in self._decl_shapes[i])
+                resolved = tuple(int(d) for d in self.context.get_tensor_shape(self.tensor_names[i]))
+                if any(d <= 0 for d in resolved):
+                    raise RuntimeError("Unsupported unresolved output shape: {} {}".format(self.tensor_names[i], resolved))
                 self._max_sizes[i] = int(np.prod(resolved)) if resolved else 1
 
             # ONE set of pinned host + device buffers, sized for max batch.
@@ -293,7 +355,7 @@ class TRTEngine(object):
                 (self.max_batch,) + self._fixed_chw
             )
 
-    def infer_prepared(self, b: int) -> List[np.ndarray]:
+    def infer_prepared(self, b: int, copy_outputs=True) -> List[np.ndarray]:
         """
         Run inference on the first `b` rows already written into input_view.
 
@@ -310,13 +372,16 @@ class TRTEngine(object):
         with CudaContext(self.device_id):
             # Tell TRT the actual batch for this call; resolves dynamic dims so
             # get_tensor_shape() below returns concrete output shapes.
-            self.context.set_input_shape(self.input_name, (b,) + self._fixed_chw)
+            if not self.context.set_input_shape(self.input_name, (b,) + self._fixed_chw):
+                raise RuntimeError("TensorRT rejected input batch {}".format(b))
 
             n_in = b * self._in_row_size
             cuda.memcpy_htod_async(self._dev_bufs[ii], self._host_bufs[ii][:n_in], stream)
 
             # GPU inference (async); tensor addresses were bound in __init__.
-            self.context.execute_async_v3(stream_handle=stream.handle)
+            if not self.context.execute_async_v3(stream_handle=stream.handle):
+                stream.synchronize()
+                raise RuntimeError("TensorRT execution failed")
 
             # D2H: resolve each output's real shape for this batch and copy only
             # that many elements back.
@@ -324,13 +389,16 @@ class TRTEngine(object):
             for oi in self.output_indices:
                 out_shape = tuple(int(x) for x in self.context.get_tensor_shape(self.tensor_names[oi]))
                 n_out = int(np.prod(out_shape)) if out_shape else 1
+                if any(d <= 0 for d in out_shape) or n_out > self._max_sizes[oi]:
+                    stream.synchronize()
+                    raise RuntimeError("Output shape exceeds allocated buffer: {}".format(out_shape))
                 cuda.memcpy_dtoh_async(self._host_bufs[oi][:n_out], self._dev_bufs[oi], stream)
                 pending.append((oi, n_out, out_shape))
 
             stream.synchronize()
 
             outs = [
-                self._host_bufs[oi][:n_out].copy().reshape(out_shape)
+                (self._host_bufs[oi][:n_out].copy() if copy_outputs else self._host_bufs[oi][:n_out]).reshape(out_shape)
                 for (oi, n_out, out_shape) in pending
             ]
 
@@ -352,6 +420,20 @@ class TRTEngine(object):
 
         np.copyto(self.input_view[:b], input_chw)
         return self.infer_prepared(b)
+
+    def close(self):
+        """Release GPU allocations on the same thread that created them."""
+        with CudaContext(self.device_id):
+            self._stream.synchronize()
+            self.context = None
+            for allocation in self._dev_bufs:
+                allocation.free()
+            self._dev_bufs.clear()
+            self.input_view = None
+            self._host_bufs.clear()
+            self._stream = None
+            self.engine = None
+            self._runtime = None
 
 
 # -----------------------------
@@ -393,7 +475,7 @@ class YoloV8DetTRT(object):
         topk: int = 100,
         device_id: int = 0,
     ):
-        self.trt = TRTEngine(engine_path, device_id=device_id)
+        self.trt = TRTEngine(engine_path, device_id=device_id, input_chw=(3, int(imgsz), int(imgsz)))
         self.imgsz = int(imgsz)
 
         # Fail at startup rather than on every frame: a mismatch here used to
@@ -411,6 +493,12 @@ class YoloV8DetTRT(object):
         self.iou = float(iou)
         self.allowed = set(allowed)
         self.topk = int(topk)
+        self._dedupe = os.getenv("DEDUPE_CROSS_CLASS", "true").lower() in ("1", "true", "yes", "on")
+        self._dedupe_thresholds = {
+            "iou_threshold": float(os.getenv("DEDUPE_IOU", "0.55")),
+            "overlap_threshold": float(os.getenv("DEDUPE_OVERLAP", "0.70")),
+            "size_ratio_threshold": float(os.getenv("DEDUPE_SIZE_RATIO", "0.65")),
+        }
         # Numeric ids of the allowed classes, for vectorized filtering.
         self._allowed_ids = np.array(
             sorted(i for i, name in COCO_NAMES.items() if name in self.allowed),
@@ -430,7 +518,7 @@ class YoloV8DetTRT(object):
         H0, W0 = bgr.shape[:2]
         x, r, (padx, pady) = preprocess(bgr, self.imgsz)
         outs = self.trt.infer(x)               # x is (1,3,H,W)
-        return self._parse_pred(outs[0], H0, W0, r, padx, pady)
+        return self._postprocess(self._parse_pred(outs[0], H0, W0, r, padx, pady))
 
     def _fill_row(self, row_chw: np.ndarray, bgr: np.ndarray):
         """
@@ -473,11 +561,17 @@ class YoloV8DetTRT(object):
                 r, padx, pady = self._fill_row(view[i], bgr)
                 geom.append((H0, W0, r, padx, pady))
 
-            pred = self.trt.infer_prepared(len(chunk))[0]    # (b, ...)
+            # Parse before the next inference reuses the pinned output buffer.
+            pred = self.trt.infer_prepared(len(chunk), copy_outputs=False)[0]
             for i, (H0, W0, r, padx, pady) in enumerate(geom):
                 # pred[i:i+1] keeps the leading dim so _parse_pred sees (1, ...)
                 results.append(self._parse_pred(pred[i:i + 1], H0, W0, r, padx, pady))
-        return results
+        return [self._postprocess(dets) for dets in results]
+
+    def _postprocess(self, dets):
+        if self._dedupe:
+            dets = suppress_cross_class_duplicates(dets, **self._dedupe_thresholds)
+        return sorted(dets, key=lambda d: d["conf"], reverse=True)[:self.topk]
 
     def _parse_pred(self, pred: np.ndarray, H0: int, W0: int, r: float, padx: int, pady: int) -> List[Dict]:
         if pred.ndim != 3:
@@ -548,7 +642,7 @@ class YoloV8DetTRT(object):
         y2 = y_c + h / 2
         boxes = np.stack([x1, y1, x2, y2], axis=1)
 
-        keep_idx = nms_xyxy(boxes, score, self.iou)
+        keep_idx = nms_xyxy(boxes, score, self.iou, topk=self.topk)
         out = []
 
         for i in keep_idx:
@@ -600,6 +694,10 @@ class TRTInfer(object):
         # reported max_batch=1 in /health) even on a correct 10-wide engine,
         # sending operators off to re-export an engine that was already fine.
         self.max_batch = int(getattr(self.det_runner, "max_batch", 1))
+
+    def close(self):
+        self.det_runner.trt.close()
+        release_cuda_context()
 
     def infer_multitask(self, bgr: np.ndarray, meta: Dict) -> Dict:
         t0 = time.perf_counter()
@@ -696,7 +794,7 @@ def build_default() -> TRTInfer:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     det_engine = os.getenv("DET_ENGINE")
     if not det_engine:
-        det_engine = os.path.join(base_dir, "models", "yolo26n.engine")
+        det_engine = os.path.join(base_dir, "models", "yolo26m.engine")
     elif not os.path.isabs(det_engine) and not os.path.exists(det_engine):
         candidate = os.path.join(base_dir, det_engine)
         if os.path.exists(candidate):

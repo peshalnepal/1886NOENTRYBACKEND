@@ -4,10 +4,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from application.services.user_snapshot_cache import (
-    CachedUserSnapshot,
-    UserSnapshotLookupError,
-)
+from application.services.user_snapshot_cache import CachedUserSnapshot
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
@@ -17,6 +14,7 @@ from dependencies import (
     get_async_db,
     get_current_user,
     get_manager,
+    get_manager_optional,
     get_user_snapshot_cache,
     RequirePermission,
     OrgContext,
@@ -40,6 +38,12 @@ from application.services.detection_stream import (
     normalize_box_px,
     resp_to_detection_out,
     stream_camera_detections,
+)
+from application.services.inventory_service import InventoryService
+from routes._camera_serializers import (
+    camera_out,
+    camera_webrtc_url,
+    camera_with_config_out,
 )
 from routes._errors import camera_not_found
 from routes._stream_auth import DB_UNAVAILABLE, resolve_stream_user
@@ -115,49 +119,6 @@ async def _ensure_camera_access(db: AsyncSession, cam: Any, ctx: OrgContext) -> 
     if accessible is not None and getattr(cam, "site_uuid", None) not in accessible:
         raise camera_not_found()
 
-
-def _camera_webrtc_url(cam: Any) -> Optional[str]:
-    return resolve_camera_webrtc_url(
-        camera_code=getattr(cam, "camera_code", None),
-        stored_url=getattr(cam, "webrtc_url", None),
-    )
-
-
-def _tri_state(cam: Any, attr: str) -> str:
-    """Read a tri-state camera column, defaulting to "inherit"."""
-    return str(getattr(cam, attr, "inherit") or "inherit")
-
-
-def _camera_with_config_out(
-    cam_out: Any, *, webrtc_url: Optional[str]
-) -> CameraWithConfigSchema:
-    """Build the camera response from a `CameraOut` (the manager's DTO).
-
-    `CameraOut` names the flags `enabled` / `detection_enabled` / …, while the
-    HTTP contract uses the `is_` prefix, so the mapping cannot be automatic.
-    """
-    now = datetime.now(timezone.utc)
-    return CameraWithConfigSchema(
-        camera_uuid=cam_out.camera_uuid,
-        camera_code=cam_out.camera_code,
-        name=getattr(cam_out, "name", None),
-        location=getattr(cam_out, "location", None),
-        site_uuid=cam_out.site_uuid,
-        device_uuid=cam_out.device_uuid,
-        source_url=cam_out.source_url,
-        webrtc_url=webrtc_url,
-        is_enabled=cam_out.enabled,
-        is_detection_enabled=cam_out.detection_enabled,
-        is_notification_enabled=cam_out.notification_enabled,
-        notification_trigger_mode=_tri_state(cam_out, "notification_trigger_mode"),
-        camera_playback_enabled=_tri_state(cam_out, "camera_playback_enabled"),
-        use_site_schedule=bool(getattr(cam_out, "use_site_schedule", True)),
-        roi=cam_out.roi,
-        configuration=cam_out.configuration,
-        timezone=cam_out.timezone,
-        created_at=getattr(cam_out, "created_at", None) or now,
-        updated_at=getattr(cam_out, "updated_at", None) or now,
-    )
 
 async def _resolve_stream_user(
     *,
@@ -275,8 +236,6 @@ async def list_cameras(
     if site_uuid is None:
         raise HTTPException(status_code=422, detail="site_uuid query param is required")
 
-    # Enforce org + (for members) site-level access. Platform admins in super
-    # context (org_id is None) bypass the org scoping check entirely.
     if ctx.org_id is not None:
         accessible = await AuthzService.accessible_site_uuids(
             db, user=ctx.user, org_id=ctx.org_id, role=ctx.role
@@ -294,24 +253,9 @@ async def list_cameras(
     )
 
     return [
-        CameraSchema(
-            camera_uuid=cam.camera_uuid,
-            camera_code=cam.camera_code,
-            name=getattr(cam, "name", None),
-            location=getattr(cam, "location", None),
-            site_uuid=cam.site_uuid,
+        camera_out(
+            cam,
             device_uuid=getattr(getattr(cam, "device", None), "device_uuid", None),
-            source_url=cam.source_url,
-            webrtc_url=_camera_webrtc_url(cam),
-            is_enabled=cam.is_enabled,
-            is_detection_enabled=cam.is_detection_enabled,
-            is_notification_enabled=cam.is_notification_enabled,
-            notification_trigger_mode=_tri_state(cam, "notification_trigger_mode"),
-            camera_playback_enabled=_tri_state(cam, "camera_playback_enabled"),
-            use_site_schedule=bool(getattr(cam, "use_site_schedule", True)),
-            roi=getattr(cam, "roi", None),
-            created_at=cam.created_at,
-            updated_at=cam.updated_at,
         )
         for cam in cams
     ]
@@ -330,26 +274,12 @@ async def get_camera(
     cam, cfg, _pid = full
     await _ensure_camera_access(db, cam, ctx)
 
-    return CameraWithConfigSchema(
-        camera_uuid=cam.camera_uuid,
-        camera_code=cam.camera_code,
-        name=getattr(cam, "name", None),
-        location=getattr(cam, "location", None),
-        site_uuid=cam.site_uuid,
-        device_uuid=getattr(getattr(cam, "device", None), "device_uuid", None),
-        source_url=cam.source_url,
-        webrtc_url=_camera_webrtc_url(cam),
-        is_enabled=cam.is_enabled,
-        is_detection_enabled=cam.is_detection_enabled,
-        is_notification_enabled=cam.is_notification_enabled,
-        notification_trigger_mode=_tri_state(cam, "notification_trigger_mode"),
-        camera_playback_enabled=_tri_state(cam, "camera_playback_enabled"),
-        use_site_schedule=bool(getattr(cam, "use_site_schedule", True)),
-        roi=getattr(cam, "roi", None),
+    return camera_with_config_out(
+        cam,
+        webrtc_url=camera_webrtc_url(cam),
         configuration=(cfg.configuration if cfg else {}),
-        timezone=(cfg.timezone if cfg else None),
-        created_at=cam.created_at,
-        updated_at=cam.updated_at,
+        timezone_name=(cfg.timezone if cfg else None),
+        device_uuid=getattr(getattr(cam, "device", None), "device_uuid", None),
     )
 
 
@@ -632,7 +562,7 @@ async def create_camera(
         from routes.notifications_routes import invalidate_camera_mode_cache
 
         await invalidate_camera_mode_cache(cam_out.camera_uuid)
-        return _camera_with_config_out(cam_out, webrtc_url=webrtc_url)
+        return camera_with_config_out(cam_out, webrtc_url=webrtc_url)
     except HTTPException:
         raise
     except ValueError as e:
@@ -699,7 +629,7 @@ async def edit_camera(
     from routes.notifications_routes import invalidate_camera_mode_cache
 
     await invalidate_camera_mode_cache(cam_out.camera_uuid)
-    return _camera_with_config_out(cam_out, webrtc_url=_camera_webrtc_url(cam_out))
+    return camera_with_config_out(cam_out, webrtc_url=camera_webrtc_url(cam_out))
 
 
 from routes._background import _delete_blobs_background, _spawn_bg_task  # noqa: E402
@@ -762,7 +692,7 @@ async def _cleanup_camera_runtime(
 async def delete_camera(
     camera_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
-    manager: Manager = Depends(get_manager),
+    manager: Optional[Manager] = Depends(get_manager_optional),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_CAMERAS)),
 ):
     """Delete a camera and everything attached to it.
@@ -798,6 +728,10 @@ async def delete_camera(
     device_urls = [device_url] if device_url else []
 
     # 1. Close the reconcile race window before touching anything external.
+    #    The removal is recorded in the same step, while the row still exists:
+    #    inventory is what stops the next discovery sweep adding this camera
+    #    straight back.
+    await InventoryService().remove_camera(db, camera_uuid=camera_uuid)
     await repo.disable_cameras(db, camera_uuids=[camera_uuid], user_id=owner_id)
     await db.commit()
 

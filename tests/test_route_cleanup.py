@@ -57,18 +57,48 @@ class RouteCleanupTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_device_cleanup_keeps_database_path_alive_on_manager_failure(self):
         manager = SimpleNamespace(
-            get_activepipeline=AsyncMock(side_effect=RuntimeError("offline")),
+            get_loaded_pipeline=Mock(side_effect=RuntimeError("offline")),
+            cleanup_device_resources=AsyncMock(),
         )
         db = Mock()
+        device_uuid = uuid.uuid4()
 
-        await _cleanup_device_runtime(
-            manager,
-            db,
-            device_uuid=uuid.uuid4(),
-            owner_id=7,
+        await _cleanup_device_runtime(manager, db, device_uuid=device_uuid, owner_id=7)
+
+        # An unreadable pipeline still leaves the DB-backed teardown to run.
+        manager.cleanup_device_resources.assert_awaited_once_with(
+            db, device_uuid=device_uuid, active=None
         )
 
-        manager.get_activepipeline.assert_awaited_once_with(user_id=7)
+    async def test_device_cleanup_never_starts_a_pipeline_to_tear_one_down(self):
+        pipeline = SimpleNamespace(remove_channel=AsyncMock())
+        manager = SimpleNamespace(
+            get_loaded_pipeline=Mock(return_value=pipeline),
+            get_activepipeline=AsyncMock(),
+            cleanup_device_resources=AsyncMock(),
+        )
+        db = Mock()
+        device_uuid = uuid.uuid4()
+
+        await _cleanup_device_runtime(manager, db, device_uuid=device_uuid, owner_id=7)
+
+        manager.get_loaded_pipeline.assert_called_once_with(user_id=7)
+        manager.get_activepipeline.assert_not_awaited()
+        manager.cleanup_device_resources.assert_awaited_once_with(
+            db, device_uuid=device_uuid, active=pipeline
+        )
+
+    async def test_device_cleanup_survives_failing_cleanup_call(self):
+        manager = SimpleNamespace(
+            get_loaded_pipeline=Mock(return_value=None),
+            cleanup_device_resources=AsyncMock(side_effect=RuntimeError("edge down")),
+        )
+
+        await _cleanup_device_runtime(
+            manager, Mock(), device_uuid=uuid.uuid4(), owner_id=7
+        )
+
+        manager.cleanup_device_resources.assert_awaited_once()
 
 
 if __name__ == "__main__":

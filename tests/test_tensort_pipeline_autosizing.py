@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 
-sys.path.insert(0, "/home/peshal/1886NOENTRY/Backend/tensort")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tensort"))
 import pipeline as tensort_pipeline  # noqa: E402
 
 
@@ -35,6 +35,9 @@ class _FakeInferenceWorkerPool(object):
     def has_capacity(self):
         return True
 
+    async def wait_ready(self):
+        return 8
+
     def stop(self):
         return None
 
@@ -43,11 +46,11 @@ class _FakeInferenceWorkerPool(object):
 
 
 class TensortPipelineAutosizingTests(unittest.TestCase):
-    def test_auto_worker_cap_defaults_are_nano_safe(self):
-        self.assertEqual(tensort_pipeline._default_auto_worker_cap(4096), 1)
-        self.assertEqual(tensort_pipeline._default_auto_worker_cap(8192), 2)
-        self.assertEqual(tensort_pipeline._default_auto_worker_cap(16384), 3)
-        self.assertEqual(tensort_pipeline._default_auto_worker_cap(32768), 4)
+    def test_legacy_auto_settings_use_one_ordered_worker(self):
+        with patch.dict(os.environ, {"INFER_NUM_WORKERS": "0", "INFER_NUM_WORKERS_MAX": "4"}):
+            pipe = tensort_pipeline.SimpleInferencePipeline()
+        self.assertEqual(pipe._num_workers, 1)
+        self.assertEqual(pipe._num_workers_max, 1)
 
     def test_infer_timeout_is_a_flat_leak_guard(self):
         # A timed-out frame is no longer discarded (a late result is still
@@ -56,7 +59,7 @@ class TensortPipelineAutosizingTests(unittest.TestCase):
         pipe = tensort_pipeline.SimpleInferencePipeline()
         self.assertAlmostEqual(pipe._infer_result_timeout_s, 3.0)
 
-    def test_pipeline_starts_small_and_grows_with_camera_count(self):
+    def test_pipeline_keeps_one_worker_as_camera_count_grows(self):
         async def scenario():
             with patch.dict(
                 os.environ,
@@ -73,14 +76,14 @@ class TensortPipelineAutosizingTests(unittest.TestCase):
                             await pipe.start()
                             self.assertEqual(len(pipe._infer_pool._workers), 1)
 
-                            await pipe.add_channel(types.SimpleNamespace(camera_uuid="cam-1"))
+                            await pipe.add_channel(types.SimpleNamespace(camera_uuid="cam-1", enabled=True))
                             self.assertEqual(len(pipe._infer_pool._workers), 1)
 
-                            await pipe.add_channel(types.SimpleNamespace(camera_uuid="cam-2"))
-                            self.assertEqual(len(pipe._infer_pool._workers), 2)
+                            await pipe.add_channel(types.SimpleNamespace(camera_uuid="cam-2", enabled=True))
+                            self.assertEqual(len(pipe._infer_pool._workers), 1)
 
-                            await pipe.add_channel(types.SimpleNamespace(camera_uuid="cam-3"))
-                            self.assertEqual(len(pipe._infer_pool._workers), 3)
+                            await pipe.add_channel(types.SimpleNamespace(camera_uuid="cam-3", enabled=True))
+                            self.assertEqual(len(pipe._infer_pool._workers), 1)
                         finally:
                             await pipe.shutdown()
 

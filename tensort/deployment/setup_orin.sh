@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # setup_orin.sh — full deployment of the tensort camera detection service on a
-#                 Jetson ORIN Nano (JetPack 6.x/7.x, Ubuntu 22.04/24.04,
+#                 Jetson ORIN Nano (JetPack with TensorRT 10, Ubuntu 22.04,
 #                 Python 3.10+, TensorRT 10).
 #
 #   THIS IS THE SCRIPT FOR THE ORIN NANO. For the original Jetson Nano
@@ -20,9 +20,9 @@
 # breaks hardware video decode).
 #
 # Env overrides:
-#   MODEL=yolo26n         base model name in models/
+#   MODEL=yolo26m         base model name in models/
 #   VENV=.venv_trt        venv directory name
-#   MAX_BATCH=10          dynamic-engine max batch = plan for this many cameras
+#   MAX_BATCH=8           dynamic-engine max batch (1..8)
 #   OPT_BATCH=6           batch size the engine is optimised for
 #   IMG_SZ=640            engine input resolution (must match .env IMG_SZ)
 #   PORT=8080             service port
@@ -44,15 +44,16 @@ APP_DIR="$(cd "${HERE}/.." && pwd)"      # the tensort/ folder
 cd "$APP_DIR"
 [ -f main.py ] || die "main.py not found in ${APP_DIR} — is the deployment/ folder inside tensort/?"
 
-# yolo26s is the default: more accurate than yolo26n and still within the Orin
-# Nano's budget for ~10 cameras. Roll back with `MODEL=yolo26n ./setup_orin.sh`.
-MODEL="${MODEL:-yolo26s}"
+# Use the nano model as the conservative starting point for eight cameras.
+MODEL="${MODEL:-yolo26m}"
 VENV="${VENV:-.venv_trt}"
-MAX_BATCH="${MAX_BATCH:-10}"
+MAX_BATCH="${MAX_BATCH:-8}"
 # Steady-state batches are full now that frames pool while the GPU is busy, so
 # optimize the engine's tactics for the batch size it will actually see.
-OPT_BATCH="${OPT_BATCH:-10}"
+OPT_BATCH="${OPT_BATCH:-${MAX_BATCH}}"
 IMG_SZ="${IMG_SZ:-640}"
+[[ "$MAX_BATCH" =~ ^[1-8]$ ]] || { echo "MAX_BATCH must be between 1 and 8"; exit 1; }
+[[ "$OPT_BATCH" =~ ^[1-8]$ ]] && (( OPT_BATCH <= MAX_BATCH )) || { echo "OPT_BATCH must be between 1 and MAX_BATCH"; exit 1; }
 PORT="${PORT:-8080}"
 SERVICE_NAME="${SERVICE_NAME:-jetson-cameras}"
 WORKSPACE_MB="${WORKSPACE_MB:-3072}"
@@ -75,7 +76,7 @@ esac
 PYVER="$(py_version)"
 case "$PYVER" in
   3.1[0-9]) ok "Python ${PYVER}" ;;
-  *) warn_track "Expected Python 3.10+ on JetPack 6/7; found ${PYVER}. \
+  *) warn_track "Expected Python 3.10+ on a JetPack release with TensorRT 10; found ${PYVER}. \
 For Python 3.6 / original Nano use setup_nano.sh." ;;
 esac
 
