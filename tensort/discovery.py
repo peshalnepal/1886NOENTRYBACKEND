@@ -94,6 +94,14 @@ class DiscoveryConfig(object):
         # Credentials applied to every discovered camera.
         self.username = env_str("HIK_USERNAME", "admin")
         self.password = env_str("HIK_PASSWORD", "")
+        
+        # Credentials for remote NVRs
+        self.nvr_username = env_str("NVR_USERNAME", self.username)
+        self.nvr_password = env_str("NVR_PASSWORD", self.password)
+        
+        # Remote NVRs to probe. Format: host:port:channels;host:port:channels
+        # e.g., initialsecurity.dvrlists.com:16805:1-15
+        self.discovery_nvrs = env_str("DISCOVERY_NVRS", "")
 
         # Explicit subnets to sweep, e.g. "192.168.1.0/24,10.0.0.0/24".
         # Empty means "derive from this host's own primary IPv4 address".
@@ -116,27 +124,21 @@ class DiscoveryConfig(object):
         self.rtsp_channel = env_int("HIK_RTSP_CHANNEL", 1, minimum=1, maximum=64)
         self.rtsp_stream = env_int("HIK_RTSP_STREAM", 2, minimum=1, maximum=3)
         self.http_port = env_int("HIK_HTTP_PORT", 80, minimum=1, maximum=65535)
-
-    def rtsp_url_for(self, ip):
-        """Build the RTSP URL for a discovered camera.
-
-        Credentials are embedded because the GStreamer/OpenCV decode path in
-        channels/channel.py takes a single URL string and has nowhere else to
-        put them.
-        """
+        
+    def rtsp_url_for(self, dev, force_credentials=None):
+        """Construct RTSP URL for a device, optionally overriding credentials for NVRs."""
         cred = ""
-        if self.username:
+        user, pwd = force_credentials if force_credentials else (self.username, self.password)
+        if user:
             cred = "{u}:{p}@".format(
-                u=quote(self.username, safe=""), p=quote(self.password, safe="")
+                u=quote(user, safe=""), p=quote(pwd, safe="")
             )
-        # Hikvision encodes the path segment as channel*100 + stream, so
-        # channel 1 main = 101 and channel 1 sub = 102. Concatenating the two
-        # numbers as strings only coincidentally matches for channels 1-9.
+        # NVRs multiplex cameras by using channel*100 + stream
         return "rtsp://{cred}{ip}:{port}/Streaming/Channels/{ch}".format(
             cred=cred,
-            ip=ip,
-            port=self.rtsp_port,
-            ch=self.rtsp_channel * 100 + self.rtsp_stream,
+            ip=dev.ip,
+            port=dev.rtsp_port,
+            ch=dev.channel * 100 + self.rtsp_stream,
         )
 
 
@@ -145,9 +147,8 @@ class DiscoveryConfig(object):
 # ---------------------------------------------------------------------------
 
 HikDevice = namedtuple(
-    "HikDevice", "ip serial_number model firmware device_name mac"
+    "HikDevice", "ip serial_number model firmware device_name mac channel rtsp_port"
 )
-
 
 def identity_of(dev):
     """Stable identity for a physical camera.
@@ -315,66 +316,122 @@ def _opener_for(url, cfg):
 def _strip_ns(tag):
     return tag.split("}", 1)[1] if "}" in tag else tag
 
+def _probe_nvr_channels(ip, cfg, opener, rtsp_port=None, channels_override=None):
+    """Query an NVR for cameras connected to its internal PoE switch."""
+    url = "http://{ip}:{port}/ISAPI/ContentMgmt/InputProxy/channels".format(ip=ip, port=cfg.http_port)
+    cameras = []
+    
+    try:
+        body = opener.open(url, timeout=cfg.http_timeout_s).read()
+        root = ElementTree.fromstring(body)
+    except Exception:
+        logger.debug("Could not read NVR channels from %s", ip)
+        return cameras
+
+    for ch in root:
+        if _strip_ns(ch.tag) != "InputProxyChannel": 
+            continue
+            
+        ch_fields = {_strip_ns(c.tag): (c.text or "").strip() for c in ch}
+        ch_id = ch_fields.get("id", "1")
+        ch_int = int(ch_id) if ch_id.isdigit() else 1
+        
+        if channels_override and ch_int not in channels_override:
+            continue
+        
+        # The nested sourceInputPortDescriptor holds the actual camera hardware info
+        desc_node = None
+        for child in ch:
+            if _strip_ns(child.tag) == "sourceInputPortDescriptor":
+                desc_node = child
+                break
+                
+        if desc_node is not None:
+            desc_fields = {_strip_ns(c.tag): (c.text or "").strip() for c in desc_node}
+            serial = desc_fields.get("serialNumber")
+            
+            if serial:
+                # Hikvision NVRs usually offset internal PoE IP cameras by 32
+                cameras.append(HikDevice(
+                    ip=ip,  # We must use the NVR's IP to stream this camera
+                    serial_number=serial,
+                    model=desc_fields.get("model", "NVR-Proxied-Camera"),
+                    firmware=desc_fields.get("firmwareVersion"),
+                    device_name=ch_fields.get("name") or "Camera {}".format(ch_id),
+                    mac=desc_fields.get("macAddress"),
+                    channel=ch_int,
+                    rtsp_port=rtsp_port if rtsp_port else cfg.rtsp_port
+                ))
+                
+    return cameras
 
 def probe_hikvision(ip, cfg):
-    """Identify `ip` as a Hikvision camera via ISAPI, or return None.
-
-    Only a <DeviceInfo> document carrying a serial number counts. A generic web
-    server answering 200 on port 80 does not.
-    """
     url = "http://{ip}:{port}{path}".format(ip=ip, port=cfg.http_port, path=ISAPI_PATH)
-    #this will user url and create a opener 
-    # (opener is urlopen but will call the url twice so that first time you get 401 error from camera and send you code you comebine that code with user and password to auth)
     opener = _opener_for(url, cfg)
 
     try:
         body = opener.open(url, timeout=cfg.http_timeout_s).read()
-        #this body is xml which looks something like this 
-        # <DeviceInfo xmlns="http://www.hikvision.com/ver20/XMLSchema">
-            # <deviceName>Front Gate</deviceName>
-            # <serialNumber>DS-2CD2043G0...</serialNumber>
-            # ...
-        # </DeviceInfo>
-        # here this is name space so every element below will look like 
-        # {namespace}deviceName (to distinguish from other camera send their response)
-        
+        root = ElementTree.fromstring(body)
     except (HTTPError, URLError, socket.timeout):
-        return None
+        return []
     except Exception:
         logger.debug("ISAPI probe failed for %s", ip, exc_info=True)
-        return None
+        return []
 
-    try:
-        root = ElementTree.fromstring(body)
-    except Exception:
-        return None
     if _strip_ns(root.tag) != "DeviceInfo":
-        return None
+        return []
 
     fields = {_strip_ns(c.tag): (c.text or "").strip() for c in root}
-    #cleaning the namespace and just keeping name and value in them like
-    # this is converted by strp_ns {http://www.hikvision.com/ver20/XMLSchema}DeviceInfo to just DeviceInfo
-    # so the dictonary will look like fields = {"deviceName": "Front Gate", "serialNumber": "DS-2CD...", "model": "", ...}
     serial = fields.get("serialNumber")
     if not serial:
-        # Without a serial we cannot track this camera across IP changes, and a
-        # device that omits it is very unlikely to be a Hikvision camera.
-        return None
-
-    return HikDevice(
+        return []
+        
+    device_type = fields.get("deviceType", "").upper()
+    model = fields.get("model", "").upper()
+    if "NVR" in device_type or model.startswith("DS-7"):
+        return _probe_nvr_channels(ip, cfg, opener)
+    return [HikDevice(
         ip=ip,
         serial_number=serial,
-        model=fields.get("model") or None,
+        model=model or None,
         firmware=fields.get("firmwareVersion") or None,
         device_name=fields.get("deviceName") or None,
         mac=fields.get("macAddress") or None,
-    )
+        channel=1,
+        rtsp_port=cfg.rtsp_port
+    )]
+def probe_remote_nvr(host, rtsp_port, channels, cfg):
+    """Probe a remote NVR directly using its public hostname/IP."""
+    url = "http://{ip}:{port}{path}".format(ip=host, port=cfg.http_port, path=ISAPI_PATH)
+    
+    # Use NVR credentials
+    mgr = HTTPPasswordMgrWithDefaultRealm()
+    mgr.add_password(None, url, cfg.nvr_username, cfg.nvr_password)
+    opener = build_opener(HTTPBasicAuthHandler(mgr), HTTPDigestAuthHandler(mgr))
 
+    try:
+        body = opener.open(url, timeout=cfg.http_timeout_s).read()
+        root = ElementTree.fromstring(body)
+    except (HTTPError, URLError, socket.timeout):
+        return []
+    except Exception:
+        logger.debug("ISAPI probe failed for remote NVR %s", host, exc_info=True)
+        return []
+
+    if _strip_ns(root.tag) != "DeviceInfo":
+        return []
+
+    fields = {_strip_ns(c.tag): (c.text or "").strip() for c in root}
+    serial = fields.get("serialNumber")
+    if not serial:
+        return []
+
+    # Override the _probe_nvr_channels call to use the remote NVR settings
+    return _probe_nvr_channels(host, cfg, opener, rtsp_port=rtsp_port, channels_override=channels)
 
 # ---------------------------------------------------------------------------
 # Sweep orchestration
 # ---------------------------------------------------------------------------
-
 def scan_network(cfg=None):
     """Run one full discovery sweep and return the confirmed Hikvision cameras.
 
@@ -386,7 +443,11 @@ def scan_network(cfg=None):
 
     candidates = wsdiscover(timeout_s=cfg.wsd_timeout_s)
     if candidates:
-        logger.info("WS-Discovery found %d ONVIF responder(s)", len(candidates))
+        logger.info(
+            "WS-Discovery found %d ONVIF responder(s): %s", 
+            len(candidates), 
+            sorted(list(candidates))
+        )
 
     if not candidates or not cfg.sweep_only_if_wsd_empty:
         subnets = cfg.subnets or _default_subnet_from_host(own_ip)
@@ -402,21 +463,63 @@ def scan_network(cfg=None):
                 candidates.update(hosts)
 
     candidates.discard(own_ip)  # never probe ourselves
-    if not candidates:
-        return []
-
+    
     targets = sorted(candidates)
-    workers = min(cfg.probe_workers, len(targets))
+    
+    if targets:
+        # 2. Log ALL final candidate IPs being probed at INFO level
+        logger.info("Probing %d total candidate host(s): %s", len(targets), targets)
 
-    def probe(ip):
-        try:
-            return probe_hikvision(ip, cfg)
-        except Exception:
-            logger.debug("Hikvision probe raised for %s", ip, exc_info=True)
-            return None
+        workers = min(cfg.probe_workers, len(targets))
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        devices = [d for d in pool.map(probe, targets) if d is not None]
+        def probe(ip):
+            try:
+                return probe_hikvision(ip, cfg)
+            except Exception:
+                logger.debug("Hikvision probe raised for %s", ip, exc_info=True)
+                return None
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            devices = []
+            for dev_list in pool.map(probe, targets):
+                if dev_list:
+                    devices.extend(dev_list)
+    else:
+        devices = []
+        logger.info("No local candidates found to probe.")
+
+    # Probe remote NVRs from config
+    if cfg.discovery_nvrs:
+        logger.info("Probing remote NVRs: %s", cfg.discovery_nvrs)
+        for nvr_str in cfg.discovery_nvrs.split(";"):
+            nvr_str = nvr_str.strip()
+            if not nvr_str:
+                continue
+            parts = nvr_str.split(":")
+            if len(parts) >= 2:
+                host = parts[0]
+                try:
+                    rtsp_port = int(parts[1])
+                except ValueError:
+                    rtsp_port = cfg.rtsp_port
+                
+                channels = None
+                if len(parts) >= 3:
+                    channels = []
+                    for ch_part in parts[2].split(","):
+                        if "-" in ch_part:
+                            try:
+                                start, end = map(int, ch_part.split("-"))
+                                channels.extend(range(start, end + 1))
+                            except ValueError:
+                                pass
+                        elif ch_part.isdigit():
+                            channels.append(int(ch_part))
+                
+                logger.info("Probing remote NVR: host=%s, rtsp_port=%s, channels=%s", host, rtsp_port, channels)
+                remote_cams = probe_remote_nvr(host, rtsp_port, channels, cfg)
+                if remote_cams:
+                    devices.extend(remote_cams)
 
     by_identity = {}
     for dev in devices:
@@ -424,7 +527,7 @@ def scan_network(cfg=None):
 
     found = list(by_identity.values())
     logger.info(
-        "Discovery sweep complete: %d candidate host(s) probed, %d Hikvision camera(s) confirmed",
-        len(targets), len(found),
+        "Discovery sweep complete: %d Hikvision camera(s) confirmed",
+        len(found),
     )
     return found

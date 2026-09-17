@@ -143,34 +143,35 @@ class VideoChannel():
 
     @staticmethod
     def _gst_quote(value):
-        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+        # Escape $ to prevent gst_parse_launch variable expansion
+        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$') + '"'
 
-    def _build_rtsp_pipeline(self, url, decoder):
-        """RTSP fast path: depay/parse H.264 + (HW or CPU) decode."""
+    def _build_rtsp_pipeline(self, url, decoder, codec="h264"):
+        """RTSP fast path: depay/parse + (HW or CPU) decode."""
         lat = int(self.config.gst_latency_ms)
         proto = self.config.rtsp_transport
         # Never drop compressed RTP packets before depay/decode: doing so
         # corrupts reference frames until the camera sends another keyframe.
         url = self._gst_quote(url)
 
+        depay = "rtph265depay ! h265parse config-interval=1 ! video/x-h265" if codec == "h265" else "rtph264depay ! h264parse config-interval=1 ! video/x-h264"
+
         if decoder == "nvv4l2decoder":
             return (
                 "rtspsrc location={url} latency={lat} protocols={proto} "
                 "drop-on-latency=true do-retransmission=false ! "
-                "rtph264depay ! "
-                "h264parse config-interval=1 ! "
-                "video/x-h264,stream-format=byte-stream,alignment=au ! "
+                "{depay},stream-format=byte-stream,alignment=au ! "
                 "nvv4l2decoder enable-max-performance=1 ! "
                 + self._gst_appsink_tail(hw=True)
-            ).format(url=url, lat=lat, proto=proto)
-        # CPU fallback decoder (avdec_h264)
+            ).format(url=url, lat=lat, proto=proto, depay=depay)
+        # CPU fallback decoder (avdec_h264 / avdec_h265)
         return (
             "rtspsrc location={url} latency={lat} protocols={proto} "
             "drop-on-latency=true do-retransmission=false ! "
-            "rtph264depay ! h264parse config-interval=1 ! "
+            "{depay} ! "
             "{dec} ! "
             + self._gst_appsink_tail(hw=False)
-        ).format(url=url, lat=lat, proto=proto, dec=decoder)
+        ).format(url=url, lat=lat, proto=proto, dec=decoder, depay=depay)
 
     def _build_uridecodebin_pipeline(self, url, hw):
         """Generic pipeline for srt/rtmp/http(HLS/MJPEG/progressive) and rtsp.
@@ -213,10 +214,12 @@ class VideoChannel():
         scheme = self._url_scheme(url)
         cands = []
         if scheme in ("rtsp", "rtsps"):
-            cands.append(("rtsp-nvv4l2decoder", self._build_rtsp_pipeline(url, self.config.gst_decoder)))
+            cands.append(("rtsp-nvv4l2decoder-h265", self._build_rtsp_pipeline(url, self.config.gst_decoder, codec="h265")))
+            cands.append(("rtsp-nvv4l2decoder-h264", self._build_rtsp_pipeline(url, self.config.gst_decoder, codec="h264")))
             # Generic fallback also covers H.265 / non-H264 RTSP cameras.
             cands.append(("rtsp-uridecodebin-hw", self._build_uridecodebin_pipeline(url, hw=True)))
-            cands.append(("rtsp-avdec_h264", self._build_rtsp_pipeline(url, "avdec_h264")))
+            cands.append(("rtsp-avdec_h265", self._build_rtsp_pipeline(url, "avdec_h265", codec="h265")))
+            cands.append(("rtsp-avdec_h264", self._build_rtsp_pipeline(url, "avdec_h264", codec="h264")))
             cands.append(("rtsp-uridecodebin-cpu", self._build_uridecodebin_pipeline(url, hw=False)))
         elif scheme in ("whep", "wheps", "webrtc"):
             cands.append(("whep-hw", self._build_whep_pipeline(url, hw=True)))

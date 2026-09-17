@@ -361,7 +361,12 @@ class DeviceReconciler:
             # Their WHEP streams are already provisioned — adoption goes through
             # the normal channel-create path, which calls ensure_stream itself —
             # so only the edge-side sets are rebuilt here.
-            if adoption.get("adopted"):
+            #
+            # A repoint (DHCP moved a camera) changes no membership, only the
+            # URL on an existing row, but the re-read still has to happen: the
+            # `cams` list above carries the pre-repoint address and is what
+            # builds every edge payload below.
+            if adoption.get("adopted") or adoption.get("repointed"):
                 cams, desired_set, _streams = await self._recompute_desired(
                     device_uuids=reconcile_device_uuids,
                 )
@@ -411,7 +416,9 @@ class DeviceReconciler:
         # edge and surface to the frontend as pending adoption instead.
         discovered_uuids: Set[str] = set()
         missing_cameras: List[Dict[str, Any]] = []
-        if isinstance(discovery_report, dict):
+        valid_report = isinstance(discovery_report, dict) and "roster" in discovery_report
+
+        if valid_report:
             for entry in discovery_report.get("roster") or []:
                 if isinstance(entry, dict) and entry.get("camera_uuid"):
                     discovered_uuids.add(str(entry["camera_uuid"]))
@@ -419,7 +426,12 @@ class DeviceReconciler:
                 if isinstance(entry, dict):
                     missing_cameras.append(entry)
 
-        unadopted = sorted((set(to_remove) & discovered_uuids) - desired_set)
+            unadopted = sorted((set(to_remove) & discovered_uuids) - desired_set)
+        else:
+            # We don't have the roster. Assume any unknown camera might be a newly
+            # discovered one to prevent the add/delete race condition.
+            unadopted = sorted(set(to_remove) - desired_set)
+
         if unadopted:
             to_remove = [cu for cu in to_remove if cu not in set(unadopted)]
             edge_warnings.append(
@@ -448,6 +460,7 @@ class DeviceReconciler:
             "missing_cameras": missing_cameras,
             "adopted": list(adoption.get("adopted") or []),
             "linked": list(adoption.get("linked") or []),
+            "repointed": list(adoption.get("repointed") or []),
         }
 
         if dry_run:
@@ -479,6 +492,32 @@ class DeviceReconciler:
             except Exception as e:
                 logger.warning("Edge upsert failed during reconcile for camera %s", cu, exc_info=True)
                 out["errors"].append(f"Failed to add {cu}: {e}")
+
+        # A camera that moved address is in both `desired_set` and `edge_set`,
+        # so it falls out of the diff above entirely — membership did not
+        # change, only the URL. The edge already repointed its own pipeline
+        # when it noticed, so this patch is normally a no-op that simply keeps
+        # the two sides from disagreeing; it matters when the edge restarted
+        # and re-read a camera the cloud repointed in the meantime.
+        for repoint in adoption.get("repointed") or []:
+            cu = str(repoint.get("camera_uuid") or "")
+            cam = cams_by_uuid.get(cu)
+            if not cu or cam is None or cu in set(to_add):
+                continue
+            try:
+                await self._call_with_timeout(
+                    self._state.edge.patch_camera(
+                        device_url=device_url,
+                        camera_uuid=cu,
+                        patch={"source_url": cam.source_url},
+                    ),
+                    timeout_s=self._state.external_timeout_s,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Edge repoint patch failed during reconcile for camera %s", cu, exc_info=True
+                )
+                out["errors"].append(f"Failed to repoint {cu}: {e}")
 
         if delete_unknown:
             for cu in to_remove:

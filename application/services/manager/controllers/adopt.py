@@ -162,7 +162,9 @@ class CameraAdopter:
     ) -> Dict[str, Any]:
         """Create Camera rows for every present, unregistered discovered camera.
 
-        Returns a summary dict: `adopted`, `linked`, `skipped`, `errors`.
+        Returns a summary dict: `adopted`, `linked`, `repointed`, `skipped`,
+        `errors`. An already-registered camera is `linked`, and additionally
+        `repointed` when the sweep found it at a new address.
 
         Best-effort by contract: a failure on one camera is recorded and the
         sweep moves on, because a single bad roster entry must never block the
@@ -171,6 +173,7 @@ class CameraAdopter:
         out: Dict[str, Any] = {
             "adopted": [],
             "linked": [],
+            "repointed": [],
             "skipped": [],
             "errors": [],
         }
@@ -228,18 +231,30 @@ class CameraAdopter:
             if existing is not None:
                 # Already registered. Backfill the provenance if this row was
                 # created by hand, so the next sweep matches on identity
-                # instead of falling back to the fragile host comparison.
+                # instead of falling back to the fragile host comparison, and
+                # follow the camera if DHCP moved it to a new address.
                 out["linked"].append(str(existing.camera_uuid))
-                if identity and not dry_run:
+                if (identity or source_url) and not dry_run:
                     try:
-                        await self._backfill_identity(
-                            camera_uuid=existing.camera_uuid, entry=entry
+                        repointed = await self._sync_existing_camera(
+                            camera_uuid=existing.camera_uuid,
+                            entry=entry,
+                            source_url=source_url,
                         )
                     except Exception as exc:
                         logger.warning(
-                            "Failed to backfill discovery identity for camera %s: %s",
+                            "Failed to sync discovery state for camera %s: %s",
                             existing.camera_uuid, exc, exc_info=True,
                         )
+                    else:
+                        if repointed:
+                            out["repointed"].append(
+                                {
+                                    "camera_uuid": str(existing.camera_uuid),
+                                    "identity": identity,
+                                    "source_url": source_url,
+                                }
+                            )
                 continue
 
             if dry_run:
@@ -365,8 +380,28 @@ class CameraAdopter:
             raise RuntimeError("Channel create returned no camera")
         return result.cameras[0].camera_uuid
 
-    async def _backfill_identity(self, *, camera_uuid: uuid.UUID, entry: Dict[str, Any]) -> None:
-        """Stamp discovery provenance onto a camera that predates discovery."""
+    async def _sync_existing_camera(
+        self,
+        *,
+        camera_uuid: uuid.UUID,
+        entry: Dict[str, Any],
+        source_url: str,
+    ) -> bool:
+        """Reconcile one already-registered camera with this sweep's findings.
+
+        Two things can be stale on a camera the cloud already knows about:
+
+        1. Its discovery provenance, when the row was created by hand before
+           discovery ever ran. Stamping it makes the next sweep match on
+           identity instead of the fragile host comparison.
+        2. Its `source_url`, when DHCP moved the camera. The edge repoints its
+           own pipeline the moment it notices, but that patch is local to the
+           Jetson — without the update below the cloud keeps the old address,
+           MediaMTX keeps streaming from an IP nothing answers on, and the next
+           reconcile pushes the stale URL back down over the edge's correct one.
+
+        Returns True when the camera was repointed, so the caller can report it.
+        """
         patch = {
             "discovered": True,
             "discovery_identity": entry.get("identity"),
@@ -377,25 +412,64 @@ class CameraAdopter:
             "discovery_name": entry.get("device_name"),
         }
         patch = {k: v for k, v in patch.items() if v is not None}
-        if not patch:
-            return
+
+        repointed = False
+        camera_code: Optional[str] = None
 
         async with self._state.session_factory() as db:
             full = await self._state.channel_repo.get_camera_full(db, camera_uuid=camera_uuid)
             if not full:
-                return
-            _cam, chan_cfg, _pid = full
-            if chan_cfg is None:
-                return
+                return False
+            cam, chan_cfg, _pid = full
 
-            merged = dict(chan_cfg.configuration or {})
-            if all(merged.get(k) == v for k, v in patch.items()):
-                return  # already stamped — skip the write entirely
-            merged.update(patch)
-            chan_cfg.configuration = merged
-            # configuration is a plain JSON column, so an in-place dict mutation
-            # would not be detected; reassigning above is what marks it dirty.
+            # Only the host is compared: the edge rebuilds the whole URL from
+            # its own configured credentials and stream path every sweep, so a
+            # byte-comparison would repoint endlessly on any cloud-side edit to
+            # the channel or stream number without the address having moved.
+            old_host = _host_of(getattr(cam, "source_url", None))
+            new_host = _host_of(source_url)
+            if source_url and new_host and new_host != old_host:
+                cam.source_url = source_url
+                camera_code = str(getattr(cam, "camera_code", "") or "").strip() or None
+                repointed = True
+
+            cfg_changed = False
+            if chan_cfg is not None and patch:
+                merged = dict(chan_cfg.configuration or {})
+                if any(merged.get(k) != v for k, v in patch.items()):
+                    merged.update(patch)
+                    # configuration is a plain JSON column, so an in-place dict
+                    # mutation would not be detected; reassigning marks it dirty.
+                    chan_cfg.configuration = merged
+                    cfg_changed = True
+
+            if not repointed and not cfg_changed:
+                return False  # already current — skip the write entirely
+
             await db.commit()
+
+        if repointed:
+            logger.info(
+                "Repointed camera %s to %s after discovery reported an address change",
+                camera_uuid, source_url,
+            )
+            # Best-effort: the DB is authoritative and the next reconcile pushes
+            # the new URL to the edge regardless, so a gateway hiccup here must
+            # not fail the sweep. Without a camera_code there is no MediaMTX
+            # path to patch.
+            if camera_code:
+                try:
+                    await self._state.webrtc.update_stream(
+                        stream_key=camera_code, source_url=source_url
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to repoint MediaMTX stream %s for camera %s; "
+                        "live view keeps the old address until the next reconcile",
+                        camera_code, camera_uuid, exc_info=True,
+                    )
+
+        return repointed
 
 
 class _AdoptedRef:

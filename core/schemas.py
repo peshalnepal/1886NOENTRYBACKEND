@@ -463,6 +463,14 @@ class EdgeReconcileOut(BaseModel):
             "them, so they were matched to the existing row instead of re-added."
         ),
     )
+    repointed: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Registered cameras the sweep found at a new address (a DHCP move). "
+            "Their source_url, MediaMTX stream and edge config were all updated "
+            "to follow. Each entry carries camera_uuid, identity and source_url."
+        ),
+    )
 
 
 class DeviceCreate(BaseModel):

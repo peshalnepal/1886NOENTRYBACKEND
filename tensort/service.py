@@ -174,15 +174,23 @@ class DiscoveryService(object):
         for dev in devices:
             identity = dev.identity()
             present_identities.append(identity)
-            source_url = self._cfg.rtsp_url_for(dev.ip)
+            
+            # Use NVR credentials if it's on a custom port (likely an NVR)
+            is_nvr = dev.rtsp_port != self._cfg.rtsp_port
+            credentials_override = (self._cfg.nvr_username, self._cfg.nvr_password) if is_nvr else None
+            source_url = self._cfg.rtsp_url_for(dev, force_credentials=credentials_override)
+            
+            # The host in source_url is exactly dev.ip (which could be the NVR's public hostname)
+            public_rtsp_url = source_url
 
-            state = self._repo.mark_seen(dev, source_url=source_url)
+            state = self._repo.mark_seen(dev, source_url=source_url, public_rtsp_url=public_rtsp_url)
 
             if state.get("ip_changed"):
                 ip_changes.append({
                     "identity": identity,
                     "ip_address": dev.ip,
                     "source_url": source_url,
+                    "public_rtsp_url": public_rtsp_url,
                 })
 
             if state.get("recovered"):
@@ -196,11 +204,11 @@ class DiscoveryService(object):
                 continue
 
             if not self.auto_add:
-                new_cameras.append(self._camera_entry(dev, identity, source_url, adopted=False))
+                new_cameras.append(self._camera_entry(dev, identity, source_url, adopted=False, public_rtsp_url=public_rtsp_url))
                 continue
 
             try:
-                new_cameras.append(self._adopt(dev, identity, source_url))
+                new_cameras.append(self._adopt(dev, identity, source_url, public_rtsp_url=public_rtsp_url))
             except Exception as e:
                 logger.exception("Failed to adopt discovered camera %s", identity)
                 errors.append("Failed to add {}: {}".format(identity, e))
@@ -246,12 +254,13 @@ class DiscoveryService(object):
     # Pipeline adoption
     # ------------------------------------------------------------------
     @staticmethod
-    def _camera_entry(dev, identity, source_url, adopted, camera_uuid=None, **extra):
+    def _camera_entry(dev, identity, source_url, adopted, camera_uuid=None, public_rtsp_url=None, **extra):
         """The per-camera shape reported under `new_cameras`."""
         entry = {
             "identity": identity,
             "ip_address": dev.ip,
             "source_url": source_url,
+            "public_rtsp_url": public_rtsp_url,
             "camera_uuid": camera_uuid,
             "adopted": adopted,
             "model": dev.model,
@@ -300,7 +309,7 @@ class DiscoveryService(object):
                 return cam.get("camera_uuid")
         return None
 
-    def _adopt(self, dev, identity, source_url):
+    def _adopt(self, dev, identity, source_url, public_rtsp_url=None):
         """Provision a newly-discovered camera into the running pipeline."""
         existing = self._existing_camera_uuid_for(dev, identity, source_url)
         if existing:
@@ -312,6 +321,7 @@ class DiscoveryService(object):
             return self._camera_entry(
                 dev, identity, source_url,
                 adopted=False, camera_uuid=existing, already_present=True,
+                public_rtsp_url=public_rtsp_url
             )
 
         camera_uuid = str(uuid_mod.uuid4())
@@ -339,6 +349,7 @@ class DiscoveryService(object):
             dev, identity, source_url,
             adopted=True, camera_uuid=camera_uuid,
             config=result.get("config") if isinstance(result, dict) else None,
+            public_rtsp_url=public_rtsp_url
         )
 
     def _repoint(self, change):

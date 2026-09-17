@@ -1096,6 +1096,7 @@ async def link_device_to_site(
         result["discovery"] = {
             "adopted": adoption.get("adopted") or [],
             "linked": adoption.get("linked") or [],
+            "repointed": adoption.get("repointed") or [],
             "errors": adoption.get("errors") or [],
         }
     except asyncio.TimeoutError:

@@ -99,6 +99,8 @@ class DiscoveredCamera(Base):
     device_name = Column(String(255), nullable=True)
 
     source_url = Column(Text, nullable=True)
+    public_rtsp_url = Column(Text, nullable=True)
+    rtsp_port = Column(Integer, nullable=True)
     camera_uuid = Column(String(64), nullable=True, index=True)
 
     is_present = Column(Boolean, nullable=False, default=True)
@@ -127,6 +129,8 @@ class DiscoveredCamera(Base):
             "firmware": self.firmware,
             "device_name": self.device_name,
             "source_url": self.source_url,
+            "public_rtsp_url": self.public_rtsp_url,
+            "rtsp_port": self.rtsp_port,
             "camera_uuid": self.camera_uuid,
             "is_present": bool(self.is_present),
             "consecutive_misses": int(self.consecutive_misses or 0),

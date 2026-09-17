@@ -57,7 +57,7 @@ class DiscoveryRepository(object):
         finally:
             session.close()
 
-    def mark_seen(self, device, source_url=None):
+    def mark_seen(self, device, source_url=None, public_rtsp_url=None):
         """Record that `device` (a discovery.HikDevice) is present right now.
 
         Returns a dict describing the transition:
@@ -99,8 +99,11 @@ class DiscoveryRepository(object):
             row.model = device.model
             row.firmware = device.firmware
             row.device_name = device.device_name
+            row.rtsp_port = getattr(device, "rtsp_port", 554)
             if source_url:
                 row.source_url = source_url
+            if public_rtsp_url:
+                row.public_rtsp_url = public_rtsp_url
 
             row.is_present = True
             row.consecutive_misses = 0
