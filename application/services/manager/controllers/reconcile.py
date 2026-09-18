@@ -422,6 +422,9 @@ class DeviceReconciler:
             for entry in discovery_report.get("roster") or []:
                 if isinstance(entry, dict) and entry.get("camera_uuid"):
                     discovered_uuids.add(str(entry["camera_uuid"]))
+            for entry in discovery_report.get("new_cameras") or []:
+                if isinstance(entry, dict) and entry.get("camera_uuid"):
+                    discovered_uuids.add(str(entry["camera_uuid"]))
             for entry in discovery_report.get("missing_cameras") or []:
                 if isinstance(entry, dict):
                     missing_cameras.append(entry)
