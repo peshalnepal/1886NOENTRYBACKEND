@@ -17,6 +17,25 @@ logger = logging.getLogger(__name__)
 # Statuses that mean "wrong path, try the next candidate" rather than a failure.
 _ROUTE_FALLBACK_STATUS_CODES = {404, 405}
 
+# Statuses that are a considered answer, not a transient fault. Retrying them
+# cannot change the outcome: a 409 "device is full" stays full, and a 400/422
+# payload stays malformed. Without this, one rejected camera costs
+# retry_count x len(candidate_urls) requests -- six round trips to be told the
+# same thing six times, per camera, per reconcile pass.
+_TERMINAL_STATUS_CODES = {400, 409, 422}
+
+
+class EdgeTerminalError(RuntimeError):
+    """An edge rejection that retrying cannot fix.
+
+    Carries the status code so callers can distinguish "device at capacity"
+    (409) from a bad payload (400/422) without parsing the message text.
+    """
+
+    def __init__(self, detail: str, *, status_code: int) -> None:
+        self.status_code = int(status_code)
+        super().__init__(detail)
+
 _HEALTH_KEYS = ("ok", "pipeline_ready", "startup_error")
 
 
@@ -161,6 +180,7 @@ class EdgeInferenceClient:
         last_exc: Optional[Exception] = None
         last_url = urls[-1] if urls else ""
         saw_404, saw_non_404 = False, False
+        terminal_exc: Optional[EdgeTerminalError] = None
 
         for attempt in range(self.retry_count):
             for url in urls:
@@ -179,15 +199,28 @@ class EdgeInferenceClient:
                         last_exc = RuntimeError(f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}")
                         continue
                         
+                    if r.status_code in _TERMINAL_STATUS_CODES:
+                        # Re-raised below, outside the retry handler. Raising it
+                        # here would be caught by our own `except` and retried,
+                        # which is exactly the amplification this avoids.
+                        terminal_exc = EdgeTerminalError(
+                            f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}",
+                            status_code=r.status_code,
+                        )
+                        break
+
                     if r.status_code >= 400:
                         raise RuntimeError(f"Edge service error {r.status_code} for {method} {url}: {r.text[:300]}")
-                        
+
                     return r
-                    
+
                 except Exception as exc:
                     last_url, last_exc = url, exc
                     saw_non_404 = True
                     continue
+
+            if terminal_exc is not None:
+                raise terminal_exc
                     
             if attempt + 1 >= self.retry_count:
                 break
@@ -218,6 +251,30 @@ class EdgeInferenceClient:
             except Exception:
                 continue
         return None
+
+    async def get_camera_capacity(self, *, device_url: str) -> Optional[int]:
+        """How many enabled cameras this device will accept, or None if unknown.
+
+        Read from `/health`'s stats block, where the edge reports the same
+        `max_cameras` value its admission check enforces. Returning None means
+        "the edge did not say" -- an older firmware, or an unreachable box --
+        and callers must then fall back to the previous add-everything
+        behaviour rather than inventing a limit and refusing to provision.
+        """
+        health = await self.get_health(device_url=device_url)
+        if not isinstance(health, dict):
+            return None
+
+        stats = health.get("stats")
+        if not isinstance(stats, dict):
+            return None
+
+        try:
+            limit = int(stats["max_cameras"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        return limit if limit > 0 else None
 
     async def list_cameras(self, *, device_url: str) -> Set[str]:
         urls = self._candidate_urls(device_url=device_url, path=self.list_path)
@@ -343,6 +400,11 @@ class EdgeInferenceClient:
         urls = self._candidate_urls(device_url=device_url, path=self.patch_path.format(camera_uuid=camera_uuid))
         try:
             await self._request("PATCH", urls, json_payload=patch)
+        except EdgeTerminalError:
+            # The edge understood the PATCH and refused it. This fallback is
+            # for firmware that has no PATCH route at all, so re-sending the
+            # same rejected content as a POST would just earn a second refusal.
+            raise
         except Exception:
             upsert_payload = dict(patch or {})
             upsert_payload.setdefault("camera_uuid", str(camera_uuid))

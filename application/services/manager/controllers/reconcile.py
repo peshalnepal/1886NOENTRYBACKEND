@@ -7,7 +7,7 @@ import logging
 import uuid
 from typing import Any, Awaitable, Dict, List, Optional, Set, Union
 
-from application.services.edgeinference import EdgeCameraInventoryError
+from application.services.edgeinference import EdgeCameraInventoryError, EdgeTerminalError
 from application.repositories.device_repository import normalize_device_url
 
 from application.services.manager.helpers import (
@@ -409,6 +409,7 @@ class DeviceReconciler:
         to_add = sorted(desired_set - edge_set)
         to_remove = sorted(edge_set - desired_set)
 
+
         # Cameras the edge discovered on its own are NOT unknown strays — they
         # are the edge exercising its role as source of truth. Deleting them
         # here would tear down a camera the Jetson just adopted, and the next
@@ -450,6 +451,53 @@ class DeviceReconciler:
                 )
             )
 
+        # A Jetson enforces a hard ceiling on enabled cameras (a property of the
+        # hardware, not a setting) and rejects everything past it with a 409.
+        # Without this the cloud rediscovers that ceiling one failed POST at a
+        # time, every pass, forever: over-assigned cameras never leave
+        # `desired_set`, so the identical rejections repeat on the next
+        # reconcile and bury real failures in tracebacks.
+        #
+        # This must run AFTER `to_remove` is final. Cameras the edge discovered
+        # itself were just carved out of it and keep running, so counting them
+        # as freed slots would overshoot the cap and 409 all over again.
+        capacity_overflow: List[str] = []
+        max_cameras = None
+        if to_add:
+            try:
+                max_cameras = await self._call_with_timeout(
+                    self._state.edge.get_camera_capacity(device_url=device_url),
+                    timeout_s=self._state.external_timeout_s,
+                )
+            except Exception as e:
+                # Never fatal: an edge that cannot report capacity gets the old
+                # add-everything behaviour, which is no worse than before.
+                logger.info(
+                    "Edge capacity unknown for %s; adding without a cap: %s", device_url, e,
+                )
+                max_cameras = None
+
+            if max_cameras is not None:
+                freed = len(to_remove) if delete_unknown else 0
+                retained = max(0, len(edge_set) - freed)
+                free_slots = max(0, max_cameras - retained)
+                if len(to_add) > free_slots:
+                    capacity_overflow = to_add[free_slots:]
+                    to_add = to_add[:free_slots]
+
+        if capacity_overflow:
+            edge_warnings.append(
+                "{} camera(s) could not be provisioned: this device is limited to {} "
+                "enabled cameras and is already full. Move them to another device or "
+                "disable cameras here to free slots: {}".format(
+                    len(capacity_overflow), max_cameras, ", ".join(capacity_overflow),
+                )
+            )
+            logger.warning(
+                "Device %s is at capacity (%s cameras); %d camera(s) left unprovisioned: %s",
+                device_url, max_cameras, len(capacity_overflow), ", ".join(capacity_overflow),
+            )
+
         out: Dict[str, Any] = {
             "to_add": to_add,
             "to_remove": to_remove,
@@ -461,6 +509,7 @@ class DeviceReconciler:
             "warnings": edge_warnings,
             "discovered": sorted(unadopted),
             "missing_cameras": missing_cameras,
+            "capacity_overflow": list(capacity_overflow),
             "adopted": list(adoption.get("adopted") or []),
             "linked": list(adoption.get("linked") or []),
             "repointed": list(adoption.get("repointed") or []),
@@ -492,6 +541,12 @@ class DeviceReconciler:
                     timeout_s=self._state.external_timeout_s
                 )
                 out["added"].append(cu)
+            except EdgeTerminalError as e:
+                # The edge considered this camera and said no. That is an
+                # answer, not a fault, so it gets one line instead of a stack
+                # trace -- a traceback here buries genuine failures in noise.
+                logger.warning("Edge rejected camera %s: %s", cu, e)
+                out["errors"].append(f"Failed to add {cu}: {e}")
             except Exception as e:
                 logger.warning("Edge upsert failed during reconcile for camera %s", cu, exc_info=True)
                 out["errors"].append(f"Failed to add {cu}: {e}")
