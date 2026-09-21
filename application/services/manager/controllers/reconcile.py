@@ -451,6 +451,21 @@ class DeviceReconciler:
                 )
             )
 
+        # Discovery-managed devices own their source selection. Cloud records
+        # must not refill reserved slots with unrelated relay streams.
+        selection_managed = False
+        try:
+            health = await self._call_with_timeout(
+                self._state.edge.get_health(device_url=device_url),
+                timeout_s=self._state.external_timeout_s,
+            )
+            selection_managed = isinstance(health, dict) and (health.get("stats") or {}).get("camera_selection") == "discovery"
+        except Exception:
+            logger.debug("Could not read edge selection policy", exc_info=True)
+        if selection_managed:
+            to_add = []
+            to_remove = []
+
         # A Jetson enforces a hard ceiling on enabled cameras (a property of the
         # hardware, not a setting) and rejects everything past it with a 409.
         # Without this the cloud rediscovers that ceiling one failed POST at a

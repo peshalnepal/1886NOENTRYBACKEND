@@ -755,6 +755,86 @@ class DatabaseManager:
                             "Skipping %s.user_id FK migration: %s", table_name, exc
                         )
 
+            # Ensure camera_inventory actually carries its foreign keys.
+            # `create_all` only ever builds the table as the ORM defines it
+            # *today*, and never alters one that already exists — so a database
+            # that created this table from an earlier definition can be missing
+            # the constraints entirely. Without them, deleting a device leaves
+            # its inventory rows behind, and the next discovery sweep re-adopts
+            # cameras for hardware that is gone.
+            if dialect_name.startswith("mysql"):
+                inventory_fks = (
+                    ("device_uuid", "devices", "device_uuid", "CASCADE"),
+                    ("site_uuid", "sites", "site_uuid", "SET NULL"),
+                    ("camera_uuid", "camera", "camera_uuid", "SET NULL"),
+                )
+                try:
+                    table_exists = (
+                        await conn.execute(
+                            text(
+                                "SELECT 1 FROM information_schema.TABLES "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "AND TABLE_NAME = 'camera_inventory' LIMIT 1"
+                            )
+                        )
+                    ).fetchone()
+                except Exception as exc:
+                    table_exists = None
+                    logger.warning("Could not inspect camera_inventory: %s", exc)
+
+                if table_exists:
+                    for column, ref_table, ref_column, rule in inventory_fks:
+                        try:
+                            existing = (
+                                await conn.execute(
+                                    text("""
+                                        SELECT rc.CONSTRAINT_NAME, rc.DELETE_RULE
+                                        FROM information_schema.REFERENTIAL_CONSTRAINTS rc
+                                        JOIN information_schema.KEY_COLUMN_USAGE k
+                                          ON k.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+                                         AND k.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
+                                        WHERE rc.CONSTRAINT_SCHEMA = DATABASE()
+                                          AND rc.TABLE_NAME = 'camera_inventory'
+                                          AND k.COLUMN_NAME = :col
+                                        LIMIT 1
+                                    """),
+                                    {"col": column},
+                                )
+                            ).fetchone()
+
+                            if existing and existing[1] == rule:
+                                continue  # already correct
+
+                            if existing:
+                                await conn.execute(
+                                    text(
+                                        "ALTER TABLE camera_inventory "
+                                        f"DROP FOREIGN KEY {existing[0]}"
+                                    )
+                                )
+
+                            await conn.execute(
+                                text(
+                                    "ALTER TABLE camera_inventory "
+                                    f"ADD CONSTRAINT fk_inventory_{column} "
+                                    f"FOREIGN KEY ({column}) "
+                                    f"REFERENCES {ref_table}({ref_column}) "
+                                    f"ON DELETE {rule}"
+                                )
+                            )
+                            logger.info(
+                                "Added camera_inventory.%s FK (ON DELETE %s).",
+                                column,
+                                rule,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Skipping camera_inventory.%s FK migration: %s",
+                                column,
+                                exc,
+                            )
+
+            if dialect_name.startswith("mysql"):
                 # Recipient uniqueness moves from (user_id, site_uuid, email) to
                 # (site_uuid, email): the same address must not be emailed twice
                 # just because two admins each added it.

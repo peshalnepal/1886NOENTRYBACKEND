@@ -695,7 +695,39 @@ async def delete_camera(
     manager: Optional[Manager] = Depends(get_manager_optional),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_CAMERAS)),
 ):
-    """Delete a camera and everything attached to it.
+    """Delete a camera and everything attached to it."""
+    repo = ChannelRepository()
+    full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
+    if not full:
+        raise camera_not_found()
+    cam, _cfg, _pid = full
+    await _ensure_camera_access(db, cam, ctx)
+    owner_id = _camera_owner_id(cam, ctx.user.id)
+
+    await perform_camera_deletion(
+        camera_uuid=camera_uuid,
+        cam=cam,
+        owner_id=owner_id,
+        db=db,
+        manager=manager,
+    )
+    return {"ok": True}
+
+
+async def perform_camera_deletion(
+    *,
+    camera_uuid: uuid.UUID,
+    cam: Any,
+    owner_id: int,
+    db: AsyncSession,
+    manager: Optional[Manager],
+) -> None:
+    """Tear down one camera completely: runtime, row, heavy tables, blobs.
+
+    Split out of the route so other cascades — deleting the device a camera
+    hangs off, for one — can reuse the exact same teardown instead of
+    reimplementing it and drifting. The caller owns authorization; by the time
+    this runs the camera is already known to exist and be in scope.
 
     Ordering matters throughout:
 
@@ -715,12 +747,6 @@ async def delete_camera(
     logger.info("[Camera Delete] Starting deletion of camera=%s", camera_uuid)
 
     repo = ChannelRepository()
-    full = await repo.get_camera_full(db, camera_uuid=camera_uuid)
-    if not full:
-        raise camera_not_found()
-    cam, _cfg, _pid = full
-    await _ensure_camera_access(db, cam, ctx)
-    owner_id = _camera_owner_id(cam, ctx.user.id)
 
     cam_code: Optional[str] = getattr(cam, "camera_code", None)
     site_uuid = cam.site_uuid
@@ -854,7 +880,6 @@ async def delete_camera(
     )
 
     logger.info("[Camera Delete] camera=%s deleted", camera_uuid)
-    return {"ok": True}
 
 @router.get("/{camera_uuid}/snapshot.jpg")
 async def snapshot_jpg(

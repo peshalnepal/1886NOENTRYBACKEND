@@ -55,6 +55,20 @@ def _device_owner_id(device: Device, ctx: OrgContext) -> int:
     return int(device.user_id) if device.user_id is not None else int(ctx.user.id)
 
 
+def _camera_owner_id_for_device(camera, device_owner_id: int) -> int:
+    """Whose runtime pipeline holds this camera.
+
+    A camera on a shared device may have been created by a different member, so
+    its own `user_id` is the pipeline key when it still has one; the device
+    owner is the fallback after a member deletion SET NULL it.
+    """
+    return (
+        int(camera.user_id)
+        if getattr(camera, "user_id", None) is not None
+        else int(device_owner_id)
+    )
+
+
 async def _cleanup_device_runtime(
     manager: Manager,
     db: AsyncSession,
@@ -171,12 +185,67 @@ async def update_device(
 @router.delete("/{device_uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_device(
     device_uuid: uuid.UUID,
+    cascade: bool = False,
     db: AsyncSession = Depends(get_async_db),
     ctx: OrgContext = Depends(RequirePermission(Permission.ORG_MANAGE_DEVICES)),
     manager: Optional[Manager] = Depends(get_manager_optional),
 ):
+    """Delete a device, and optionally the cameras that stream through it.
+
+    `camera.device_uuid` is ON DELETE SET NULL, so dropping a device that still
+    has cameras would leave them behind pointing at nothing: still listed, still
+    flagged enabled, but with no edge box left to stream them. That is never
+    what the caller wants, so by default this refuses — mirroring the same guard
+    on unlinking a device from a site.
+
+    Pass `cascade=true` to delete those cameras properly first. Each one goes
+    through the full camera teardown (edge, WebRTC, pipeline, notifications,
+    clips and blobs) rather than being dropped by a bare SQL delete, so nothing
+    is stranded on the edge or in storage.
+    """
+    from routes.camera_routes import perform_camera_deletion
+
     device = await _get_device_or_404(db, ctx.org_id, device_uuid)
     owner_id = _device_owner_id(device, ctx)
+
+    channel_repo = ChannelRepository()
+    # include_device: the teardown reads `cam.device.device_url` to stop the
+    # camera on its edge box, and a lazy load there would raise on the async
+    # session rather than silently returning None.
+    attached = await channel_repo.list_cameras(
+        db, device_uuid=device.device_uuid, include_device=True
+    )
+
+    if attached and not cascade:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete this device while {len(attached)} camera(s) are "
+                f"assigned to it. Move or delete those cameras first, or retry "
+                f"with cascade=true to delete them along with the device."
+            ),
+        )
+
+    # Delete the cameras before the device row, so each teardown still has the
+    # device_url it needs to stop the camera on the edge box.
+    for cam in attached:
+        cam_uuid = cam.camera_uuid
+        try:
+            await perform_camera_deletion(
+                camera_uuid=cam_uuid,
+                cam=cam,
+                owner_id=_camera_owner_id_for_device(cam, owner_id),
+                db=db,
+                manager=manager,
+            )
+        except Exception:
+            # One bad camera must not strand the rest, nor block the device
+            # delete: the remaining cameras still need tearing down.
+            logger.exception(
+                "[Device Delete] Camera teardown failed cam=%s device=%s; continuing",
+                cam_uuid,
+                device_uuid,
+            )
 
     # Best-effort cleanup — DB delete must succeed even if manager/edge is down.
     if manager is not None:

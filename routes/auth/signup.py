@@ -62,6 +62,62 @@ SMTP_FROM = (os.getenv("FROM_EMAIL") or os.getenv("SMTP_FROM") or SMTP_USERNAME)
 SMTP_USE_TLS = env_bool("SMTP_USE_TLS", True)
 
 
+class SmtpConfigError(RuntimeError):
+    """SMTP rejected our credentials, or is not configured at all.
+
+    Split out from transient failures because the two need opposite handling:
+    this one will fail identically on every retry until an operator rotates the
+    credential, so the caller must not invite the user to try again.
+    """
+
+
+def _send_via_smtp(message: MIMEText, recipient: str) -> None:
+    """Deliver one already-built message, classifying failures.
+
+    Raises `SmtpConfigError` for anything an operator has to fix (bad or
+    revoked credentials, missing config) and lets genuinely transient errors —
+    timeouts, dropped connections, greylisting — propagate as-is so the caller
+    can tell the user a retry is worth it.
+    """
+    if not SMTP_HOST or not SMTP_FROM:
+        raise SmtpConfigError("SMTP is not configured")
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=12) as server:
+            if SMTP_USE_TLS:
+                server.starttls()
+            if SMTP_USERNAME and SMTP_PASSWORD:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, [recipient], message.as_string())
+    except (smtplib.SMTPAuthenticationError, smtplib.SMTPNotSupportedError) as exc:
+        # 535 here is usually a revoked/expired app password. Log loudly: every
+        # signup and reset in the deployment is down until it is rotated.
+        raise SmtpConfigError(f"SMTP rejected our credentials: {exc}") from exc
+    except smtplib.SMTPSenderRefused as exc:
+        raise SmtpConfigError(f"SMTP refused the From address {SMTP_FROM!r}: {exc}") from exc
+
+
+def _email_failure_http_error(exc: Exception, *, what: str) -> HTTPException:
+    """Map a send failure onto the right status and user-facing advice."""
+    if isinstance(exc, SmtpConfigError):
+        logger.critical(
+            "SMTP is misconfigured — %s delivery is down until credentials are "
+            "rotated: %s", what, exc,
+        )
+        return HTTPException(
+            status_code=503,
+            detail=(
+                f"{what.capitalize()} email cannot be sent right now due to a "
+                "server configuration problem. Please contact support — "
+                "retrying will not help."
+            ),
+        )
+    return HTTPException(
+        status_code=503,
+        detail=f"Failed to send {what}. Please try again.",
+    )
+
+
 def _slug_from_email(email: str) -> str:
     """Build a URL-safe organization slug from the signup email.
 
@@ -177,20 +233,12 @@ def _build_signup_email_body(user_name: str, code: str) -> str:
 
 
 def _send_signup_code_email_sync(email: str, user_name: str, code: str) -> None:
-    if not SMTP_HOST or not SMTP_FROM:
-        raise RuntimeError("SMTP is not configured for signup verification")
-
     message = MIMEText(_build_signup_email_body(user_name=user_name, code=code), "plain", "utf-8")
     message["Subject"] = "1886NoEntry signup verification code"
     message["From"] = SMTP_FROM
     message["To"] = email
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=12) as server:
-        if SMTP_USE_TLS:
-            server.starttls()
-        if SMTP_USERNAME and SMTP_PASSWORD:
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM, [email], message.as_string())
+    _send_via_smtp(message, email)
 
 
 async def _send_signup_code_email(email: str, user_name: str, code: str) -> None:
@@ -270,7 +318,7 @@ async def signup_request_code(
                 used=False,
             )
         )
-        await db.commit()
+        await db.flush()
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Account already exists")
@@ -282,14 +330,24 @@ async def signup_request_code(
     try:
         await _send_signup_code_email(email=email, user_name=user_name, code=code)
     except Exception as exc:
-        logger.exception("Failed to send signup verification email to %s", email)
         if AUTH_DEBUG_RETURN_OTP:
+            logger.warning(
+                "Signup email to %s failed; returning debug code: %s", email, exc
+            )
             debug_code = code
         else:
-            raise HTTPException(
-                status_code=503,
-                detail="Failed to send verification code. Please try again.",
-            ) from exc
+            await db.rollback()
+            logger.exception("Failed to send signup verification email to %s", email)
+            raise _email_failure_http_error(exc, what="verification code") from exc
+
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Account already exists")
+    except Exception:
+        await db.rollback()
+        raise
 
     message = f"Verification code sent to {email}. Enter the code to finish signup."
     return SignupCodeOut(
@@ -443,9 +501,6 @@ def _build_reset_email_body(user_name: str, code: str) -> str:
 
 
 def _send_reset_code_email_sync(email: str, user_name: str, code: str) -> None:
-    if not SMTP_HOST or not SMTP_FROM:
-        raise RuntimeError("SMTP is not configured for password reset")
-
     message = MIMEText(
         _build_reset_email_body(user_name=user_name, code=code), "plain", "utf-8"
     )
@@ -453,12 +508,7 @@ def _send_reset_code_email_sync(email: str, user_name: str, code: str) -> None:
     message["From"] = SMTP_FROM
     message["To"] = email
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=12) as server:
-        if SMTP_USE_TLS:
-            server.starttls()
-        if SMTP_USERNAME and SMTP_PASSWORD:
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM, [email], message.as_string())
+    _send_via_smtp(message, email)
 
 
 @router.post(
@@ -520,7 +570,7 @@ async def password_forgot(
             user_agent=request.headers.get("user-agent"),
             purpose=PURPOSE_PASSWORD_RESET,
         )
-        await db.commit()
+        await db.flush()
     except Exception:
         await db.rollback()
         raise
@@ -530,13 +580,21 @@ async def password_forgot(
             _send_reset_code_email_sync, email, user.user_name, code
         )
     except Exception as exc:
-        logger.exception("Failed to send password reset email to %s", email)
         if AUTH_DEBUG_RETURN_OTP:
+            logger.warning(
+                "Reset email to %s failed; returning debug code: %s", email, exc
+            )
+            await db.commit()
             return generic.model_copy(update={"debug_code": code})
-        raise HTTPException(
-            status_code=503,
-            detail="Failed to send reset code. Please try again.",
-        ) from exc
+        await db.rollback()
+        logger.exception("Failed to send password reset email to %s", email)
+        raise _email_failure_http_error(exc, what="reset code") from exc
+
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
     return generic
 
