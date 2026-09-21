@@ -52,6 +52,18 @@ def _host_of(url: Optional[str]) -> Optional[str]:
     return authority.split(":", 1)[0].strip().lower() or None
 
 
+def _is_channel_identity(identity: Optional[str]) -> bool:
+    """True when this identity names one input of a multi-channel recorder.
+
+    The edge appends "#<channel>" for anything behind an NVR (see
+    `identity_of` in tensort/discovery.py), because every channel is reached
+    through the recorder's single address and so cannot be told apart by host
+    alone. Such an identity is already exact, and must never be widened to a
+    host comparison: doing so matches a *different* channel on the same NVR.
+    """
+    return "#" in str(identity or "")
+
+
 class CameraAdopter:
     """Turns edge discovery roster entries into cloud Camera rows."""
 
@@ -142,6 +154,13 @@ class CameraAdopter:
             if identity:
                 by_identity[identity] = cam
 
+            # A row that already carries a channel identity is exactly
+            # identified, so it must not also be reachable by host: several NVR
+            # channels share one host, and whichever happened to be indexed
+            # first would then absorb the others.
+            if _is_channel_identity(identity):
+                continue
+
             host = _host_of(getattr(cam, "source_url", None))
             # First writer wins: if two cameras somehow share a host, the
             # identity match above is the one that should decide.
@@ -225,7 +244,7 @@ class CameraAdopter:
                 continue
 
             existing = by_identity.get(identity) if identity else None
-            if existing is None and host:
+            if existing is None and host and not _is_channel_identity(identity):
                 existing = by_host.get(host)
 
             if existing is not None:
@@ -285,7 +304,12 @@ class CameraAdopter:
             # to the same host inside one sweep cannot both be adopted.
             if identity:
                 by_identity[identity] = _AdoptedRef(camera_uuid)
-            if host:
+            # Channels of one NVR all share a host, so indexing them here would
+            # make the first adopted channel swallow every later channel in the
+            # same sweep -- the first import of an 8-channel recorder would
+            # yield a single camera. Their "#<channel>" identities already
+            # dedupe them above.
+            if host and not _is_channel_identity(identity):
                 by_host.setdefault(host, _AdoptedRef(camera_uuid))
 
             logger.info(
