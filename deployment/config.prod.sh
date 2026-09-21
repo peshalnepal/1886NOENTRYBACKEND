@@ -30,7 +30,7 @@ APP_DB_PASSWORD="ChangeThis_AppPassword_2026!"          # TEMP
 # --------------------------
 ENABLE_SMTP="true"
 SMTP_USERNAME="peshalnepal3@gmail.com"
-SMTP_PASSWORD="kfco nzvt goqq urzy"            # TEMP if ENABLE_SMTP=true
+SMTP_PASSWORD="qlol rcde hpie zmxe"            # TEMP if ENABLE_SMTP=true
 SMTP_FROM="peshalnepal3@gmail.com"
 SMTP_USERNAME="peshalnepal3@gmail.com"
 
