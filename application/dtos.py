@@ -116,6 +116,7 @@ class InventoryEntryDTO(_DTO):
     device_name: Optional[str] = None
     source_url: Optional[str] = None
     edge_camera_uuid: Optional[str] = None
+    first_frame_at: Optional[datetime] = None
     is_present: bool = True
     consecutive_misses: int = 0
     first_seen_at: Optional[datetime] = None

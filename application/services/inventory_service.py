@@ -32,6 +32,7 @@ _ROSTER_FIELDS = {
     "device_name": "device_name",
     "source_url": "source_url",
     "camera_uuid": "edge_camera_uuid",
+    "first_frame_at": "first_frame_at",
     "is_present": "is_present",
     "consecutive_misses": "consecutive_misses",
     "first_seen_at": "first_seen_at",
@@ -39,7 +40,7 @@ _ROSTER_FIELDS = {
     "missing_since": "missing_since",
 }
 
-_TIMESTAMP_FIELDS = ("first_seen_at", "last_seen_at", "missing_since")
+_TIMESTAMP_FIELDS = ("first_seen_at", "last_seen_at", "missing_since", "first_frame_at")
 
 
 def parse_timestamp(value: Any) -> Optional[datetime]:
@@ -182,6 +183,10 @@ class InventoryService:
             if not row.source_url:
                 results.append(self._result(identity, False, "no_source_url"))
                 continue
+            if row.first_frame_at is None:
+                results.append(self._result(identity, False, "unverified",
+                                            detail="Waiting for the edge to receive a decoded frame"))
+                continue
 
             try:
                 camera_uuid = await self._manager.create_camera_from_inventory(
@@ -249,6 +254,9 @@ class InventoryService:
             "firmware": row.firmware,
             "source": redact_source(row.source_url),
             "is_present": bool(row.is_present),
+            "first_frame_at": row.first_frame_at,
+            "verification_state": ("unverified" if row.first_frame_at is None else
+                                   "online" if row.is_present else "offline"),
             "first_seen_at": row.first_seen_at,
             "last_seen_at": row.last_seen_at,
             "missing_since": row.missing_since,

@@ -37,6 +37,7 @@ _REPORTED_FIELDS = (
     "device_name",
     "source_url",
     "edge_camera_uuid",
+    "first_frame_at",
     "is_present",
     "consecutive_misses",
     "first_seen_at",

@@ -524,6 +524,8 @@ class InventoryCameraOut(BaseModel):
     source: Optional[str] = None
 
     is_present: bool = True
+    first_frame_at: Optional[datetime] = None
+    verification_state: str = "unverified"
     first_seen_at: Optional[datetime] = None
     last_seen_at: Optional[datetime] = None
     missing_since: Optional[datetime] = None

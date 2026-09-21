@@ -406,6 +406,7 @@ class CameraInventory(Base):
     source_url = Column(Text, nullable=True)
     # The UUID the edge provisioned this camera into, when it adopted one.
     edge_camera_uuid = Column(String(64), nullable=True, index=True)
+    first_frame_at = Column(DateTime(timezone=True), nullable=True)
 
     is_present = Column(Boolean, nullable=False, default=True)
     consecutive_misses = Column(Integer, nullable=False, default=0)

@@ -173,6 +173,8 @@ class DatabaseManager:
         ...
         async with self.async_engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            from core.inventory_schema import ensure_inventory_frame_column
+            await conn.run_sync(ensure_inventory_frame_column)
             dialect_name = str(conn.dialect.name or "").lower()
 
             # Migrate: old schema had a NOT NULL `code` column in email_verifications

@@ -91,12 +91,17 @@ class CameraAdopter:
             return []
 
         out: List[Dict[str, Any]] = []
+        capacity_rejected = set(discovery_report.get("capacity_rejected") or [])
         for entry in discovery_report.get("roster") or []:
             if not isinstance(entry, dict):
                 continue
             if not entry.get("is_present"):
                 continue
             if not entry.get("source_url"):
+                continue
+            if entry.get("verification_state") == "unverified":
+                continue
+            if entry.get("identity") in capacity_rejected:
                 continue
             out.append(entry)
         return out
