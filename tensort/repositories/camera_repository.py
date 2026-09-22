@@ -7,8 +7,9 @@ owns its own sessions (the edge service has no request-scoped session to
 inherit) and commits, which is what the previous inline `PipelineRuntime`
 methods did.
 
-Async methods are the ones the pipeline loop calls; `list_all()` is sync
-because it runs during construction, before the async loop is servicing work.
+Async writes run on the pipeline loop. Synchronous `list_all()` serves
+camera restoration on the calling thread; the pipeline loop is already
+running and receives channel updates through the runtime.
 """
 
 import logging

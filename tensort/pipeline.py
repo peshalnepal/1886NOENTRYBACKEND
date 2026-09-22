@@ -1008,11 +1008,15 @@ class SimpleInferencePipeline(object):
 
     def _handle_result(self, result, meta):
         """
-        Process one inference result. Runs synchronously inside the future's
-        done-callback (or from the worker's late-result path).
+        Process one inference result on the pipeline event loop.
+
+        Both normal completion and late results are scheduled on this loop,
+        so the GPU worker never writes these caches directly.
         """
         camera_uuid = str(meta.get("camera_uuid", "unknown"))
         bgr = meta.pop("_bgr_ref", None)
+        # A replacement can reuse the UUID while old GPU work is still running.
+        # Match the generation so old work cannot overwrite the new results.
         if self._closing or ("_generation" in meta and
                 self._channel_generation.get(camera_uuid) is not meta["_generation"]):
             return
@@ -1133,8 +1137,8 @@ class SimpleInferencePipeline(object):
         loop = asyncio.get_event_loop()
         max_edge = self._snapshot_max_edge
         jpeg_quality = self._snapshot_jpeg_quality
-        # Encode in executor; capture frame_bgr in the lambda then release
-        # our local reference so the caller's frame can be GC'd sooner.
+        # JPEG encoding runs off the pipeline loop. Keep the frame alive until
+        # the executor finishes, then drop this coroutine's reference.
         encoded = await loop.run_in_executor(
             self._snapshot_executor,
             lambda bgr=frame_bgr: _encode_jpeg_bytes(

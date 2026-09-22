@@ -398,6 +398,8 @@ class TRTEngine(object):
 
             stream.synchronize()
 
+            # With copy_outputs=False, these views share reusable host buffers.
+            # Consume them before the next inference overwrites those buffers.
             outs = [
                 (self._host_bufs[oi][:n_out].copy() if copy_outputs else self._host_bufs[oi][:n_out]).reshape(out_shape)
                 for (oi, n_out, out_shape) in pending
@@ -608,17 +610,17 @@ class YoloV8DetTRT(object):
             return out
 
         if pred.shape[1] < pred.shape[2]:
-            p = pred[0]
+            predictions = pred[0]
         else:
-            p = pred[0].T
+            predictions = pred[0].T
 
-        C, N = p.shape
-        nc = C - 4
-        boxes_xywh = p[0:4, :]
-        cls_scores = p[4:4 + nc, :]
+        attribute_count, candidate_count = predictions.shape
+        nc = attribute_count - 4
+        boxes_xywh = predictions[0:4, :]
+        cls_scores = predictions[4:4 + nc, :]
 
         cls_id = np.argmax(cls_scores, axis=0)
-        score = cls_scores[cls_id, np.arange(N)]
+        score = cls_scores[cls_id, np.arange(candidate_count)]
 
         keep = score >= self.conf
         cls_id = cls_id[keep]
