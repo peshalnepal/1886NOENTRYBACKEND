@@ -63,7 +63,6 @@ def sse_generator(target_camera_uuid=None):
     if runtime.pipeline is None:
         return
 
-    # Subscribe
     q = None
     q_future = asyncio.run_coroutine_threadsafe(
         runtime.pipeline.broadcaster.subscribe(target_camera_uuid),
@@ -101,7 +100,6 @@ def sse_generator(target_camera_uuid=None):
             if not isinstance(msg, dict):
                 continue
 
-            # Yield SSE
             data_str = json.dumps(msg)
             yield f"data: {data_str}\n\n"
 

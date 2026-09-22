@@ -68,23 +68,18 @@ class VideoChannelConfig(object):
         self.validate()
 
     def _normalize(self):
-        # normalize camera_uuid -> string (optional)
         if self.camera_uuid is not None:
             self.camera_uuid = str(self.camera_uuid)
 
-        # default channel_id from camera_uuid
         if not self.channel_id:
             if self.camera_uuid:
                 self.channel_id = str(self.camera_uuid)
             else:
                 self.channel_id = "unknown-channel"
 
-        # normalize decode_backend
         if self.decode_backend not in ("gstreamer", "opencv"):
-            # keep it simple: fallback to opencv
             self.decode_backend = "opencv"
 
-        # normalize resize
         if self.resize is not None:
             if (not isinstance(self.resize, (tuple, list))) or len(self.resize) != 2:
                 self.resize = None
@@ -96,7 +91,6 @@ class VideoChannelConfig(object):
                 else:
                     self.resize = (w, h)
 
-        # normalize transport
         if self.rtsp_transport not in ("tcp", "udp"):
             self.rtsp_transport = "tcp"
 

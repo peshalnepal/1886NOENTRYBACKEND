@@ -273,7 +273,6 @@ class TRTEngine(object):
             self.input_index = None
             self.input_name = None
             self.output_indices = []
-            self.output_names = []
 
             self._dtypes = {}        # index -> numpy dtype
             self._decl_shapes = {}   # index -> declared shape (may contain -1)
@@ -290,7 +289,6 @@ class TRTEngine(object):
                     self.input_name = name
                 else:
                     self.output_indices.append(i)
-                    self.output_names.append(name)
 
             if self.input_index is None:
                 raise RuntimeError("No input tensor found.")
@@ -298,9 +296,9 @@ class TRTEngine(object):
             in_decl = self._decl_shapes[self.input_index]
             if len(in_decl) != 4:
                 raise RuntimeError("Expected NCHW input, got {}".format(in_decl))
-            self._dynamic = any(d < 0 for d in in_decl)
+            is_dynamic = any(d < 0 for d in in_decl)
 
-            if self._dynamic:
+            if is_dynamic:
                 # profile 0's MAX shape gives the largest batch the engine accepts
                 _min, _opt, _max = self.engine.get_tensor_profile_shape(self.input_name, 0)
                 self.max_batch = int(tuple(_max)[0])
@@ -628,7 +626,6 @@ class YoloV8DetTRT(object):
         allowed_mask = np.array([lab in self.allowed for lab in labels], dtype=bool)
 
         labels = [lab for lab, m in zip(labels, allowed_mask) if m]
-        cls_id = cls_id[allowed_mask]
         score = score[allowed_mask]
         boxes_xywh = boxes_xywh[:, allowed_mask]
 

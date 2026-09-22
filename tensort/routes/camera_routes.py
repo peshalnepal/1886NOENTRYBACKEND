@@ -51,12 +51,6 @@ def add_camera():
                      "rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt."
         }), 400
 
-    if "camera_uuid" not in cfg and body.get("camera_uuid"):
-        cfg["camera_uuid"] = body.get("camera_uuid")
-
-    if "channel_id" not in cfg and body.get("channel_id"):
-        cfg["channel_id"] = body.get("channel_id")
-
     try:
         out = get_runtime().add_camera(source_url, cfg)
         return jsonify(out), 201
