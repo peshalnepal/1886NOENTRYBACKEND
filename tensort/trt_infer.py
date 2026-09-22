@@ -27,6 +27,8 @@ import pycuda.driver as cuda
 
 logger = logging.getLogger(__name__)
 
+_VEHICLE_CLASSES = frozenset({"car", "truck", "bus", "van"})
+
 # -----------------------------
 # CUDA context management (unchanged)
 # -----------------------------
@@ -179,8 +181,7 @@ def box_norm_xyxy(x1, y1, x2, y2, W, H):
 
 
 def _same_object_class(a, b):
-    vehicles = {"car", "truck", "bus", "van"}
-    return a == b or (a in vehicles and b in vehicles)
+    return a == b or (a in _VEHICLE_CLASSES and b in _VEHICLE_CLASSES)
 
 
 def suppress_cross_class_duplicates(detections, iou_threshold=0.55,
@@ -193,6 +194,7 @@ def suppress_cross_class_duplicates(detections, iou_threshold=0.55,
     if len(detections) < 2:
         return detections
     kept = []
+    kept_areas = {}
     for index in sorted(range(len(detections)), key=lambda i: detections[i]["conf"], reverse=True):
         candidate = detections[index]
         box = candidate["box"]
@@ -203,7 +205,7 @@ def suppress_cross_class_duplicates(detections, iou_threshold=0.55,
             if not _same_object_class(candidate["cls_name"], winner["cls_name"]):
                 continue
             other = winner["box"]
-            other_area = max(0, other["x2"] - other["x1"]) * max(0, other["y2"] - other["y1"])
+            other_area = kept_areas[previous]
             if min(area, other_area) <= 0:
                 continue
             intersection = (max(0, min(box["x2"], other["x2"]) - max(box["x1"], other["x1"])) *
@@ -216,6 +218,7 @@ def suppress_cross_class_duplicates(detections, iou_threshold=0.55,
                 break
         if not duplicate:
             kept.append(index)
+            kept_areas[index] = area
     return [detections[i] for i in sorted(kept)]
 
 
@@ -641,10 +644,12 @@ class YoloV8DetTRT(object):
 
         keep_idx = nms_xyxy(boxes, score, self.iou, topk=self.topk)
         out = []
+        padding = np.array([padx, pady, padx, pady], dtype=np.float32)
+        scale = max(r, 1e-9)
 
         for i in keep_idx:
             bx = boxes[i]
-            bx0 = (bx - np.array([padx, pady, padx, pady], dtype=np.float32)) / max(r, 1e-9)
+            bx0 = (bx - padding) / scale
             x1o, y1o, x2o, y2o = clamp_xyxy(bx0[0], bx0[1], bx0[2], bx0[3], W0, H0)
             out.append({
                 "cls_name": labels[i],
