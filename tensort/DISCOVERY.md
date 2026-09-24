@@ -1,5 +1,7 @@
 # Camera Auto-Discovery — Jetson Edge
 
+For a junior-developer walkthrough of discovery and detection, start with [README.md](README.md).
+
 The Jetson is now the **source of truth** for which cameras physically exist.
 A scheduled service sweeps the network every minute, adopts Hikvision cameras
 it has never seen into the detection pipeline, and raises an alert when a
@@ -11,18 +13,19 @@ camera that used to be there stops answering.
 
 | File | What it does |
 | --- | --- |
-| `discovery.py` | **New.** Network probing. ONVIF WS-Discovery + Hikvision ISAPI identification. Stdlib only. |
-| `env_utils.py` | **New.** Shared `env_str/int/float/bool` getters used by `discovery.py` and `service.py`. |
-| `tests/test_discovery.py` | **New.** The suite described under *Verification status*. Fake camera + in-memory repo; no hardware or DB. |
-| `service.py` | **New.** The scheduler. Runs a sweep every `DISCOVERY_INTERVAL_S`, adopts new cameras, ages out missing ones, builds the report. |
-| `repositories/discovery_repository.py` | **New.** Persistence for the discovered-camera roster. |
-| `routes/discovery_routes.py` | **New.** `/discovery*` endpoints and `POST /sync`. |
-| `database_orm.py` | **Changed.** Added the `DiscoveredCamera` model (`discovered_cameras` table). |
-| `repositories/__init__.py` | **Changed.** Exports `DiscoveryRepository`. |
-| `routes/__init__.py` | **Changed.** Registers the discovery blueprint. |
-| `routes/helpers.py` | **Changed.** `/` and `/health` now include a `discovery` block. |
-| `main.py` | **Changed.** `runtime.discovery` attribute + `start_discovery()` called after boot. |
-| `.env`, `.env.example` | **Changed.** Discovery configuration block appended. |
+| `discovery.py` | Network probing. ONVIF WS-Discovery + Hikvision ISAPI identification. Stdlib only. `probe_device()` handles both LAN cameras and NVRs. |
+| `deployment/diagnose_discovery.py` | Explains step by step why discovery is or is not finding cameras. Read-only; safe against live hardware. |
+| `env_utils.py` | Shared `env_str/int/float/bool` getters used by `discovery.py` and `service.py`. |
+| `tests/test_discovery.py` | The suite described under *Verification status*. Fake camera + in-memory repo; no hardware or DB. |
+| `service.py` | The scheduler. Runs a sweep every `DISCOVERY_INTERVAL_S`, adopts new cameras, ages out missing ones, builds the report. |
+| `repositories/discovery_repository.py` | Persistence for the discovered-camera roster. |
+| `routes/discovery_routes.py` | `/discovery*` endpoints and `POST /sync`. |
+| `database_orm.py` | Added the `DiscoveredCamera` model (`discovered_cameras` table). |
+| `repositories/__init__.py` | Exports `DiscoveryRepository`. |
+| `routes/__init__.py` | Registers the discovery blueprint. |
+| `routes/helpers.py` | `/` and `/health` now include a `discovery` block. |
+| `main.py`, `runtime.py` | Start discovery after inference initialization and camera restore. |
+| `.env`, `.env.example` | Discovery configuration block appended. |
 
 Cloud side (`Backend/`):
 
@@ -48,13 +51,18 @@ Two probes run per sweep, merged by IP:
    `<DeviceInfo>` document with a `<serialNumber>`. It also confirms the
    credentials work.
 
-**A camera is only adopted if ISAPI confirms it.** That matters: an RTSP URL
-built with the wrong password produces a camera that is "discovered" but never
-decodes a frame. Wrong credentials → not adopted.
+ISAPI verifies compatible device information and HTTP access. It does not
+verify RTSP live-view permissions, video decoding, or whether an NVR input is
+online. `STATIC_NVRS` bypasses ISAPI verification, but every source still must
+deliver a decoded frame before discovery confirms it. Candidates with no
+frames appear only in diagnostic `unverified_candidates`, not as new cameras.
+Existing records remain unverified until frames arrive; verified cameras stay
+in the roster as offline after missed sweeps rather than being deleted.
 
-If WS-Discovery finds nothing (multicast is often blocked on managed switches),
-the service falls back to sweeping the configured subnet directly. Only `/16`
-through `/32` are accepted — anything wider is refused as a port scan.
+By default, discovery also sweeps the configured subnet even when some devices
+answer WS-Discovery. This finds cameras with ONVIF disabled. Only `/16` through
+`/32` are accepted. Set `DISCOVERY_SWEEP_ONLY_IF_WSD_EMPTY=true` to opt into
+skipping the subnet sweep whenever any ONVIF responder is found.
 
 ### Identity
 
@@ -161,7 +169,7 @@ Every route is also mounted under `/api/…`.
 | `GET` | `/discovery/report` | The last sweep report, **without** rescanning. 404 before the first sweep. |
 | `POST` | `/discovery/scan` | Force a sweep now, return the fresh report. Slow — use a generous timeout. |
 | `DELETE` | `/discovery/<identity>` | Forget a decommissioned camera so it stops alerting. |
-| `POST` | `/sync` | **The cloud sync entry point.** Rescans, then returns `cameras` + `discovery` report. |
+| `POST` | `/sync` | **The cloud sync entry point.** Schedules a refresh; returns `cameras`, last complete `discovery` report, and `discovery_pending`. |
 
 `GET /` and `GET /health` now carry a `discovery` block so the cloud can tell an
 actively-scanning Jetson from one whose scanner died, without a second round trip.
@@ -229,6 +237,8 @@ a sweep finds no changes.
 - `missing_cameras` — full detail per missing camera
 - `warnings` — human-readable lines: `"Camera went missing from the network: Loading Bay (last seen 2026-08-27T18:02:00)"`
 - `discovered` — cameras the edge adopted that the cloud has no row for yet
+- `repointed` — registered cameras found at a new address, with the new
+  `source_url` now applied to the DB row, MediaMTX and the edge
 
 ---
 
@@ -242,6 +252,17 @@ a camera plugged in since the last sweep would be missing from `edge_set`.
 
 This is best-effort: an edge that predates discovery returns `None` (404 on all
 candidate paths) and reconcile proceeds exactly as before.
+
+**A camera that moves IP is followed.** The edge repoints its own pipeline as
+soon as a sweep finds a known camera at a new address, but that patch is local
+to the Jetson. Adoption compares the roster's `source_url` host against the
+stored one and, on a difference, updates `Camera.source_url`, patches the
+MediaMTX path so live view follows, and re-pushes the URL to the edge. Without
+it the cloud kept the old address and the next reconcile pushed that stale URL
+back down over the edge's correct one. Only the **host** is compared — the edge
+rebuilds the full URL from its own credentials and stream path every sweep, so
+comparing whole strings would repoint endlessly. Repoints are reported under
+`repointed` on the reconcile response.
 
 **Edge-discovered cameras are never deleted.** A camera the Jetson adopted has
 no cloud row, so it would normally land in `to_remove` as an unknown stray.
@@ -259,13 +280,18 @@ All in `Backend/tensort/.env`.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `DISCOVERY_ENABLED` | `true` | Master switch. |
+| `DISCOVERY_LOCAL_ENABLED` | `true` | Set `false` to skip LAN multicast/subnet discovery while keeping configured NVRs. |
 | `DISCOVERY_INTERVAL_S` | `60` | Sweep interval. Floor is 10s. |
 | `DISCOVERY_MISS_THRESHOLD` | `2` | Sweeps absent before alerting. **Do not set to 1.** |
 | `DISCOVERY_AUTO_ADD` | `true` | `false` = discover and report only, never touch the pipeline. |
 | `HIK_USERNAME` | `admin` | Applied to every discovered camera. |
-| `HIK_PASSWORD` | *(empty)* | **Must be set** or no camera will authenticate. |
+| `HIK_PASSWORD` | *(empty)* | Direct-camera password; may be empty when using only NVRs with `NVR_USERNAME` / `NVR_PASSWORD`. |
+| `DISCOVERY_NVRS` | *(empty)* | LAN or remote NVRs, `;`-separated. Each is `host:rtsp_port[:channels[:http_port]]`. Use the ISAPI HTTP port, not the SDK/server port (often 8000). |
+| `NVR_USERNAME` / `NVR_PASSWORD` | *(falls back to `HIK_*`)* | Account used for NVR-proxied cameras. |
 | `DISCOVERY_SUBNETS` | *(empty)* | Comma-separated CIDRs. Empty = derive the `/24` from this host's own IPv4. Only `/16`–`/32`. |
-| `DISCOVERY_SWEEP_ONLY_IF_WSD_EMPTY` | `true` | Set `false` if some cameras have ONVIF disabled. |
+| `DISCOVERY_SWEEP_ONLY_IF_WSD_EMPTY` | `false` | Sweep subnet hosts even when other cameras answer ONVIF. Existing `.env` values override this default. |
+| `STATIC_NVRS` | *(empty)* | Explicit candidates, verified by frames: `host:rtsp_port:channels`. |
+| `NVR_CHANNEL_OFFSET` | `0` | Added to the ISAPI channel ID when building RTSP paths; change only after verifying the recorder's paths. |
 | `DISCOVERY_WSD_TIMEOUT_S` | `3.0` | Multicast listen window. |
 | `DISCOVERY_HTTP_TIMEOUT_S` | `2.0` | Per-host ISAPI probe timeout. |
 | `DISCOVERY_PROBE_WORKERS` | `32` | Concurrent probe threads. |
@@ -280,6 +306,128 @@ Cloud side (`Backend/.env`):
 | --- | --- | --- |
 | `EDGE_SYNC_PATH` | `/sync` | |
 | `EDGE_SYNC_TIMEOUT_S` | `45` | A sweep scans the network; it needs far more than a normal edge call. |
+
+### Direct LAN cameras and cameras behind an NVR
+
+For a Jetson and cameras on `192.168.1.0/24`, with a recorder at
+`192.168.1.200`, configure:
+
+```dotenv
+DISCOVERY_ENABLED=true
+DISCOVERY_SUBNETS=192.168.1.0/24
+DISCOVERY_SWEEP_ONLY_IF_WSD_EMPTY=false
+HIK_USERNAME=admin
+HIK_PASSWORD=your-camera-password
+NVR_USERNAME=admin
+NVR_PASSWORD=your-recorder-password
+DISCOVERY_NVRS=192.168.1.200:554:1-8:80
+HIK_RTSP_STREAM=2
+NVR_CHANNEL_OFFSET=0
+```
+
+Use your actual subnet mask and ports. Automatic subnet selection assumes a
+`/24` on the default-route interface; set `DISCOVERY_SUBNETS` explicitly for
+multiple interfaces or a different mask. List a LAN NVR by its LAN IP so its
+explicit ports and channel filter also exclude it from the generic LAN scan.
+
+Direct cameras use `HIK_*`. NVR inputs use `NVR_*` and stream through the NVR:
+channel 1 uses `/Streaming/Channels/102`, channel 2 uses `/Streaming/Channels/202`.
+The Jetson does not need access to the cameras' private PoE subnet, and NVR
+virtual-host access is not required. The inputs must already be configured
+and online on the recorder. The account needs ISAPI channel-list access and
+RTSP live-view permission. Substream 2 must be enabled; use stream 1 if needed.
+
+An unlisted LAN recorder can also be discovered. After an HTTP 401, discovery
+tries the configured NVR account if it differs from the camera account. Listing
+the recorder explicitly avoids this initial failed camera-account attempt.
+
+Restart the edge service after changing its environment. Trigger a sweep with
+`POST /discovery/scan`, then check `/health` for incoming frames in
+`stats.capture.<id>.connected` and request `/cameras/<id>/snapshot.jpg` to
+verify video decoding. Finding an ISAPI channel alone does not prove playback.
+
+### Configured NVRs (`DISCOVERY_NVRS`)
+
+An NVR reached over the internet is never found by a LAN sweep, so it is listed
+explicitly:
+
+```
+host:rtsp_port[:channels[:http_port]]
+ |      |          |          |
+ |      |          |          +-- port ISAPI/HTTP answers on (the web UI port)
+ |      |          +------------- "1-15" or "1,3,5". Omitted = every channel.
+ |      +------------------------ port the NVR streams RTSP on
+ +------------------------------- hostname or IP
+```
+
+**Set the 4th field for every remote NVR.** Its HTTP and RTSP ports are
+forwarded to *different* external ports. Without it, ISAPI is probed on the
+LAN-wide `HIK_HTTP_PORT` (80), which is not where these NVRs listen — the probe
+times out and the NVR contributes zero cameras.
+
+### When an NVR exposes only its RTSP port (`STATIC_NVRS`)
+
+Discovery identifies devices over **ISAPI, which is HTTP**. A remote NVR reached
+by dynamic DNS typically forwards *only* its RTSP port, so ISAPI is unreachable
+and no amount of credential or port configuration will find its cameras.
+
+Confirmed for both production NVRs on 2026-09-18: ports 80, 81, 85, 8000 and
+8080 are filtered on each host, and the RTSP port answers `RTSP/1.0` even to an
+HTTP request.
+
+For these, declare the channels instead:
+
+```
+STATIC_NVRS=initialsecurity.dvrlists.com:16805:1-15;innovationdistrict.asuscomm.com:12050:1-2
+DISCOVERY_LOCAL_ENABLED=false
+DISCOVERY_NVRS=
+```
+
+Format is `host:rtsp_port:channels`. Static entries skip ISAPI, but must deliver
+video frames before discovery adopts them or reports them present. Existing
+captures provide frame freshness; new streams use a temporary capture. NVR
+credentials come from `NVR_USERNAME` and `NVR_PASSWORD`.
+
+Changing this list does not delete saved cameras. Startup restores enabled
+database records before discovery runs; `MAX_CAMERAS` defaults to 8 and limits
+those captures too. To compare saved records with the current declarations,
+run from the Jetson's `tensort` directory:
+
+```sh
+python3 deployment/audit_cameras.py
+```
+
+The audit is read-only and omits credentials. Review unmatched records before
+disabling or deleting them. Raising `MAX_CAMERAS` admits more captures but does
+not fix obsolete URLs or increase GPU throughput. Discovery applies verified
+source URL changes to existing camera UUIDs and retries failed updates on the
+next sweep.
+
+Verify a site's channels once before declaring them:
+
+```
+python3 deployment/probe_nvr_paths.py <host> <rtsp_port> <user> '<pass>' 1-16
+```
+
+### When discovery finds nothing
+
+Run the diagnostic; it uses the same code path as the service but narrates each
+step and prints the real HTTP status:
+
+```
+python3 deployment/diagnose_discovery.py              # config + configured NVRs
+python3 deployment/diagnose_discovery.py --full-sweep # a complete sweep
+python3 deployment/diagnose_discovery.py --host 192.168.1.64
+```
+
+In order of likelihood:
+
+1. **`.env` was never loaded.** `main.py` only reads it when `python-dotenv` is
+   installed. Missing → blank password, no NVRs, nothing discovered. The service
+   now prints a warning on startup when this happens.
+   Fix: `pip install python-dotenv`, or run under systemd.
+2. **Wrong credentials.** Logged as `authentication failed (HTTP 401)`.
+3. **Wrong ISAPI port for a remote NVR.** See the 4th field above.
 
 ### RTSP URL construction
 
@@ -324,14 +472,27 @@ Key columns: `identity` (unique), `camera_uuid` (link to `camera_configs`),
 
 ## Verification status
 
-Logic is verified by `tests/test_discovery.py` (35 tests, `python3
-tests/test_discovery.py` from `Backend/tensort`) covering RTSP URL
+The integration suite is `tests/test_discovery.py` (`python3
+tests/test_discovery.py` from `Backend/tensort`), covering RTSP URL
 construction, CIDR expansion and rejection, digest auth against a live HTTP
 server, ISAPI identification (including wrong-credential and non-Hikvision
 rejection), the full sweep lifecycle (adopt → idempotent → grace window →
 missing → alert once → recover → IP repoint → dedupe on wiped roster), sweep
 coalescing under concurrency, all HTTP routes, and sync resilience to a failing
 sweep.
+
+Added with the NVR fixes: `DISCOVERY_NVRS` parsing (including malformed entries
+and the optional `http_port`), and a live fake NVR that demands digest auth on
+**both** ISAPI paths — that last one is the regression guard for the
+credential-scoping bug, which the old single-path fake camera could not catch.
+
+Socket-free regressions in `tests/test_discovery_networks.py` exercise urllib's
+Digest authentication with an in-memory HTTP transport, separate LAN/NVR
+accounts, channel filtering, partial ONVIF responses, and input validation:
+
+```bash
+python3 -m unittest discover -s tests -p test_discovery_networks.py -v
+```
 
 The cloud client's `sync_discovery` and its 404/500/unreachable fallbacks are
 **not** covered here — that code lives on the cloud side.

@@ -1,39 +1,9 @@
-# service.py  (Python 3.6)
-"""
-Scheduled Hikvision camera discovery for the Jetson edge.
+"""Discover working cameras, preserve their identities, and schedule adoption.
 
-The Jetson is the source of truth for which cameras exist. This service is what
-makes that true: every minute it sweeps the network, adopts cameras it has
-never seen before into the detection pipeline, and flags cameras that have
-stopped answering so the frontend can raise an alert.
-
-Threading model
----------------
-Discovery does blocking socket work (UDP multicast, then up to 254 HTTP probes)
-that takes seconds. Running that on the pipeline's asyncio loop would stall
-every camera's decode task, so the scheduler owns a dedicated daemon thread and
-reaches the pipeline only through `PipelineRuntime`'s existing thread-safe
-wrappers — the same ones the Flask request threads use.
-
-Sweep lifecycle
----------------
-1. `scan_network()` returns the confirmed Hikvision cameras.
-2. Each is marked present in the roster. A camera with no roster row is NEW.
-3. New cameras are auto-provisioned: a UUID is minted, an RTSP URL is built
-   from the shared credentials, and `runtime.add_camera()` starts a channel.
-4. Roster rows absent from the sweep age towards missing; once past the miss
-   threshold they raise a one-shot alert.
-5. The resulting report is broadcast on the SSE stream and cached so the
-   cloud's sync/reconcile call can pull it.
-
-Why UUIDs are minted here
--------------------------
-`PipelineRuntime.add_camera` refuses to generate IDs — the cloud normally owns
-them. But an auto-discovered camera has no cloud row yet, and the cloud's
-`EdgeInferenceClient.list_cameras` discards any entry whose camera_uuid is not
-a parseable UUID. So the edge mints a real uuid4 and the cloud adopts it on the
-next sync. The `discovered: True` marker in the config is what tells the cloud
-(and a human reading the DB) that this row originated at the edge.
+Network probes and video verification run on a discovery thread. Runtime methods
+bridge to the asyncio pipeline safely. Read `_sweep()` for the complete flow:
+scan candidates, verify frames, adopt/update cameras, then report missing cameras.
+Discovery mints UUIDs only for cameras that the cloud has not provisioned yet.
 """
 
 import logging
@@ -41,20 +11,18 @@ import threading
 import time
 import uuid as uuid_mod
 from datetime import datetime
+from urllib.parse import urlsplit
 
-try:
-    # Script mode (python main.py from Backend/tensort)
-    from discovery import DiscoveryConfig, scan_network
-    from env_utils import env_bool, env_int
-    from repositories import DiscoveryRepository
-except ModuleNotFoundError:
-    # Package mode (python -m Backend.tensort.main). Only a genuinely absent
-    # top-level module falls through to here — an ImportError raised *inside* a
-    # module that does exist (a missing DB driver, say) propagates instead of
-    # being masked by a relative import that cannot work in script mode.
+if __package__:
     from .discovery import DiscoveryConfig, scan_network
     from .env_utils import env_bool, env_int
+    from .limits import CameraCapacityError, camera_limit
     from .repositories import DiscoveryRepository
+else:
+    from discovery import DiscoveryConfig, scan_network
+    from env_utils import env_bool, env_int
+    from limits import CameraCapacityError, camera_limit
+    from repositories import DiscoveryRepository
 
 logger = logging.getLogger("jetson-discovery-service")
 
@@ -68,7 +36,8 @@ class DiscoveryService(object):
 
     Public surface used by the routes:
         start() / stop()
-        run_once(force=False) -> report dict   (also what /sync triggers)
+        run_once(force=False) -> report dict
+        request_scan()        -> schedule a nonblocking refresh for /sync
         last_report()         -> report dict or None
         roster()              -> list of roster dicts
         forget(identity)      -> bool
@@ -80,9 +49,11 @@ class DiscoveryService(object):
         self._repo = repository or DiscoveryRepository()
         self._cfg = config or DiscoveryConfig()
 
-        self.interval_s = env_int("DISCOVERY_INTERVAL_S", 60, minimum=10)
+        self.interval_s = env_int("DISCOVERY_INTERVAL_S", 150, minimum=60)
         self.miss_threshold = env_int("DISCOVERY_MISS_THRESHOLD", 2, minimum=1)
         self.auto_add = env_bool("DISCOVERY_AUTO_ADD", True)
+
+        self._last_sweep_finished_at = None
 
         self._thread = None
         self._stop_evt = threading.Event()
@@ -94,6 +65,9 @@ class DiscoveryService(object):
 
         self._report_lock = threading.Lock()
         self._last_report = None
+        self._selected_identities = set()
+        self._request_lock = threading.Lock()
+        self._requested_scan_thread = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -121,6 +95,40 @@ class DiscoveryService(object):
         self._stop_evt.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=timeout_s)
+        if self._requested_scan_thread is not None and self._requested_scan_thread.is_alive():
+            self._requested_scan_thread.join(timeout=timeout_s)
+
+    def request_scan(self):
+        """Schedule one refresh without holding an HTTP request open for video.
+
+        Frame verification across staggered WAN cameras can exceed the cloud's
+        request timeout. Repeated sync requests share the in-flight scan.
+        """
+        if not self._cfg.enabled or self._stop_evt.is_set():
+            return False
+        with self._request_lock:
+            if self._sweep_lock.locked() or (self._requested_scan_thread is not None and
+                                           self._requested_scan_thread.is_alive()):
+                return True
+
+            if self._within_quiet_period():
+                return True
+
+            def refresh():
+                try:
+                    self.run_once()
+                except Exception:
+                    logger.exception("Requested discovery sweep failed; retaining last report")
+
+            self._requested_scan_thread = threading.Thread(target=refresh, name="discovery-refresh", daemon=True)
+            self._requested_scan_thread.start()
+            return True
+
+    def _within_quiet_period(self):
+        """True while `interval_s` has not elapsed since the last sweep finished."""
+        if self._last_sweep_finished_at is None:
+            return False
+        return (time.time() - self._last_sweep_finished_at) < self.interval_s
 
     def _loop(self):
         # The first sweep happens immediately so a freshly-booted Jetson has
@@ -130,7 +138,6 @@ class DiscoveryService(object):
                 self.run_once()
             except Exception:
                 logger.exception("Discovery sweep failed; will retry next interval")
-            # wait() returns early when stop() is called, so shutdown is prompt.
             self._stop_evt.wait(self.interval_s)
 
     # ------------------------------------------------------------------
@@ -164,103 +171,120 @@ class DiscoveryService(object):
     def _sweep(self):
         started = time.time()
         devices = scan_network(self._cfg)
+        # Select before opening streams. Offline selected cameras retain their
+        # slot, so reconnects do not churn identities or displace other sources.
+        devices = devices[:camera_limit()]
+        previous_selection = self._selected_identities
+        selected_identities = {dev.identity() for dev in devices}
+        self._selected_identities = selected_identities
+        if self.auto_add and hasattr(self._runtime, "select_discovery_sources"):
+            self._runtime.select_discovery_sources([self._cfg.rtsp_url_for(dev) for dev in devices])
 
-        present_identities = []
-        new_cameras = []
-        recovered = []
-        ip_changes = []
-        errors = []
-
+        report = self._empty_report()
+        report.pop("reason")
+        report["scanned"] = len(devices)
+        source_updates = []
         for dev in devices:
-            identity = dev.identity()
-            present_identities.append(identity)
-            
-            # Use NVR credentials if it's on a custom port (likely an NVR)
-            is_nvr = dev.rtsp_port != self._cfg.rtsp_port
-            credentials_override = (self._cfg.nvr_username, self._cfg.nvr_password) if is_nvr else None
-            source_url = self._cfg.rtsp_url_for(dev, force_credentials=credentials_override)
-            
-            # The host in source_url is exactly dev.ip (which could be the NVR's public hostname)
-            public_rtsp_url = source_url
+            if self._stop_evt.is_set():
+                return self.last_report() or self._empty_report(reason="stopped")
+            self._inspect_candidate(dev, report, source_updates)
 
-            state = self._repo.mark_seen(dev, source_url=source_url, public_rtsp_url=public_rtsp_url)
-
-            if state.get("ip_changed"):
-                ip_changes.append({
-                    "identity": identity,
-                    "ip_address": dev.ip,
-                    "source_url": source_url,
-                    "public_rtsp_url": public_rtsp_url,
-                })
-
-            if state.get("recovered"):
-                recovered.append(dev.to_dict())
-
-            # Retry a previously seen camera whose admission failed (for
-            # example because all eight slots were occupied at the last scan).
-            row = state.get("row")
-            needs_adoption = state.get("is_new") or (row is not None and not row.get("camera_uuid"))
-            if not needs_adoption:
-                continue
-
-            if not self.auto_add:
-                new_cameras.append(self._camera_entry(dev, identity, source_url, adopted=False, public_rtsp_url=public_rtsp_url))
-                continue
-
-            try:
-                new_cameras.append(self._adopt(dev, identity, source_url, public_rtsp_url=public_rtsp_url))
-            except Exception as e:
-                logger.exception("Failed to adopt discovered camera %s", identity)
-                errors.append("Failed to add {}: {}".format(identity, e))
-
-        for change in ip_changes:
+        for change in source_updates:
             try:
                 self._repoint(change)
-            except Exception as e:
-                logger.exception("Failed to repoint camera after IP change: %s", change["identity"])
-                errors.append("Failed to repoint {}: {}".format(change["identity"], e))
+                report["ip_changes"].append(change)
+            except Exception as error:
+                logger.exception("Failed to update discovered camera source: %s", change["identity"])
+                report["errors"].append("Failed to repoint {}: {}".format(change["identity"], error))
 
-        missing = self._repo.mark_missing(present_identities, miss_threshold=self.miss_threshold)
+        if self._stop_evt.is_set():
+            # A partial sweep must not age out cameras that were not tested.
+            return self.last_report() or self._empty_report(reason="stopped")
+        present_identities = [camera["identity"] for camera in report["present"]]
+        # Excluded rows are historical, not newly missing selected cameras.
+        excluded = [row["identity"] for row in self._repo.list_all()
+                    if row["identity"] not in (selected_identities | previous_selection)]
+        report["missing_cameras"] = self._repo.mark_missing(
+            present_identities + excluded, miss_threshold=self.miss_threshold)
+        report["roster"] = [row for row in self._repo.list_all()
+                            if row["identity"] in selected_identities]
+        report["generated_at"] = _utc_now_iso()
+        report["duration_s"] = round(time.time() - started, 2)
+        # Stamped on completion, not on start: a sweep that overruns the quiet
+        # period should still leave a full gap behind it before the next one.
+        self._last_sweep_finished_at = time.time()
+        self._publish_report(report)
+        return report
 
-        report = {
-            "type": "discovery_report",
-            "generated_at": _utc_now_iso(),
-            "duration_s": round(time.time() - started, 2),
-            "scanned": len(devices),
-            "present": [d.to_dict() for d in devices],
-            "new_cameras": new_cameras,
-            "missing_cameras": missing,
-            "recovered_cameras": recovered,
-            "ip_changes": ip_changes,
-            "roster": self._repo.list_all(),
-            "errors": errors,
-        }
+    def _inspect_candidate(self, dev, report, source_updates):
+        """Verify a candidate, record presence, and adopt it when permitted."""
+        identity = dev.identity()
+        source_url = self._cfg.rtsp_url_for(dev)
+        if not self._runtime.verify_source(source_url, self._stop_evt):
+            report["unverified_candidates"].append(identity)
+            return
+        report["present"].append(dev.to_dict())
+        state = self._repo.mark_seen(dev, source_url=source_url)
 
+        existing = self._existing_camera_uuid_for(dev, identity, source_url)
+        current = next((cam for cam in self._runtime.list_cameras()
+                        if cam.get("camera_uuid") == existing), None)
+        if current is not None and current.get("source_url") != source_url:
+            source_updates.append({
+                "identity": identity,
+                "ip_address": dev.ip,
+                "source_url": source_url,
+                "camera_uuid": existing,
+            })
+
+        if state.get("recovered"):
+            report["recovered_cameras"].append(dev.to_dict())
+
+        # Retry a previously seen camera whose admission failed (for
+        # example because all eight slots were occupied at the last scan).
+        row = state.get("row")
+        needs_adoption = state.get("is_new") or (row is not None and not row.get("camera_uuid"))
+        if not needs_adoption:
+            return
+
+        if not self.auto_add:
+            report["new_cameras"].append(
+                self._camera_entry(dev, identity, source_url, adopted=False)
+            )
+            return
+
+        try:
+            report["new_cameras"].append(self._adopt(dev, identity, source_url))
+        except CameraCapacityError:
+            report["capacity_rejected"].append(identity)
+            report["errors"].append("At capacity, not added: {}".format(identity))
+        except Exception as e:
+            logger.exception("Failed to adopt discovered camera %s", identity)
+            report["errors"].append("Failed to add {}: {}".format(identity, e))
+
+    def _publish_report(self, report):
+        """Cache the completed sweep and broadcast inventory changes."""
         with self._report_lock:
             self._last_report = report
-
-        if new_cameras or missing or recovered or ip_changes:
-            logger.info(
-                "Discovery: %d present, %d new, %d missing, %d recovered, %d ip change(s)",
-                len(devices), len(new_cameras), len(missing), len(recovered), len(ip_changes),
-            )
+        if report["capacity_rejected"]:
+            logger.warning("Camera capacity reached; not added: %s",
+                           ", ".join(report["capacity_rejected"]))
+        changes = ("new_cameras", "missing_cameras", "recovered_cameras", "ip_changes")
+        if any(report[key] for key in changes):
+            logger.info("Discovery: %d present, %d new, %d missing, %d recovered, %d source changes",
+                        len(report["present"]), *(len(report[key]) for key in changes))
             self._broadcast(report)
-        else:
-            logger.debug("Discovery: %d present, no changes", len(devices))
-
-        return report
 
     # ------------------------------------------------------------------
     # Pipeline adoption
     # ------------------------------------------------------------------
     @staticmethod
-    def _camera_entry(dev, identity, source_url, adopted, camera_uuid=None, public_rtsp_url=None, **extra):
+    def _camera_entry(dev, identity, source_url, adopted, camera_uuid=None, **extra):
         """The per-camera shape reported under `new_cameras`."""
         entry = {
             "identity": identity,
             "ip_address": dev.ip,
             "source_url": source_url,
-            "public_rtsp_url": public_rtsp_url,
             "camera_uuid": camera_uuid,
             "adopted": adopted,
             "model": dev.model,
@@ -270,46 +294,49 @@ class DiscoveryService(object):
         return entry
 
     @staticmethod
-    def _host_of(url):
-        """Hostname of a stream URL, ignoring credentials, port and path."""
-        if not url or not isinstance(url, str):
+    def _stream_endpoint(url):
+        """Compare streams without credentials; retain the NVR channel path."""
+        try:
+            parsed = urlsplit(url or "")
+            return (parsed.scheme, parsed.hostname, parsed.port or 554,
+                    parsed.path, parsed.query)
+        except ValueError:
             return None
-        authority = url.split("://", 1)[-1].split("/", 1)[0]
-        if "@" in authority:
-            authority = authority.rsplit("@", 1)[1]
-        return authority.split(":", 1)[0].strip().lower() or None
 
     def _existing_camera_uuid_for(self, dev, identity, source_url):
-        """Find an already-provisioned camera for this physical device.
+        """Prefer saved identity over endpoint, then direct-camera host fallback."""
+        cameras = self._runtime.list_cameras() or []
+        row = self._repo.get_by_identity(identity)
+        linked_uuid = row.get("camera_uuid") if row else None
+        is_nvr = bool(dev.is_nvr)
 
-        Guards the case where the roster says "new" but the pipeline already
-        has the camera — e.g. the roster table was recreated while
-        camera_configs survived, or the camera was pushed down by the cloud
-        before discovery ever ran. Adopting again would give one physical
-        camera two channels, both decoding the same stream.
+        # Check stronger matches across the whole list before weaker fallbacks.
+        for camera in cameras:
+            if linked_uuid and camera.get("camera_uuid") == linked_uuid:
+                return linked_uuid
+        for camera in cameras:
+            config = camera.get("config") or {}
+            if config.get("discovery_identity") == identity:
+                return camera.get("camera_uuid")
+            same_serial = dev.serial_number and config.get("discovery_serial") == dev.serial_number
+            same_channel = not is_nvr or config.get("discovery_channel") == dev.channel
+            if same_serial and same_channel:
+                return camera.get("camera_uuid")
 
-        Matched on discovery identity first, then on the host in source_url,
-        which is what catches a cloud-provisioned camera that has no discovery
-        provenance at all.
-        """
-        try:
-            cameras = self._runtime.list_cameras()
-        except Exception:
-            return None
+        target = self._stream_endpoint(source_url)
+        for camera in cameras:
+            if target is not None and self._stream_endpoint(camera.get("source_url")) == target:
+                return camera.get("camera_uuid")
 
-        host = self._host_of(source_url)
-
-        for cam in cameras or []:
-            cfg = cam.get("config") or {}
-            if cfg.get("discovery_identity") == identity:
-                return cam.get("camera_uuid")
-            if dev.serial_number and cfg.get("discovery_serial") == dev.serial_number:
-                return cam.get("camera_uuid")
-            if host and self._host_of(cam.get("source_url")) == host:
-                return cam.get("camera_uuid")
+        # NVR channels share a host, so host-only matching would merge cameras.
+        if not is_nvr and target is not None and target[1]:
+            for camera in cameras:
+                saved = self._stream_endpoint(camera.get("source_url"))
+                if saved is not None and saved[1] == target[1]:
+                    return camera.get("camera_uuid")
         return None
 
-    def _adopt(self, dev, identity, source_url, public_rtsp_url=None):
+    def _adopt(self, dev, identity, source_url):
         """Provision a newly-discovered camera into the running pipeline."""
         existing = self._existing_camera_uuid_for(dev, identity, source_url)
         if existing:
@@ -321,7 +348,6 @@ class DiscoveryService(object):
             return self._camera_entry(
                 dev, identity, source_url,
                 adopted=False, camera_uuid=existing, already_present=True,
-                public_rtsp_url=public_rtsp_url
             )
 
         camera_uuid = str(uuid_mod.uuid4())
@@ -337,6 +363,10 @@ class DiscoveryService(object):
             "discovery_model": dev.model,
             "discovery_serial": dev.serial_number,
             "discovery_name": dev.device_name,
+            # Channel + nvr flag are what disambiguate two cameras that share a
+            # host (and sometimes a serial) behind the same NVR.
+            "discovery_channel": getattr(dev, "channel", 1),
+            "discovery_is_nvr": bool(getattr(dev, "is_nvr", False)),
         })
         self._repo.attach_camera_uuid(identity, camera_uuid, source_url=source_url)
 
@@ -349,21 +379,17 @@ class DiscoveryService(object):
             dev, identity, source_url,
             adopted=True, camera_uuid=camera_uuid,
             config=result.get("config") if isinstance(result, dict) else None,
-            public_rtsp_url=public_rtsp_url
         )
 
     def _repoint(self, change):
-        """Update an adopted camera's source_url after its IP moved."""
-        row = self._repo.get_by_identity(change["identity"])
-        if not row or not row.get("camera_uuid"):
-            return
-        self._runtime.patch_camera(row["camera_uuid"], {
+        """Apply a verified source change; a failed update retries next sweep."""
+        self._runtime.patch_camera(change["camera_uuid"], {
             "source_url": change["source_url"],
             "discovery_ip": change["ip_address"],
         })
         logger.info(
-            "Repointed camera %s to %s after IP change",
-            row["camera_uuid"], change["ip_address"],
+            "Updated camera %s source at %s",
+            change["camera_uuid"], change["ip_address"],
         )
 
     # ------------------------------------------------------------------
@@ -400,8 +426,25 @@ class DiscoveryService(object):
         with self._report_lock:
             return dict(self._last_report) if self._last_report else None
 
+    def current_report(self):
+        """Expose verified selected rows during a long sweep for cloud adoption.
+
+        Partial reports must not be used to infer that absent cameras are offline.
+        """
+        report = self.last_report()
+        if not self._sweep_lock.locked() and report is not None:
+            return report
+        report = self._empty_report("discovery_pending")
+        report["partial"] = True
+        active = {camera["camera_uuid"] for camera in self._runtime.list_cameras()}
+        report["roster"] = [row for row in self._repo.list_all()
+                            if row["identity"] in self._selected_identities
+                            and row.get("camera_uuid") in active]
+        return report
+
     def roster(self):
-        return self._repo.list_all()
+        return [row for row in self._repo.list_all()
+                if row["identity"] in self._selected_identities]
 
     def forget(self, identity):
         return self._repo.forget(identity)
@@ -416,6 +459,8 @@ class DiscoveryService(object):
             "interval_s": self.interval_s,
             "miss_threshold": self.miss_threshold,
             "auto_add": self.auto_add,
+            "in_quiet_period": self._within_quiet_period(),
+            "scan_in_progress": self._sweep_lock.locked(),
             "last_sweep_at": report["generated_at"] if report else None,
             "last_sweep_duration_s": report["duration_s"] if report else None,
             "present_count": len(report["present"]) if report else 0,
@@ -428,12 +473,14 @@ class DiscoveryService(object):
             "generated_at": _utc_now_iso(),
             "duration_s": 0.0,
             "scanned": 0,
+            "unverified_candidates": [],
+            "capacity_rejected": [],
             "present": [],
             "new_cameras": [],
             "missing_cameras": [],
             "recovered_cameras": [],
             "ip_changes": [],
-            "roster": self._repo.list_all(),
+            "roster": [],
             "errors": [],
             "reason": reason,
         }

@@ -11,6 +11,8 @@
 #   - tensorrt        (built for the system Python)
 #   - opencv (cv2)    (system OpenCV, built WITH GStreamer + HW decode)
 #   - numpy           (already provided by the system OpenCV/JetPack stack)
+#   - PyGObject / Gst / GstVideo (apt: python3-gi, gir1.2-gstreamer-1.0,
+#     gir1.2-gst-plugins-base-1.0; used for native appsink capture)
 #
 # The pip `opencv-python` wheel has NO GStreamer support and will break
 # hardware video decode on the Jetson — never install it here.
@@ -30,5 +32,5 @@ pycuda>=2025.1
 
 # --- Config ---
 # Lets `python3 main.py` read .env the same way systemd's EnvironmentFile does.
-# Optional: main.py skips it silently if it is not installed.
+# Without it, main.py warns if .env exists and credentials are not exported.
 python-dotenv>=1.0

@@ -90,6 +90,7 @@ if [ "${SKIP_APT:-0}" != "1" ]; then
       python3-venv python3-dev python3-pip build-essential \
       curl \
       gstreamer1.0-tools \
+      python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 else
   log "SKIP_APT=1 — skipping apt step."

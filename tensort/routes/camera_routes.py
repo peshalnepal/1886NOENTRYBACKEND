@@ -5,14 +5,14 @@ import logging
 
 from flask import Blueprint, jsonify, Response
 
-try:
-    from limits import CameraCapacityError
-    from routes.helpers import json_body, require_source
-    from routes.runtime_ref import get_runtime
-except Exception:
+if "." in __package__:
     from ..limits import CameraCapacityError
     from .helpers import json_body, require_source
     from .runtime_ref import get_runtime
+else:
+    from limits import CameraCapacityError
+    from routes.helpers import json_body, require_source
+    from routes.runtime_ref import get_runtime
 
 logger = logging.getLogger("jetson-app")
 

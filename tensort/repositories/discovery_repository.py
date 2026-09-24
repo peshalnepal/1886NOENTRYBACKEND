@@ -14,14 +14,12 @@ transaction on the edge for a caller to own.
 import logging
 from datetime import datetime
 
-try:
-    # Script mode (python main.py from Backend/tensort)
-    from database import db_manager
-    from database_orm import DiscoveredCamera
-except Exception:
-    # Package mode (python -m Backend.tensort.main)
+if "." in __package__:
     from ..database import db_manager
     from ..database_orm import DiscoveredCamera
+else:
+    from database import db_manager
+    from database_orm import DiscoveredCamera
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +55,7 @@ class DiscoveryRepository(object):
         finally:
             session.close()
 
-    def mark_seen(self, device, source_url=None, public_rtsp_url=None):
+    def mark_seen(self, device, source_url=None):
         """Record that `device` (a discovery.HikDevice) is present right now.
 
         Returns a dict describing the transition:
@@ -102,10 +100,11 @@ class DiscoveryRepository(object):
             row.rtsp_port = getattr(device, "rtsp_port", 554)
             if source_url:
                 row.source_url = source_url
-            if public_rtsp_url:
-                row.public_rtsp_url = public_rtsp_url
+                row.public_rtsp_url = source_url
 
             row.is_present = True
+            if row.first_frame_at is None:
+                row.first_frame_at = now
             row.consecutive_misses = 0
             row.alerted = False
             row.missing_since = None

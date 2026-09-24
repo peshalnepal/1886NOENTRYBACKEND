@@ -2,7 +2,7 @@
 
 import os
 
-SUPPORTED_MAX_CAMERAS = 8
+DEFAULT_MAX_CAMERAS = 8
 
 
 class CameraCapacityError(ValueError):
@@ -10,9 +10,9 @@ class CameraCapacityError(ValueError):
 
 
 def camera_limit():
-    """Allow a smaller site limit, with a hard ceiling of eight cameras."""
+    """Read the admission limit from configuration, without a hidden ceiling."""
     try:
-        configured = int(os.getenv("MAX_CAMERAS", str(SUPPORTED_MAX_CAMERAS)))
+        configured = int(os.getenv("MAX_CAMERAS", str(DEFAULT_MAX_CAMERAS)))
     except ValueError:
-        configured = SUPPORTED_MAX_CAMERAS
-    return max(1, min(configured, SUPPORTED_MAX_CAMERAS))
+        configured = DEFAULT_MAX_CAMERAS
+    return max(1, configured)

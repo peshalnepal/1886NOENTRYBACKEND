@@ -1,10 +1,12 @@
 # Jetson Orin Nano 8 GB inference service
 
+Start with [README.md](README.md) for the code reading order and both pipeline walkthroughs.
+
 This service decodes camera streams, runs YOLO detection, and sends detection
 metadata to the cloud over SSE. Tracking, recordings, and alerts live in the
 cloud backend.
 
-The supported ceiling is **eight enabled cameras**. Start at **3 detection FPS
+`MAX_CAMERAS` sets the enabled-camera limit. Start with **eight cameras** and **3 detection FPS
 per camera**, using `yolo26m`, FP16, 640-pixel model input, and low-resolution
 camera substreams. This is a commissioning target, not a measured throughput
 claim. `yolo26m` is the accuracy-first model — roughly 2–2.5x the compute of
@@ -51,8 +53,10 @@ bounded when consumers cannot keep up.
 |---|---|
 | `main.py` | Load environment and create the Flask application |
 | `runtime.py` | Serialize camera mutations, enforce capacity, persist/restore cameras |
-| `limits.py` | Shared ceiling of eight enabled cameras |
-| `pipeline.py` | Frame pool, ordered inference queue, results and snapshot cache |
+| `limits.py` | Shared admission limit from MAX_CAMERAS |
+| `pipeline.py` | Camera orchestration, results, SSE and snapshot cache |
+| `frame_pool.py` | Bounded, fair queues of recent frames |
+| `inference_worker.py` | Ordered GPU execution and readiness |
 | `channels/channel.py` | Capture, GStreamer pipelines, reconnect and frame handoff |
 | `trt_infer.py` | CUDA ownership, TensorRT buffers, YOLO preprocessing/postprocessing |
 | `service.py`, `discovery.py` | Camera discovery and adoption |
@@ -60,9 +64,10 @@ bounded when consumers cannot keep up.
 
 ## Capture and deployment
 
-Use JetPack's OpenCV with GStreamer support. Do not install `opencv-python` on
-the Jetson: its wheel can shadow that build. The runtime sets OpenCV's CPU thread
-count to one to avoid nested thread pools across eight cameras.
+Use JetPack's OpenCV and system GStreamer GI bindings. Capture pulls native
+appsink samples and copies stride-aware BGR frames into NumPy; it no longer
+depends on OpenCV's GStreamer capture wrapper. OpenCV still handles resizing,
+JPEG encoding and FFmpeg fallback. The runtime limits its CPU thread count.
 
 RTSP tries hardware decode before CPU fallbacks. Compressed packets are never
 intentionally dropped before the decoder; decoded frames can be dropped safely.
@@ -70,7 +75,9 @@ GStreamer `videorate` limits BGR conversion to the sample rate. Hardware scaling
 still happens before that gate, and the original stream is still decoded in
 full, so camera substreams are the main way to reduce decode load. Generic
 `uridecodebin` selects its decoder automatically; the `*-hw` backend name reports
-the selected pipeline, not proof of which decoder it auto-plugged.
+the selected pipeline, not proof of which decoder it auto-plugged. The CPU
+automatic candidate sets `force-sw-decoders=true` to avoid NVMM negotiation
+against a software-only converter.
 
 `DEFAULT_RESIZE_W/H` defaults to 640x360. GStreamer scales to those exact dimensions;
 choose dimensions matching the camera aspect ratio (640x480 for 4:3 sources), or
@@ -92,10 +99,18 @@ MODEL=yolo26m MAX_BATCH=8 ./deployment/build_engine.sh
 `.env.example` contains the recommended starting settings. On upgrade, existing
 `.env` and stored per-camera FPS/resize settings are retained: update both as
 needed. The setup script updates engine path, input size and batch size to match
-its build. `MAX_CAMERAS` can lower the ceiling but cannot raise it above eight.
-POST or PATCH enabling a ninth camera returns HTTP 409. Disabled configurations
+its build. `MAX_CAMERAS` is the admission limit; there is no second hardcoded
+camera ceiling. POST or PATCH exceeding it returns HTTP 409. Disabled configurations
 do not consume a slot. On restore, excess enabled rows stay on disk and are
 logged as skipped. Discovery retries unadopted cameras after capacity becomes free.
+
+LAN, ISAPI and static NVR results are candidates until a decoded frame arrives.
+Running streams are verified from frame freshness, without duplicate sessions.
+Only verified candidates enter the discovery roster. Existing rows survive an
+additive `first_frame_at` migration as unverified; previously verified cameras
+become offline after the configured missed-sweep threshold and retain history.
+`POST /sync` schedules a refresh and immediately returns the last complete
+report with `discovery_pending`; poll `/discovery/report` for completion.
 
 ## Verify eight-camera capacity on the device
 
@@ -147,17 +162,12 @@ enough for the cloud tracker's low-confidence association (default 0.20).
 
 ## Off-device verification
 
-The test files run separately because older suites install import stubs globally.
-No GPU is required. Discovery's integration tests need permission to bind a local
-HTTP server; route tests additionally need Flask.
+Run each suite in its own process because older suites install import stubs globally.
+No GPU is required. Discovery integration tests need permission to bind a local
+HTTP server; use an environment with Flask and the database dependencies installed.
 
 ```bash
-python3 tests/test_frame_pool.py
-python3 tests/test_dispatch.py
-python3 tests/test_cross_class_dedupe.py
-python3 tests/test_orin_capacity.py
-python3 tests/test_trt_shapes.py
-python3 tests/test_discovery.py
+python3 tests/run_tests.py
 ```
 
 The code uses the TensorRT 10 API; the legacy `setup_nano.sh` does not make this

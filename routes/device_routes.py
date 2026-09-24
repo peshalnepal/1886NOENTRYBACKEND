@@ -209,9 +209,6 @@ async def delete_device(
     owner_id = _device_owner_id(device, ctx)
 
     channel_repo = ChannelRepository()
-    # include_device: the teardown reads `cam.device.device_url` to stop the
-    # camera on its edge box, and a lazy load there would raise on the async
-    # session rather than silently returning None.
     attached = await channel_repo.list_cameras(
         db, device_uuid=device.device_uuid, include_device=True
     )
@@ -226,8 +223,6 @@ async def delete_device(
             ),
         )
 
-    # Delete the cameras before the device row, so each teardown still has the
-    # device_url it needs to stop the camera on the edge box.
     for cam in attached:
         cam_uuid = cam.camera_uuid
         try:
@@ -239,8 +234,6 @@ async def delete_device(
                 manager=manager,
             )
         except Exception:
-            # One bad camera must not strand the rest, nor block the device
-            # delete: the remaining cameras still need tearing down.
             logger.exception(
                 "[Device Delete] Camera teardown failed cam=%s device=%s; continuing",
                 cam_uuid,

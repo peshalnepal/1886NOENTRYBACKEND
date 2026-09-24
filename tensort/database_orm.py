@@ -104,6 +104,7 @@ class DiscoveredCamera(Base):
     camera_uuid = Column(String(64), nullable=True, index=True)
 
     is_present = Column(Boolean, nullable=False, default=True)
+    first_frame_at = Column(DateTime, nullable=True)
     consecutive_misses = Column(Integer, nullable=False, default=0)
     alerted = Column(Boolean, nullable=False, default=False)
 
@@ -132,7 +133,10 @@ class DiscoveredCamera(Base):
             "public_rtsp_url": self.public_rtsp_url,
             "rtsp_port": self.rtsp_port,
             "camera_uuid": self.camera_uuid,
-            "is_present": bool(self.is_present),
+            "is_present": bool(self.is_present) and self.first_frame_at is not None,
+            "first_frame_at": self.first_frame_at.isoformat() if self.first_frame_at else None,
+            "verification_state": ("unverified" if self.first_frame_at is None else
+                                   "online" if self.is_present else "offline"),
             "consecutive_misses": int(self.consecutive_misses or 0),
             "alerted": bool(self.alerted),
             "first_seen_at": self.first_seen_at.isoformat() if self.first_seen_at else None,

@@ -3,10 +3,7 @@
 
 from flask import Blueprint, jsonify
 
-try:
-    from routes.helpers import runtime_status
-except Exception:
-    from .helpers import runtime_status
+from .helpers import runtime_status
 
 bp = Blueprint("health", __name__)
 

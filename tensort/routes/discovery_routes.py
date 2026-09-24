@@ -7,7 +7,7 @@ Discovery + sync endpoints.
     GET    /discovery/report     -> the last sweep report, without rescanning
     POST   /discovery/scan       -> force a sweep now, return the fresh report
     DELETE /discovery/<identity> -> forget a decommissioned camera
-    POST   /sync                 -> triggers a sweep and returns cameras + report
+    POST   /sync                 -> schedules a sweep; returns cameras + last complete report
 
 Note on "list the cameras attached to this Jetson": that already exists as
 `GET /cameras` in camera_routes.py, and the cloud's EdgeInferenceClient is
@@ -15,10 +15,10 @@ already pointed at it (EDGE_LIST_PATH defaults to /cameras). Adding a second
 listing endpoint would give the cloud two disagreeing sources of truth, so the
 routes here are strictly additive.
 
-`POST /sync` is the one the cloud calls. The Jetson is the source of truth for
-which cameras physically exist, so a sync must reflect the network as it is
-*now*, not as it was up to a minute ago — hence the sweep runs inline before
-the camera list is rendered.
+`POST /sync` is the one the cloud calls. Frame verification can take longer
+than its HTTP timeout, so sync schedules a sweep and returns the last complete
+report. Partial scans never replace the roster. GET /discovery/report retrieves
+the completed report; POST /discovery/scan remains an explicit blocking scan.
 """
 
 import logging
@@ -26,10 +26,7 @@ from functools import wraps
 
 from flask import Blueprint, jsonify
 
-try:
-    from routes.runtime_ref import get_runtime
-except ModuleNotFoundError:
-    from .runtime_ref import get_runtime
+from .runtime_ref import get_runtime
 
 logger = logging.getLogger("jetson-app")
 
@@ -118,37 +115,39 @@ def forget_discovered(svc, identity):
 
 @route("/sync", methods=["POST"])
 def sync():
-    """Cloud sync entry point: rescan the network, then report.
+    """Cloud sync entry point: request a refresh and return current state.
 
     Returns both halves of the truth the cloud needs:
       - `cameras`: what is provisioned on this Jetson right now (same shape as
         GET /cameras, so the cloud's existing parser works unchanged)
-      - `discovery`: what the sweep just found, including cameras that have
+      - `discovery`: the last complete sweep, including cameras that have
         gone missing so the frontend can alert on them
 
-    The sweep runs before the camera list is read, so a camera adopted during
-    this very sweep is already in `cameras`. Unlike the routes above, a missing
-    discovery service is not a 503 here — the cloud still needs the camera list.
+    Unlike the routes above, a missing discovery service is not a 503 here —
+    the cloud still needs the camera list.
     """
     runtime = get_runtime()
     svc = getattr(runtime, "discovery", None)
 
     report = None
     warnings = []
+    pending = False
     if svc is not None:
         try:
-            report = svc.run_once(force=True)
+            pending = svc.request_scan()
+            report = svc.current_report()
         except Exception as e:
             # A failed sweep must not fail the sync — the cloud still needs the
             # camera list, and stale discovery data beats no response at all.
             logger.exception("Discovery sweep failed during sync")
-            report = svc.last_report()
+            report = svc.current_report()
             warnings.append("Discovery sweep failed during sync: {}".format(e))
 
     payload = {
         "cameras": runtime.list_cameras(),
         "discovery": report,
         "status": svc.status() if svc is not None else None,
+        "discovery_pending": pending,
     }
     if warnings:
         payload["warnings"] = warnings

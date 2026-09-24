@@ -8,10 +8,7 @@ import logging
 
 from flask import Blueprint, jsonify, Response, stream_with_context
 
-try:
-    from routes.runtime_ref import get_runtime
-except Exception:
-    from .runtime_ref import get_runtime
+from .runtime_ref import get_runtime
 
 logger = logging.getLogger("jetson-app")
 

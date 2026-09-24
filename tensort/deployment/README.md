@@ -1,6 +1,7 @@
 # Deploy on Jetson Orin Nano 8 GB
 
-This revision supports **at most eight enabled cameras** and requires the
+This revision defaults to **eight enabled cameras**, configurable with
+`MAX_CAMERAS`, and requires the
 TensorRT 10 API. Use JetPack for the Orin Nano that supplies TensorRT 10; verify
 `python3 -c 'import tensorrt; print(tensorrt.__version__)'`. Earlier JetPack
 releases with TensorRT 8 need a compatible older code revision.
@@ -67,9 +68,31 @@ CONF=0.20
 ```
 
 `INFER_NUM_WORKERS` values above one are reduced to one to keep results ordered.
-`MAX_CAMERAS` can lower the supported ceiling, but cannot raise it above eight.
+`MAX_CAMERAS` is the enabled-camera admission limit; eight is a starting profile,
+not a hardcoded ceiling. A limit of 20 and eight configured channels still
+provides at most eight candidates. `INFER_MAX_BATCH` separately limits batches
+and is bounded by the engine's actual capacity.
 Stored per-camera FPS and resize settings take precedence over defaults; update
 them with PATCH if you are reducing an existing installation's load.
+
+Native GStreamer capture requires system packages `python3-gi`,
+`gir1.2-gstreamer-1.0` and `gir1.2-gst-plugins-base-1.0`, visible through the
+service's `--system-site-packages` environment. Setup installs these packages.
+The supported data path is appsink → owned BGR NumPy frame → inference;
+OpenCV's GStreamer video-capture bridge is not used.
+
+Discovery confirms a candidate only after receiving a decoded frame, including
+static NVR channels. Edge and cloud upgrades add nullable `first_frame_at`
+columns without deleting existing cameras. Old rows remain unverified until
+frames arrive. Deploy the matching cloud changes to retain verification state
+in inventory and avoid adopting cameras the edge rejected for capacity.
+Sync returns the last completed report while a new scan runs in the background.
+
+Validate on the Jetson using `python3 tests/test_native_capture.py`, then inspect
+`/health`: capture entries should report frame ages and increasing frame counts.
+Run `python3 deployment/check_capacity.py --cameras 8 --fps 3 --seconds 120`
+after all eight streams have warmed up. The native tests exercise synthetic
+video; only this live check can validate NVR stability and hardware throughput.
 
 ## Cameras and health
 

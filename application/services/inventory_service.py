@@ -264,8 +264,22 @@ class InventoryService:
 
     @staticmethod
     def _adoption_entry(row: CameraInventory) -> Dict[str, Any]:
-        """The roster-shaped dict the adopter builds a channel from."""
-        return {
+        """The roster-shaped dict the adopter builds a channel from.
+
+        `camera_uuid` carries the edge's own UUID through to the adopter, which
+        reuses it instead of minting a new one. Without it the cloud files the
+        camera under a UUID the Jetson has never heard of: the edge keeps
+        emitting detections for its own UUID, the cloud subscribes to the new
+        one, and the camera shows live video while never producing a single
+        detection. It also makes the edge reject the follow-up upsert with a
+        409, because the selected source already belongs to the edge's UUID.
+
+        `edge_camera_uuid` is free-text on the inventory row, so a malformed
+        value is dropped rather than raising: the adopter would fail the whole
+        add on `uuid.UUID(...)`, and a fresh UUID is a better outcome than no
+        camera at all.
+        """
+        entry: Dict[str, Any] = {
             "identity": row.discovery_identity,
             "source_url": row.source_url,
             "ip_address": row.ip_address,
@@ -273,6 +287,19 @@ class InventoryService:
             "model": row.model,
             "serial_number": row.serial_number,
         }
+
+        edge_uuid = str(row.edge_camera_uuid or "").strip()
+        if edge_uuid:
+            try:
+                entry["camera_uuid"] = str(uuid.UUID(edge_uuid))
+            except ValueError:
+                logger.warning(
+                    "Inventory row %s has an unusable edge_camera_uuid %r; "
+                    "adopting with a new UUID instead",
+                    row.discovery_identity, edge_uuid,
+                )
+
+        return entry
 
     @staticmethod
     def _result(

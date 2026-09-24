@@ -17,16 +17,21 @@ def read_health(url):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8080")
-    parser.add_argument("--cameras", type=int, default=8)
+    parser.add_argument("--cameras", type=int, default=None,
+                        help="Expected running cameras; defaults to the current capture count")
     parser.add_argument("--fps", type=float, default=3)
     parser.add_argument("--seconds", type=float, default=120)
     parser.add_argument("--max-age-ms", type=int, default=1000)
     args = parser.parse_args()
-    if not 1 <= args.cameras <= 8 or args.fps <= 0 or args.seconds <= 0:
-        parser.error("Use 1..8 cameras and positive FPS/duration")
+    if (args.cameras is not None and args.cameras < 1) or args.fps <= 0 or args.seconds <= 0:
+        parser.error("Use a positive camera count, FPS and duration")
 
     baseline = read_health(args.url)
     camera_ids = set(baseline.get("capture", {}))
+    if args.cameras is None:
+        args.cameras = len(camera_ids)
+    if args.cameras < 1 or args.cameras > baseline.get("max_cameras", args.cameras):
+        parser.error("Expected cameras must be between one and the device's configured MAX_CAMERAS")
     if len(camera_ids) != args.cameras or not camera_ids <= baseline.get("cameras", {}).keys():
         raise SystemExit("Expected {} warmed-up cameras; check /health first".format(args.cameras))
     started = time.monotonic()

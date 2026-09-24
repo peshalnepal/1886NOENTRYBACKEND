@@ -15,7 +15,7 @@ import os
 import time
 import threading
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import cv2
@@ -702,43 +702,6 @@ class TRTInfer(object):
     def close(self):
         self.det_runner.trt.close()
         release_cuda_context()
-
-    def infer_multitask(self, bgr: np.ndarray, meta: Dict) -> Dict:
-        t0 = time.perf_counter()
-
-        camera_uuid = str(meta.get("camera_uuid", "unknown"))
-        channel_id = meta.get("channel_id")
-        frame_ts_ms = int(meta.get("frame_ts_ms", int(time.time() * 1000)))
-        frame_seq = int(meta.get("frame_seq", 0))
-
-        try:
-            dets = self.det_runner.run(bgr)
-            ms = int((time.perf_counter() - t0) * 1000)
-            H, W = bgr.shape[:2]
-            return {
-                "type": "DetectionsProducedEvent",
-                "channel_id": channel_id,
-                "camera_uuid": camera_uuid,
-                "model_id": self.model_id,
-                "frame_ts_ms": frame_ts_ms,
-                "frame_seq": frame_seq,
-                "frame_w": W,
-                "frame_h": H,
-                "detections": dets,
-                "pose": None,
-                "inference_ms": ms,
-            }
-        except Exception as e:
-            ms = int((time.perf_counter() - t0) * 1000)
-            return {
-                "type": "InferenceFailedEvent",
-                "channel_id": channel_id,
-                "camera_uuid": camera_uuid,
-                "model_id": self.model_id,
-                "frame_ts_ms": frame_ts_ms,
-                "frame_seq": frame_seq,
-                "reason": "{}: {} (after {} ms)".format(type(e).__name__, e, ms),
-            }
 
     def _fail_event(self, meta: Dict, reason: str) -> Dict:
         return {

@@ -1,5 +1,4 @@
-# env_utils.py  (Python 3.6)
-"""Environment parsing shared by discovery.py and service.py.
+"""Environment parsing shared by discovery and detection.
 
 Every getter is total: a malformed value falls back to the default rather than
 raising, because a typo in .env must not stop the Jetson from booting.
@@ -16,7 +15,7 @@ def env_str(name, default=""):
 def env_int(name, default, minimum=None, maximum=None):
     try:
         v = int(env_str(name, str(default)))
-    except Exception:
+    except (TypeError, ValueError):
         v = int(default)
     if minimum is not None:
         v = max(minimum, v)
@@ -28,7 +27,7 @@ def env_int(name, default, minimum=None, maximum=None):
 def env_float(name, default, minimum=None):
     try:
         v = float(env_str(name, str(default)))
-    except Exception:
+    except (TypeError, ValueError):
         v = float(default)
     if minimum is not None:
         v = max(minimum, v)

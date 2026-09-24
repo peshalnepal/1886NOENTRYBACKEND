@@ -43,8 +43,8 @@ class VideoChannelConfig(object):
         decode_backend="gstreamer",  # "gstreamer" or "opencv"
         resize=None,                # (width, height) or None
         reconnect_base_ms=1000,
-        reconnect_max_ms=8000,
-        gst_latency_ms=5,
+        reconnect_max_ms=30000,
+        gst_latency_ms=200,
         rtsp_transport="tcp",       # "tcp" or "udp"
         gst_decoder="nvv4l2decoder", # Jetson HW decode; fallback happens in code
         **_ignored

@@ -5,10 +5,7 @@ from typing import Any, Dict
 
 from flask import request
 
-try:
-    from routes.runtime_ref import get_runtime
-except Exception:
-    from .runtime_ref import get_runtime
+from .runtime_ref import get_runtime
 
 
 def json_body() -> Dict[str, Any]:

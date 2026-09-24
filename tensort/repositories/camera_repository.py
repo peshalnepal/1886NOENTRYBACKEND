@@ -17,14 +17,12 @@ from typing import Any, Dict, List
 
 from sqlalchemy import select
 
-try:
-    # Script mode (python main.py from Backend/tensort)
-    from database import db_manager, AsyncSessionLocal
-    from database_orm import CameraConfig
-except Exception:
-    # Package mode (python -m Backend.tensort.main)
+if "." in __package__:
     from ..database import db_manager, AsyncSessionLocal
     from ..database_orm import CameraConfig
+else:
+    from database import db_manager, AsyncSessionLocal
+    from database_orm import CameraConfig
 
 logger = logging.getLogger(__name__)
 

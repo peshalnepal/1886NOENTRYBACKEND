@@ -67,11 +67,21 @@ class DatabaseManager:
         try:
             self._migrate_rtsp_url_to_source_url()
             Base.metadata.create_all(bind=self.sync_engine)
+            self._migrate_frame_verification()
             logger.info("Database tables created/verified successfully")
             return True
         except Exception as e:
             logger.exception("Failed to create database tables: %s", e)
             return False
+
+    def _migrate_frame_verification(self):
+        """Preserve legacy rows as unverified until the first decoded frame."""
+        if __package__:
+            from .schema_migrations import ensure_frame_verification_column
+        else:
+            from schema_migrations import ensure_frame_verification_column
+        with self.sync_engine.begin() as conn:
+            ensure_frame_verification_column(conn)
 
     def _migrate_rtsp_url_to_source_url(self):
         """Rename the legacy camera_configs.rtsp_url column to source_url.

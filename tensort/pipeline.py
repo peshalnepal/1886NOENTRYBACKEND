@@ -1,41 +1,29 @@
-# pipeline.py
-#
-# Frame path: capture thread (one per camera) -> event loop -> FramePool ->
-# dispatcher -> inference worker thread (TensorRT) -> Broadcaster -> SSE.
-#
-# Design points that matter:
-#  * FramePool is a SHARED pool with one FIFO deque per camera. Cameras add
-#    frames asynchronously; a batch is drawn from whatever is pooled, so the
-#    GPU never waits for a slow camera and one camera may contribute several
-#    frames when others are quiet. Overload is shed inside the pool, per
-#    camera, so a spike never blanks every camera at once.
-#  * The dispatcher waits for a free worker slot BEFORE drawing a batch. This
-#    is what keeps the pool (not the dispatcher) in charge of what to drop.
-#  * One periodic sweeper times out stuck frames instead of one watchdog task
-#    per frame, and a result that lands after its timeout is still delivered
-#    rather than discarded.
-#  * Detection results are handled synchronously on the loop; only the JPEG
-#    snapshot encode is offloaded to an executor.
-#
-# See ARCHITECTURE.md in this directory for the full walkthrough.
+"""Connect camera capture to ordered detection, result caching, and SSE.
+
+The asyncio loop owns channels, frame queues, and result callbacks. CUDA runs on
+a dedicated worker thread; JPEG encoding has its own bounded executor.
+See README.md for the full flow and ARCHITECTURE.md for tuning details.
+"""
 
 import asyncio
-import collections
 import logging
 import re
-import threading
-import queue
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
-try:
-    from channels.channel import VideoChannel
-    from limits import CameraCapacityError, camera_limit
-except ImportError:
+if __package__:
     from .channels.channel import VideoChannel
+    from .env_utils import env_bool, env_float, env_int
+    from .frame_pool import FramePool as FramePool
+    from .inference_worker import InferenceWorker as InferenceWorker, InferenceWorkerPool
     from .limits import CameraCapacityError, camera_limit
+else:
+    from channels.channel import VideoChannel
+    from env_utils import env_bool, env_float, env_int
+    from frame_pool import FramePool as FramePool
+    from inference_worker import InferenceWorker as InferenceWorker, InferenceWorkerPool
+    from limits import CameraCapacityError, camera_limit
 
 logger = logging.getLogger(__name__)
 
@@ -65,29 +53,6 @@ def _encode_jpeg_bytes(frame_bgr, *, max_edge: int = 960, jpeg_quality: int = 75
         return encoded.tobytes()
     except Exception:
         return None
-
-
-def _env_int(name: str, default: int, minimum: int = 0) -> int:
-    try:
-        v = int(os.getenv(name, str(default)))
-    except Exception:
-        v = int(default)
-    return max(minimum, v)
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
-    try:
-        value = float(os.getenv(name, str(default)))
-    except Exception:
-        value = float(default)
-    return max(float(minimum), float(value))
 
 
 def _detect_total_memory_mb() -> Optional[int]:
@@ -152,398 +117,6 @@ class Broadcaster:
 
 
 # ---------------------------------------------------------------------------
-# FramePool — shared, fair, multi-frame-per-camera staging for batching
-# ---------------------------------------------------------------------------
-
-class FramePool(object):
-    """
-    Shared pool of pending frames, one FIFO deque per camera.
-
-    Replaces the old CoalescingBuffer (which kept exactly ONE frame per camera
-    and therefore could never fill a 10-wide batch: batch fullness was bounded
-    by how many DISTINCT cameras happened to produce a frame inside the linger
-    window). Here cameras push frames in asynchronously and a batch is drawn
-    from whatever is pooled, so one camera can contribute several frames when
-    others are quiet — the GPU never idles waiting for a slow camera.
-
-    Eviction when the pool is full:
-      1. Frames older than `max_age_s` are always dropped (stale frames are
-         worse than useless — the tracker rejects out-of-date boxes).
-      2. Otherwise the camera holding the MOST frames loses its OLDEST frame.
-         That is the fairness rule: a fast camera that has hogged the pool pays
-         for a new camera's frame, not the quiet cameras.
-      3. If every camera holds exactly one frame there is no over-represented
-         camera to charge, so the globally oldest frame is dropped.
-
-    All access is from the single asyncio event-loop thread — no locks needed.
-    Per-camera FIFO order is load-bearing: the cloud tracker discards
-    out-of-order frame_seq, so frames of one camera must stay ordered from
-    pool -> batch -> future resolution.
-    """
-
-    def __init__(self, capacity=30, max_age_s=0.7):
-        self._frames = {}                 # camera_key -> deque[RTSPEvent]
-        self._total = 0
-        self._capacity = max(1, int(capacity))
-        self._max_age_s = max(0.0, float(max_age_s))
-        self._data_evt = asyncio.Event()
-        self.evicted_total = 0
-        self.expired_total = 0
-
-    # -- internals ----------------------------------------------------------
-
-    def _drop_expired(self):
-        """Drop frames older than max_age_s. Deques are FIFO so the head is the
-        oldest — stop scanning a camera as soon as its head is fresh."""
-        if self._max_age_s <= 0.0 or self._total == 0:
-            return
-        cutoff_ms = (time.time() - self._max_age_s) * 1000.0
-        for dq in self._frames.values():
-            while dq and float(dq[0].ts_ms) < cutoff_ms:
-                dq.popleft()
-                self._total -= 1
-                self.expired_total += 1
-
-    def _evict_one(self):
-        """Free exactly one slot using the fairness rule above."""
-        victim_key = None
-        victim_len = 0
-        victim_ts = 0.0
-        for key, dq in self._frames.items():
-            if not dq:
-                continue
-            head_ts = float(dq[0].ts_ms)
-            # Most frames wins; tie-break on the oldest head so eviction is
-            # deterministic rather than dict-iteration-order dependent.
-            if victim_key is None or len(dq) > victim_len or (len(dq) == victim_len and head_ts < victim_ts):
-                victim_key = key
-                victim_len = len(dq)
-                victim_ts = head_ts
-
-        if victim_key is None:
-            return
-
-        # When every camera holds exactly one frame the scan above degenerates
-        # to "oldest head wins", which is exactly the desired fallback: nobody
-        # is over-represented, so the globally oldest frame is the one to drop.
-        self._frames[victim_key].popleft()
-        self._total -= 1
-        self.evicted_total += 1
-
-    # -- producer side ------------------------------------------------------
-
-    def put(self, ev):
-        """Add one frame. Called from the event loop (capture thread -> loop)."""
-        self._drop_expired()
-        if self._total >= self._capacity:
-            self._evict_one()
-
-        key = str(ev.camera_uuid)
-        dq = self._frames.get(key)
-        if dq is None:
-            # A newly added camera starts contributing immediately — no
-            # scheduler registration, no rebalancing step.
-            dq = collections.deque()
-            self._frames[key] = dq
-        dq.append(ev)
-        self._total += 1
-        self._data_evt.set()
-
-    def discard_camera(self, camera_key):
-        dq = self._frames.pop(str(camera_key), None)
-        if dq:
-            self._total -= len(dq)
-
-    # -- consumer side ------------------------------------------------------
-
-    async def get_batch(self, max_n, linger_s=0.0):
-        """
-        Draw up to `max_n` frames, round-robin across cameras, oldest first.
-
-        Never waits for all cameras: it returns whatever is pooled. The linger
-        is a small top-up window used ONLY when the pool is underfilled (idle or
-        cold start); in steady state the pool has already accumulated frames
-        while the GPU was busy with the previous batch, so batches self-fill.
-        """
-        max_n = max(1, int(max_n))
-
-        while True:
-            self._drop_expired()
-            if self._total > 0:
-                break
-            self._data_evt.clear()
-            await self._data_evt.wait()
-
-        if self._total < max_n and linger_s > 0.0:
-            await asyncio.sleep(linger_s)
-            self._drop_expired()
-
-        # Round-robin: every camera with pending frames contributes one frame
-        # before any camera contributes a second. This is what makes per-camera
-        # detection FPS equal under load instead of first-come-first-served.
-        evs = []
-        while len(evs) < max_n:
-            ready = [k for k, dq in self._frames.items() if dq]
-            if not ready:
-                break
-            ready.sort(key=lambda k: self._frames[k][0].ts_ms)
-            for key in ready:
-                if len(evs) >= max_n:
-                    break
-                evs.append(self._frames[key].popleft())
-                self._total -= 1
-
-        # Drop entries for cameras that are now empty, so a long-running service
-        # that cycles through many cameras does not keep scanning dead keys.
-        if self._total == 0:
-            self._frames.clear()
-
-        return evs
-
-    def depth(self):
-        return self._total
-
-
-# ---------------------------------------------------------------------------
-# Inference worker: owns the CUDA context
-# ---------------------------------------------------------------------------
-
-class InferenceWorker(object):
-    """
-    One dedicated inference thread owning its own CUDA context + TRT engines.
-    Never share across threads.
-    """
-    def __init__(self, loop, worker_id=0, max_q=1, ready_cb=None, late_result_cb=None):
-        self._loop = loop
-        self._worker_id = int(worker_id)
-        # Queue holds whole BATCH JOBS (each a list of (bgr, meta, fut)).
-        # Depth 1 = one batch executing + one queued. The dispatcher waits for
-        # capacity BEFORE drawing frames, so surplus load is shed inside the
-        # FramePool (fairly, newest-first) instead of being dropped here.
-        self._q = queue.Queue(maxsize=max(1, int(max_q)))
-        self._ready_cb = ready_cb
-        self._late_result_cb = late_result_cb
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="trt-infer-worker-{}".format(worker_id),
-            daemon=True,
-        )
-        self._infer = None
-        self.initialized = threading.Event()
-        self.init_error = None
-        self._thread.start()
-
-    def submit_job(self, job):
-        """job: list of (bgr, meta, fut). Returns False if the queue is full."""
-        try:
-            self._q.put_nowait(job)
-            return True
-        except queue.Full:
-            return False
-
-    def stop(self):
-        self._stop.set()
-        try:
-            self._q.put_nowait(None)
-        except Exception:
-            pass
-
-    def join(self, timeout=2.0):
-        try:
-            self._thread.join(timeout)
-        except Exception:
-            pass
-
-    def _fail_result(self, meta, reason):
-        return {
-            "type": "InferenceFailedEvent",
-            "camera_uuid": str(meta.get("camera_uuid", "unknown")),
-            "frame_ts_ms": int(meta.get("frame_ts_ms", 0)),
-            "frame_seq": int(meta.get("frame_seq", 0)),
-            "reason": reason,
-        }
-
-    def _run(self):
-        try:
-            if __package__:
-                from .trt_infer import build_default
-            else:
-                from trt_infer import build_default
-            self._infer = build_default()
-            eng_max = int(getattr(self._infer, "max_batch", 1))
-            logger.info(
-                "[worker-%d] TRTInfer ready (engine_max_batch=%d)",
-                self._worker_id, eng_max,
-            )
-            if eng_max <= 1:
-                logger.warning(
-                    "[worker-%d] engine max_batch=1 — NOT a dynamic-batch engine; "
-                    "batches will be split to 1 frame each. Re-export a dynamic "
-                    "engine (see .env.example) for real batching.",
-                    self._worker_id,
-                )
-        except Exception as e:
-            logger.exception("[worker-%d] Failed to init TRT: %s", self._worker_id, e)
-            self.init_error = "{}: {}".format(type(e).__name__, e)
-            self._infer = None
-        finally:
-            self.initialized.set()
-
-        try:
-            self._process_jobs()
-        finally:
-            if self._infer is not None:
-                try:
-                    self._infer.close()
-                except Exception:
-                    logger.exception("Failed to release inference worker resources")
-                self._infer = None
-
-    def _process_jobs(self):
-        while not self._stop.is_set():
-            try:
-                job = self._q.get(timeout=0.05)
-            except queue.Empty:
-                continue
-
-            # A slot just freed up — tell the dispatcher it may draw the next
-            # batch while this one runs on the GPU.
-            if self._ready_cb is not None:
-                try:
-                    self._loop.call_soon_threadsafe(self._ready_cb)
-                except Exception:
-                    pass
-
-            if job is None:        # stop sentinel
-                continue
-
-            # job is an already-assembled batch: [(bgr, meta, fut), ...]
-            bgrs = [it[0] for it in job]
-            metas = [it[1] for it in job]
-            futs = [it[2] for it in job]
-
-            if self._infer is None:
-                results = [self._fail_result(m, "TRT inference not initialized") for m in metas]
-            else:
-                try:
-                    results = self._infer.infer_multitask_batch(bgrs, metas)
-                except Exception as e:
-                    reason = "{}: {}".format(type(e).__name__, e)
-                    results = [self._fail_result(m, reason) for m in metas]
-
-            for fut, res, meta in zip(futs, results, metas):
-                self._loop.call_soon_threadsafe(self._deliver_result, fut, res, meta)
-
-    def _deliver_result(self, fut, res, meta):
-        """
-        Resolve the frame's future, or salvage a late result.
-
-        The sweeper may already have timed this frame out. Discarding the real
-        result in that case (as the old code did) threw away completed GPU work
-        and left the camera with a gap — a direct cause of detections blinking
-        out. If the detections did arrive, hand them to the pipeline anyway.
-        """
-        try:
-            if not fut.done():
-                fut.set_result(res)
-                return
-        except Exception:
-            return
-
-        if self._late_result_cb is None:
-            return
-        if not isinstance(res, dict) or res.get("type") == "InferenceFailedEvent":
-            return
-        try:
-            self._late_result_cb(res, meta)
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Worker queue and readiness
-# ---------------------------------------------------------------------------
-
-class InferenceWorkerPool(object):
-    """
-    Wraps N InferenceWorker threads.
-
-    Batches are already assembled (cross-camera) by the dispatcher, so whole
-    batch jobs are round-robined across workers. On a single GPU one worker is
-    usually best (multiple CUDA contexts time-slice the GPU); extra workers only
-    help if batches arrive faster than one worker can drain them.
-    """
-    def __init__(self, loop, num_workers, max_q_per_worker=1, ready_cb=None, late_result_cb=None):
-        self._loop = loop
-        self._max_q_per_worker = max_q_per_worker
-        self._ready_cb = ready_cb
-        self._late_result_cb = late_result_cb
-        self._workers = []
-        self._rr = 0
-        self.ensure_size(num_workers)
-
-    def ensure_size(self, num_workers):
-        target = max(1, int(num_workers))
-        current = len(self._workers)
-        if target <= current:
-            return current
-        for i in range(current, target):
-            self._workers.append(
-                InferenceWorker(
-                    self._loop,
-                    worker_id=i,
-                    max_q=self._max_q_per_worker,
-                    ready_cb=self._ready_cb,
-                    late_result_cb=self._late_result_cb,
-                )
-            )
-        logger.info("InferenceWorkerPool: %d workers", len(self._workers))
-        return len(self._workers)
-
-    def has_capacity(self):
-        """True if at least one worker can accept a batch right now."""
-        for w in self._workers:
-            if not w._q.full():
-                return True
-        return False
-
-    async def wait_ready(self, timeout_s=60.0):
-        deadline = asyncio.get_event_loop().time() + timeout_s
-        while not all(w.initialized.is_set() for w in self._workers):
-            if asyncio.get_event_loop().time() >= deadline:
-                raise RuntimeError("TensorRT initialization timed out")
-            await asyncio.sleep(0.05)
-        errors = [w.init_error for w in self._workers if w.init_error]
-        if errors:
-            raise RuntimeError("TensorRT initialization failed: " + "; ".join(errors))
-        return min(w._infer.max_batch for w in self._workers)
-
-    def submit_batch(self, job):
-        """
-        Hand a whole batch job to a worker (round-robin). Tries every worker
-        once; returns False only if all worker queues are full.
-        """
-        n = len(self._workers)
-        if n == 0:
-            return False
-        for off in range(n):
-            w = self._workers[(self._rr + off) % n]
-            if w.submit_job(job):
-                self._rr = (self._rr + off + 1) % n
-                return True
-        return False
-
-    def stop(self):
-        for w in self._workers:
-            w.stop()
-
-    def join(self, timeout=2.0):
-        for w in self._workers:
-            w.join(timeout)
-
-
-# ---------------------------------------------------------------------------
 # Camera lifecycle and inference dispatch
 # ---------------------------------------------------------------------------
 
@@ -552,16 +125,14 @@ class SimpleInferencePipeline(object):
         if infer_q_max is None:
             # Depth 1: one batch executing + one queued. Load is shed in the
             # FramePool, not here.
-            infer_q_max = _env_int("INFER_QUEUE_MAX", 1, minimum=1)
+            infer_q_max = env_int("INFER_QUEUE_MAX", 1, minimum=1)
 
         self._detected_mem_mb = _detect_total_memory_mb()
 
         # One ordered GPU queue avoids duplicate engines and cross-batch
         # reordering. Extra CUDA contexts do not add another GPU on an Orin.
-        if _env_int("INFER_NUM_WORKERS", 1) > 1:
+        if env_int("INFER_NUM_WORKERS", 1) > 1:
             logger.warning("Using one inference worker to preserve per-camera result order")
-        self._num_workers = 1
-        self._num_workers_max = 1
         self._max_cameras = camera_limit()
         self._engine_max_batch = 0
         self._lock = asyncio.Lock()
@@ -573,18 +144,19 @@ class SimpleInferencePipeline(object):
         self._channel_tasks = {}
         self._closing = False
         self._started = False
-        self._configured_max_batch = min(8, _env_int("INFER_MAX_BATCH", 8, minimum=1))
+        self._configured_max_batch = min(self._max_cameras,
+                                         env_int("INFER_MAX_BATCH", self._max_cameras, minimum=1))
         self._max_batch = self._configured_max_batch
         # Top-up window used only when the pool is underfilled (idle/cold start).
-        self._batch_linger_s = _env_float("INFER_BATCH_LINGER_MS", 10.0, minimum=0.0) / 1000.0
+        self._batch_linger_s = env_float("INFER_BATCH_LINGER_MS", 10.0, minimum=0.0) / 1000.0
 
         # Pool holds a few batches' worth of frames so a camera can contribute
         # more than one frame when others are quiet. Frames older than
         # FRAME_MAX_AGE_MS are dropped rather than inferred — a stale detection
         # is rejected by the tracker anyway and costs a GPU slot.
-        self._frame_max_age_s = _env_float("FRAME_MAX_AGE_MS", 700.0, minimum=0.0) / 1000.0
+        self._frame_max_age_s = env_float("FRAME_MAX_AGE_MS", 700.0, minimum=0.0) / 1000.0
         self._buffer = FramePool(
-            capacity=_env_int("FRAME_POOL_CAP", self._max_batch * 2, minimum=self._max_cameras),
+            capacity=env_int("FRAME_POOL_CAP", self._max_batch * 2, minimum=self._max_cameras),
             max_age_s=self._frame_max_age_s,
         )
 
@@ -597,25 +169,25 @@ class SimpleInferencePipeline(object):
         self._snapshot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snapshot")
         self._camera_metrics = {}
         self._channel_generation = {}
-        self._snapshot_enabled = _env_bool("ENABLE_SNAPSHOT_CACHE", True)
-        self._snapshot_min_interval_ms = _env_int("SNAPSHOT_MIN_INTERVAL_MS", 1000, minimum=0)
-        self._snapshot_max_edge = _env_int("SNAPSHOT_MAX_EDGE", 640, minimum=64)
-        self._snapshot_jpeg_quality = min(100, _env_int("SNAPSHOT_JPEG_QUALITY", 65, minimum=1))
-        self._snapshot_on_detection_only = _env_bool("SNAPSHOT_ON_DETECTION_ONLY", True)    # matches .env.example SNAPSHOT_ON_DETECTION_ONLY=true
+        self._snapshot_enabled = env_bool("ENABLE_SNAPSHOT_CACHE", True)
+        self._snapshot_min_interval_ms = env_int("SNAPSHOT_MIN_INTERVAL_MS", 1000, minimum=0)
+        self._snapshot_max_edge = env_int("SNAPSHOT_MAX_EDGE", 640, minimum=64)
+        self._snapshot_jpeg_quality = min(100, env_int("SNAPSHOT_JPEG_QUALITY", 65, minimum=1))
+        self._snapshot_on_detection_only = env_bool("SNAPSHOT_ON_DETECTION_ONLY", True)    # matches .env.example SNAPSHOT_ON_DETECTION_ONLY=true
         # The cloud tracker ages tracks by frame arrival: it must see the frames
         # where an object is absent, otherwise a disappearance looks like a
         # stalled stream and tracks coast instead of expiring.
-        self._emit_empty_detections = _env_bool("EMIT_EMPTY_DETECTIONS", True)
+        self._emit_empty_detections = env_bool("EMIT_EMPTY_DETECTIONS", True)
         # Failed/timed-out frames carry no detections. Forwarding them makes the
         # tracker treat a transient GPU hiccup as "everything vanished", so they
         # are logged and counted but not broadcast by default.
-        self._emit_failed_events = _env_bool("EMIT_FAILED_EVENTS", False)
+        self._emit_failed_events = env_bool("EMIT_FAILED_EVENTS", False)
         # Leak guard, not a latency knob: a timed-out frame is no longer thrown
         # away (the worker still delivers a late result), so this can be
         # generous. The old memory-scaled 1.5s on an 8GB Orin Nano was tight
         # enough to time out frames the GPU was about to return.
-        self._infer_result_timeout_s = _env_float("INFER_RESULT_TIMEOUT_S", 3.0, minimum=0.0)
-        self._infer_error_log_interval_s = _env_float("INFER_ERROR_LOG_INTERVAL_S", 10.0, minimum=0.0)
+        self._infer_result_timeout_s = env_float("INFER_RESULT_TIMEOUT_S", 3.0, minimum=0.0)
+        self._infer_error_log_interval_s = env_float("INFER_ERROR_LOG_INTERVAL_S", 10.0, minimum=0.0)
         self._last_infer_error_sig = {}
         self._last_infer_error_ts = {}
 
@@ -639,11 +211,9 @@ class SimpleInferencePipeline(object):
         self._worker_free_evt.set()
 
         logger.info(
-            "[pipeline] config mem_total_mb=%s workers=%s worker_cap=%d infer_timeout_s=%.2f "
+            "[pipeline] config mem_total_mb=%s workers=1 infer_timeout_s=%.2f "
             "max_batch=%d batch_linger_ms=%d pool_cap=%d frame_max_age_ms=%d",
             self._detected_mem_mb if self._detected_mem_mb is not None else "unknown",
-            "auto" if self._num_workers == 0 else int(self._num_workers),
-            int(self._num_workers_max),
             float(self._infer_result_timeout_s),
             int(self._max_batch),
             int(self._batch_linger_s * 1000),
@@ -735,13 +305,8 @@ class SimpleInferencePipeline(object):
 
             loop = asyncio.get_event_loop()
 
-            num_workers = self._num_workers
-            if num_workers == 0:
-                num_workers = min(max(1, len(self._channels)), self._num_workers_max)
-
             self._infer_pool = InferenceWorkerPool(
                 loop=loop,
-                num_workers=num_workers,
                 max_q_per_worker=self._infer_q_max,
                 ready_cb=self._worker_free_evt.set,
                 late_result_cb=self._handle_result,
@@ -754,10 +319,8 @@ class SimpleInferencePipeline(object):
                 raise
             self._max_batch = min(self._configured_max_batch, self._engine_max_batch)
             logger.info(
-                "[pipeline] starting camera_count=%d worker_count=%d auto_workers=%s",
+                "[pipeline] starting camera_count=%d worker_count=1",
                 len(self._channels),
-                len(self._infer_pool._workers),
-                self._num_workers == 0,
             )
 
             self._inference_task = asyncio.ensure_future(self._pump_inference())
@@ -862,6 +425,51 @@ class SimpleInferencePipeline(object):
     # Inference dispatch — capacity-gated, never drops a whole batch
     # ------------------------------------------------------------------
     
+    def _prepare_frame_job(self, event, loop):
+        """Attach metadata and a completion callback to one captured frame."""
+        camera_uuid = str(event.camera_uuid)
+        bgr = getattr(event, "frame", None)
+        event.frame = None   # let the event be GC'd
+
+        if bgr is None:
+            self._stats["infer_fail"] += 1
+            if self._should_log_infer_failure(camera_uuid, "no frame data"):
+                logger.warning(
+                    "[pipeline] camera=%s produced an event with no frame",
+                    camera_uuid,
+                )
+            return None
+
+        meta = {
+            "camera_uuid": camera_uuid,
+            "channel_id": getattr(event, "channel_id", None),
+            "frame_ts_ms": int(event.ts_ms),
+            "frame_seq": int(event.seq),
+            "_bgr_ref": bgr,
+            "_generation": self._channel_generation.get(camera_uuid),
+        }
+
+        fut = loop.create_future()
+        inflight_key = (camera_uuid, int(event.seq))
+        deadline = loop.time() + self._infer_result_timeout_s
+        self._inflight[inflight_key] = (fut, deadline)
+
+        # Each call owns its metadata, so callbacks cannot mix camera frames.
+        def on_done(completed):
+            if self._inflight.get(inflight_key, (None,))[0] is completed:
+                self._inflight.pop(inflight_key, None)
+            if completed.cancelled():
+                meta.pop("_bgr_ref", None)
+                return
+            try:
+                self._handle_result(completed.result(), meta)
+            except Exception:
+                logger.exception("[pipeline] result handler failed")
+
+        fut.add_done_callback(on_done)
+
+        return bgr, meta, fut
+
     async def _pump_inference(self):
         """
         Draw a batch from the FramePool and hand it to a worker.
@@ -898,52 +506,11 @@ class SimpleInferencePipeline(object):
 
                 self._stats["frames_in"] += len(events)
 
-                job = []   # [(bgr, meta, fut), ...]
-                for rtsp_ev in events:
-                    camera_uuid_str = str(rtsp_ev.camera_uuid)
-                    bgr = getattr(rtsp_ev, "frame", None)
-                    rtsp_ev.frame = None   # let the event be GC'd
-
-                    if bgr is None:
-                        self._stats["infer_fail"] += 1
-                        if self._should_log_infer_failure(camera_uuid_str, "no frame data"):
-                            logger.warning(
-                                "[pipeline] camera=%s produced an event with no frame",
-                                camera_uuid_str,
-                            )
-                        continue
-
-                    meta = {
-                        "camera_uuid": camera_uuid_str,
-                        "channel_id": getattr(rtsp_ev, "channel_id", None),
-                        "frame_ts_ms": int(rtsp_ev.ts_ms),
-                        "frame_seq": int(rtsp_ev.seq),
-                        "_bgr_ref": bgr,
-                        "_ts_ms": int(rtsp_ev.ts_ms),
-                        "_generation": self._channel_generation.get(camera_uuid_str),
-                    }
-
-                    fut = loop.create_future()
-                    inflight_key = (camera_uuid_str, int(rtsp_ev.seq))
-                    deadline = loop.time() + self._infer_result_timeout_s
-                    self._inflight[inflight_key] = (fut, deadline)
-
-                    # Resolve inline: _handle_result is synchronous, so a frame
-                    # costs no extra event-loop task (the old code spawned two
-                    # per frame — ~240 tasks/s at 10 cameras).
-                    def _on_done(f, _meta=meta, _key=inflight_key):
-                        if self._inflight.get(_key, (None,))[0] is f:
-                            self._inflight.pop(_key, None)
-                        if f.cancelled():
-                            _meta.pop("_bgr_ref", None)
-                            return
-                        try:
-                            self._handle_result(f.result(), _meta)
-                        except Exception:
-                            logger.exception("[pipeline] result handler failed")
-                    fut.add_done_callback(_on_done)
-
-                    job.append((bgr, meta, fut))
+                job = []
+                for event in events:
+                    frame_job = self._prepare_frame_job(event, loop)
+                    if frame_job is not None:
+                        job.append(frame_job)
 
                 if not job:
                     continue
@@ -1020,7 +587,7 @@ class SimpleInferencePipeline(object):
         if self._closing or ("_generation" in meta and
                 self._channel_generation.get(camera_uuid) is not meta["_generation"]):
             return
-        ts_ms = int(meta.get("_ts_ms", 0))
+        ts_ms = int(meta.get("frame_ts_ms", 0))
         frame_seq = int(meta.get("frame_seq", 0))
 
         failed = isinstance(result, dict) and result.get("type") == "InferenceFailedEvent"
@@ -1109,8 +676,8 @@ class SimpleInferencePipeline(object):
             "frame_max_age_ms": int(self._frame_max_age_s * 1000),
             "inflight_count": len(self._inflight),
             "num_workers": len(self._infer_pool._workers) if self._infer_pool else 0,
-            "workers_auto": self._num_workers == 0,
-            "worker_cap": int(self._num_workers_max),
+            "workers_auto": False,
+            "worker_cap": 1,
             "max_batch": int(self._max_batch),
             "configured_max_batch": self._configured_max_batch,
             "engine_max_batch": self._engine_max_batch,
