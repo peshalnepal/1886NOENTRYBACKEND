@@ -805,6 +805,8 @@ class DetectionItemOut(BaseModel):
     conf: float
     box_norm: Optional[BoxNorm] = None
     track_id: Optional[int] = None
+    coast_remaining_s: Optional[float] = None
+    display_max_s: Optional[float] = None
 
 
 class DetectionOut(BaseModel):

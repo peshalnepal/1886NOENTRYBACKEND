@@ -85,7 +85,7 @@ def _sanitize_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, Any
     if not detections:
         return []
     clean: List[Dict[str, Any]] = []
-    for d in detections:
+    for index, d in enumerate(detections):
         if not isinstance(d, dict) or "bbox" not in d:
             continue
         try:
@@ -107,6 +107,7 @@ def _sanitize_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, Any
             conf = 0.0
         conf = max(0.0, min(1.0, conf))
         clean.append({
+            "detection_index": d.get("detection_index", index),
             "bbox": np.array([x1, y1, x2, y2], dtype=np.float32),
             "cls_name": str(d.get("cls_name", "unknown")),
             "conf": conf,
@@ -268,6 +269,9 @@ class Track:
     hits: int = 1
     misses: int = 0
     confirmed: bool = False
+    detection_index: Optional[int] = None
+    # Unknown motion gets a short display lifetime until the second observation.
+    display_max_s: float = 0.25
 
     # Confidence-weighted votes per label; cls_name follows the running winner
     # rather than whichever label the first frame carried.
@@ -311,6 +315,12 @@ class Track:
             (new[3] - old[3]) / elapsed,
         ], dtype=np.float32)
         self.vel = alpha * self.vel + (1.0 - alpha) * new_vel
+        # Limit how long a displayed box may stand in for this observation.
+        # Use the faster of recent and smoothed motion to react to acceleration.
+        speed = max(float(np.hypot(*new_vel[:2])), float(np.hypot(*self.vel[:2])))
+        speed += 0.5 * max(abs(float(new_vel[2])), abs(float(self.vel[2])))
+        box_size = max(1.0, min(float(det_bbox[2] - det_bbox[0]), float(new[3])))
+        self.display_max_s = min(3.0, 0.25 * box_size / max(speed, 1e-6))
         self.bbox = det_bbox
         self.score = float(det_score)
         self.last_ts = now_ts
@@ -329,9 +339,8 @@ class ByteTrackLite:
     dedicated pipeline, ~0.1-0.25 FPS when one Jetson round-robins 20 cameras —
     so every time-based threshold self-tunes to the observed interval.
 
-    NOTE: low_th must stay at or above the edge's CONF filter (see
-    Backend/tensort/.env.example), or the stage-2 rescue band is empty and a
-    briefly-dimmer detection drops the track instead of re-linking it.
+    The edge must deliver scores below high_th for low-confidence rescue.
+    Its CONF filter should be <= low_th so the whole rescue band reaches us.
     """
     def __init__(
         self,
@@ -346,14 +355,16 @@ class ByteTrackLite:
         stale_frames: float = 8.0,
         predict_horizon_frames: float = 1.5,
         match_same_class: bool = True,
-        emit_coasting_tracks: bool = False,
+        emit_coasting_tracks: bool = True,
         assoc_center_dist: bool = True,
         assoc_dist_scale: float = 2.5,
-        assoc_dist_min_interval: float = 0.25,
+        assoc_dist_min_interval: float = 0.25,  # gap where the distance gate reaches full size
         assoc_dist_per_s: float = 1.5,      # gate widens with time to move
         assoc_dist_max_scale: float = 12.0, # ceiling, or it links unrelated objects
         dedupe_overlap: float = 0.70,       # 0 disables dedupe
         dedupe_size_ratio: float = 0.65,
+        coast_max_misses: int = 2,
+        coast_max_s: float = 0.5,
     ) -> None:
         self.high_th = float(high_th)
         self.low_th = float(low_th)
@@ -368,8 +379,10 @@ class ByteTrackLite:
         self.predict_horizon_frames = float(predict_horizon_frames)
         self.match_same_class = bool(match_same_class)
         self.emit_coasting_tracks = bool(emit_coasting_tracks)
-        # Rescues low FPS, where an object moves more than its own size between
-        # frames and IoU alone spawns a new id every frame.
+        self.coast_max_misses = max(0, int(coast_max_misses))
+        self.coast_max_s = max(0.0, float(coast_max_s))
+        # Distance rescue also lets new tracks learn velocity when their
+        # first two boxes do not overlap enough. The gate grows with the gap.
         self.assoc_center_dist = bool(assoc_center_dist)
         self.assoc_dist_scale = float(assoc_dist_scale)
         self.assoc_dist_min_interval = float(assoc_dist_min_interval)
@@ -459,12 +472,7 @@ class ByteTrackLite:
         matched_track_idxs: set = set()
         live_track_ids: set[int] = set()
 
-        use_dist = self.assoc_center_dist and self._frame_interval() >= self.assoc_dist_min_interval
-        # cost:  IoU [0, 1-min_iou) | distance [1, 1.5) | forbidden 1e6
-        #
-        # _ACCEPT must stay at the TOP of the distance band so the gate is the
-        # only rejection test; lower it and pairings the gate admitted are
-        # silently discarded, narrowing the effective gate.
+        use_dist = self.assoc_center_dist
         _ACCEPT = 1.5
 
         def _match(track_idxs, det_idxs, det_list, min_iou):
@@ -481,6 +489,7 @@ class ByteTrackLite:
                 pcx = 0.5 * (float(pb[0]) + float(pb[2]))
                 pcy = 0.5 * (float(pb[1]) + float(pb[3]))
                 ph = float(pb[3]) - float(pb[1])
+                pw = float(pb[2]) - float(pb[0])
                 # A track coasting through misses had longer to move, so it
                 # earns a proportionally wider gate below.
                 gap_s = max(0.0, now_ts - t.last_ts)
@@ -501,18 +510,21 @@ class ByteTrackLite:
                     dcy = 0.5 * (float(db[1]) + float(db[3]))
                     dw = float(db[2]) - float(db[0])
                     dh = float(db[3]) - float(db[1])
-                    if ph <= 0.0 or dh <= 0.0:
+                    if min(pw, ph, dw, dh) <= 0.0:
                         continue
-                    ratio = dh / ph
-                    if ratio < 0.5 or ratio > 2.0:                                        # very different scales
+                    if not (0.5 <= dh / ph <= 2.0 and 0.5 <= dw / pw <= 2.0):
                         continue
-                    # Size alone is not enough: the same car needs a ~200px gate
-                    # at 10 FPS and ~800px after a 4s round-robin gap.
-                    size = 0.5 * (dw + dh)
+                    # Use the smaller box so a large detection cannot widen
+                    # its own gate. Longer gaps allow more movement.
+                    size = 0.5 * min(dw + dh, pw + ph)
                     scale = min(
                         self.assoc_dist_scale + self.assoc_dist_per_s * gap_s,
                         self.assoc_dist_max_scale,
                     )
+                    # Short gaps get a smaller gate, never a disabled gate.
+                    # A cold track must match once before it can learn velocity.
+                    if self.assoc_dist_min_interval > 0.0:
+                        scale *= min(1.0, max(0.3, gap_s / self.assoc_dist_min_interval))
                     gate = size * scale
                     if gate <= 0.0:
                         continue
@@ -534,6 +546,7 @@ class ByteTrackLite:
             unmatched_hi.discard(dj)
             self._tracks[ti].vote_class(hi[dj]["cls_name"], float(hi[dj]["conf"]))
             self._tracks[ti].update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts)
+            self._tracks[ti].detection_index = hi[dj]["detection_index"]
             live_track_ids.add(self._tracks[ti].track_id)
 
         # ─── Stage 1b: tentative tracks ↔ remaining high-conf detections ───
@@ -543,6 +556,7 @@ class ByteTrackLite:
             t = self._tracks[ti]
             t.vote_class(hi[dj]["cls_name"], float(hi[dj]["conf"]))
             t.update(hi[dj]["bbox"], float(hi[dj]["conf"]), now_ts)
+            t.detection_index = hi[dj]["detection_index"]
             live_track_ids.add(t.track_id)
             if self._should_confirm(t, now_ts):
                 t.confirmed = True
@@ -558,6 +572,7 @@ class ByteTrackLite:
             was_confirmed = t.confirmed
             t.vote_class(lo[dj]["cls_name"], float(lo[dj]["conf"]))
             t.update(lo[dj]["bbox"], float(lo[dj]["conf"]), now_ts)
+            t.detection_index = lo[dj]["detection_index"]
             live_track_ids.add(t.track_id)
             if (not was_confirmed) and self._should_confirm(t, now_ts):
                 t.confirmed = True
@@ -580,6 +595,7 @@ class ByteTrackLite:
                 score=float(d["conf"]),
                 start_ts=now_ts,
                 last_ts=now_ts,
+                detection_index=d["detection_index"],
             ))
             live_track_ids.add(tid)
             events.append(("track_created", tid))
@@ -588,23 +604,42 @@ class ByteTrackLite:
         # frame beside the new track of the object that jumped ahead.
         self._purge(now_ts)
 
-        # Coasting tracks keep their old bbox, so emitting them leaves a stale
-        # box behind a fast-moving object.
+        # Bridge brief detection gaps for display only. Keep the last measured
+        # bbox/time intact: velocity must be calculated from real observations.
         out_tracks = []
         for t in self._tracks:
-            if not self.emit_coasting_tracks and t.track_id not in live_track_ids:
-                continue
-            out_tracks.append({
+            coasting = t.track_id not in live_track_ids
+            bbox = t.bbox
+            elapsed = max(0.0, now_ts - t.last_ts)
+            coast_limit = min(self.coast_max_s, t.display_max_s)
+            if coasting:
+                if (not self.emit_coasting_tracks or not t.confirmed
+                        or t.misses > self.coast_max_misses
+                        or not 0.0 < elapsed < coast_limit):
+                    continue
+                bbox = t.predict(now_ts, min(max_track_dt, coast_limit))
+                # A current detection takes precedence over an overlapping
+                # prediction, even if it was too dim to match.
+                if any(_same_object_class(t.cls_name, d["cls_name"])
+                       and _iou(bbox, d["bbox"]) >= self.min_iou_low
+                       for d in detections):
+                    continue
+            item = {
                 "track_id": t.track_id,
                 "cls_name": t.cls_name,
                 "conf": t.score,
-                "bbox": t.bbox.tolist(),
+                "bbox": bbox.tolist(),
+                "detection_index": None if coasting else t.detection_index,
+                "display_max_s": max(0.0, t.display_max_s - elapsed),
                 "confirmed": t.confirmed,
                 "hits": t.hits,
                 "misses": t.misses,
                 "age_s": now_ts - t.start_ts,
                 "last_seen_s": now_ts - t.last_ts,
-            })
+            }
+            if coasting:
+                item["coast_remaining_s"] = coast_limit - elapsed
+            out_tracks.append(item)
         return {"events": events, "tracks": out_tracks}
 
 @dataclass(frozen=True)
@@ -839,6 +874,9 @@ class ROIAlertEngine:
             for t in tracks:
                 if not t.get("confirmed", False):
                     continue
+                # Predicted display boxes are not evidence of an ROI entry.
+                if t.get("misses", 0) > 0:
+                    continue
                 if roi.allowed_classes is not None and t["cls_name"] not in roi.allowed_classes:
                     continue
 
@@ -938,7 +976,7 @@ class MultiCameraByteTrack:
             ts_s = time.time()
 
         dets: List[Dict[str, Any]] = []
-        for d in ev.get("detections", []) or []:
+        for index, d in enumerate(ev.get("detections", []) or []):
             b = d.get("box") if isinstance(d, dict) else None
             if not isinstance(b, dict):
                 continue
@@ -947,6 +985,7 @@ class MultiCameraByteTrack:
             except (KeyError, TypeError, ValueError):
                 continue
             dets.append({
+                "detection_index": index,
                 "bbox": bbox,
                 "cls_name": str(d.get("cls_name", "unknown")),
                 "conf": float(d.get("conf", 0.0)),

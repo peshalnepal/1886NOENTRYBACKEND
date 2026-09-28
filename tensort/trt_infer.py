@@ -125,7 +125,7 @@ def preprocess(bgr: np.ndarray, imgsz: int) -> Tuple[np.ndarray, float, Tuple[in
     return x, r, (padx, pady)
 
 
-def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk: int = 100) -> List[int]:
+def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk: int = 100, class_ids=None) -> List[int]:
     if boxes is None or len(boxes) == 0:
         return []
 
@@ -154,7 +154,10 @@ def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk:
         h = np.maximum(0.0, yy2 - yy1 + 1.0)
         inter = w * h
         iou = inter / (areas[i] + areas[rest] - inter + eps)
-        order = rest[iou <= iou_thr]
+        suppress = iou > iou_thr
+        if class_ids is not None:
+            suppress &= class_ids[rest] == class_ids[i]
+        order = rest[~suppress]
 
     return keep
 
@@ -632,6 +635,7 @@ class YoloV8DetTRT(object):
 
         labels = [lab for lab, m in zip(labels, allowed_mask) if m]
         score = score[allowed_mask]
+        cls_id = cls_id[allowed_mask]
         boxes_xywh = boxes_xywh[:, allowed_mask]
 
         if boxes_xywh.size == 0:
@@ -644,7 +648,7 @@ class YoloV8DetTRT(object):
         y2 = y_c + h / 2
         boxes = np.stack([x1, y1, x2, y2], axis=1)
 
-        keep_idx = nms_xyxy(boxes, score, self.iou, topk=self.topk)
+        keep_idx = nms_xyxy(boxes, score, self.iou, topk=self.topk, class_ids=cls_id)
         out = []
         padding = np.array([padx, pady, padx, pady], dtype=np.float32)
         scale = max(r, 1e-9)

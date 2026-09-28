@@ -64,6 +64,8 @@ def resp_to_detection_out(resp: Any, *, normalize: bool) -> DetectionOut:
                 conf=float(d.get("conf") or 0.0),
                 box_norm=normalize_box_px(box, fw, fh) if normalize else None,
                 track_id=int(tid) if tid is not None else None,
+                coast_remaining_s=d.get("coast_remaining_s"),
+                display_max_s=d.get("display_max_s"),
             )
         )
 

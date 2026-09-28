@@ -156,6 +156,10 @@ class VideoChannel():
         self._pending_frame = None
         self._handoff_scheduled = False
         self._capture_backend = None
+        # Name of the GStreamer candidate that last delivered frames. Tried
+        # first on reconnect so a camera does not re-walk candidates that are
+        # known to fail for it (each costs a full probe window).
+        self._preferred_pipeline = None
         self._gstreamer_failures = {}
         self._connected = False
         self._handoff_dropped = 0
@@ -168,35 +172,14 @@ class VideoChannel():
         return url.split("://", 1)[0] if "://" in url else ""
 
     def _gst_appsink_tail(self, hw):
-        """Trailing convert+resize+appsink segment shared by every pipeline.
-
-        ``hw=True`` uses Jetson's nvvidconv (handles NVMM output from
-        nvv4l2decoder); ``hw=False`` uses CPU videoscale/videoconvert. Both end
-        in BGR frames for the OpenCV appsink. Resize matches the historical RTSP
-        behaviour (fixed WxH; aspect handled later by the TRT letterbox).
-        """
-        resize = self.config.resize
-        if hw:
-            if resize is not None:
-                w, h = resize
-                conv = (
-                    "nvvidconv interpolation-method=1 ! "
-                    "video/x-raw,width={w},height={h},format=BGRx ! "
-                ).format(w=int(w), h=int(h))
-            else:
-                conv = "nvvidconv ! video/x-raw,format=BGRx ! "
-        else:
-            if resize is not None:
-                w, h = resize
-                conv = "videoscale ! video/x-raw,width={w},height={h} ! ".format(
-                    w=int(w), h=int(h)
-                )
-            else:
-                conv = ""
+        """Decode at source dimensions; _maybe_resize preserves the aspect ratio."""
+        # Do not force width/height here: that stretches the image before
+        # _maybe_resize can inspect its original dimensions.
+        conv = "nvvidconv ! video/x-raw,format=BGRx ! " if hw else ""
         fps = Fraction(str(self.config.sample_fps)).limit_denominator(1000)
         rate = "videorate drop-only=true ! video/x-raw,framerate={}/{} ! ".format(fps.numerator, fps.denominator)
         # Limit CPU color conversion to the requested inference rate. Hardware
-        # scaling remains before videorate to bring NVMM into system memory.
+        # conversion remains before videorate to bring NVMM into system memory.
         prefix = conv + rate if hw else rate + conv
         return prefix + "videoconvert ! video/x-raw,format=BGR ! appsink drop=true sync=false max-buffers=1"
 
@@ -340,8 +323,12 @@ class VideoChannel():
                 probe_budget_s = float(os.getenv("CAPTURE_PROBE_S", "12"))
             except Exception:
                 probe_budget_s = 12.0
+            candidates = self._gst_candidates()
+            if self._preferred_pipeline is not None:
+                # Stable sort: the known-good pipeline first, the rest in order.
+                candidates.sort(key=lambda cand: cand[0] != self._preferred_pipeline)
             is_first = True
-            for name, gst in self._gst_candidates():
+            for name, gst in candidates:
                 # Check between candidates, not just inside the frame probe. A
                 # channel torn down mid-open would otherwise keep walking the
                 # whole ladder, holding the worker thread for the sum of every
@@ -362,6 +349,7 @@ class VideoChannel():
                 is_first = False
                 if cap is not None and cap.isOpened() and self._probe_first_frame(cap, probe_s):
                     self._capture_backend = name
+                    self._preferred_pipeline = name
                     logger.info(
                         "[%s] opened %s source via native GStreamer appsink pipeline=%s",
                         self.config.camera_uuid, scheme, name,
@@ -476,16 +464,14 @@ class VideoChannel():
     def _maybe_resize(self, frame):
         if self.config.resize is None:
             return frame
-        target_w, target_h = self.config.resize
-        fh, fw = frame.shape[:2]
-        # Maintain aspect ratio: scale to fit within target dimensions
-        scale = min(target_w / max(fw, 1), target_h / max(fh, 1))
-        if scale >= 1.0:
-            return frame  # don't upscale
-        new_w = int(round(fw * scale))
-        new_h = int(round(fh * scale))
-        return cv2.resize(frame, (new_w, new_h))
-    
+        h, w = frame.shape[:2]
+        max_w, max_h = self.config.resize
+        scale = min(max_w / w, max_h / h, 1.0)
+        if scale == 1.0:
+            return frame
+        size = (max(1, round(w * scale)), max(1, round(h * scale)))
+        return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+
     def _put_latest(self, ev):
         # if we're stopping, do not enqueue any new RTSPEvents
         if getattr(self, "_stopping", False) and ev is not _DONE:

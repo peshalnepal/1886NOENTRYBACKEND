@@ -105,6 +105,12 @@ def _normalize_overlay_detection(raw: Any) -> Optional[Dict[str, Any]]:
         "box": box,
     }
 
+    # Keep display deadlines intact through SSE serialization.
+    for key in ("coast_remaining_s", "display_max_s"):
+        value = src.get(key)
+        if value is not None:
+            out[key] = float(value)
+
     box_norm = _normalize_box_norm(src.get("box_norm"))
     if box_norm is not None:
         out["box_norm"] = box_norm

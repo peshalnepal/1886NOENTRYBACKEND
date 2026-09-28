@@ -103,21 +103,19 @@ def _humanize_item_detected(
 
 
 def _live_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Tracks that should actually be drawn on the live overlay.
+    """Measured tracks, plus confirmed predictions with a display budget.
 
-    Coasting tracks (kept alive for a few frames after they stop matching a
-    detection) have a pure velocity-extrapolated bbox, which trails stale ghost
-    boxes behind a fast object. Only confirmed tracks matched this frame are
-    drawn. Raw edge detections are drawn separately, so this never hides a real
-    object.
+    A tentative track can label an existing detection; confirmation is still
+    required for predicted boxes and ROI alerts.
     """
     out: List[Dict[str, Any]] = []
     for t in tracks:
-        if not isinstance(t, dict) or not t.get("confirmed", False):
+        if not isinstance(t, dict):
             continue
         try:
             if int(t.get("misses", 0) or 0) > 0:
-                continue
+                if not t.get("confirmed") or float(t.get("coast_remaining_s", 0)) <= 0:
+                    continue
         except (TypeError, ValueError):
             continue
         out.append(t)
@@ -134,7 +132,31 @@ def _overlay_payload_from_resp(
     tracked_bases: Set[Tuple[Any, ...]] = set()
     untracked_indexes: Dict[Tuple[Any, ...], int] = {}
 
-    for raw_detection in chain(resp.detections or (), fallback_detections or ()):
+    # The tracker supplies the original detection index. Replace that entry
+    # instead of appending a second box when its stabilized class differs.
+    measured = list(resp.detections or ())
+    matched_indices = {
+        t.get("track_id"): t.get("detection_index")
+        for t in resp.tracks or () if isinstance(t, dict) and not t.get("misses", 0)
+    }
+    extra = []
+    for track in fallback_detections or ():
+        index = track.get("detection_index") if isinstance(track, dict) else None
+        # ROI alerts carry a track ID but not the detection index.
+        if index is None and isinstance(track, dict):
+            index = matched_indices.get(track.get("track_id"))
+        if (isinstance(index, int) and 0 <= index < len(measured)
+                and isinstance(measured[index], dict)):
+            measured[index] = {
+                **measured[index],
+                "track_id": track["track_id"],
+                "cls_name": track["cls_name"],
+                "display_max_s": track.get("display_max_s"),
+            }
+        else:
+            extra.append(track)
+
+    for raw_detection in chain(measured, extra):
         _append_overlay_detection(
             detections,
             raw_detection,
