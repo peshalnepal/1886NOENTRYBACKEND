@@ -25,11 +25,21 @@ routes/__pycache__
 *.pyd
 .env
 *.log
-tests/
 
-# Keep edge regression tests; ignore generated artifacts.
-!tensort/tests/
-!tensort/tests/*.py
+# -------------------------
+# Tests (any test folder or test case, anywhere)
+# -------------------------
+test/
+tests/
+**/test/
+**/tests/
+test_*.py
+*_test.py
+test.py
+conftest.py
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
 .ruff_cache/
 tensort/log.txt
