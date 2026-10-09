@@ -222,6 +222,7 @@ function deploy_infrastructure() {
       deployMediaMtx="${DEPLOY_MEDIA_MTX}" \
       mediamtxApiUser="${MEDIAMTX_API_USER}" \
       mediamtxApiPass="${MEDIAMTX_API_PASS}" \
+      nvrRecordingApiKey="${NVR_RECORDING_API_KEY:-}" \
     --query "properties.outputs.appUrl.value" \
     -o tsv)
 

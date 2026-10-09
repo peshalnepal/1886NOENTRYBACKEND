@@ -254,6 +254,7 @@ class CameraContextDTO(_DTO):
     camera_name: Optional[str] = None
     device_uuid: Optional[uuid.UUID] = None
     device_name: Optional[str] = None
+    device_url: Optional[str] = None
     notification_trigger_mode: str = "inherit"
     camera_playback_enabled: str = "inherit"
 

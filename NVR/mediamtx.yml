@@ -1,0 +1,38 @@
+# MiniPC relay. Replace the reader password before starting MediaMTX.
+# Cloud MediaMTX retains WebRTC responsibility; main-stream recording stays here.
+logLevel: info
+api: yes
+# HTTP control API: the NVR service configures stream paths here. Keep local.
+# Matches MEDIAMTX_API_URL in NVR/.env.
+apiAddress: 127.0.0.1:9997
+rtsp: yes
+# RTSP video listener: Jetson and cloud readers connect here for streams.
+# Safe local default. Set to the MiniPC LAN address:8554 for deployment.
+# MEDIAMTX_LAN_RTSP_BASE_URL uses that MiniPC address with rtsp:// and credentials.
+rtspAddress: 127.0.0.1:8554
+rtspTransports: [tcp]
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+playback: yes
+playbackAddress: 127.0.0.1:9996
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    ips: [127.0.0.1, '::1']
+    permissions:
+      - action: api
+      - action: playback
+  - user: nvr-reader
+    pass: Ycn4ufni2026!
+    permissions:
+      - action: read
+        path: '~^nvr-'
+
+# NVR provisions separate nvr-* (stream 2, on demand) and record-* (stream 1,
+# always on) paths. Only the local API can read recordings.
+pathDefaults:
+  record: no
+paths: {}

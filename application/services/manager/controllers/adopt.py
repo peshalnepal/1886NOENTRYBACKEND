@@ -12,11 +12,8 @@ can never enter `desired_set`. Adoption closes that loop by creating the Camera
 takes (`Manager.update_pipeline` -> `ChannelController.add_channel`), so an
 adopted camera is indistinguishable from a hand-added one afterwards.
 
-Identity, not URL, is the dedupe key: the edge's roster identity
-("serial:…" > "mac:…" > "ip:…") is stored in the camera's channel configuration
-under `discovery_identity`. That is what makes re-adoption idempotent across
-DHCP moves — the same physical camera keeps its identity when its IP changes, so
-a second sweep links to the existing row instead of creating a duplicate.
+The NVR/Jetson camera UUID is the matching key. Discovery identity is retained
+as provenance and used to detect conflicting UUIDs, never to replace them.
 """
 
 from __future__ import annotations
@@ -25,6 +22,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,16 +50,39 @@ def _host_of(url: Optional[str]) -> Optional[str]:
     return authority.split(":", 1)[0].strip().lower() or None
 
 
-def _is_channel_identity(identity: Optional[str]) -> bool:
-    """True when this identity names one input of a multi-channel recorder.
+_DEFAULT_PORTS = {"rtsp": 554, "rtsps": 322, "http": 80, "https": 443}
 
-    The edge appends "#<channel>" for anything behind an NVR (see
-    `identity_of` in tensort/discovery.py), because every channel is reached
-    through the recorder's single address and so cannot be told apart by host
-    alone. Such an identity is already exact, and must never be widened to a
-    host comparison: doing so matches a *different* channel on the same NVR.
+
+def _endpoint_of(url: Optional[str]) -> Optional[Tuple[str, Optional[int]]]:
+    """(host, port) of a stream URL, ignoring scheme, credentials and path.
+
+    The repoint check needs the port too: a MiniPC relay URL is
+    `rtsp://<public-host>:<port>/nvr-<hash>`, so moving the relay to another
+    port changes nothing but the port. A missing port means the scheme default,
+    so `rtsp://h/x` and `rtsp://h:554/x` are the same endpoint.
     """
-    return "#" in str(identity or "")
+    host = _host_of(url)
+    if host is None:
+        return None
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:  # out-of-range or non-numeric port
+        port = None
+    return host, port or _DEFAULT_PORTS.get(parts.scheme.lower())
+
+
+def _capacity_rejected_identities(report: Dict[str, Any]) -> set:
+    """Identities in `capacity_rejected`, whichever edge sent the report.
+
+    The Jetson lists bare identity strings; the MiniPC lists full roster rows.
+    """
+    identities = set()
+    for item in report.get("capacity_rejected") or []:
+        identity = item.get("identity") if isinstance(item, dict) else item
+        if isinstance(identity, str) and identity:
+            identities.add(identity)
+    return identities
 
 
 class CameraAdopter:
@@ -91,7 +112,7 @@ class CameraAdopter:
             return []
 
         out: List[Dict[str, Any]] = []
-        capacity_rejected = set(discovery_report.get("capacity_rejected") or [])
+        capacity_rejected = _capacity_rejected_identities(discovery_report)
         for entry in discovery_report.get("roster") or []:
             if not isinstance(entry, dict):
                 continue
@@ -138,19 +159,13 @@ class CameraAdopter:
     async def _existing_index(
         self, db: AsyncSession, *, device_uuids: List[uuid.UUID]
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Index the cameras already registered for these devices.
-
-        Returns (by_identity, by_host). `by_identity` is the authoritative
-        match; `by_host` catches a camera that was added by hand before
-        discovery ever ran, so adoption links to it rather than creating a
-        second row for the same physical stream.
-        """
+        """Index by edge UUID; identity is used only to detect conflicting UUIDs."""
         cams = await self._state.channel_repo.list_cameras(
             db, device_uuids=device_uuids, include_config=True
         )
 
         by_identity: Dict[str, Any] = {}
-        by_host: Dict[str, Any] = {}
+        by_uuid: Dict[str, Any] = {}
 
         for cam in cams:
             cfg = _camera_config_json(cam)
@@ -159,20 +174,9 @@ class CameraAdopter:
             if identity:
                 by_identity[identity] = cam
 
-            # A row that already carries a channel identity is exactly
-            # identified, so it must not also be reachable by host: several NVR
-            # channels share one host, and whichever happened to be indexed
-            # first would then absorb the others.
-            if _is_channel_identity(identity):
-                continue
+            by_uuid[str(cam.camera_uuid)] = cam
 
-            host = _host_of(getattr(cam, "source_url", None))
-            # First writer wins: if two cameras somehow share a host, the
-            # identity match above is the one that should decide.
-            if host and host not in by_host:
-                by_host[host] = cam
-
-        return by_identity, by_host
+        return by_identity, by_uuid
 
     async def adopt_discovered_cameras(
         self,
@@ -228,7 +232,7 @@ class CameraAdopter:
                 return out
 
             site_uuid = site_uuids[0]
-            by_identity, by_host = await self._existing_index(db, device_uuids=targets)
+            by_identity, by_uuid = await self._existing_index(db, device_uuids=targets)
             # A camera the user removed must stay removed. The existing index
             # is built from live Camera rows, so a deleted camera is invisible
             # to it and would be re-created on every sweep; inventory is what
@@ -240,7 +244,6 @@ class CameraAdopter:
         for entry in entries:
             identity = str(entry.get("identity") or "").strip()
             source_url = str(entry.get("source_url") or "").strip()
-            host = _host_of(source_url)
 
             if identity and identity in blocked and identity not in by_identity:
                 out["skipped"].append(
@@ -248,14 +251,26 @@ class CameraAdopter:
                 )
                 continue
 
-            existing = by_identity.get(identity) if identity else None
-            if existing is None and host and not _is_channel_identity(identity):
-                existing = by_host.get(host)
+            try:
+                edge_uuid = str(uuid.UUID(str(entry.get("camera_uuid") or "")))
+            except (ValueError, TypeError, AttributeError):
+                out["errors"].append(
+                    "Camera {} requires a valid camera_uuid from NVR/Jetson".format(identity)
+                )
+                continue
+
+            identity_match = by_identity.get(identity) if identity else None
+            if identity_match is not None and str(identity_match.camera_uuid) != edge_uuid:
+                out["errors"].append(
+                    "Camera UUID conflict for {}: backend {}, NVR/Jetson {}".format(
+                        identity, identity_match.camera_uuid, edge_uuid)
+                )
+                continue
+            existing = by_uuid.get(edge_uuid)
 
             if existing is not None:
                 # Already registered. Backfill the provenance if this row was
-                # created by hand, so the next sweep matches on identity
-                # instead of falling back to the fragile host comparison, and
+                # created by hand with this UUID, and
                 # follow the camera if DHCP moved it to a new address.
                 out["linked"].append(str(existing.camera_uuid))
                 if (identity or source_url) and not dry_run:
@@ -305,17 +320,11 @@ class CameraAdopter:
                 continue
 
             out["adopted"].append(str(camera_uuid))
-            # Keep the in-memory index current so two roster rows that resolve
-            # to the same host inside one sweep cannot both be adopted.
+            # Repeated roster rows with the same edge UUID link to the same camera.
+            reference = _AdoptedRef(camera_uuid)
+            by_uuid[str(camera_uuid)] = reference
             if identity:
-                by_identity[identity] = _AdoptedRef(camera_uuid)
-            # Channels of one NVR all share a host, so indexing them here would
-            # make the first adopted channel swallow every later channel in the
-            # same sweep -- the first import of an 8-channel recorder would
-            # yield a single camera. Their "#<channel>" identities already
-            # dedupe them above.
-            if host and not _is_channel_identity(identity):
-                by_host.setdefault(host, _AdoptedRef(camera_uuid))
+                by_identity[identity] = reference
 
             logger.info(
                 "Adopted discovered camera %s (%s) into site %s as %s",
@@ -366,7 +375,9 @@ class CameraAdopter:
         # this ID right now, so keeping it means adoption does not restart the
         # stream or orphan the edge's camera_configs row.
         camera_uuid = entry.get("camera_uuid")
-        cam_uuid = uuid.UUID(str(camera_uuid)) if camera_uuid else uuid.uuid4()
+        if not camera_uuid:
+            raise ValueError("camera_uuid from NVR/Jetson is required")
+        cam_uuid = uuid.UUID(str(camera_uuid))
 
         configs: Dict[str, Any] = {
             "camera_uuid": cam_uuid,
@@ -421,9 +432,9 @@ class CameraAdopter:
         Two things can be stale on a camera the cloud already knows about:
 
         1. Its discovery provenance, when the row was created by hand before
-           discovery ever ran. Stamping it makes the next sweep match on
-           identity instead of the fragile host comparison.
-        2. Its `source_url`, when DHCP moved the camera. The edge repoints its
+           discovery ever ran. UUID remains the matching key.
+        2. Its `source_url`, when DHCP moved the camera or the MiniPC relay
+           moved to another public host/port. The edge repoints its
            own pipeline the moment it notices, but that patch is local to the
            Jetson — without the update below the cloud keeps the old address,
            MediaMTX keeps streaming from an IP nothing answers on, and the next
@@ -451,13 +462,13 @@ class CameraAdopter:
                 return False
             cam, chan_cfg, _pid = full
 
-            # Only the host is compared: the edge rebuilds the whole URL from
-            # its own configured credentials and stream path every sweep, so a
-            # byte-comparison would repoint endlessly on any cloud-side edit to
-            # the channel or stream number without the address having moved.
-            old_host = _host_of(getattr(cam, "source_url", None))
-            new_host = _host_of(source_url)
-            if source_url and new_host and new_host != old_host:
+            # Only host and port are compared: the edge rebuilds the whole URL
+            # from its own configured credentials and stream path every sweep,
+            # so a byte-comparison would repoint endlessly on any cloud-side
+            # edit to the channel or stream number without the address moving.
+            old_endpoint = _endpoint_of(getattr(cam, "source_url", None))
+            new_endpoint = _endpoint_of(source_url)
+            if source_url and new_endpoint and new_endpoint != old_endpoint:
                 cam.source_url = source_url
                 camera_code = str(getattr(cam, "camera_code", "") or "").strip() or None
                 repointed = True

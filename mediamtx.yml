@@ -42,7 +42,7 @@ webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
 
 pathDefaults:
-  record: yes
+  record: no
   recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
   recordFormat: fmp4
   recordPartDuration: 1s

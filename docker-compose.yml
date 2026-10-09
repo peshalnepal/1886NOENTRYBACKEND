@@ -45,6 +45,8 @@ services:
       - MTX_API_PASS=api_pass_123
       
       # Video clip capture settings
+      - VIDEO_CLIP_PROVIDER=nvr
+      - NVR_RECORDING_API_KEY=${NVR_RECORDING_API_KEY:-}
       - VIDEO_CLIP_CAPTURE_ENABLED=true
       - VIDEO_CLIP_DURATION_S=120
       - VIDEO_CLIP_COOLDOWN_S=120

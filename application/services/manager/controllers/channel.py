@@ -132,7 +132,9 @@ class ChannelController:
             raise ValueError("Create_Channel requires site_uuid")
         site_uuid = require_uuid(site_uuid, "site_uuid")
 
-        cam_uuid = patch.get("camera_uuid") or uuid.uuid4()
+        cam_uuid = patch.get("camera_uuid")
+        if not cam_uuid:
+            raise ValueError("camera_uuid from NVR/Jetson is required")
         cam_uuid = require_uuid(cam_uuid, "camera_uuid")
         patch["camera_uuid"] = cam_uuid
         patch["channel_id"] = cam_uuid

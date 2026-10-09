@@ -771,6 +771,23 @@ class ModelPipeline:
         self, key: str, ch: VideoChannel, payload: Dict[str, Any]
     ) -> bool:
         resp = self._payload_to_resp(payload, ch)
+        # resp=ObjDetectResponse(
+        #     camera_uuid=expected_cam, # Camera uuid obtained from ch.config.camera_UUId
+        #     frame_ts_ms=int(frame_ts_ms),
+        #     frame_seq=int(frame_seq),
+        #     event_type=str(event_type), give us event like "InferenceFailedEvent" , "DetectionsProducedEvent"
+        #     reason=str(reason), # represent error or event info like "Worker pool refused the batch"
+        #     frame_w=int(frame_w),
+        #     frame_h=int(frame_h),
+        #     site_uuid=ch.config.site_uuid,
+        #     device_uuid=ch.config.device_uuid,
+        #     detections=tuple(dets) if isinstance(dets, list) else (),
+        #     pose=payload.get("pose"),
+        #     inference_ms=int(inf_ms) if inf_ms is not None else None,
+        #     model_id=str(model_id) if model_id is not None else None,
+        #     image_url=str(image_url).strip() if image_url is not None else None,
+        # )
+
         if resp is None or not self._is_new_detection(key, resp):
             return False
 

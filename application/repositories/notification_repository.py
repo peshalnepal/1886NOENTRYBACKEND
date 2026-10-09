@@ -58,6 +58,7 @@ class NotificationRepository:
         Device.name,
         Camera.notification_trigger_mode,
         Camera.camera_playback_enabled,
+        Device.device_url,
     )
 
     def _camera_context_query(self):
@@ -81,6 +82,7 @@ class NotificationRepository:
             device_name,
             trigger_mode,
             playback_enabled,
+            device_url,
         ) = row
         return camera_uuid, CameraContext(
             user_id=int(user_id),
@@ -90,6 +92,7 @@ class NotificationRepository:
             camera_name=camera_name or camera_code,
             device_uuid=device_uuid,
             device_name=device_name,
+            device_url=device_url,
             notification_trigger_mode=coerce_trigger_mode(trigger_mode),
             camera_playback_enabled=coerce_playback_mode(playback_enabled),
         )

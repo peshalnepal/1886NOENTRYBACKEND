@@ -18,7 +18,8 @@ def _mediamtx_source_payload(source: str) -> Dict[str, Any]:
     ``rtspTransport`` only applies to RTSP/RTSPS sources; sending it for a
     WebRTC/HLS/RTMP/SRT source is meaningless, so it is only included for RTSP.
     """
-    payload: Dict[str, Any] = {"source": source, "sourceOnDemand": True}
+    payload: Dict[str, Any] = {"source": source, "sourceOnDemand": True,
+                               "record": os.getenv("VIDEO_CLIP_PROVIDER", "nvr").strip().lower() == "mediamtx"}
     if is_rtsp_source(source):
         payload["rtspTransport"] = "tcp"
     return payload

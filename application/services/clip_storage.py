@@ -274,14 +274,18 @@ class EventClipService:
     PLAYBACK_BACKOFF_S = 60.0
 
     def __init__(self) -> None:
+        self.provider = os.getenv("VIDEO_CLIP_PROVIDER", "nvr").strip().lower()
+        if self.provider not in {"nvr", "mediamtx"}:
+            raise ValueError("VIDEO_CLIP_PROVIDER must be nvr or mediamtx")
+        self.nvr_api_key = os.getenv("NVR_RECORDING_API_KEY", "").strip()
         self.playback_base_url = (os.getenv("MEDIAMTX_PLAYBACK_BASE_URL") or "").strip().rstrip("/")
         self.connection_string = (os.getenv("VIDEO_CLIP_BLOB_CONNECTION_STRING") or "").strip()
         self.container_name = (os.getenv("VIDEO_CLIP_BLOB_CONTAINER") or "event-clips").strip() or "event-clips"
 
         capture_enabled_raw = os.getenv("VIDEO_CLIP_CAPTURE_ENABLED", "").strip().lower()
         capture_enabled = capture_enabled_raw not in {"0", "false", "no", "off"}
-        self.storage_enabled = bool(self.connection_string)
-        self.enabled = bool(capture_enabled and self.playback_base_url)
+        self.storage_enabled = bool(self.connection_string and self.provider == "mediamtx")
+        self.enabled = bool(capture_enabled and (self.provider == "nvr" or self.playback_base_url))
 
         # Derive duration from pre/post-roll so the event stays at the pre-roll boundary.
         self.PRE_EVENT_S = env_int("VIDEO_CLIP_PRE_EVENT_S", self.PRE_EVENT_S)
@@ -635,6 +639,43 @@ class EventClipService:
             await db.commit()
             return merged
 
+    async def _capture_tower_clip(self, *, camera_uuid, ctx, event_ts_ms,
+                                 overlay_payload, requires_approval):
+        """Ask the camera's tower to export video; persist metadata only here."""
+        base = str(getattr(ctx, "device_url", None) or "").rstrip("/")
+        if not base or not self.nvr_api_key:
+            logger.warning("Tower recording endpoint/key is not configured camera=%s", camera_uuid)
+            return None
+        # device_url is the existing NVR gateway URL, optionally ending in /api.
+        try:
+            endpoint = base + "/recordings/cameras/" + str(uuid.UUID(str(camera_uuid))) + "/events"
+            event = datetime.now(timezone.utc) if event_ts_ms is None else datetime.fromtimestamp(float(event_ts_ms) / 1000, timezone.utc)
+            response = await self._http.post(endpoint, headers={"Authorization": "Bearer " + self.nvr_api_key},
+                                             json={"event_time": event.isoformat()})
+            response.raise_for_status()
+            data = response.json()
+            start, end = _parse_ts(data["start_time"]), _parse_ts(data["end_time"])
+            if (data.get("status") != "completed" or data.get("camera_uuid") != str(camera_uuid)
+                    or start is None or end is None or (end - start).total_seconds() != 120
+                    or abs((start - (event - timedelta(seconds=90))).total_seconds()) > 0.01):
+                raise ValueError("Invalid tower recording window")
+            external_id = "nvr-" + data["clip_id"]
+            recording_url = data["recording_url"]
+            try:
+                await self._save_video_record(camera_uuid=str(camera_uuid), external_id=external_id,
+                    start_time=start, end_time=end, duration_s=120, status="completed", storage_key="",
+                    recording_url=recording_url, overlay_payload=overlay_payload, requires_approval=requires_approval)
+            except Exception:
+                logger.exception("Failed to persist tower clip metadata camera=%s", camera_uuid)
+            result = ClipCaptureResult(external_id=external_id, storage_key="", recording_url=recording_url,
+                status="completed", start_time=start, end_time=end, duration=120,
+                path=str(ctx.camera_code or camera_uuid)).to_payload()
+            result.update(download_url=data["download_url"], expires_at=data["expires_at"], provider="nvr")
+            return result
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, OverflowError, OSError):
+            logger.warning("Tower event clip unavailable camera=%s", camera_uuid)
+            return None
+
     async def capture_pre_event_clip(
         self,
         *,
@@ -647,6 +688,12 @@ class EventClipService:
     ) -> Optional[Dict[str, Any]]:
         if not self.enabled:
             return None
+
+        if getattr(self, "provider", "mediamtx") == "nvr":
+            return await self._capture_tower_clip(
+                camera_uuid=camera_uuid, ctx=ctx, event_ts_ms=event_ts_ms,
+                overlay_payload=overlay_payload, requires_approval=requires_approval,
+            )
 
         path = str(ctx.camera_code or "").strip()
         if not path:

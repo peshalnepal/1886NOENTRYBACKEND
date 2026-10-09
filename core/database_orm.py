@@ -498,7 +498,7 @@ class Camera(Base):
     # Each camera runs on at most one device; a device may host many cameras.
     device_uuid = Column(GUID, ForeignKey("devices.device_uuid", ondelete="SET NULL"), nullable=True, index=True)
 
-    camera_uuid = Column(GUID, default=uuid.uuid4, unique=True, nullable=False, index=True)
+    camera_uuid = Column(GUID, unique=True, nullable=False, index=True)
     camera_code = Column(String(64), nullable=False, index=True)
 
     name = Column(String(255), nullable=True)

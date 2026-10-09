@@ -43,3 +43,11 @@ conftest.py
 htmlcov/
 .ruff_cache/
 tensort/log.txt
+
+# Keep camera identity regression coverage in version control.
+!/tests/
+/tests/*
+!/tests/test_camera_uuid_required.py
+!/tests/test_adopt_nvr_channels.py
+!/tests/test_discovery_repoint.py
+!/tests/test_nvr_recordings.py

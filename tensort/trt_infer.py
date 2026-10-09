@@ -1,36 +1,22 @@
-# trt_infer.py
-#
-# TensorRT (v10 name-based API) detection runner for a dynamic-batch YOLO engine.
-#
-# Hot path (run_batch): each frame is letterboxed DIRECTLY into a row of the
-# engine's pinned input buffer (TRTEngine.input_view), then one H2D copy +
-# one execute + one D2H runs the whole batch. The older path built a per-frame
-# blob, concatenated the batch, then copied that into pinned memory — three
-# copies of ~49 MB per 10-frame batch at 640px.
-#
-# A fixed batch=1 engine still works: run_batch chunks to the engine's max.
-# See ARCHITECTURE.md in this directory.
+"""TensorRT 10 YOLO inference with reusable pinned buffers and batched events."""
 
-import os
-import time
-import threading
 import logging
+import os
+import threading
+import time
 from typing import Dict, List, Tuple
 
-import numpy as np
 import cv2
-
-_BLOB_FROM_IMAGE = getattr(getattr(cv2, "dnn", None), "blobFromImage", None)
-
-import tensorrt as trt
+import numpy as np
 import pycuda.driver as cuda
+import tensorrt as trt
 
 logger = logging.getLogger(__name__)
 
 _VEHICLE_CLASSES = frozenset({"car", "truck", "bus", "van"})
 
 # -----------------------------
-# CUDA context management (unchanged)
+# Thread-local CUDA context management
 # -----------------------------
 cuda.init()
 _tls = threading.local()
@@ -46,7 +32,7 @@ def ensure_cuda_context(device_id=0):
     return ctx
 
 
-class CudaContext(object):
+class CudaContext:
     def __init__(self, device_id=0):
         self.device_id = int(device_id)
         self.ctx = None
@@ -74,7 +60,7 @@ def release_cuda_context():
 
 
 # -----------------------------
-# CPU preprocessing (unchanged logic, now called before infer())
+# CPU preprocessing and bounding-box helpers
 # -----------------------------
 
 def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) -> Tuple[np.ndarray, float, Tuple[int, int]]:
@@ -96,35 +82,6 @@ def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) 
     return out, r, (left, top)
 
 
-def _prepare_input_tensor(img_lb: np.ndarray) -> np.ndarray:
-    if _BLOB_FROM_IMAGE is not None:
-        return _BLOB_FROM_IMAGE(
-            img_lb,
-            scalefactor=1.0 / 255.0,
-            size=(img_lb.shape[1], img_lb.shape[0]),
-            mean=(0.0, 0.0, 0.0),
-            swapRB=True,
-            crop=False,
-        )
-    rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
-    x = np.empty((1, 3, img_lb.shape[0], img_lb.shape[1]), dtype=np.float32)
-    x[0] = np.transpose(rgb, (2, 0, 1))
-    x *= (1.0 / 255.0)
-    return x
-
-
-def preprocess(bgr: np.ndarray, imgsz: int) -> Tuple[np.ndarray, float, Tuple[int, int]]:
-    """
-    Full CPU preprocessing pipeline.
-    Returns (chw_float32_tensor, scale_r, (padx, pady)).
-    Call this BEFORE TRTEngine.infer() — it runs on CPU and can overlap with
-    a previous frame's GPU execution.
-    """
-    img_lb, r, (padx, pady) = letterbox_bgr(bgr, imgsz)
-    x = _prepare_input_tensor(img_lb)
-    return x, r, (padx, pady)
-
-
 def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk: int = 100, class_ids=None) -> List[int]:
     if boxes is None or len(boxes) == 0:
         return []
@@ -132,8 +89,7 @@ def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45, topk:
     boxes = boxes.astype(np.float32, copy=False)
     scores = scores.astype(np.float32, copy=False)
 
-    x1 = boxes[:, 0]; y1 = boxes[:, 1]
-    x2 = boxes[:, 2]; y2 = boxes[:, 3]
+    x1, y1, x2, y2 = boxes.T
     areas = (x2 - x1 + 1.0) * (y2 - y1 + 1.0)
 
     order = scores.argsort()[::-1]
@@ -167,8 +123,10 @@ def clamp_xyxy(x1, y1, x2, y2, W, H):
     y1 = int(max(0, min(y1, H - 1)))
     x2 = int(max(0, min(x2, W - 1)))
     y2 = int(max(0, min(y2, H - 1)))
-    if x2 < x1: x1, x2 = x2, x1
-    if y2 < y1: y1, y2 = y2, y1
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
     return x1, y1, x2, y2
 
 
@@ -229,28 +187,12 @@ def suppress_cross_class_duplicates(detections, iou_threshold=0.55,
 # TensorRT engine: one stream and reusable pinned buffers
 # -----------------------------
 
-class TRTEngine(object):
-    """
-    Dynamic-batch TensorRT engine.
+class TRTEngine:
+    """Own one execution context, CUDA stream, and reusable buffer set.
 
-    The engine is expected to be built with a dynamic batch axis and an
-    optimization profile (min=1 .. max=N). We allocate ONE set of pinned host
-    + device buffers sized for the profile's MAX batch, then per infer() call
-    set the actual batch with set_input_shape and transfer only the rows in use.
-
-    A fixed-shape (batch=1) engine still works: it is treated as max_batch=1,
-    so single-frame inference keeps running unchanged. This is the fallback for
-    an engine that was NOT re-exported with a dynamic axis.
-
-    One stream, one buffer set: throughput comes from batching, and a single
-    execution context serialises execute_async_v3 calls anyway, so a second
-    stream would not overlap two batches' GPU work. What it could hide is the
-    CPU preprocess of the next batch — measure before adding that complexity;
-    with the pinned-buffer path below, preprocess is a single strided copy.
-
-    Usage (hot path):
-        engine.input_view[i] <- letterboxed CHW frame   # write into pinned mem
-        outputs = engine.infer_prepared(b)              # GPU, (B,...) outputs
+    Buffers are sized for the profile's maximum batch. Callers fill input_view,
+    then infer_prepared() transfers only the active rows. Fixed batch-1 engines
+    are supported too. Create, execute, and close on the same worker thread.
     """
 
     def __init__(self, engine_path: str, device_id: int = 0, input_chw=None):
@@ -323,7 +265,7 @@ class TRTEngine(object):
                 raise RuntimeError("Expected concrete RGB input dimensions, got {}".format(self._fixed_chw))
             if np.dtype(self._dtypes[self.input_index]) not in (np.dtype(np.float32), np.dtype(np.float16)):
                 raise RuntimeError("Expected floating-point image input")
-            self._in_row_size = int(np.prod(self._fixed_chw)) if self._fixed_chw else 1
+            self._in_row_size = int(np.prod(self._fixed_chw))
 
             # Ask TensorRT to resolve all dimensions at the selected spatial
             # size. Dynamic output axes can represent anchors, not just batch.
@@ -350,11 +292,7 @@ class TRTEngine(object):
 
             self._stream = cuda.Stream()
 
-            # (max_batch, C, H, W) view over the pinned input buffer. Callers
-            # letterbox straight into a row of this view, so a frame is copied
-            # once (uint8 BGR -> float32 CHW, in pinned memory) instead of the
-            # old path's three copies: per-frame blob, batch concatenate, then
-            # copy into pinned.
+            # Each frame is written directly into a row of pinned input memory.
             self.input_view = self._host_bufs[self.input_index].reshape(
                 (self.max_batch,) + self._fixed_chw
             )
@@ -378,7 +316,7 @@ class TRTEngine(object):
             # get_tensor_shape() below returns concrete output shapes.
             if not self.context.set_input_shape(self.input_name, (b,) + self._fixed_chw):
                 raise RuntimeError("TensorRT rejected input batch {}".format(b))
-
+            #n_in=batchsize * (self.in_row_size=Channel*Height*Width)
             n_in = b * self._in_row_size
             cuda.memcpy_htod_async(self._dev_bufs[ii], self._host_bufs[ii][:n_in], stream)
 
@@ -409,23 +347,6 @@ class TRTEngine(object):
             ]
 
         return outs
-
-    def infer(self, input_chw: np.ndarray) -> List[np.ndarray]:
-        """
-        Convenience path for a pre-built (B,C,H,W) float32 tensor.
-        Kept for single-frame callers and tests/diag_batch.py; the batched path
-        writes into input_view and calls infer_prepared() instead.
-        """
-        if input_chw.ndim != 4:
-            raise ValueError("Expected 4D (B,C,H,W), got {}".format(input_chw.shape))
-        b = int(input_chw.shape[0])
-        if tuple(int(x) for x in input_chw.shape[1:]) != self._fixed_chw:
-            raise ValueError("Expected (B,{}), got {}".format(self._fixed_chw, input_chw.shape))
-        if b < 1 or b > self.max_batch:
-            raise ValueError("Batch {} out of range [1,{}]".format(b, self.max_batch))
-
-        np.copyto(self.input_view[:b], input_chw)
-        return self.infer_prepared(b)
 
     def close(self):
         """Release GPU allocations on the same thread that created them."""
@@ -470,7 +391,7 @@ COCO_NAMES = {
 }
 
 
-class YoloV8DetTRT(object):
+class YoloV8DetTRT:
     def __init__(
         self,
         engine_path: str,
@@ -485,7 +406,7 @@ class YoloV8DetTRT(object):
         self.imgsz = int(imgsz)
 
         # Fail at startup rather than on every frame: a mismatch here used to
-        # raise inside infer() for each frame, turning a config error into an
+        # raise during inference for each frame, turning a config error into an
         # endless stream of per-frame inference failures.
         if self.trt._fixed_chw != (3, self.imgsz, self.imgsz):
             raise RuntimeError(
@@ -517,26 +438,17 @@ class YoloV8DetTRT(object):
             )
         # Largest batch this engine actually accepts (1 for a fixed batch=1
         # engine). Callers must not feed more than this.
-        self.max_batch = int(getattr(self.trt, "max_batch", 1))
+        self.max_batch = self.trt.max_batch
 
     def run(self, bgr: np.ndarray) -> List[Dict]:
-        """Single-frame convenience path: preprocess -> infer (B=1) -> parse."""
-        H0, W0 = bgr.shape[:2]
-        x, r, (padx, pady) = preprocess(bgr, self.imgsz)
-        outs = self.trt.infer(x)               # x is (1,3,H,W)
-        return self._postprocess(self._parse_pred(outs[0], H0, W0, r, padx, pady))
+        """Run a single frame through the same path used by camera batches."""
+        return self.run_batch([bgr])[0]
 
     def _fill_row(self, row_chw: np.ndarray, bgr: np.ndarray):
-        """
-        Letterbox one frame straight into a pinned (3,H,W) float32 row.
-
-        Writing into the destination avoids the temporary blob + the batch
-        concatenate the old path built for every call (~49 MB of alloc-and-copy
-        per 10-frame batch at 640px).
-        """
+        """Letterbox BGR into a pinned RGB CHW row in the engine's dtype."""
         img_lb, r, (padx, pady) = letterbox_bgr(bgr, self.imgsz)
         # BGR->RGB is a reversed view; transpose to CHW is a view as well, so
-        # this is a single strided uint8 -> float32 conversion into pinned mem.
+        # this converts uint8 directly into the pinned buffer's floating dtype.
         np.copyto(row_chw, img_lb[:, :, ::-1].transpose(2, 0, 1), casting="unsafe")
         row_chw *= (1.0 / 255.0)
         return r, padx, pady
@@ -551,10 +463,7 @@ class YoloV8DetTRT(object):
         if not bgr_list:
             return []
 
-        # Never feed the engine more than it accepts. A dynamic engine takes the
-        # whole batch in one call; a fixed batch=1 engine processes one frame per
-        # call. This keeps things correct regardless of whether the dynamic
-        # engine has been re-exported yet.
+        # Split batches to fit the engine, including fixed batch-1 engines.
         eng_max = max(1, int(self.trt.max_batch))
         view = self.trt.input_view
 
@@ -599,28 +508,19 @@ class YoloV8DetTRT(object):
             kept_scores = scores[keep]
             kept_cls = cls_ids[keep]
 
-            out = []
-            for i in range(len(kept)):
-                x1o, y1o, x2o, y2o = clamp_xyxy(
-                    boxes[i, 0], boxes[i, 1], boxes[i, 2], boxes[i, 3], W0, H0
-                )
-                out.append({
-                    "cls_name": COCO_NAMES.get(int(kept_cls[i]), str(int(kept_cls[i]))),
-                    "conf": float(kept_scores[i]),
-                    "box": {"x1": x1o, "y1": y1o, "x2": x2o, "y2": y2o},
-                    "box_norm": box_norm_xyxy(x1o, y1o, x2o, y2o, W0, H0),
-                })
-            return out
+            return [
+                self._format_detection(box, score, COCO_NAMES.get(int(cls_id), str(int(cls_id))), W0, H0)
+                for box, score, cls_id in zip(boxes, kept_scores, kept_cls)
+            ]
 
         if pred.shape[1] < pred.shape[2]:
             predictions = pred[0]
         else:
             predictions = pred[0].T
 
-        attribute_count, candidate_count = predictions.shape
-        nc = attribute_count - 4
+        candidate_count = predictions.shape[1]
         boxes_xywh = predictions[0:4, :]
-        cls_scores = predictions[4:4 + nc, :]
+        cls_scores = predictions[4:, :]
 
         cls_id = np.argmax(cls_scores, axis=0)
         score = cls_scores[cls_id, np.arange(candidate_count)]
@@ -654,24 +554,28 @@ class YoloV8DetTRT(object):
         scale = max(r, 1e-9)
 
         for i in keep_idx:
-            bx = boxes[i]
-            bx0 = (bx - padding) / scale
-            x1o, y1o, x2o, y2o = clamp_xyxy(bx0[0], bx0[1], bx0[2], bx0[3], W0, H0)
-            out.append({
-                "cls_name": labels[i],
-                "conf": float(score[i]),
-                "box": {"x1": x1o, "y1": y1o, "x2": x2o, "y2": y2o},
-                "box_norm": box_norm_xyxy(x1o, y1o, x2o, y2o, W0, H0),
-            })
+            frame_box = (boxes[i] - padding) / scale
+            out.append(self._format_detection(frame_box, score[i], labels[i], W0, H0))
 
         return out
 
+    @staticmethod
+    def _format_detection(box, score, label, width, height):
+        """Build the shared pixel and normalized box payload in frame coordinates."""
+        x1, y1, x2, y2 = clamp_xyxy(*box, width, height)
+        return {
+            "cls_name": label,
+            "conf": float(score),
+            "box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+            "box_norm": box_norm_xyxy(x1, y1, x2, y2, width, height),
+        }
+
 
 # -----------------------------
-# In-process inference API (unchanged public surface)
+# In-process inference API
 # -----------------------------
 
-class TRTInfer(object):
+class TRTInfer:
     def __init__(
         self,
         det_engine_path: str,
@@ -686,7 +590,6 @@ class TRTInfer(object):
         self.model_id = model_id
         self.device_id = int(device_id)
 
-        ensure_cuda_context(self.device_id)
         self.det_runner = YoloV8DetTRT(
             det_engine_path,
             imgsz=imgsz,
@@ -696,12 +599,8 @@ class TRTInfer(object):
             topk=nms_topk,
             device_id=self.device_id,
         )
-        # Re-expose the engine's max batch on the TRTInfer facade. The worker
-        # pool reads max_batch off THIS object; without it every start logged a
-        # false "engine max_batch=1 — NOT a dynamic-batch engine" warning (and
-        # reported max_batch=1 in /health) even on a correct 10-wide engine,
-        # sending operators off to re-export an engine that was already fine.
-        self.max_batch = int(getattr(self.det_runner, "max_batch", 1))
+        # The worker uses this limit when dispatching camera batches.
+        self.max_batch = self.det_runner.max_batch
 
     def close(self):
         self.det_runner.trt.close()

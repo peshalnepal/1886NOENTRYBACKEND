@@ -74,6 +74,9 @@ param mediamtxApiUser string = 'api'
 @secure()
 param mediamtxApiPass string = '' // TEMP (only if deployMediaMtx=true)
 
+@secure()
+param nvrRecordingApiKey string = ''
+
 // ----------------------------
 // Reference existing ACR + Key Vault (not used for secrets yet)
 // ----------------------------
@@ -319,6 +322,8 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
 
             // Video clip capture (pre-record on detection)
             { name: 'VIDEO_CLIP_CAPTURE_ENABLED', value: 'true' }
+            { name: 'VIDEO_CLIP_PROVIDER', value: 'nvr' }
+            { name: 'NVR_RECORDING_API_KEY', value: nvrRecordingApiKey }
             // Clip layout: 90s pre-roll + 30s post-roll = 120s total, event anchored at 90s.
             { name: 'VIDEO_CLIP_PRE_EVENT_S', value: '90' }
             { name: 'VIDEO_CLIP_POST_EVENT_S', value: '30' }
@@ -453,7 +458,7 @@ webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
 
 pathDefaults:
-  record: yes
+  record: no
   recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
   recordFormat: fmp4
   recordPartDuration: 1s

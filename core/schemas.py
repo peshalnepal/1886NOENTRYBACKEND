@@ -119,6 +119,7 @@ class CameraCreateSchema(BaseModel):
 
     user_id: Optional[int] = Field(default=None, ge=1, description="Optional. Server resolves user from JWT.")
 
+    camera_uuid: uuid.UUID = Field(description="Existing camera UUID supplied by NVR/Jetson.")
     site_uuid: uuid.UUID
     device_uuid: Optional[uuid.UUID] = None
     # The single camera source URL: rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt.
@@ -330,6 +331,7 @@ class SetArmRequest(BaseModel):
 
 
 class SiteCameraCreate(BaseModel):
+    camera_uuid: uuid.UUID = Field(description="Existing camera UUID supplied by NVR/Jetson.")
     device_uuid: uuid.UUID
     # The single camera source URL: rtsp/rtsps/webrtc/whep/http/https/rtmp/rtmps/srt.
     source_url: str = Field(..., min_length=1, max_length=2048)

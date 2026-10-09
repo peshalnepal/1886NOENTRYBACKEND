@@ -156,6 +156,10 @@
     "caddyEmail": {
       "type": "string",
       "defaultValue": "peshalnepal3@gmail.com"
+    },
+    "nvrRecordingApiKey": {
+      "type": "secureString",
+      "defaultValue": ""
     }
   },
   "variables": {
@@ -174,7 +178,7 @@
     "regionForHost": "[toLower(replace(parameters('location'), ' ', ''))]",
     "mediamtxPublicHost": "[format('{0}.{1}.azurecontainer.io', variables('mediamtxDns'), variables('regionForHost'))]",
     "proxyHost": "[if(not(equals(parameters('mediamtxHostOverride'), '')), parameters('mediamtxHostOverride'), variables('mediamtxPublicHost'))]",
-    "mediamtxYaml": "[format('logLevel: info\nlogDestinations: [stdout]\nwriteQueueSize: 1024\nudpReadBufferSize: 0\n\nauthMethod: internal\nauthInternalUsers:\n  - user: any\n    pass: \"\"\n    ips: []\n    permissions:\n      - action: publish\n        path:\n      - action: read\n        path:\n      - action: playback\n        path:\n  - user: \"{0}\"\n    pass: \"{1}\"\n    ips: []\n    permissions:\n      - action: api\n\napi: yes\napiAddress: :9997\napiAllowOrigins: [''*'']\n\nplayback: yes\nplaybackAddress: :9996\nplaybackAllowOrigins: [''*'']\n\nwebrtc: yes\nwebrtcAddress: :8889\n\nwebrtcLocalUDPAddress: :8189\nwebrtcLocalTCPAddress: ''''\nwebrtcAllowOrigins: [''*'']\n\nwebrtcIPsFromInterfaces: no\nwebrtcAdditionalHosts: [''{2}'']\n\nwebrtcICEServers2:\n  - url: stun:stun.l.google.com:19302\n\npathDefaults:\n  record: yes\n  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f\n  recordFormat: fmp4\n  recordPartDuration: 1s\n  recordSegmentDuration: 15s\n  recordDeleteAfter: 7m\n\nhls: false\nrtmp: false\nsrt: false\n\npaths:\n  all_others: {{}}\n', parameters('mediamtxApiUser'), parameters('mediamtxApiPass'), variables('proxyHost'))]",
+    "mediamtxYaml": "[format('logLevel: info\nlogDestinations: [stdout]\nwriteQueueSize: 1024\nudpReadBufferSize: 0\n\nauthMethod: internal\nauthInternalUsers:\n  - user: any\n    pass: \"\"\n    ips: []\n    permissions:\n      - action: publish\n        path:\n      - action: read\n        path:\n      - action: playback\n        path:\n  - user: \"{0}\"\n    pass: \"{1}\"\n    ips: []\n    permissions:\n      - action: api\n\napi: yes\napiAddress: :9997\napiAllowOrigins: [''*'']\n\nplayback: yes\nplaybackAddress: :9996\nplaybackAllowOrigins: [''*'']\n\nwebrtc: yes\nwebrtcAddress: :8889\n\nwebrtcLocalUDPAddress: :8189\nwebrtcLocalTCPAddress: ''''\nwebrtcAllowOrigins: [''*'']\n\nwebrtcIPsFromInterfaces: no\nwebrtcAdditionalHosts: [''{2}'']\n\nwebrtcICEServers2:\n  - url: stun:stun.l.google.com:19302\n\npathDefaults:\n  record: no\n  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f\n  recordFormat: fmp4\n  recordPartDuration: 1s\n  recordSegmentDuration: 15s\n  recordDeleteAfter: 7m\n\nhls: false\nrtmp: false\nsrt: false\n\npaths:\n  all_others: {{}}\n', parameters('mediamtxApiUser'), parameters('mediamtxApiPass'), variables('proxyHost'))]",
     "caddyfile": "[format('{{\n  email {0}\n}}\n\n{1} {{\n  encode gzip\n\n  handle_path /playback/* {{\n    reverse_proxy 127.0.0.1:9996\n  }}\n\n  @api path /v3/*\n  reverse_proxy @api 127.0.0.1:9997\n\n  reverse_proxy 127.0.0.1:8889\n}}\n', parameters('caddyEmail'), variables('proxyHost'))]"
   },
   "resources": [
@@ -533,6 +537,14 @@
                 {
                   "name": "VIDEO_CLIP_BLOB_CONNECTION_STRING",
                   "secretRef": "video-clip-blob-connection-string"
+                },
+                {
+                  "name": "VIDEO_CLIP_PROVIDER",
+                  "value": "nvr"
+                },
+                {
+                  "name": "NVR_RECORDING_API_KEY",
+                  "value": "[parameters('nvrRecordingApiKey')]"
                 }
               ],
               "probes": [

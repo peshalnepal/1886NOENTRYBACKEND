@@ -55,7 +55,7 @@ class NotificationService:
             # (POST_EVENT_S + 2s, ~32s by default) plus download/upload time, or
             # capture_pre_event_clip is cancelled mid-sleep and no clip is produced.
             # Capture runs on a background finalize task, so generous values are safe.
-            site_prerecord_timeout_s=env_float("SITE_PRERECORD_TIMEOUT_S", 90.0, minimum=1.0),
+            site_prerecord_timeout_s=env_float("SITE_PRERECORD_TIMEOUT_S", 180.0, minimum=1.0),
             trigger_camera_timeout_s=env_float("TRIGGER_CAMERA_TIMEOUT_S", 90.0, minimum=1.0),
         )
         
