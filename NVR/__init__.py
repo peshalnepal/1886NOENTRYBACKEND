@@ -1,4 +1,4 @@
 """Standalone camera discovery and Jetson HTTP gateway.
 
-Run from Backend/: python -m NVR.main
+Run from this folder: python main.py   (or from its parent: python -m NVR.main)
 """

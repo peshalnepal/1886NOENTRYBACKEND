@@ -75,7 +75,7 @@ param mediamtxApiUser string = 'api'
 param mediamtxApiPass string = '' // TEMP (only if deployMediaMtx=true)
 
 @secure()
-param nvrRecordingApiKey string = ''
+param nvrRecordingApiKey string = 'v48O4gm7a7a6RruamcTWsohFiHRKzUPw'
 
 // ----------------------------
 // Reference existing ACR + Key Vault (not used for secrets yet)

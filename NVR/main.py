@@ -1,4 +1,19 @@
-"""MiniPC discovery, relay and Jetson API gateway. Run: python -m NVR.main from Backend/."""
+"""MiniPC discovery, relay and Jetson API gateway.
+
+Run from this folder: python main.py   (or from its parent: python -m NVR.main)
+"""
+
+if not __package__:
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    _root = Path(__file__).resolve().parent
+    _spec = importlib.util.spec_from_file_location(
+        "NVR", _root / "__init__.py", submodule_search_locations=[str(_root)])
+    sys.modules["NVR"] = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(sys.modules["NVR"])
+    __package__ = "NVR"
 
 import logging
 from contextlib import asynccontextmanager

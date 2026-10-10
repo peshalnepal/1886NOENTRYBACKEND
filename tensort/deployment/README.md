@@ -41,9 +41,9 @@ with GStreamer enabled. The setup checks for a shadowing wheel.
 | `MAX_BATCH=8` | Maximum batch size, 1–8 |
 | `OPT_BATCH=8` | Optimization batch, no larger than MAX_BATCH |
 | `IMG_SZ=640` | Model input size |
-| `SKIP_APT=1` | Skip packages already installed |
-| `SKIP_ENGINE=1` | Retain an engine already built on this device |
-| `SKIP_SERVICE=1` | Skip systemd changes |
+| `DISCOVERY=false` | Value written to `DISCOVERY_ENABLED` in `.env` (the MiniPC owns discovery in a tower) |
+| `FORCE_ENGINE=1` | Rebuild even if an identical engine exists |
+| `SKIP_APT=1` / `SKIP_ENGINE=1` / `SKIP_SERVICE=1` | Skip a step outright; normally unnecessary, finished work is detected and skipped |
 
 For just the engine: `MODEL=yolo26m MAX_BATCH=8 ./deployment/build_engine.sh` from
 `tensort/`. Select the board's appropriate power mode; numeric `nvpmodel` mode
