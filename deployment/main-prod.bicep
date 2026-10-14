@@ -26,7 +26,7 @@ param videoClipStorageAccountName string = '1886noentry'
 param videoClipContainerName string = 'event-clips'
 
 param mediamtxImageRepo string = 'mediamtx'
-param mediamtxImageTag string = '1.16.1'
+param mediamtxImageTag string = '1.16.1-ffmpeg'
 param acrUsername string
 param caddyImageRepo string = 'caddy'
 param caddyImageTag string = '2.8.4'
