@@ -2,6 +2,8 @@
 
 This is a review report, not a patch set. It prioritizes the reported symptoms: late camera appearance and missing/delayed detections on an Orin Nano 8GB using YOLO26m.
 
+**Historical findings.** This report describes an earlier checkout. The October 19, 2026 fixes enforce frame-age deadlines through inference and live delivery, coalesce subscriber queues, avoid unchanged camera restarts, and bound native capture stalls. NVR now adopts verified cameras incrementally using one Jetson roster snapshot per sweep; the frontend multiplexes authorized visible cameras and rejects duplicate frames. The current local jitter setting is 200 ms, resize preserves aspect ratio, and local connection stagger is 1.5 seconds. These are local code/configuration checks, not deployed measurements. See [current runtime behavior](../README.md) and [NVR architecture](../../NVR/ARCHITECTURE.md); the findings below are retained as review history.
+
 Evidence labels: **reproduced** means an isolated execution or existing failing regression confirms it; **source-confirmed** means the control/data flow demonstrates it, without a live deployment reproduction; **measure** means a performance hypothesis requiring observations.
 
 **Update 2026-09-22.** The deployed `Backend/tensort/.env` was supplied and reviewed. It differs materially from `.env.example`, and several of its values explain the reported symptoms directly, without any code change. Those are catalogued as **C1, C4, and C5** below and should be addressed *first*: they are configuration, they are reversible, and they are cheaper than the code fixes. The test suite was also executed on this checkout; results are recorded per finding.

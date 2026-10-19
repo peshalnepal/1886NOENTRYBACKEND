@@ -80,7 +80,7 @@ class MediaRelay:
 
     async def ensure_recording(self, identity, source):
         await self._ensure_path(self.recording_path(identity), {
-            "source": self.stream_url(source, 2), "sourceOnDemand": False,
+            "source": self.stream_url(source, 1), "sourceOnDemand": False,
             "rtspTransport": "tcp", "record": self.settings.recording_enabled,
             "recordPath": self.settings.recording_directory.rstrip("/") + "/%path/%Y-%m-%d_%H-%M-%S-%f",
             "recordFormat": "fmp4", "recordPartDuration": "1s",

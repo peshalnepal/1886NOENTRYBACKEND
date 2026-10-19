@@ -274,10 +274,19 @@ class PipelineRuntime(object):
         with self._lock:
             other_enabled = sum(bool(c.get("enabled", True)) for key, c in self._cameras.items()
                                 if key != camera_uuid)
+            previous = self._cameras.get(camera_uuid)
         if cfg.enabled and other_enabled >= self._max_cameras:
             raise CameraCapacityError("Device supports at most {} enabled cameras".format(self._max_cameras))
         pipeline = self._require_pipeline()
-        self._call(pipeline.add_channel(cfg), timeout_s=15.0)
+        previous_cfg = VideoChannelConfig(**previous) if previous is not None else None
+        # Compare normalized capture settings, not JSON representation (resize
+        # may arrive as a list). Metadata-only updates must not interrupt video.
+        unchanged = previous_cfg is not None and all(
+            getattr(previous_cfg, key) == getattr(cfg, key)
+            for key in VideoChannelConfig.__slots__
+        )
+        if not unchanged:
+            self._call(pipeline.add_channel(cfg), timeout_s=15.0)
         self._save_camera_to_db(camera_uuid, cfg_data)
         with self._lock:
             self._cameras[camera_uuid] = dict(cfg_data)

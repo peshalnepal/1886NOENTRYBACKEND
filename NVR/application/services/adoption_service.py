@@ -15,7 +15,14 @@ class AdoptionService:
         self._jetson = jetson
         self._relay = relay
 
-    async def reconcile(self, identities):
+    async def camera_snapshot(self):
+        """Reuse one roster (or one connection failure) throughout a sweep."""
+        try:
+            return await self._jetson.cameras()
+        except JetsonError as exc:
+            return exc
+
+    async def reconcile(self, identities, remote=None):
         """POST missing channels, PATCH moved ones. Returns safe error strings.
 
         HTTP 409 becomes capacity_pending and retries next sweep. Existing channel
@@ -26,12 +33,12 @@ class AdoptionService:
             cameras = list((await db.execute(select(Camera).where(Camera.identity.in_(identities)))).scalars())
         if not cameras:
             return []
-        try:
-            remote = await self._jetson.cameras()
-        except JetsonError as exc:
+        if remote is None:
+            remote = await self.camera_snapshot()
+        if isinstance(remote, JetsonError):
             for camera in cameras:
-                await self._save(camera.id, camera.camera_uuid, "error", str(exc))
-            return [str(exc)]
+                await self._save(camera.id, camera.camera_uuid, "error", str(remote))
+            return [str(remote)]
 
         errors = []
         for camera in cameras:
@@ -56,14 +63,17 @@ class AdoptionService:
             await self._save(camera.id, camera_uuid, "pending", None)
             try:
                 if existing is None:
-                    await self._jetson.request("POST", "/cameras", json={
+                    payload = {
                         "source_url": source,
                         "config": {"camera_uuid": camera_uuid,
                                    "discovery_identity": camera.identity,
                                    "detection_enabled": camera.detection_wanted},
-                    })
+                    }
+                    await self._jetson.request("POST", "/cameras", json=payload)
+                    remote.append(dict(payload, camera_uuid=camera_uuid))
                 elif existing.get("source_url") != source:
                     await self._jetson.request("PATCH", "/cameras/" + camera_uuid, json={"source_url": source})
+                    existing["source_url"] = source
                 await self._save(camera.id, camera_uuid, "pushed", None)
             except JetsonError as exc:
                 state = "capacity_pending" if exc.status_code == 409 else "error"

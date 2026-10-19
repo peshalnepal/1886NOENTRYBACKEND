@@ -158,6 +158,7 @@ meta = {
     "frame_seq": 42,
     "_bgr_ref": frame_bgr,
     "_generation": generation_token,
+    "_infer_deadline": monotonic_deadline,
 }
 ```
 
@@ -169,11 +170,11 @@ A generation token changes when a channel is replaced. Late results from its old
 
 ## Timeouts do not cancel CUDA
 
-`_sweep_inflight()` periodically resolves overdue futures as `InferenceFailedEvent`. It does not terminate a GPU kernel or remove the worker's batch. A successful late result is still delivered through `late_result_cb`.
+`_sweep_inflight()` periodically resolves overdue futures as `InferenceFailedEvent`. It does not terminate a GPU kernel or remove the worker's batch. Expired results are discarded; completed or cancelled futures cannot republish stale detections.
 
-With timeout 4 seconds, the sweep interval is `max(0.25, 4/4) = 1` second. A result can therefore be declared late on a later sweep rather than at exactly 4.000 seconds. Failed events are normally not broadcast; genuine successful empty detections are broadcast so trackers can age disappeared objects.
+The sweep interval is one quarter of the smallest enabled budget, with a 250-ms minimum. The worker and completion callback also check the deadline, so a result cannot slip into the live cache between sweeps. Failed events are normally not broadcast; genuine successful empty detections are broadcast so trackers can age disappeared objects.
 
-Increasing `INFER_RESULT_TIMEOUT_S` can reduce timeout counters. It does not make inference faster. A timeout can consume `_bgr_ref`, so a later successful result can have detections without a new snapshot.
+Increasing `INFER_RESULT_TIMEOUT_S` does not make inference faster or override `FRAME_MAX_AGE_MS`. Zero disables the inference timeout; capture-age filtering remains active unless separately disabled.
 
 ## Reconnect and probe costs
 
@@ -183,7 +184,7 @@ Reconnect starts at 1000 ms, doubles up to 30000 ms, and applies a random factor
 
 The first GStreamer candidate has a default 12-second frame budget. Later candidates use `min(CAPTURE_PROBE_S, max(3, latency_seconds+2))`. At ordinary latency, six unsuccessful candidates can spend roughly `12 + 5×3 = 27` seconds in frame probes before FFmpeg fallback, plus construction/teardown/network costs. These budgets are not absolute end-to-end deadlines.
 
-`GstCapture.grab()` normally has a five-second read budget and polls in short intervals for cancellation. `GRAB_MISS_TOLERANCE=15` means a silent stream can spend roughly 75 seconds in unsuccessful reads before reconnect, plus waits, unless EOS/errors make those reads return earlier. This is a deployment hypothesis worth checking when a camera looks connected but stops producing frames.
+The capture worker polls native `GstCapture.grab()` with at most a one-second budget. `CAPTURE_STALL_TIMEOUT_S=5` reconnects after five seconds without a frame, allowing at least three sampling intervals for sparse streams. Explicit errors reconnect sooner. The OpenCV fallback still depends on its underlying blocking read timeout.
 
 ## Safe resource handling
 

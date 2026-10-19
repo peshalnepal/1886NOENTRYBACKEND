@@ -9,6 +9,7 @@ os.environ.setdefault(
 
 import asyncio
 import logging
+import math
 import random
 import time
 import threading
@@ -552,10 +553,15 @@ class VideoChannel():
                 emit_interval_s = 1.0 / sample_fps
                 next_emit = 0.0
                 try:
-                    max_grab_misses = int(os.getenv("GRAB_MISS_TOLERANCE", "15"))
-                except Exception:
-                    max_grab_misses = 15
-                grab_misses = 0
+                    stall_timeout_s = float(os.getenv("CAPTURE_STALL_TIMEOUT_S", "5"))
+                except (TypeError, ValueError):
+                    stall_timeout_s = 5.0
+                if not math.isfinite(stall_timeout_s) or stall_timeout_s <= 0:
+                    stall_timeout_s = 5.0
+                # Sparse sampling is healthy: allow at least three expected
+                # frame intervals before declaring a silent stream stalled.
+                stall_timeout_s = max(stall_timeout_s, 3 * emit_interval_s)
+                last_grab = time.monotonic()
 
                 while not self._stop_thread_evt.is_set():
                     grabbed = False
@@ -563,21 +569,24 @@ class VideoChannel():
                         with self._cap_lock:
                             if self._cap is None:
                                 break
-                            grabbed = self._cap.grab()
+                            if isinstance(self._cap, GstCapture):
+                                remaining = stall_timeout_s - (time.monotonic() - last_grab)
+                                grabbed = self._cap.grab(timeout_s=max(0.01, min(1.0, remaining)))
+                            else:
+                                grabbed = self._cap.grab()
                     except Exception:
                         grabbed = False
 
                     if not grabbed:
-                        grab_misses += 1
-                        if grab_misses >= max_grab_misses:
-                            raise RuntimeError(
-                                "Frame grab failed {} times consecutively".format(grab_misses)
-                            )
+                        if not cap.isOpened():
+                            raise RuntimeError("Capture closed while waiting for a frame")
+                        if time.monotonic() - last_grab >= stall_timeout_s:
+                            raise RuntimeError("No frames for {:.1f}s".format(stall_timeout_s))
                         if self._stop_thread_evt.wait(0.1):
                             break
                         continue
 
-                    grab_misses = 0
+                    last_grab = time.monotonic()
                     ts_ms = int(time.time() * 1000)
 
                     now = time.monotonic()

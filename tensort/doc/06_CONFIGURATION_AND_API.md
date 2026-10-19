@@ -35,10 +35,10 @@ Some values are read at module import; others at object construction. Treat chan
 | `INFER_MAX_BATCH` | Camera limit | 8 | Further capped by camera policy and engine profile |
 | `INFER_QUEUE_MAX` | 1 | 1 | Waiting **batches**, excluding executing batch |
 | `INFER_BATCH_LINGER_MS` | 10 | 10 | Brief top-up wait for an underfilled pool |
-| `INFER_RESULT_TIMEOUT_S` | 3 | 4 | Future leak/late-result guard, not a GPU deadline |
+| `INFER_RESULT_TIMEOUT_S` | 3 | 4 | Pending-work deadline; zero disables it; does not cancel CUDA |
 | `INFER_ERROR_LOG_INTERVAL_S` | 10 | Not set | Repeated failure log throttling |
 | `FRAME_POOL_CAP` | Configured max batch × 2, minimum camera limit | 16 | Waiting images in pool |
-| `FRAME_MAX_AGE_MS` | 700 | 1000 | Pool expiry age; zero disables expiry |
+| `FRAME_MAX_AGE_MS` | 700 | 1000 | Age budget across pool, worker and live publication; zero disables it |
 | `CHANNEL_OUT_Q_MAX` | 1 | 1 | Async output queue per capture |
 | `EMIT_EMPTY_DETECTIONS` | true | true | Publish successful zero-object frames |
 | `EMIT_FAILED_EVENTS` | false | false | Publish failed inference events if enabled |
@@ -56,9 +56,9 @@ Constructors such as `TRTInfer(...)` and `YoloV8DetTRT(...)` have their own defa
 | `GST_LATENCY_MS` | 200 | Not set | RTSP jitter buffering request |
 | `RECONNECT_BASE_MS` | 1000 | Not set | Initial reconnect delay before random factor |
 | `RECONNECT_MAX_MS` | 30000 | Not set | Backoff ceiling before random factor |
-| `CAMERA_START_STAGGER_S` | 1.5 | Not set | Process-wide spacing between capture opens |
+| `CAMERA_START_STAGGER_S` | 1.5 | 1.5 | Process-wide spacing between capture opens |
 | `CAPTURE_PROBE_S` | 12 | Not set | First candidate verification budget |
-| `GRAB_MISS_TOLERANCE` | 15 | Not set | Consecutive unsuccessful grabs before reconnect |
+| `CAPTURE_STALL_TIMEOUT_S` | 5 | 5 | Native capture silence budget, with at least three sample intervals of grace |
 | `OPENCV_FFMPEG_CAPTURE_OPTIONS` | TCP plus timeout/delay options set with `setdefault` | Not set | Existing process value wins |
 | `ENABLE_SNAPSHOT_CACHE` | true | true | Enable async JPEG caching |
 | `SNAPSHOT_ON_DETECTION_ONLY` | true | true | Empty successful frames do not refresh JPEG |

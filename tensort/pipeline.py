@@ -6,6 +6,7 @@ See README.md for the full flow and ARCHITECTURE.md for tuning details.
 """
 
 import asyncio
+from collections import OrderedDict
 import logging
 import re
 import time
@@ -72,6 +73,43 @@ def _detect_total_memory_mb() -> Optional[int]:
 # Detection event subscribers
 # ---------------------------------------------------------------------------
 
+class LatestDetectionQueue:
+    """One pending event per camera, consumed in camera arrival order.
+
+    Replacing a camera's pending event keeps its place, so a busy camera
+    cannot starve quieter cameras. Access is confined to the pipeline loop.
+    """
+    def __init__(self, maxsize):
+        self.maxsize = max(1, int(maxsize))
+        self._pending = OrderedDict()
+        self._available = asyncio.Event()
+
+    def put_nowait(self, msg, deadline=None):
+        key = str(msg.get("camera_uuid", "unknown"))
+        if key not in self._pending and len(self._pending) >= self.maxsize:
+            self._pending.popitem(last=False)
+        self._pending[key] = (msg, deadline)
+        self._available.set()
+
+    def get_nowait(self):
+        while self._pending:
+            _, (msg, deadline) = self._pending.popitem(last=False)
+            if deadline is None or time.monotonic() < deadline:
+                return msg
+        raise asyncio.QueueEmpty
+
+    async def get(self):
+        while True:
+            try:
+                return self.get_nowait()
+            except asyncio.QueueEmpty:
+                self._available.clear()
+                await self._available.wait()
+
+    def qsize(self):
+        return len(self._pending)
+
+
 class Broadcaster:
     """
     Lock-free broadcast for the hot path.
@@ -83,11 +121,11 @@ class Broadcaster:
     no await, no contention.
     """
     def __init__(self):
-        self._subscribers = []          # [(asyncio.Queue, Optional[str])]
+        self._subscribers = []          # [(LatestDetectionQueue, Optional[str])]
         self._sub_lock = asyncio.Lock() # only for subscribe/unsubscribe
 
     async def subscribe(self, camera_uuid=None):
-        q = asyncio.Queue(maxsize=200)
+        q = LatestDetectionQueue(1 if camera_uuid is not None else camera_limit())
         camera_key = None if camera_uuid is None else str(camera_uuid)
         async with self._sub_lock:
             self._subscribers = self._subscribers + [(q, camera_key)]  # new list = atomic replace
@@ -97,7 +135,7 @@ class Broadcaster:
         async with self._sub_lock:
             self._subscribers = [(sub_q, camera_key) for (sub_q, camera_key) in self._subscribers if sub_q is not q]
 
-    def broadcast(self, msg):
+    def broadcast(self, msg, deadline=None):
         # Synchronous: it only does put_nowait, never awaits. Keeping it a
         # coroutine forced the result path to spawn a task per frame.
         # Snapshot is a single attribute read — atomic under GIL, no lock needed.
@@ -108,12 +146,7 @@ class Broadcaster:
         for q, camera_key in self._subscribers:
             if camera_key is not None and camera_key != msg_camera_uuid:
                 continue
-            try:
-                q.put_nowait(msg)
-            except asyncio.QueueFull:
-                # A slow consumer needs recent detections, not an old backlog.
-                q.get_nowait()
-                q.put_nowait(msg)
+            q.put_nowait(msg, deadline)
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +215,7 @@ class SimpleInferencePipeline(object):
         # tracker treat a transient GPU hiccup as "everything vanished", so they
         # are logged and counted but not broadcast by default.
         self._emit_failed_events = env_bool("EMIT_FAILED_EVENTS", False)
-        # Leak guard, not a latency knob: a timed-out frame is no longer thrown
-        # away (the worker still delivers a late result), so this can be
-        # generous. The old memory-scaled 1.5s on an 8GB Orin Nano was tight
-        # enough to time out frames the GPU was about to return.
+        # Also bound pending work when capture-age filtering is disabled.
         self._infer_result_timeout_s = env_float("INFER_RESULT_TIMEOUT_S", 3.0, minimum=0.0)
         self._infer_error_log_interval_s = env_float("INFER_ERROR_LOG_INTERVAL_S", 10.0, minimum=0.0)
         self._last_infer_error_sig = {}
@@ -309,7 +339,6 @@ class SimpleInferencePipeline(object):
                 loop=loop,
                 max_q_per_worker=self._infer_q_max,
                 ready_cb=self._worker_free_evt.set,
-                late_result_cb=self._handle_result,
             )
             try:
                 self._engine_max_batch = await self._infer_pool.wait_ready()
@@ -324,7 +353,7 @@ class SimpleInferencePipeline(object):
             )
 
             self._inference_task = asyncio.ensure_future(self._pump_inference())
-            if self._infer_result_timeout_s > 0.0:
+            if self._infer_result_timeout_s > 0.0 or self._frame_max_age_s > 0.0:
                 self._sweeper_task = asyncio.ensure_future(self._sweep_inflight())
 
             for camera_key in list(self._channels.keys()):
@@ -448,10 +477,17 @@ class SimpleInferencePipeline(object):
             "_bgr_ref": bgr,
             "_generation": self._channel_generation.get(camera_uuid),
         }
+        remaining_s = self._infer_result_timeout_s or float("inf")
+        if self._frame_max_age_s > 0:
+            age_s = max(0.0, time.time() - event.ts_ms / 1000.0)
+            remaining_s = min(remaining_s, self._frame_max_age_s - age_s)
+        # Convert the wall-clock capture age once; queue waiting and inference
+        # then share a monotonic deadline unaffected by clock adjustments.
+        meta["_infer_deadline"] = time.monotonic() + remaining_s
 
         fut = loop.create_future()
         inflight_key = (camera_uuid, int(event.seq))
-        deadline = loop.time() + self._infer_result_timeout_s
+        deadline = meta["_infer_deadline"]
         self._inflight[inflight_key] = (fut, deadline)
 
         # Each call owns its metadata, so callbacks cannot mix camera frames.
@@ -542,11 +578,11 @@ class SimpleInferencePipeline(object):
 
         Replaces the old per-frame watchdog coroutine (one asyncio task + one
         timer per frame). A worker that overruns is a GPU stall, not a per-frame
-        event, so one periodic sweep is enough — and if the real result lands
-        afterwards the worker still delivers it via late_result_cb instead of
-        throwing the finished work away.
+        event, so one periodic sweep is enough. Completed results still have
+        to satisfy the capture-age budget before entering the live caches.
         """
-        interval = max(0.25, float(self._infer_result_timeout_s) / 4.0)
+        budgets = [value for value in (self._infer_result_timeout_s, self._frame_max_age_s) if value > 0]
+        interval = max(0.25, min(budgets, default=1.0) / 4.0)
         loop = asyncio.get_event_loop()
         try:
             while not self._closing:
@@ -577,8 +613,8 @@ class SimpleInferencePipeline(object):
         """
         Process one inference result on the pipeline event loop.
 
-        Both normal completion and late results are scheduled on this loop,
-        so the GPU worker never writes these caches directly.
+        Completion callbacks run on this loop, so the GPU worker never writes
+        these caches directly.
         """
         camera_uuid = str(meta.get("camera_uuid", "unknown"))
         bgr = meta.pop("_bgr_ref", None)
@@ -591,6 +627,15 @@ class SimpleInferencePipeline(object):
         frame_seq = int(meta.get("frame_seq", 0))
 
         failed = isinstance(result, dict) and result.get("type") == "InferenceFailedEvent"
+
+        # Dropped work is not a real empty frame. Do not clear detections or
+        # age the cloud tracker as though inference observed no objects.
+        expired = (time.monotonic() >= meta.get("_infer_deadline", float("inf")) or
+                   (self._frame_max_age_s > 0 and ts_ms > 0 and
+                    time.time() - ts_ms / 1000.0 >= self._frame_max_age_s))
+        if expired:
+            self._stats["infer_dropped"] += 1
+            return
 
         if failed:
             self._stats["infer_fail"] += 1
@@ -643,7 +688,7 @@ class SimpleInferencePipeline(object):
         self._latest[camera_uuid] = result
 
         if should_emit:
-            self.broadcaster.broadcast(result)
+            self.broadcaster.broadcast(result, deadline=meta.get("_infer_deadline"))
 
     # ------------------------------------------------------------------
     # Public API

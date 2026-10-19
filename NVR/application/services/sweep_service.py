@@ -1,4 +1,4 @@
-"""Scan, verify, persist, then provision the relay and reconcile Jetson channels.
+"""Scan, then persist and provision cameras as verification completes.
 
 Sweeps are serialized and shared by concurrent callers. Missing cameras are retained.
 """
@@ -118,149 +118,51 @@ class SweepService:
     async def _sweep(self) -> Dict[str, Any]:
         started = time.monotonic()
         scan = await self._adapter.scan()
-        # scan={"nvr": {
-        #     "host": "192.168.1.10",
-        #     "rtsp_port": 554,
-        #     "http_port": 80,
-        #     "origin": "static",
-        #     "channels_spec": "1-2",
-        #     "responded": true
-        #     },
-        #     "candidates": [
-        #     {
-        #         "sources": [
-        #         {
-        #             "source_identity": "serial:CAM001#1",
-        #             "kind": "nvr",
-        #             "host": "192.168.1.10",
-        #             "rtsp_port": 554,
-        #             "channel_no": 1,
-        #             "source_url": "rtsp://192.168.1.10:554/Streaming/Channels/102",
-        #             "serial_number": "CAM001",
-        #             "mac_address": null,
-        #             "model": "DS-2CD2143G0-I",
-        #             "firmware": null,
-        #             "device_name": "Front Door"
-        #         }
-        #         ]
-        #     },
-        #     {
-        #         "sources": [
-        #         {
-        #             "source_identity": "ip:192.168.1.10#2",
-        #             "kind": "nvr",
-        #             "host": "192.168.1.10",
-        #             "rtsp_port": 554,
-        #             "channel_no": 2,
-        #             "source_url": "rtsp://192.168.1.10:554/Streaming/Channels/202",
-        #             "serial_number": null,
-        #             "mac_address": null,
-        #             "model": "NVR-Static-Channel",
-        #             "firmware": null,
-        #             "device_name": "192.168.1.10 ch2"
-        #         }
-        #         ]
-        #     },
-        #     {
-        #         "sources": [
-        #         {
-        #             "source_identity": "serial:CAM003",
-        #             "kind": "direct",
-        #             "host": "192.168.1.30",
-        #             "rtsp_port": 554,
-        #             "channel_no": null,
-        #             "source_url": "rtsp://192.168.1.30:554/Streaming/Channels/102",
-        #             "serial_number": "CAM003",
-        #             "mac_address": null,
-        #             "model": "DS-2CD2143G0-I",
-        #             "firmware": "V5.7",
-        #             "device_name": "Back Door"
-        #         }
-        #         ]
-        #     }
-        #     ],
-        #     "errors": []}
-
-        winners = await asyncio.gather(*(self._verify(candidate) for candidate in scan.candidates))
-        # winners=  =[
-        #     {
-        #     "source_identity": "serial:CAM001#1",
-        #     "kind": "nvr",
-        #     "host": "192.168.1.10",
-        #     "rtsp_port": 554,
-        #     "channel_no": 1,
-        #     "source_url": "rtsp://192.168.1.10:554/Streaming/Channels/102",
-        #     "serial_number": "CAM001",
-        #     "mac_address": null,
-        #     "model": "DS-2CD2143G0-I",
-        #     "firmware": null,
-        #     "device_name": "Front Door"
-        #     },
-        #     {
-        #     "source_identity": "ip:192.168.1.10#2",
-        #     "kind": "nvr",
-        #     "host": "192.168.1.10",
-        #     "rtsp_port": 554,
-        #     "channel_no": 2,
-        #     "source_url": "rtsp://192.168.1.10:554/Streaming/Channels/202",
-        #     "serial_number": null,
-        #     "mac_address": null,
-        #     "model": "NVR-Static-Channel",
-        #     "firmware": null,
-        #     "device_name": "192.168.1.10 ch2"
-        #     },
-        #     {
-        #     "source_identity": "serial:CAM003",
-        #     "kind": "direct",
-        #     "host": "192.168.1.30",
-        #     "rtsp_port": 554,
-        #     "channel_no": null,
-        #     "source_url": "rtsp://192.168.1.30:554/Streaming/Channels/102",
-        #     "serial_number": "CAM003",
-        #     "mac_address": null,
-        #     "model": "DS-2CD2143G0-I",
-        #     "firmware": "V5.7",
-        #     "device_name": "Back Door"
-        #     }
-        # ]
-
         report = empty_report(self._settings.nvr_mode)
         report["scanned"] = len(scan.candidates)
         report["errors"].extend(scan.errors)
         now = utc_now()
-        async with self._session_factory() as db:
-            async with db.begin():
-                nvr_id = await self._sweep_nvr(db, scan.nvr, winners, report, now)
-                present_ids = set()
-                for candidate, winner in zip(scan.candidates, winners):
-                    camera_id = await self._record(db, candidate, winner, nvr_id, report, now)
-                    if camera_id is not None:
-                        present_ids.add(camera_id)
-                report["missing_cameras"] = await self._cameras.mark_missing(
-                    db, present_ids, self._settings.discovery_miss_threshold, now)
+        # Reserve the recorder ID for camera foreign keys. Presence is finalized
+        # once per completed sweep, never once per candidate.
+        async with self._session_factory() as db, db.begin():
+            nvr = await self._nvrs.upsert(db, scan.nvr, now) if scan.nvr else None
+            nvr_id = nvr.id if nvr else None
 
-        # Relay first: adoption only points Jetson at a configured relay path.
-        present = [entry["identity"] for entry in report["present"]]
-        # this report present will look something like ZipFile The class for reading and writing ZIP files.  See section 
-        #  {
-        #     "identity": camera.identity,# this is source identity made by serial number with ip
-        #     "ip": camera.ip_address, 
-        #     "ip_address": camera.ip_address,
-        #     "serial_number": camera.serial_number,
-        #     "model": camera.model,
-        #     "firmware": camera.firmware,
-        #     "device_name": camera.device_name,
-        #     "mac": camera.mac_address,
-        #     "channel": camera.channel_no or 1,
-        #     "rtsp_port": camera.rtsp_port,
-        #     "is_nvr": camera.source_kind == "nvr",
-        #     "source_kind": camera.source_kind,
-        #     "nvr_id": camera.nvr_id,
-        #     "channel_no": camera.channel_no,
-        #     "source_url": camera.source_url,
-        # }
-        report["errors"].extend(await self._relay.reconcile(present))
-        report["errors"].extend(await self._adoption.reconcile(present))
+        async def verify(candidate):
+            return candidate, await self._verify(candidate)
+
+        probes = [asyncio.create_task(verify(candidate)) for candidate in scan.candidates]
+        winners = []
+        present_ids = set()
+        remote = None
+        try:
+            for completed in asyncio.as_completed(probes):
+                candidate, winner = await completed
+                winners.append(winner)
+                # Commit before calling MediaMTX/Jetson. A slow or failed probe
+                # must not hold up cameras that are already playable.
+                async with self._session_factory() as db, db.begin():
+                    camera_id = await self._record(db, candidate, winner, nvr_id, report, now)
+                if camera_id is not None:
+                    present_ids.add(camera_id)
+                    identity = report["present"][-1]["identity"]
+                    report["errors"].extend(await self._relay.reconcile([identity]))
+                    if remote is None:
+                        remote = await self._adoption.camera_snapshot()
+                    errors = await self._adoption.reconcile([identity], remote=remote)
+                    report["errors"].extend(error for error in errors if error not in report["errors"])
+        finally:
+            for probe in probes:
+                if not probe.done():
+                    probe.cancel()
+            await asyncio.gather(*probes, return_exceptions=True)
+
+        # Only a complete scan may age missing cameras. Cancellation keeps any
+        # committed successes, without falsely marking unfinished probes absent.
+        async with self._session_factory() as db, db.begin():
+            await self._sweep_nvr(db, scan.nvr, winners, report, now)
+            report["missing_cameras"] = await self._cameras.mark_missing(
+                db, present_ids, self._settings.discovery_miss_threshold, now)
 
         report["roster"] = await self._roster_rows()
         by_identity = {row["identity"]: row for row in report["roster"]}
@@ -318,52 +220,6 @@ class SweepService:
             is_new = camera is None
             recovered = not is_new and not camera.is_present and camera.first_frame_at is not None
             camera, change = await self._cameras.save_verified(db, camera, candidate, winner, nvr_id, now)
-            # DIRECT CAMERA EXCESS
-            # change = {
-            #     "identity": "serial:ABC123",
-            #     "camera_uuid": None,
-            #     "ip_address": "192.168.1.21",
-            #     "source_url": "rtsp://192.168.1.21:554/Streaming/Channels/102",
-            #     "previous_source_url": "rtsp://192.168.1.20:554/Streaming/Channels/102",
-            #     "source_kind": "direct",
-            #     "channel_no": None,
-            #     "reason": "ip_change",
-            # }
-            # NVR BASED CAMERA 
-            # change = {
-            #     "identity": "serial:ABC123#3",
-            #     "camera_uuid": None,
-            #     "ip_address": "192.168.1.11",
-            #     "source_url": "rtsp://192.168.1.11:554/Streaming/Channels/302",
-            #     "previous_source_url": "rtsp://192.168.1.10:554/Streaming/Channels/302",
-            #     "source_kind": "nvr",
-            #     "channel_no": 3,
-            #     "reason": "ip_change",
-            # }
-            # Camera Object
-            # camera = Camera(
-            #     id=7,                         # local database row ID
-            #     identity="serial:ABC123",     # stable identity from when first saved
-            #     dedupe_key="serial:ABC123",
-            #     camera_uuid="550e8400-e29b-41d4-a716-446655440000",
-
-            #     serial_number="ABC123",
-            #     mac_address="aa:bb:cc:dd:ee:ff",
-            #     model="DS-2CD...",
-            #     firmware="V5.7...",
-            #     device_name="Front Door",
-
-            #     source_kind="nvr",            # currently verified route
-            #     nvr_id=1,                     # local NVR database row ID
-            #     channel_no=3,
-            #     ip_address="192.168.1.10",    # NVR IP
-            #     rtsp_port=554,
-            #     source_url="rtsp://192.168.1.10:554/Streaming/Channels/302",
-
-            #     is_present=True,
-            #     jetson_state="pushed",
-            #     # plus timestamps, miss counters, alert state, etc.
-            # )
             if change is not None:
                 report["ip_changes"].append(change)
 
@@ -371,8 +227,8 @@ class SweepService:
             return None
 
         entry = {
-            "identity": camera.identity,# this is source identity made by serial number with ip
-            "ip": camera.ip_address, 
+            "identity": camera.identity,
+            "ip": camera.ip_address,
             "ip_address": camera.ip_address,
             "serial_number": camera.serial_number,
             "model": camera.model,
@@ -394,7 +250,7 @@ class SweepService:
             report["recovered_cameras"].append(entry)
         return camera.id
 
-    # 
+    # ------------------------------------------------------------------
     # Reporting / state
     # ------------------------------------------------------------------
     def _publish(self, report: Dict[str, Any]) -> None:
@@ -426,7 +282,7 @@ class SweepService:
         return [self._relay.export(row) for row in await self._roster_rows()]
 
     async def forget(self, identity: str) -> bool:
-        """Drop a local roster entry. Jetson channel------------------------------------------------------------------s and relay paths are kept."""
+        """Drop a local roster entry. Jetson channels and relay paths are kept."""
         async with self._session_factory() as db:
             async with db.begin():
                 return await self._cameras.forget(db, identity)

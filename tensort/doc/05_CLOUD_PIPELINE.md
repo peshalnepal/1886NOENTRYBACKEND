@@ -177,8 +177,8 @@ Clip capture and alert image materialization use separate services. The cloud re
 
 ## Browser behavior
 
-[`detection/overlay.js`](../../../Frontend/rtsp-ui/src/app/detection/overlay.js) consumes cloud SSE and draws boxes on top of separate video playback. It learns arrival cadence and expires live overlays using `clamp(interval×1.0, 500, 1500)` milliseconds, with 1000 ms before a cadence is learned. Fading begins halfway through that window.
+[`detection/overlay.js`](../../../Frontend/rtsp-ui/src/app/detection/overlay.js) consumes cloud SSE and draws boxes on top of separate video playback. One authenticated stream carries the visible cameras, each checked against its owner's pipeline and viewer permissions. Public walls retain their share-scoped stream. Duplicate and out-of-order events cannot refresh live boxes; accepted clock resets recover after a gap.
 
-At one detection every 2 seconds, the maximum 1.5-second overlay lifetime leaves a visible gap even if delivery is regular. At fast object speed, old boxes also lag behind live video because the streams have independent latency. Increasing overlay hold time can hide gaps while increasing stale boxes; fix the underlying cadence/latency first.
+Capture timestamps determine the learned cadence without comparing clocks across computers. Live expiry uses `clamp(interval×1.25 + 500, 750, 3000)` milliseconds, with a 250-ms fade; motion and prediction budgets can shorten each box's lifetime. Recorded image/clip overlays do not expire with live state. Video and detections still have independent transport latency, which requires a live measurement.
 
 [`app.js`](../../../Frontend/rtsp-ui/src/app/app.js) schedules normal data refresh every 30 seconds, with visibility/lifecycle conditions. Camera creation in SQL can therefore precede its appearance in an already open browser. Compare the cloud camera API directly before blaming discovery.

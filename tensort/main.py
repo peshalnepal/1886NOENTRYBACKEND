@@ -1,6 +1,7 @@
 """HTTP entry point. Run one process: it owns one GPU inference runtime."""
 
 import logging
+import re
 import os
 import sys
 
@@ -30,7 +31,24 @@ else:
     from routes import register_routes
     from lifecycle import serve
 
+class _RedactedFormatter(logging.Formatter):
+    """Redact the final log text, including exception chains, without mutation."""
+    def __init__(self, formatter):
+        super().__init__()
+        self.formatter = formatter
+
+    def format(self, record):
+        text = self.formatter.format(record)
+        text = re.sub(r"(\b[a-z][a-z0-9+.-]*://)[^\s/@]+@", r"\1***@", text,
+                      flags=re.IGNORECASE)
+        return re.sub(r"([?&](?:password|passwd|pwd|token|access_token)=)[^&\s\"']+",
+                      r"\1***", text, flags=re.IGNORECASE)
+
+
 logging.basicConfig(level=logging.INFO)
+for handler in logging.getLogger().handlers:
+    if not isinstance(handler.formatter, _RedactedFormatter):
+        handler.setFormatter(_RedactedFormatter(handler.formatter or logging.Formatter()))
 
 
 def create_app(runtime=None):

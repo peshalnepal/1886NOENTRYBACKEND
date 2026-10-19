@@ -52,3 +52,26 @@ tensort/log.txt
 !/tests/test_discovery_repoint.py
 !/tests/test_nvr_recordings.py
 !/tests/test_tensort_registration.py
+
+# Detection latency regressions run without cameras or a GPU.
+!/tests/test_detection_delivery.py
+!/tests/test_nvr_sweep_latency.py
+!/tests/test_tensort_pipeline_autosizing.py
+!/tests/test_service_helper_cleanup.py
+!/tensort/tests/
+/tensort/tests/*
+!/tensort/tests/run_tests.py
+!/tensort/tests/test_broadcaster.py
+!/tensort/tests/test_capture_recovery.py
+!/tensort/tests/test_frame_jobs.py
+!/tensort/tests/test_worker_frame_age.py
+!/tensort/tests/test_dispatch.py
+!/tensort/tests/test_credential_logging.py
+!/tensort/tests/test_native_capture.py
+!/tensort/tests/test_orin_capacity.py
+!/NVR/tests/
+/NVR/tests/*
+!/NVR/tests/fakes.py
+!/NVR/tests/test_sweep_service.py
+!/NVR/tests/test_gateway.py
+!/NVR/tests/test_relay.py

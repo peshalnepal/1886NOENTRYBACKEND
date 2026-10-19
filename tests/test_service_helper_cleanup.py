@@ -57,10 +57,15 @@ class ClipCaptureConfigurationTests(unittest.TestCase):
                 self.assertEqual(service.enabled, expected)
                 self.assertEqual(service.CLIP_DURATION_S, service.PRE_EVENT_S + service.POST_EVENT_S)
 
-    def test_capture_requires_playback_url(self):
-        with patch.dict("os.environ", {}, clear=True):
+    def test_mediamtx_capture_requires_playback_url(self):
+        with patch.dict("os.environ", {"VIDEO_CLIP_PROVIDER": "mediamtx"}, clear=True):
             with patch("application.services.clip_storage.httpx.AsyncClient"):
                 self.assertFalse(EventClipService().enabled)
+
+    def test_nvr_capture_does_not_require_cloud_playback_url(self):
+        with patch.dict("os.environ", {"VIDEO_CLIP_PROVIDER": "nvr"}, clear=True):
+            with patch("application.services.clip_storage.httpx.AsyncClient"):
+                self.assertTrue(EventClipService().enabled)
 
 
 class ReportImageUrlTests(unittest.IsolatedAsyncioTestCase):

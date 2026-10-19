@@ -23,14 +23,9 @@ class _FakeVideoChannel(object):
 
 
 class _FakeInferenceWorkerPool(object):
-    def __init__(self, loop, num_workers, max_q_per_worker=1, ready_cb=None, late_result_cb=None):
+    def __init__(self, loop, max_q_per_worker=1, ready_cb=None):
         self._loop = loop
-        self._workers = [object() for _ in range(max(1, int(num_workers)))]
-
-    def ensure_size(self, num_workers):
-        while len(self._workers) < int(num_workers):
-            self._workers.append(object())
-        return len(self._workers)
+        self._workers = [object()]
 
     def has_capacity(self):
         return True
@@ -46,16 +41,7 @@ class _FakeInferenceWorkerPool(object):
 
 
 class TensortPipelineAutosizingTests(unittest.TestCase):
-    def test_legacy_auto_settings_use_one_ordered_worker(self):
-        with patch.dict(os.environ, {"INFER_NUM_WORKERS": "0", "INFER_NUM_WORKERS_MAX": "4"}):
-            pipe = tensort_pipeline.SimpleInferencePipeline()
-        self.assertEqual(pipe._num_workers, 1)
-        self.assertEqual(pipe._num_workers_max, 1)
-
-    def test_infer_timeout_is_a_flat_leak_guard(self):
-        # A timed-out frame is no longer discarded (a late result is still
-        # delivered), so the timeout is a leak guard rather than a
-        # memory-scaled latency knob.
+    def test_default_inference_deadline_is_three_seconds(self):
         pipe = tensort_pipeline.SimpleInferencePipeline()
         self.assertAlmostEqual(pipe._infer_result_timeout_s, 3.0)
 

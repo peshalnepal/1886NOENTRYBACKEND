@@ -117,6 +117,26 @@ class RegistrationTests(unittest.TestCase):
         self.runtime.remove_camera(UUID)
         self.assertEqual(self.client.post("/cameras", json=payload).status_code, 201)
 
+    def test_identical_registration_and_metadata_patch_preserve_capture(self):
+        self.runtime.add_camera(SOURCE, {"camera_uuid": UUID, "resize": (640, 360)})
+        capture = self.runtime.pipeline.channels[UUID]
+        self.runtime.add_camera(SOURCE, {"camera_uuid": UUID, "resize": [640, 360]})
+        self.assertIs(self.runtime.pipeline.channels[UUID], capture)
+        self.runtime.patch_camera(UUID, {"display_name": "Front door"})
+        self.assertIs(self.runtime.pipeline.channels[UUID], capture)
+        self.assertEqual(self.repo.saved[UUID]["display_name"], "Front door")
+
+    def test_capture_setting_changes_and_disable_enable_still_apply(self):
+        self.runtime.add_camera(SOURCE, {"camera_uuid": UUID, "sample_fps": 3})
+        capture = self.runtime.pipeline.channels[UUID]
+        self.runtime.patch_camera(UUID, {"sample_fps": 2})
+        self.assertIsNot(self.runtime.pipeline.channels[UUID], capture)
+        self.assertEqual(self.runtime.pipeline.channels[UUID].sample_fps, 2)
+        self.runtime.patch_camera(UUID, {"enabled": False})
+        self.assertNotIn(UUID, self.runtime.pipeline.channels)
+        self.runtime.patch_camera(UUID, {"enabled": True})
+        self.assertIn(UUID, self.runtime.pipeline.channels)
+
     def test_registration_still_requires_uuid(self):
         self.assertEqual(self.client.post("/cameras", json={"source_url": SOURCE}).status_code, 400)
         self.assertEqual(self.repo.saved, {})

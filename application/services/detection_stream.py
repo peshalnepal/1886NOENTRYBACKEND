@@ -108,6 +108,7 @@ async def stream_camera_detections(
     cam_key = str(camera_uuid)
     last_ts = int(after_ts_ms)
     last_seq = int(after_seq)
+    allow_reset = False
 
     initial = await pipeline.get_latest_detection(cam_key)
     if initial is not None and last_ts == 0 and last_seq > 0:
@@ -116,6 +117,7 @@ async def stream_camera_detections(
         its, isq = int(initial.frame_ts_ms), int(initial.frame_seq)
         if its > last_ts or (its == last_ts and isq > last_seq):
             last_ts, last_seq = its, isq
+            allow_reset = True
             yield detection_event(initial, normalize=normalize)
 
     while True:
@@ -127,6 +129,7 @@ async def stream_camera_detections(
             after_ts_ms=last_ts,
             after_seq=last_seq,
             timeout_ms=int(timeout_ms),
+            allow_reset=allow_reset,
         )
 
         if resp is None:
@@ -135,6 +138,7 @@ async def stream_camera_detections(
 
         last_ts = int(resp.frame_ts_ms)
         last_seq = int(resp.frame_seq)
+        allow_reset = True
         yield detection_event(resp, normalize=normalize)
 
 
@@ -209,6 +213,7 @@ async def stream_multi_camera_detections(
                 after_ts_ms=last_ts,
                 after_seq=last_seq,
                 timeout_ms=int(timeout_ms),
+                allow_reset=True,
             )
         )
         tasks[task] = cam_key
@@ -265,3 +270,4 @@ async def stream_multi_camera_detections(
     finally:
         for task in tasks:
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

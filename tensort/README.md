@@ -68,18 +68,21 @@ flowchart LR
    camera before taking a second. A silent camera never blocks others.
 4. `_pump_inference()` waits for worker queue capacity before drawing a batch.
    `_prepare_frame_job()` attaches camera identity, sequence, timestamp, and a
-   completion callback to each frame.
-5. `InferenceWorker` runs the batch on its CUDA-owning thread. `TRTInfer` resizes
+   completion callback and monotonic expiry deadline to each frame.
+5. `InferenceWorker` discards expired jobs before running the remaining batch on its CUDA-owning thread. `TRTInfer` resizes
    and letterboxes images, normalizes RGB input, executes TensorRT, and maps
    filtered detections back to each frame's dimensions.
 6. `_handle_result()` updates metrics and the latest result, broadcasts the event,
    and optionally schedules a JPEG. One encoder thread keeps snapshot work bounded.
-7. Slow SSE clients discard their oldest queued event. Empty detection events
-   normally remain enabled so the cloud tracker can age objects that disappeared.
+7. SSE clients retain only the latest pending event per camera. Expired pending
+   events are skipped; busy cameras cannot displace other active cameras. Fresh
+   empty detection events remain enabled so the cloud tracker can age objects.
 
 The single GPU worker preserves per-camera ordering and avoids duplicate engines.
 The dispatcher respects the engine's actual batch limit. Timeout failures are
-counted; successful late results can still be delivered. Camera replacement
+counted; expired results cannot update live caches or emit false empty detections.
+`INFER_RESULT_TIMEOUT_S=0` disables the job timeout; `FRAME_MAX_AGE_MS=0`
+disables the capture-age budget. When both are positive, the earlier limit wins. Camera replacement
 changes a generation token, preventing old results from repopulating its cache.
 
 Do not remove the queue bounds, cancellation handling, generation checks, or
@@ -98,6 +101,12 @@ credentials in `.env`. The main groups are:
 | `DEFAULT_RESIZE_W`, `DEFAULT_RESIZE_H` | Capture resize bounds |
 | `FRAME_POOL_CAP`, `FRAME_MAX_AGE_MS`, `INFER_MAX_BATCH` | Bounded inference workload |
 | `ENABLE_SNAPSHOT_CACHE`, `SNAPSHOT_*` | JPEG cache behavior |
+
+Unchanged camera registrations and metadata-only patches preserve the capture
+connection. Changed capture settings still replace it. Native capture reconnects
+after `CAPTURE_STALL_TIMEOUT_S` without frames (default 5 seconds, or three
+sampling intervals for sparse streams). OpenCV fallback is also subject to its
+backend read timeout. `CAMERA_START_STAGGER_S` defaults to 1.5 seconds.
 
 Saved per-camera settings survive restart. Editing a default in `.env` does not
 rewrite existing camera configurations.

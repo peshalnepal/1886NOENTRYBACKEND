@@ -25,7 +25,7 @@ when inference samples only five frames per second.
 
 Each capture thread retains at most one frame awaiting its event-loop callback;
 the asyncio output queue also defaults to one frame. The shared FramePool holds
-16 frames, discards frames older than 700 ms, and evicts the oldest frame from
+16 frames, discards frames older than `FRAME_MAX_AGE_MS` (example: 1000 ms), and evicts the oldest frame from
 the camera holding the largest backlog when full. Batches draw one frame from
 each ready camera before taking a second from any camera. A missing camera never
 holds up the others.
@@ -44,8 +44,14 @@ Initialization must succeed before the runtime becomes ready. A static batch-one
 engine is supported, but `/health` reports that actual limit.
 
 Snapshots use one encoding thread and at most one pending job per camera. Slow
-SSE clients discard their oldest queued message when full. Both paths stay
-bounded when consumers cannot keep up.
+SSE clients keep one pending result per camera, bounded by `MAX_CAMERAS`, and
+skip expired results. A busy camera keeps its queue position when replacing its
+pending event. Both paths stay bounded when consumers cannot keep up.
+
+Capture age and the inference timeout share a monotonic deadline. The worker
+checks it before inference and completion; the pipeline checks it again before
+cache updates and SSE publication. Expiration is a dropped job, not an empty
+detection event. Set either budget to zero to disable that particular limit.
 
 ## Files
 
@@ -70,7 +76,7 @@ JPEG encoding and FFmpeg fallback. The runtime limits its CPU thread count.
 
 RTSP tries hardware decode before CPU fallbacks. Compressed packets are never
 intentionally dropped before the decoder; decoded frames can be dropped safely.
-GStreamer `videorate` limits BGR conversion to the sample rate. Hardware scaling
+GStreamer `videorate` limits BGR conversion to the sample rate. Hardware conversion
 still happens before that gate, and the original stream is still decoded in
 full, so camera substreams are the main way to reduce decode load. Generic
 `uridecodebin` selects its decoder automatically; the `*-hw` backend name reports
@@ -78,9 +84,9 @@ the selected pipeline, not proof of which decoder it auto-plugged. The CPU
 automatic candidate sets `force-sw-decoders=true` to avoid NVMM negotiation
 against a software-only converter.
 
-`DEFAULT_RESIZE_W/H` defaults to 640x360. GStreamer scales to those exact dimensions;
-choose dimensions matching the camera aspect ratio (640x480 for 4:3 sources), or
-set per-camera `resize` explicitly. The OpenCV fallback fits inside those bounds.
+`DEFAULT_RESIZE_W/H` defaults to 640x360. Both capture paths fit inside these
+bounds on the CPU while preserving the source aspect ratio. Model letterboxing
+skips a redundant resize when the frame already has the required dimensions.
 Detection coordinates always refer to the emitted frame size.
 
 Use a JetPack release for this board that provides **TensorRT 10**; check the
@@ -118,11 +124,11 @@ Discovery reports and `/sync` belong to NVR.
 
    This checks batch rows and reports preprocessing + inference + parsing FPS.
    It excludes stream decoding and network delivery. Leave at least 25% headroom
-   over the desired aggregate rate (40 FPS for eight cameras at five FPS).
+   over the desired aggregate rate (24 FPS for eight cameras at three FPS).
 3. Add all eight real streams, wait for initialization/warm-up, then run:
 
    ```bash
-   .venv_trt/bin/python deployment/check_capacity.py --cameras 8 --fps 5 --seconds 120
+   .venv_trt/bin/python deployment/check_capacity.py --cameras 8 --fps 3 --seconds 120
    ```
 
    The check measures per-camera result rates, sampled frame age, failures,

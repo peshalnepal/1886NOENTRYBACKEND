@@ -37,8 +37,14 @@ flowchart LR
 Discovery candidates contain an immutable, ordered tuple of sources. Their dedupe
 key is derived from those sources (lowest serial, then MAC, then route identity).
 Verification returns the first playable source, or no winner. The sweep passes
-that result to the camera repository inside one transaction; repositories never
-commit independently.
+each result to the camera repository in a short transaction, then provisions
+its relay and Jetson channel immediately. Slow probes do not block cameras whose
+frames have already decoded. Missing-camera and NVR presence counters are updated
+once after all probes finish. An interrupted sweep keeps committed successes
+without aging unfinished cameras. Repositories never commit independently.
+Jetson's camera roster is fetched once per sweep and updated after successful
+registrations. An unreachable Jetson causes one roster timeout, not one per camera.
+Verification still requires a decoded frame; cached health does not bypass it.
 
 `CameraRepository.find_for_candidate` compares identifiers from every candidate
 source with `Camera.serial_number`, `mac_address`, `identity` and `dedupe_key`.

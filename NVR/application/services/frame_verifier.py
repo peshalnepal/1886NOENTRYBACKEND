@@ -45,7 +45,7 @@ class FrameVerifier:
     async def verify(self, url: str) -> VerifyResult:
         host = (urlsplit(url).hostname or "").lower()
         host_sem = self._per_host.setdefault(host, asyncio.Semaphore(self._per_host_limit))
-        async with self._global, host_sem:
+        async with host_sem, self._global:
             return await self._run(url)
 
     async def _run(self, url: str) -> VerifyResult:

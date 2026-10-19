@@ -4,6 +4,7 @@ import asyncio
 import logging
 import queue
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +14,7 @@ class InferenceWorker(object):
     One dedicated inference thread owning its own CUDA context + TRT engines.
     Never share across threads.
     """
-    def __init__(self, loop, worker_id=0, max_q=1, ready_cb=None, late_result_cb=None):
+    def __init__(self, loop, worker_id=0, max_q=1, ready_cb=None):
         self._loop = loop
         self._worker_id = int(worker_id)
         # Queue holds whole BATCH JOBS (each a list of (bgr, meta, fut)).
@@ -22,7 +23,6 @@ class InferenceWorker(object):
         # FramePool (oldest frame from the largest backlog) instead of being dropped here.
         self._q = queue.Queue(maxsize=max(1, int(max_q)))
         self._ready_cb = ready_cb
-        self._late_result_cb = late_result_cb
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -118,6 +118,22 @@ class InferenceWorker(object):
             if job is None:        # stop sentinel
                 continue
 
+            # Queue waiting counts against the capture-age budget. Do not use
+            # a GPU slot for a frame that can no longer produce a live result.
+            fresh = []
+            for item in job:
+                _, meta, fut = item
+                if time.monotonic() >= meta.get("_infer_deadline", float("inf")):
+                    self._loop.call_soon_threadsafe(
+                        self._deliver_result, fut,
+                        self._fail_result(meta, "Frame expired before inference"), meta,
+                    )
+                else:
+                    fresh.append(item)
+            job = fresh
+            if not job:
+                continue
+
             # job is an already-assembled batch: [(bgr, meta, fut), ...]
             bgrs = [it[0] for it in job]
             metas = [it[1] for it in job]
@@ -136,29 +152,13 @@ class InferenceWorker(object):
                 self._loop.call_soon_threadsafe(self._deliver_result, fut, res, meta)
 
     def _deliver_result(self, fut, res, meta):
-        """
-        Resolve the frame's future, or salvage a late result.
-
-        The sweeper may already have timed this frame out. Discarding the real
-        result in that case (as the old code did) threw away completed GPU work
-        and left the camera with a gap — a direct cause of detections blinking
-        out. If the detections did arrive, hand them to the pipeline anyway.
-        """
-        try:
-            if not fut.done():
-                fut.set_result(res)
-                return
-        except Exception:
+        """Resolve pending work only while its freshness budget permits it."""
+        if fut.done():
             return
-
-        if self._late_result_cb is None:
-            return
-        if not isinstance(res, dict) or res.get("type") == "InferenceFailedEvent":
-            return
-        try:
-            self._late_result_cb(res, meta)
-        except Exception:
-            pass
+        if (isinstance(res, dict) and res.get("type") != "InferenceFailedEvent" and
+                time.monotonic() >= meta.get("_infer_deadline", float("inf"))):
+            res = self._fail_result(meta, "Frame expired after inference")
+        fut.set_result(res)
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +168,10 @@ class InferenceWorker(object):
 class InferenceWorkerPool(object):
     """Own the single ordered GPU worker and expose queue readiness."""
 
-    def __init__(self, loop, max_q_per_worker=1, ready_cb=None, late_result_cb=None):
+    def __init__(self, loop, max_q_per_worker=1, ready_cb=None):
         self._workers = [InferenceWorker(
             loop, max_q=max_q_per_worker,
-            ready_cb=ready_cb, late_result_cb=late_result_cb,
+            ready_cb=ready_cb,
         )]
 
     def has_capacity(self):

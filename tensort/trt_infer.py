@@ -69,7 +69,7 @@ def letterbox_bgr(img: np.ndarray, new_shape: int = 640, color=(114, 114, 114)) 
     nh, nw = int(round(h * r)), int(round(w * r))
 
     interp = cv2.INTER_AREA if r < 1.0 else cv2.INTER_LINEAR
-    resized = cv2.resize(img, (nw, nh), interpolation=interp)
+    resized = img if (nw, nh) == (w, h) else cv2.resize(img, (nw, nh), interpolation=interp)
 
     pad_w = new_shape - nw
     pad_h = new_shape - nh

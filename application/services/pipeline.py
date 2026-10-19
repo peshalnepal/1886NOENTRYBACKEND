@@ -12,6 +12,7 @@ import logging
 import random
 import time
 import uuid as _uuid
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from itertools import chain
 from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Protocol, Set, Tuple
@@ -193,6 +194,7 @@ class ObjDetectStorePort(Protocol):
         after_ts_ms: int,
         after_seq: int,
         timeout_ms: int,
+        allow_reset: bool = False,
     ) -> Optional[ObjDetectResponse]: ...
 
 
@@ -237,41 +239,73 @@ class InMemoryObjDetectStore:
         after_ts_ms: int,
         after_seq: int,
         timeout_ms: int,
+        allow_reset: bool = False,
     ) -> Optional[ObjDetectResponse]:
         key = str(camera_uuid)
         evt = await self._evt(key)
-        timeout_s = max(0.0, timeout_ms / 1000.0)
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout_ms / 1000.0)
 
         while True:
+            async with self._lock:
+                resp = self._latest.get(key)
+                if resp is not None:
+                    cursor = (after_ts_ms, after_seq)
+                    latest = (resp.frame_ts_ms, resp.frame_seq)
+                    # The pipeline admits clock resets after a restart. Once a
+                    # stream owns its cursor, any different accepted frame is
+                    # new; caller-supplied initial cursors remain strict.
+                    if latest > cursor or (allow_reset and latest != cursor):
+                        return resp
+                # Check the value before waiting: another subscriber may have
+                # consumed the shared signal, but the latest frame is still new
+                # to this subscriber.
+                evt.clear()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
             try:
-                await asyncio.wait_for(evt.wait(), timeout=timeout_s)
+                await asyncio.wait_for(evt.wait(), timeout=remaining)
             except asyncio.TimeoutError:
                 return None
 
-            async with self._lock:
-                resp = self._latest.get(key)
-                evt.clear()
-            if resp is not None and (resp.frame_ts_ms, resp.frame_seq) > (
-                after_ts_ms, after_seq
-            ):
-                return resp
+
+class DetectionMailbox:
+    """Latest pending result per camera; slow viewers cannot build a frame FIFO."""
+
+    def __init__(self, max_cameras: int):
+        self._max_cameras = max(1, max_cameras)
+        self._pending = OrderedDict()
+        self._available = asyncio.Event()
+
+    def put_nowait(self, resp: ObjDetectResponse) -> None:
+        key = str(resp.camera_uuid)
+        if key not in self._pending and len(self._pending) >= self._max_cameras:
+            self._pending.popitem(last=False)
+        self._pending[key] = resp
+        self._available.set()
+
+    async def get(self) -> ObjDetectResponse:
+        while not self._pending:
+            self._available.clear()
+            await self._available.wait()
+        return self._pending.popitem(last=False)[1]
 
 
 class DetectionHub:
     """Pub/sub hub for all detections across all cameras, used by the global stream."""
 
     def __init__(self, max_q: int = 100):
-        self._subs: Set[asyncio.Queue] = set()
+        self._subs: Set[DetectionMailbox] = set()
         self._lock = asyncio.Lock()
         self._max_q = max_q
 
-    async def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=self._max_q)
+    async def subscribe(self) -> DetectionMailbox:
+        q = DetectionMailbox(self._max_q)
         async with self._lock:
             self._subs.add(q)
         return q
 
-    async def unsubscribe(self, q: asyncio.Queue) -> None:
+    async def unsubscribe(self, q: DetectionMailbox) -> None:
         async with self._lock:
             self._subs.discard(q)
 
@@ -279,15 +313,7 @@ class DetectionHub:
         async with self._lock:
             subs = list(self._subs)
         for q in subs:
-            try:
-                q.put_nowait(resp)
-            except asyncio.QueueFull:
-                # Drop the oldest frame rather than block the producer.
-                try:
-                    q.get_nowait()
-                    q.put_nowait(resp)
-                except Exception:
-                    pass
+            q.put_nowait(resp)
 
 
 class ModelPipeline:

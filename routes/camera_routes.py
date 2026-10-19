@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from application.services.user_snapshot_cache import CachedUserSnapshot
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,6 +38,7 @@ from application.services.detection_stream import (
     normalize_box_px,
     resp_to_detection_out,
     stream_camera_detections,
+    stream_multi_camera_detections,
 )
 from application.services.inventory_service import InventoryService
 from routes._camera_serializers import (
@@ -422,6 +423,7 @@ async def stream_all_detections_sse(
     timeout_ms: int = 30000,
     normalize: bool = False,
     access_token: Optional[str] = None,
+    camera_uuid: Optional[List[uuid.UUID]] = Query(default=None, max_length=100),
     manager: Manager = Depends(get_manager),
 ):
     sf = _session_factory_from_app(request)
@@ -429,6 +431,44 @@ async def stream_all_detections_sse(
         raise HTTPException(status_code=503, detail=DB_UNAVAILABLE)
 
     user = await _resolve_stream_user(request=request, access_token=access_token)
+    if camera_uuid is not None:
+        # Resolve each camera's owner after checking access, just like the
+        # per-camera endpoint. Members may view cameras from several owners.
+        owners = {}
+        async with sf() as db:
+            repo = ChannelRepository()
+            for camera_id in dict.fromkeys(camera_uuid):
+                full = await repo.get_camera_full(db, camera_uuid=camera_id)
+                cam = full[0] if full else None
+                owners[str(camera_id)] = await _ensure_stream_camera_access(db, cam, user)
+        pipelines = {}
+        for owner_id in set(owners.values()):
+            pipelines[owner_id] = await manager.get_activepipeline(user_id=owner_id)
+
+        async def still_authorized():
+            try:
+                current_user = await _resolve_stream_user(request=request, access_token=access_token)
+                async with sf() as db:
+                    for key, owner in owners.items():
+                        full = await repo.get_camera_full(db, camera_uuid=uuid.UUID(key))
+                        current_owner = await _ensure_stream_camera_access(
+                            db, full[0] if full else None, current_user)
+                        if current_owner != owner:
+                            return False
+                return True
+            except HTTPException:
+                return False
+
+        gen = stream_multi_camera_detections(
+            cameras=[(key, pipelines[owner]) for key, owner in owners.items()],
+            timeout_ms=timeout_ms,
+            normalize=normalize,
+            is_disconnected=request.is_disconnected,
+            still_authorized=still_authorized,
+        )
+        return StreamingResponse(gen, media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
     pipeline = await manager.get_activepipeline(user_id=user.id)
     hub = pipeline.detection_hub
 
