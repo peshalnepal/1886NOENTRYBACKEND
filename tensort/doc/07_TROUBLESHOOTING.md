@@ -20,7 +20,6 @@ ip -brief address
 ip route
 systemctl status jetson-cameras --no-pager
 curl --silent --show-error http://127.0.0.1:8080/health
-curl --silent --show-error http://127.0.0.1:8080/discovery/status
 ```
 
 Use the service's Python executable, such as `.venv_trt/bin/python`, if `python3` resolves to a different environment. Read the service unit locally to establish its working directory and environment-file path; do not publish credential-bearing environment values. Keep unredacted diagnostics private.
@@ -35,26 +34,13 @@ On the Jetson, `tegrastats` can show RAM, CPU, GPU, clocks, and temperatures whi
 
 ## Branch A: camera is slow to appear in the cloud
 
-### A1. Does the edge know the candidate?
+### A1. Did NVR register the camera?
 
-Read `/discovery/status`, `/discovery/report`, `/discovery`, and `/cameras`. Interpret each separately:
-
-| Observation | Next check |
-| --- | --- |
-| `pipeline_ready=false` or server never starts | Engine path/version/profile and startup logs |
-| First report returns 404 | First sweep has not completed; inspect `scan_in_progress` and logs |
-| Candidate not in selected roster | Correct subnet/interface, credentials, channel list, selection priority/limit |
-| Identity in `unverified_candidates` | Video connection/codec/frame decode rather than only ISAPI |
-| Roster has UUID but `/cameras` lacks it | Source-change/delete recovery defects or admission failure |
-| `/cameras` has it and capture is fresh | Move to cloud connectivity/adoption |
-
-A default-route `/24` may scan the tower's uplink rather than camera Ethernet. With an NVR, the recorder's HTTP port and RTSP port must not be confused. With eight static channels selected first, a direct camera can be excluded even if some selected channels are offline.
-
-### A2. Distinguish scheduled scan from forced scan
-
-The default quiet period is 150 seconds after completion. Repeated `/sync` calls do not bypass it. `discovery_pending=true` is the return value of `request_scan()`, which also returns true during a quiet period; inspect `status.scan_in_progress` before assuming a scan is active.
-
-A single deliberate `POST /discovery/scan` can help during commissioning, but it performs network/video work and can contend with captures. It is blocking and should not be called repeatedly by a polling UI. Reducing scan delays without measuring recorder session pressure can recreate reconnect storms.
+Read `/discovery/status`, `/discovery/report`, and `/discovery` on the NVR gateway.
+Compare its verified camera UUID and relay source with Jetson `GET /cameras`.
+A missing Jetson registration points to NVR adoption, connectivity, or capacity;
+a registered camera without detections needs capture and inference checks below.
+Use NVR `POST /sync` to request a refresh; TensorRT has no scanner or sync route.
 
 ### A3. Can the cloud reach the edge?
 

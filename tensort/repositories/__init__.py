@@ -1,6 +1,5 @@
-"""SQLite repositories for saved configurations and discovered cameras."""
+"""SQLite repositories for saved camera configurations."""
 
 from .camera_repository import CameraRepository
-from .discovery_repository import DiscoveryRepository
 
-__all__ = ["CameraRepository", "DiscoveryRepository"]
+__all__ = ["CameraRepository"]

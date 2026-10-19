@@ -1,0 +1,8 @@
+# Files that run on Linux targets (Jetson, MiniPC WSL) must keep LF endings even
+# when checked out or copied through Windows; CRLF breaks "#!/usr/bin/env bash".
+*.sh          text eol=lf
+*.py          text eol=lf
+*.txt         text eol=lf
+*.yml         text eol=lf
+.env.example  text eol=lf
+.env.*        text eol=lf

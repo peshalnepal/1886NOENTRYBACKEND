@@ -12,7 +12,7 @@
 # Env overrides:
 #   MODEL=yolo26m  MAX_BATCH=8  OPT_BATCH=MAX_BATCH  IMG_SZ=640  WORKSPACE_MB=3072
 #   PORT=8080  SERVICE_NAME=jetson-cameras  VENV=.venv_trt
-#   DISCOVERY=false   camera discovery on the Jetson (the MiniPC owns it in a tower)
+#   NVPMODEL_MODE=0   power mode id baked into the systemd unit (2 = MAXN_SUPER on Orin Nano 8GB)
 #   FORCE_ENGINE=1    rebuild the engine even if an identical one exists
 #   SKIP_APT=1 / SKIP_ENGINE=1 / SKIP_SERVICE=1   skip a step outright
 #
@@ -36,14 +36,14 @@ WORKSPACE_MB="${WORKSPACE_MB:-3072}"
 PORT="${PORT:-8080}"
 SERVICE_NAME="${SERVICE_NAME:-jetson-cameras}"
 VENV="${VENV:-.venv_trt}"
-DISCOVERY="${DISCOVERY:-false}"
+NVPMODEL_MODE="${NVPMODEL_MODE:-0}"
 export TRTEXEC="${TRTEXEC:-/usr/src/tensorrt/bin/trtexec}"
 NVCC="${NVCC:-/usr/local/cuda/bin/nvcc}"
 ONNX="models/${MODEL}.onnx"
 ENGINE="models/${MODEL}.engine"
 [[ "$MAX_BATCH" =~ ^[1-8]$ ]] || die "MAX_BATCH must be 1..8"
 [[ "$OPT_BATCH" =~ ^[1-8]$ ]] && (( OPT_BATCH <= MAX_BATCH )) || die "OPT_BATCH must be 1..MAX_BATCH"
-[[ "$DISCOVERY" =~ ^(true|false)$ ]] || die "DISCOVERY must be true or false"
+[[ "$NVPMODEL_MODE" =~ ^[0-9]+$ ]] || die "NVPMODEL_MODE must be a numeric id from /etc/nvpmodel.conf"
 
 # --- 1. Preflight ---------------------------------------------------------------
 log "=== 1/7 Preflight ==="
@@ -86,7 +86,7 @@ case "$GST_OUT" in
   NO*)  die "OpenCV has no GStreamer: a pip opencv wheel shadows JetPack's. Fix: python3 -m pip uninstall -y opencv-python opencv-python-headless; sudo apt-get install --reinstall python3-opencv" ;;
   *)    die "OpenCV import failed: ${GST_OUT}" ;;
 esac
-sudo nvpmodel -m 0 >/dev/null 2>&1 || warn_track "nvpmodel -m 0 failed (non-fatal)"
+sudo nvpmodel -m "$NVPMODEL_MODE" >/dev/null 2>&1 || warn_track "nvpmodel -m ${NVPMODEL_MODE} failed (non-fatal)"
 sudo jetson_clocks   >/dev/null 2>&1 || warn_track "jetson_clocks failed (non-fatal)"
 
 # --- 4. Python venv -------------------------------------------------------------
@@ -129,10 +129,9 @@ fi
 set_env_var .env DET_ENGINE "./${ENGINE}"
 set_env_var .env IMG_SZ "$IMG_SZ"
 set_env_var .env PORT "$PORT"
-set_env_var .env DISCOVERY_ENABLED "$DISCOVERY"
 # The service never batches above the engine's max; keep .env in step with the build.
 [ "${SKIP_ENGINE:-0}" = "1" ] || set_env_var .env INFER_MAX_BATCH "$MAX_BATCH"
-ok ".env: DET_ENGINE=./${ENGINE} IMG_SZ=${IMG_SZ} INFER_MAX_BATCH=$(grep -E '^INFER_MAX_BATCH=' .env | cut -d= -f2) PORT=${PORT} DISCOVERY_ENABLED=${DISCOVERY}"
+ok ".env: DET_ENGINE=./${ENGINE} IMG_SZ=${IMG_SZ} INFER_MAX_BATCH=$(grep -E '^INFER_MAX_BATCH=' .env | cut -d= -f2) PORT=${PORT}"
 
 # --- 7. systemd service + health check ------------------------------------------
 log "=== 7/7 Service ==="
@@ -152,7 +151,8 @@ Orin Nano setup complete.
   Logs:     sudo journalctl -u ${SERVICE_NAME} -f
   API:      http://$(hostname -I 2>/dev/null | awk '{print $1}'):${PORT}/health
   Engine:   ${ENGINE}  (batch 1..${MAX_BATCH}, opt ${OPT_BATCH}, ${IMG_SZ}px)
-  Config:   ${APP_DIR}/.env  (DISCOVERY_ENABLED=${DISCOVERY})
+  Power:    nvpmodel mode ${NVPMODEL_MODE} at every service start (re-run with NVPMODEL_MODE=2 for MAXN_SUPER)
+  Config:   ${APP_DIR}/.env
 
 Only the MiniPC should reach port ${PORT} (the API has no login):
   sudo ufw allow OpenSSH && sudo ufw allow from <MINIPC_IP> to any port ${PORT} proto tcp && sudo ufw enable

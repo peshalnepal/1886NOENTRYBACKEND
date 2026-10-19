@@ -2,11 +2,11 @@
 
 ## Camera appearance is a pull-and-adopt workflow
 
-The cloud Manager periodically reconciles enabled devices. It reaches the Jetson's `device_url`, calls `/sync`, and reads its camera inventory. There is no edge-initiated push to a cloud registration endpoint in the reviewed path.
+The cloud Manager periodically reconciles enabled devices. It reaches the NVR gateway's `device_url`, calls `/sync`, and reads its camera inventory. There is no edge-initiated push to a cloud registration endpoint in the reviewed path.
 
 ```mermaid
 sequenceDiagram
-    participant J as Jetson discovery
+    participant J as NVR gateway
     participant C as Cloud reconciler
     participant A as CameraAdopter
     participant M as MediaMTX
@@ -14,7 +14,7 @@ sequenceDiagram
     participant P as Cloud detection pipeline
     J->>J: Verify selected stream and adopt edge UUID
     C->>J: POST /sync
-    J-->>C: Current or partial discovery roster
+    J-->>C: Last completed discovery report
     C->>A: Adopt verified present entries
     A->>D: Resolve exactly one site and existing identities
     A->>M: Ensure stream path
@@ -39,7 +39,7 @@ Read [`DeviceReconciler.reconcile_device_edge_simple`](../../application/service
 6. Re-read desired state if adoption or source repointing changed cloud rows.
 7. Read edge camera UUIDs.
 8. Compute additions/removals and protect discovered entries from accidental deletion.
-9. Read the edge selection policy. If it reports `camera_selection='discovery'`, clear ordinary `to_add` and `to_remove` lists.
+9. Apply the edge reconciliation policy. TensorRT no longer reports a discovery-managed selection mode.
 10. For manual devices, check capacity and issue allowed mutations; separately patch repointed sources.
 
 This order means slow media-server administration can delay discovery adoption even when the edge is healthy. Devices are reconciled sequentially in `reconcile_all_devices_edge()`. One slow/unreachable device can delay later devices.
@@ -70,11 +70,11 @@ Automatic adoption reuses the edge `camera_uuid`. It stores discovery provenance
 
 `CameraInventory` remembers reported devices and user add/remove decisions. `Camera` is the application camera used for site ownership, video, tracking, and permissions. A discovered edge row is not automatically an inventory row or a fully usable application camera.
 
-`InventoryService.refresh_from_device()` reads the last **completed** discovery report using `fetch_discovery_report()`. The device inventory refresh route does not itself force a new network scan. Before the first edge sweep completes, it can have no new report to import even while `/sync` exposes partial active rows.
+`InventoryService.refresh_from_device()` reads the last **completed** discovery report using `fetch_discovery_report()`. The device inventory refresh route does not itself force a new network scan. Before the first NVR sweep completes, it can have no completed report to import.
 
 Inventory responses use a redacted `source`; edge camera/roster APIs expose the real connection URL. Treat captured JSON/logs accordingly when sharing diagnostics.
 
-Identity matching also differs between sides. The edge compares full credential-free stream endpoints before direct-camera host fallback. Cloud automatic adoption indexes discovery identity and a direct-camera host fallback; it does not build a full stream-endpoint index for manually created NVR rows without provenance. Aligning these contracts is a future cleanup task, especially when manually registered and automatically discovered cameras coexist.
+Identity matching also differs between sides. NVR matches its cameras against Jetson registrations by UUID, relay endpoint, and stored identity. Cloud automatic adoption indexes discovery identity and a direct-camera host fallback; it does not build a full stream-endpoint index for manually created NVR rows without provenance. Aligning these contracts is a future cleanup task, especially when manually registered and automatically discovered cameras coexist.
 
 ## SQLAlchemy explained through this code
 
@@ -93,7 +93,7 @@ async with session_factory() as session:
 
 Each concurrent task should own its own AsyncSession. A shared session must not be used concurrently by multiple tasks. SQLAlchemy states the model as Session per thread and AsyncSession per task in its [session documentation](https://docs.sqlalchemy.org/en/20/orm/session_basics.html).
 
-The edge uses two engines for one SQLite file: synchronous SQLite access on discovery/restore paths, and async `sqlite+aiosqlite` access for saved camera writes. `check_same_thread=False` permits the sync driver's connections to be used under its configured threading model; it does not make one Session safe to share between threads.
+The edge uses two engines for one SQLite file: synchronous SQLite access on restore paths, and async `sqlite+aiosqlite` access for saved camera writes. `check_same_thread=False` permits the sync driver's connections to be used under its configured threading model; it does not make one Session safe to share between threads.
 
 Cloud database configuration supports MySQL/MariaDB or SQL Server based on its connection-string parsing. Sync and async engines have separate pools. Defaults are pool size 30 and overflow 20 **per engine**, so potential connections are not capped at 50 for an entire replicated deployment. Pools are lazy, but each process/engine still needs a capacity budget.
 

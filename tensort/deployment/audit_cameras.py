@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only comparison of saved captures with declared static NVR streams.
+"""Read-only comparison of saved captures with explicitly supplied expected streams.
 
 Does not open cameras or import the runtime/database initialization modules.
 Usernames, passwords and URL query/fragment contents are never printed.
@@ -15,7 +15,6 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from discovery import DiscoveryConfig, _static_nvr_cameras
 
 
 def endpoint(url):
@@ -62,7 +61,7 @@ def audit_database(path, expected_urls):
                     enabled = enabled.strip().lower() in ("1", "true", "yes", "on")
                 item.update(
                     enabled=bool(enabled), endpoint=safe_endpoint(key),
-                    matches_static_endpoint=key in expected,
+                    matches_expected_endpoint=key in expected,
                     credentials_match=(credentials(url) == credentials(expected[key])
                                        if key in expected else None),
                     source_column_matches_config=row["source_url"] == url,
@@ -76,28 +75,26 @@ def audit_database(path, expected_urls):
     finally:
         connection.close()
     return {
-        "saved_count": len(results), "static_candidate_count": len(expected),
+        "saved_count": len(results), "expected_stream_count": len(expected),
         "cameras": results,
-        "static_endpoints_without_saved_config": [safe_endpoint(key) for key in expected if key not in seen],
+        "expected_endpoints_without_saved_config": [safe_endpoint(key) for key in expected if key not in seen],
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", type=Path, default=ROOT / ".env")
+    parser.add_argument("--expected-urls", type=Path,
+                        help="JSON file containing a list of expected stream URLs")
     parser.add_argument("--db", type=Path, default=ROOT / "jetson_cameras.db")
     args = parser.parse_args()
     try:
-        from dotenv import load_dotenv
-        load_dotenv(str(args.env))  # Same precedence as main.py: exported env wins.
-        cfg = DiscoveryConfig()
-        expected_urls = [cfg.rtsp_url_for(dev) for dev in _static_nvr_cameras(cfg)]
+        expected_urls = json.loads(args.expected_urls.read_text()) if args.expected_urls else []
         report = audit_database(args.db, expected_urls)
         report["configured_http_port"] = int(os.getenv("PORT", "8080"))
         report["max_cameras"] = int(os.getenv("MAX_CAMERAS", "8"))
     except Exception as exc:
         # Database/config errors can include raw inputs. Report only their type.
-        print("Audit failed ({}); check env, database path and dependencies".format(type(exc).__name__))
+        print("Audit failed ({}); check expected URLs, database path and dependencies".format(type(exc).__name__))
         return 1
     print(json.dumps(report, indent=2))
     return 0

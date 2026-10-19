@@ -41,7 +41,6 @@ with GStreamer enabled. The setup checks for a shadowing wheel.
 | `MAX_BATCH=8` | Maximum batch size, 1–8 |
 | `OPT_BATCH=8` | Optimization batch, no larger than MAX_BATCH |
 | `IMG_SZ=640` | Model input size |
-| `DISCOVERY=false` | Value written to `DISCOVERY_ENABLED` in `.env` (the MiniPC owns discovery in a tower) |
 | `FORCE_ENGINE=1` | Rebuild even if an identical engine exists |
 | `SKIP_APT=1` / `SKIP_ENGINE=1` / `SKIP_SERVICE=1` | Skip a step outright; normally unnecessary, finished work is detected and skipped |
 
@@ -81,12 +80,9 @@ service's `--system-site-packages` environment. Setup installs these packages.
 The supported data path is appsink → owned BGR NumPy frame → inference;
 OpenCV's GStreamer video-capture bridge is not used.
 
-Discovery confirms a candidate only after receiving a decoded frame, including
-static NVR channels. Edge and cloud upgrades add nullable `first_frame_at`
-columns without deleting existing cameras. Old rows remain unverified until
-frames arrive. Deploy the matching cloud changes to retain verification state
-in inventory and avoid adopting cameras the edge rejected for capacity.
-Sync returns the last completed report while a new scan runs in the background.
+The [NVR gateway](../../NVR/ARCHITECTURE.md) owns discovery, frame verification,
+and adoption. It registers cameras on this service using `/cameras`; no scanner
+settings or camera discovery credentials are needed in the Jetson environment.
 
 Validate on the Jetson using `python3 tests/test_native_capture.py`, then inspect
 `/health`: capture entries should report frame ages and increasing frame counts.
@@ -108,8 +104,8 @@ curl http://localhost:8080/health
 
 A ninth enabled camera returns HTTP 409. Disabled camera configurations do not
 consume a slot. When an old database contains more than eight enabled cameras,
-excess rows are retained on disk and skipped during restore. Discovery follows
-the same limit and retries cameras awaiting admission.
+excess rows are retained on disk and skipped during restore. NVR retries
+cameras awaiting admission.
 
 `/health` must show `pipeline_ready: true`. Within `stats`, check
 `engine_max_batch`, `max_batch`, `capture`, `cameras`, `pool_evicted_total`,

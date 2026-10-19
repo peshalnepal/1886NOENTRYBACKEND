@@ -1,21 +1,25 @@
+
 # MiniPC relay. Replace the reader password before starting MediaMTX.
 # Cloud MediaMTX retains WebRTC responsibility; main-stream recording stays here.
 logLevel: info
 api: yes
-# HTTP control API: the NVR service configures stream paths here. Keep local.
+# HTTP control API: the NVR service configures stream paths here. Keep local;
+# never expose it (127.0.0.1 gets the API without a password).
 # Matches MEDIAMTX_API_URL in NVR/.env.
 apiAddress: 127.0.0.1:9997
 rtsp: yes
-# RTSP video listener: Jetson and cloud readers connect here for streams.
-# Safe local default. Set to the MiniPC LAN address:8554 for deployment.
-# MEDIAMTX_LAN_RTSP_BASE_URL uses that MiniPC address with rtsp:// and credentials.
-rtspAddress: 127.0.0.1:8554
+# RTSP video listener on all interfaces:
+#   - LAN: Jetson reads MEDIAMTX_LAN_RTSP_BASE_URL (<MiniPC LAN IP>:8554).
+#   - Cloud: Tailscale Funnel tls-terminated-tcp :8443 -> 127.0.0.1:8554, so
+#     NVR_PUBLIC_RTSP_BASE_URL is rtsps://...@mpc-ct8.tail75f6df.ts.net:8443.
+rtspAddress: :8554
 rtspTransports: [tcp]
 rtmp: no
 hls: no
 webrtc: no
 srt: no
 playback: yes
+# Local only; the NVR service exports clips from here. Never expose it.
 playbackAddress: 127.0.0.1:9996
 
 authMethod: internal
@@ -25,8 +29,10 @@ authInternalUsers:
     permissions:
       - action: api
       - action: playback
+  # Funnel traffic arrives from 127.0.0.1 too, so stream reads always need this
+  # password. Must match the password in both RTSP URLs in NVR/.env.
   - user: nvr-reader
-    pass: Ycn4ufni2026!
+    pass: Ycn4ufni2026
     permissions:
       - action: read
         path: '~^nvr-'

@@ -45,16 +45,4 @@ def runtime_status(include_stats: bool) -> Dict[str, Any]:
     if include_stats:
         payload["stats"] = stats
 
-    # Surfaced on both / and /health so the cloud can tell a Jetson that is
-    # actively discovering from one where the scanner died, without a second
-    # round trip.
-    discovery = getattr(runtime, "discovery", None)
-    if discovery is not None:
-        try:
-            payload["discovery"] = discovery.status()
-        except Exception:
-            payload["discovery"] = {"enabled": True, "running": False, "error": True}
-    else:
-        payload["discovery"] = {"enabled": False, "running": False}
-
     return payload

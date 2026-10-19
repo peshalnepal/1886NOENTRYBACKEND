@@ -179,8 +179,8 @@ MiniPC and serves RTSP; opening the NVR HTTP port alone does not expose video.
    DNS, NAT, TLS and firewall provisioning are deployment work, not something a
    generated URL creates. Restrict ingress to the intended consumers. RTSP is
    unencrypted; use a private tunnel or configure MediaMTX RTSPS for public transit.
-5. On Jetson, set `DISCOVERY_ENABLED=false` so NVR owns discovery and Jetson accepts
-   API-managed cameras. No TensorRT code change or NVR package install is needed there.
+5. Run the TensorRT service on Jetson. It accepts API-managed cameras; discovery
+   runs exclusively in NVR. No NVR package install is needed on Jetson.
 6. Start NVR from its parent directory:
 
    ```bash

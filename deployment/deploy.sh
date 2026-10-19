@@ -182,6 +182,20 @@ function build_and_push_image() {
   write_success "Image pushed: ${ACR_SERVER}/${APP_NAME_MAIN}:${IMAGE_TAG}"
 }
 
+function ensure_mediamtx_image() {
+  # Must match mediamtxImageRepo/mediamtxImageTag in main-prod.bicep. The ACI
+  # pulls from ACR, so mirror the upstream tag there if it is missing.
+  local image="mediamtx:${MEDIAMTX_IMAGE_TAG:-1.16.1-ffmpeg}"
+  [[ "${DEPLOY_MEDIA_MTX}" == "true" ]] || return 0
+  if az acr repository show -n "${AZURE_ACR_NAME}" --image "${image}" >/dev/null 2>&1; then
+    write_info "MediaMTX image present: ${image}"
+    return 0
+  fi
+  write_info "Importing docker.io/bluenviron/${image} into ACR..."
+  az acr import -n "${AZURE_ACR_NAME}" --source "docker.io/bluenviron/${image}" --image "${image}" >/dev/null
+  write_success "MediaMTX image imported: ${image}"
+}
+
 function deploy_infrastructure() {
   write_info "Fetching ACR credentials for registry auth..."
   local ACR_USER ACR_PASS
@@ -417,6 +431,7 @@ function main() {
 
   # Build + push image
   build_and_push_image "../Dockerfile" ".."
+  ensure_mediamtx_image
 
   # Deploy using Bicep
   local app_fqdn

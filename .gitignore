@@ -51,3 +51,4 @@ tensort/log.txt
 !/tests/test_adopt_nvr_channels.py
 !/tests/test_discovery_repoint.py
 !/tests/test_nvr_recordings.py
+!/tests/test_tensort_registration.py

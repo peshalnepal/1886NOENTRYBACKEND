@@ -32,5 +32,5 @@ pycuda>=2025.1
 
 # --- Config ---
 # Lets `python3 main.py` read .env the same way systemd's EnvironmentFile does.
-# Without it, main.py warns if .env exists and credentials are not exported.
+# Without it, main.py warns if .env exists but cannot be loaded.
 python-dotenv>=1.0

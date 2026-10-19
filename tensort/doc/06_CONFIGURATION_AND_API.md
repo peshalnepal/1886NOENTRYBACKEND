@@ -70,29 +70,10 @@ Per-camera fields include `sample_fps`, `resize`, `decode_backend`, `gst_latency
 
 `notification_enabled` is stored on the edge but is not a filter applied by `_pump_channel()`; the cloud applies notification policy. `enabled=false` removes the live edge channel while keeping the configuration through the add/patch flow. `detection_enabled=false` leaves capture running but keeps its events out of the inference pool.
 
-## Discovery settings
+## Camera provisioning
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `DISCOVERY_ENABLED` | true | Enable scanner |
-| `DISCOVERY_LOCAL_ENABLED` | true | Include LAN scan, beyond configured NVRs |
-| `DISCOVERY_AUTO_ADD` | true | Provision verified selected candidates |
-| `DISCOVERY_INTERVAL_S` | 150, minimum 60 | Scheduler gap after a sweep; also the `/sync` quiet period after a completed sweep |
-| `DISCOVERY_MISS_THRESHOLD` | 2 | Intended missing transition threshold |
-| `DISCOVERY_SUBNETS` | Empty | Derive default-route `/24` if absent |
-| `DISCOVERY_WSD_TIMEOUT_S` | 3 | Multicast receive window |
-| `DISCOVERY_HTTP_TIMEOUT_S` | 2 | Per-ISAPI request timeout |
-| `DISCOVERY_PROBE_WORKERS` | 32, clamped 1..128 | LAN host probe concurrency |
-| `DISCOVERY_SWEEP_ONLY_IF_WSD_EMPTY` | false | Whether responders suppress subnet scanning |
-| `HIK_USERNAME` / `HIK_PASSWORD` | `admin` / empty | Direct-camera account; example password is a placeholder |
-| `NVR_USERNAME` / `NVR_PASSWORD` | HIK account | Recorder account |
-| `HIK_RTSP_PORT` / `HIK_HTTP_PORT` | 554 / 80 | Default video/control ports |
-| `HIK_RTSP_CHANNEL` / `HIK_RTSP_STREAM` | 1 / 2 | Direct channel / chosen stream |
-| `DISCOVERY_NVRS` | Empty | Recorder ISAPI enumeration targets |
-| `STATIC_NVRS` | Empty | Declared input candidates with frame verification |
-| `NVR_CHANNEL_OFFSET` | 0 | Stream-address offset for recorders only |
-
-Changing source credentials, stream number, or offset changes the selected URL and can trigger the source-transition defect described in document 08. Treat these as explicit migrations until that behavior is fixed.
+Configure discovery in [NVR](../../NVR/ARCHITECTURE.md). Jetson only needs its
+inference/capture settings and camera configurations supplied over HTTP.
 
 ## Edge HTTP reference
 
@@ -100,7 +81,7 @@ All listed routes also have `/api` aliases, except root uses `/api` as its alias
 
 | Method/path | Behavior |
 | --- | --- |
-| `GET /` | Readiness/discovery summary |
+| `GET /` | Readiness summary |
 | `GET /health` | Summary plus counters and per-camera capture/result metrics |
 | `GET /cameras` | In-memory configured camera list, not every saved/historical row |
 | `POST /cameras` | Add/replace camera with caller-supplied UUID |
@@ -110,19 +91,12 @@ All listed routes also have `/api` aliases, except root uses `/api` as its alias
 | `GET /detection/<uuid>` or `/detections/<uuid>` | Latest-event compatibility aliases |
 | `GET /cameras/<uuid>/snapshot.jpg` | Last cached JPEG, or 404 |
 | `GET /cameras/<uuid>/detections/stream` | Camera-scoped edge SSE |
-| `GET /cameras/detections/stream` | All-camera edge SSE, including discovery deltas |
-| `GET /discovery` | Currently selected roster and status |
-| `GET /discovery/status` | Scheduler/quiet-period/in-progress information |
-| `GET /discovery/report` | Last completed report; 404 before first completion |
-| `POST /sync` | Nonblocking request/coalescing and current/partial report |
-| `POST /discovery/scan` | Blocking scan; may wait on an existing sweep |
-| `DELETE /discovery/<identity>` | Forget roster history, not camera deletion |
+| `GET /cameras/detections/stream` | All-camera detection SSE |
 
 Read-only examples:
 
 ```bash
 curl --fail --silent --show-error http://127.0.0.1:8080/health
-curl --fail --silent --show-error http://127.0.0.1:8080/discovery/status
 curl --no-buffer --max-time 20 \
   http://127.0.0.1:8080/cameras/11111111-1111-4111-8111-111111111111/detections/stream
 ```
@@ -145,7 +119,7 @@ Illustrative manual-mode create payload:
 }
 ```
 
-In discovery-managed mode, the runtime rejects sources outside its selected URL set and rejects another UUID claiming the same selected URL. A 409 can therefore mean selection/duplicate identity policy, not simply “eight cameras are running.” Avoid replaying POSTs as a read-only health check: they restart capture.
+HTTP 409 means the enabled-camera capacity would be exceeded. Avoid replaying POSTs as a read-only health check: they restart capture.
 
 The edge health route returns JSON with `pipeline_ready`; do not rely only on HTTP 200. Its readiness calculation also does not currently prove dispatcher/worker liveness after startup.
 
@@ -169,9 +143,9 @@ Consult [`device_routes.py`](../../routes/device_routes.py), [`site_routes.py`](
 
 ## Database schema and migrations
 
-The edge database is `Backend/tensort/jetson_cameras.db`. `camera_configs` stores UUID/channel/user/source/config JSON. `discovered_cameras` stores identity, metadata, source URL, linked UUID, first-frame proof, and presence/history fields. `to_dict()` reports unverified legacy rows as not present until `first_frame_at` exists.
+The edge database is `Backend/tensort/jetson_cameras.db`. `camera_configs` stores UUID/channel/user/source/config JSON. NVR owns discovery persistence. Legacy Jetson `discovered_cameras` tables are unused and left intact.
 
-Startup calls `create_all` plus specific migrations for legacy source naming and frame verification. `create_all` creates missing tables; it does not perform arbitrary schema upgrades on existing tables. The standalone [`migrate_camera_configs_schema.py`](../migrate_camera_configs_schema.py) implements a more extensive normalization/rebuild path with backup support. Read it and back up an actual deployment database before using it; it is not a routine latency fix.
+Startup calls `create_all` plus specific migration for legacy source naming. `create_all` creates missing tables; it does not perform arbitrary schema upgrades on existing tables. The standalone [`migrate_camera_configs_schema.py`](../migrate_camera_configs_schema.py) implements a more extensive normalization/rebuild path with backup support. Read it and back up an actual deployment database before using it; it is not a routine latency fix.
 
 Do not copy a production SQLite file while a writer is mid-transaction and assume the copy is a consistent backup. Use a planned database backup procedure. The existing audit tool opens a read-only database path and reports configuration concerns without being a migration tool.
 
@@ -182,8 +156,6 @@ Do not copy a production SQLite file while a writer is mid-transaction and assum
 | [`setup_orin.sh`](../deployment/setup_orin.sh) | Install stack/environment, build engine, create service | Changes system packages/power/service state; review on target |
 | [`build_engine.sh`](../deployment/build_engine.sh) | Build dynamic 1..8 FP16 TensorRT engine | Overwrites selected artifact; synthetic throughput output is informational |
 | [`check_capacity.py`](../deployment/check_capacity.py) | Measure live per-camera result FPS/age and counter changes | Samples metrics; not a full latency histogram |
-| [`diagnose_discovery.py`](../deployment/diagnose_discovery.py) | Inspect settings, ports, ISAPI identification | ISAPI success does not prove decoded video |
-| [`probe_nvr_paths.py`](../deployment/probe_nvr_paths.py) | Explore recorder RTSP path responses | RTSP DESCRIBE is not a full frame-decode test |
 | [`audit_cameras.py`](../deployment/audit_cameras.py) | Compare saved configurations against expected endpoints | Does not measure GPU speed |
 | [`tests/diag_batch.py`](../tests/diag_batch.py) | Compare repeated-image outputs across batch rows | Needs target engine/CUDA/image; not an end-to-end camera test |
 

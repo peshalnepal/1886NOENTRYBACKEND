@@ -7,6 +7,7 @@ from datetime import datetime
 from pydantic import ValidationError
 
 from application.services.inventory_service import (
+    InventoryService,
     entries_from_roster,
     parse_timestamp,
     redact_source,
@@ -43,6 +44,11 @@ def _roster(**overrides):
 
 class RosterParsingTests(unittest.TestCase):
     """Every field the device sends is captured, and nothing else is."""
+
+    def test_first_frame_timestamp_is_retained(self):
+        entry = entries_from_roster(_roster(first_frame_at="2026-09-21T12:00:00Z"))[0]
+        self.assertEqual(entry.first_frame_at.year, 2026)
+        self.assertEqual(entry.first_frame_at.hour, 12)
 
     def test_all_reported_fields_are_kept(self):
         entry = entries_from_roster(_roster())[0]
@@ -128,6 +134,54 @@ class StateTests(unittest.TestCase):
         self.assertEqual(
             len({INVENTORY_AVAILABLE, INVENTORY_ADDED, INVENTORY_REMOVED}), 3
         )
+
+
+class _InventoryRow:
+    """Just the attributes `_adoption_entry` reads."""
+
+    def __init__(self, edge_camera_uuid=None):
+        self.discovery_identity = "ip:nvr.example.com#1"
+        self.source_url = "rtsp://u:p@nvr.example.com:16805/Streaming/Channels/102"
+        self.ip_address = "nvr.example.com"
+        self.device_name = "nvr ch1"
+        self.model = "NVR-Static-Channel"
+        self.serial_number = None
+        self.edge_camera_uuid = edge_camera_uuid
+
+
+class AdoptionEntryTests(unittest.TestCase):
+    """Adding a camera to a site must keep the UUID the edge already uses.
+
+    When the cloud mints its own UUID instead, the edge keeps emitting
+    detections under its original UUID while the cloud subscribes to the new
+    one. The camera then shows live video but never produces a detection, and
+    the follow-up edge upsert is rejected with a 409 because the selected
+    source already belongs to the edge's UUID.
+    """
+
+    def test_edge_uuid_is_carried_into_the_adoption_entry(self):
+        edge_uuid = "11111111-1111-4111-8111-111111111111"
+        entry = InventoryService._adoption_entry(_InventoryRow(edge_uuid))
+        self.assertEqual(entry["camera_uuid"], edge_uuid)
+
+    def test_uuid_spelling_is_normalised(self):
+        entry = InventoryService._adoption_entry(
+            _InventoryRow("{11111111-1111-4111-8111-111111111111}")
+        )
+        self.assertEqual(entry["camera_uuid"], "11111111-1111-4111-8111-111111111111")
+
+    def test_missing_or_malformed_edge_uuid_is_rejected(self):
+        for value in (None, "", "   ", "not-a-uuid"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "camera_uuid"):
+                InventoryService._adoption_entry(_InventoryRow(value))
+
+    def test_reported_fields_are_still_present(self):
+        entry = InventoryService._adoption_entry(_InventoryRow(str(uuid.uuid4())))
+        self.assertEqual(entry["identity"], "ip:nvr.example.com#1")
+        self.assertEqual(entry["ip_address"], "nvr.example.com")
+        self.assertEqual(entry["device_name"], "nvr ch1")
+        self.assertEqual(entry["model"], "NVR-Static-Channel")
+        self.assertTrue(entry["source_url"].endswith("/Streaming/Channels/102"))
 
 
 class SchemaTests(unittest.TestCase):

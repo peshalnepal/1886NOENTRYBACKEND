@@ -101,7 +101,10 @@ EnvironmentFile=-${workdir}/.env
 Environment=PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
 # '+' = run as root even though User= is set: restore max clocks after every boot.
-ExecStartPre=-+/usr/sbin/nvpmodel -m 0
+# NVPMODEL_MODE: the id from 'grep POWER_MODEL /etc/nvpmodel.conf'. Mode 0 is the
+# 15W cap on Orin Nano Super firmware; MAXN_SUPER is usually id 2 and roughly
+# 1.6x the GPU clock. Needs barrel-jack power and adequate cooling.
+ExecStartPre=-+/usr/sbin/nvpmodel -m ${NVPMODEL_MODE:-0}
 ExecStartPre=-+/usr/bin/jetson_clocks
 ExecStart=${workdir}/${venv}/bin/python3 main.py
 Restart=on-failure

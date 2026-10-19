@@ -1,4 +1,4 @@
-"""Environment parsing shared by discovery and detection.
+"""Environment parsing for the detection service.
 
 Every getter is total: a malformed value falls back to the default rather than
 raising, because a typo in .env must not stop the Jetson from booting.

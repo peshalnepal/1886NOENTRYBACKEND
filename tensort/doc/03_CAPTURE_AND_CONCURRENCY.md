@@ -24,8 +24,6 @@ In the usual CPython build, the GIL restricts simultaneous Python bytecode execu
 | Owner | Main work | Communication |
 | --- | --- | --- |
 | Main/Flask request threads | HTTP server and synchronous route handlers | `runtime._call()` submits coroutines and waits on a concurrent future |
-| `discovery-scheduler` / `discovery-refresh` | Blocking probes and sequential verification | Runtime methods and `call_soon_threadsafe` |
-| Temporary probe pool | Parallel ISAPI host probes | Return values collected by scanner |
 | `VideoChannel-<id>` per camera | Native capture, sampling, reconnect | Latest-frame handoff to loop |
 | `pipeline-loop` | Channel coroutines, frame pool, batch dispatch, futures, broadcaster | Asyncio queues, events, tasks |
 | `trt-infer-worker-0` | Preprocessing, TensorRT execution, postprocessing | Thread-safe `queue.Queue` and callbacks to loop |
@@ -83,7 +81,7 @@ For GStreamer, `videorate` drops decoded output down to the requested sample rat
 
 For OpenCV/FFmpeg, the thread repeatedly grabs frames and uses a monotonic scheduling condition before retrieving/emitting a sampled frame. Requesting a sample FPS is a target, not a guarantee.
 
-`resize=(640,360)` follows different geometry in the two paths: GStreamer caps request a fixed width/height, while `_maybe_resize()` preserves aspect ratio and avoids upscaling. A 4:3 source can be stretched to 16:9 in the former path. Later letterboxing cannot undo a distortion already introduced at capture. See the optimization report before standardizing aspect-ratio handling.
+Both GStreamer and OpenCV deliver source-sized frames to `_maybe_resize()`, which fits each frame within the configured resize bounds while preserving its width/height ratio and avoiding upscaling. With `(640,480)` bounds, 1920×1080 becomes 640×360 and 1280×960 becomes 640×480. TensorRT letterboxing adds padding afterward. Hardware decoding remains enabled, but native-resolution frames now cross into CPU memory before resizing; check throughput on the Jetson. This simple path preserves the stored frame dimensions and assumes square source pixels.
 
 ## A frame's values as it moves
 
@@ -179,7 +177,7 @@ Increasing `INFER_RESULT_TIMEOUT_S` can reduce timeout counters. It does not mak
 
 ## Reconnect and probe costs
 
-Every top-level capture-open attempt passes the process-wide gate, default 1.5 seconds. The gate is shared by persistent captures and temporary discovery verification. It spaces starts; it does not serialize an entire handshake or each fallback candidate.
+Every top-level capture-open attempt passes the process-wide gate, default 1.5 seconds. The gate is shared by persistent captures. It spaces starts; it does not serialize an entire handshake or each fallback candidate.
 
 Reconnect starts at 1000 ms, doubles up to 30000 ms, and applies a random factor between 0.75 and 1.25. A 4000-ms base therefore waits about 3–5 seconds. Backoff resets only after an actual frame is decoded.
 

@@ -59,7 +59,6 @@ bounded when consumers cannot keep up.
 | `inference_worker.py` | Ordered GPU execution and readiness |
 | `channels/channel.py` | Capture, GStreamer pipelines, reconnect and frame handoff |
 | `trt_infer.py` | CUDA ownership, TensorRT buffers, YOLO preprocessing/postprocessing |
-| `service.py`, `discovery.py` | Camera discovery and adoption |
 | `deployment/setup_orin.sh` | Device setup and local engine build |
 
 ## Capture and deployment
@@ -102,15 +101,10 @@ needed. The setup script updates engine path, input size and batch size to match
 its build. `MAX_CAMERAS` is the admission limit; there is no second hardcoded
 camera ceiling. POST or PATCH exceeding it returns HTTP 409. Disabled configurations
 do not consume a slot. On restore, excess enabled rows stay on disk and are
-logged as skipped. Discovery retries unadopted cameras after capacity becomes free.
-
-LAN, ISAPI and static NVR results are candidates until a decoded frame arrives.
-Running streams are verified from frame freshness, without duplicate sessions.
-Only verified candidates enter the discovery roster. Existing rows survive an
-additive `first_frame_at` migration as unverified; previously verified cameras
-become offline after the configured missed-sweep threshold and retain history.
-`POST /sync` schedules a refresh and immediately returns the last complete
-report with `discovery_pending`; poll `/discovery/report` for completion.
+logged as skipped. The [NVR gateway](../NVR/ARCHITECTURE.md) discovers and verifies cameras,
+then registers their UUIDs and relay URLs through the camera API. TensorRT restores
+saved configurations on startup and provides capture, inference, snapshots, and SSE.
+Discovery reports and `/sync` belong to NVR.
 
 ## Verify eight-camera capacity on the device
 
@@ -163,8 +157,8 @@ enough for the cloud tracker's low-confidence association (default 0.20).
 ## Off-device verification
 
 Run each suite in its own process because older suites install import stubs globally.
-No GPU is required. Discovery integration tests need permission to bind a local
-HTTP server; use an environment with Flask and the database dependencies installed.
+No GPU is required. Tests do not access cameras or scan the network.
+Use an environment with Flask and the database dependencies installed.
 
 ```bash
 python3 tests/run_tests.py

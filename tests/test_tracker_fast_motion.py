@@ -39,8 +39,8 @@ class ByteTrackLiteFastMotionTests(unittest.TestCase):
         self.assertNotEqual(out3["tracks"][0]["track_id"], old_id)
         self.assertEqual(out3["tracks"][0]["misses"], 0)
 
-    def test_coasting_tracks_are_not_emitted_even_when_kept_internally(self):
-        tracker = ByteTrackLite(min_hits=2, max_misses=2)
+    def test_coasting_tracks_can_be_disabled_while_kept_internally(self):
+        tracker = ByteTrackLite(min_hits=2, max_misses=2, emit_coasting_tracks=False)
 
         tracker.update([_det(0, 0, 100, 60)], ts_s=0.0)
         out2 = tracker.update([_det(8, 0, 108, 60)], ts_s=DT)
@@ -53,7 +53,7 @@ class ByteTrackLiteFastMotionTests(unittest.TestCase):
         self.assertNotIn(old_id, emitted_ids)
         self.assertIn(old_id, internal_ids)
 
-    def test_emit_coasting_tracks_opt_in_keeps_old_behavior(self):
+    def test_emit_coasting_tracks_bridges_a_short_gap(self):
         tracker = ByteTrackLite(min_hits=2, max_misses=2, emit_coasting_tracks=True)
 
         tracker.update([_det(0, 0, 100, 60)], ts_s=0.0)

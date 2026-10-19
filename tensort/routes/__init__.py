@@ -1,13 +1,12 @@
 """Register HTTP endpoints and attach the application's runtime."""
 
 from .runtime_ref import get_runtime
-from . import health_routes, camera_routes, detection_routes, discovery_routes
+from . import health_routes, camera_routes, detection_routes
 
 BLUEPRINTS = (
     health_routes.bp,
     camera_routes.bp,
     detection_routes.bp,
-    discovery_routes.bp,
 )
 
 

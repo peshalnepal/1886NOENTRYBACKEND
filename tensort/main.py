@@ -11,13 +11,11 @@ try:
     from dotenv import load_dotenv
     load_dotenv(_ENV_PATH)
 except ImportError:
-    if os.path.exists(_ENV_PATH) and not os.getenv("HIK_PASSWORD"):
+    if os.path.exists(_ENV_PATH):
         sys.stderr.write(
             "WARNING: {path} exists but python-dotenv is not installed, so it "
             "was NOT loaded.\n"
-            "         The service is running on built-in defaults: no camera "
-            "credentials and no NVRs,\n"
-            "         which means camera discovery will find nothing.\n"
+            "         Export the required inference settings before starting.\n"
             "         Fix with:  pip install python-dotenv\n"
             "         (or run under systemd, which loads .env as an "
             "EnvironmentFile)\n".format(path=_ENV_PATH)
@@ -39,7 +37,6 @@ def create_app(runtime=None):
     app = Flask(__name__)
     if runtime is None:
         runtime = PipelineRuntime()
-        runtime.start_discovery()
     register_routes(app, runtime)
     return app
 

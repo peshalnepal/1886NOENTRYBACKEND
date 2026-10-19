@@ -4,22 +4,18 @@ This is a review report, not a patch set. It prioritizes the reported symptoms: 
 
 Evidence labels: **reproduced** means an isolated execution or existing failing regression confirms it; **source-confirmed** means the control/data flow demonstrates it, without a live deployment reproduction; **measure** means a performance hypothesis requiring observations.
 
-**Update 2026-09-22.** The deployed `Backend/tensort/.env` was supplied and reviewed. It differs materially from `.env.example`, and several of its values explain the reported symptoms directly, without any code change. Those are catalogued as **C1–C6** below and should be addressed *first*: they are configuration, they are reversible, and they are cheaper than the code fixes. The test suite was also executed on this checkout; results are recorded per finding.
+**Update 2026-09-22.** The deployed `Backend/tensort/.env` was supplied and reviewed. It differs materially from `.env.example`, and several of its values explain the reported symptoms directly, without any code change. Those are catalogued as **C1, C4, and C5** below and should be addressed *first*: they are configuration, they are reversible, and they are cheaper than the code fixes. The test suite was also executed on this checkout; results are recorded per finding.
 
-Test run, `python3 tests/run_tests.py`, 2026-09-22: **16 suites passed, 2 failed** — `test_discovery.py` (2 failures, confirming **B2**) and `test_discovery_networks.py` (1 failure, confirming **B13**). Suites requiring CUDA/TensorRT hardware are not exercised on this host.
 
 ## Configuration findings — act on these first
 
-These come from the deployed `.env`, not from the code. See [document 09](09_DISCOVERY_FLOW_END_TO_END.md) for the full value-by-value trace.
+These come from the deployed `.env`, not from the code. Discovery-specific findings were retired when the scanner moved to NVR.
 
 | ID | Finding | Why it matters | Fix |
 | --- | --- | --- | --- |
 | C1 | `GST_LATENCY_MS=4000` — a 4-second RTSP jitter buffer on every stream | Almost certainly the **largest single contributor to "detections are delayed"**. It is invisible to edge metrics because `ts_ms` is stamped *after* the buffer, so `last_frame_age_ms` can read 120 ms while the image is 4 s old | Measure true lag with a clock in frame; lower in steps and watch `gstreamer_failures` |
-| C2 | `STATIC_NVRS` declares `1-6` for McCallum, but the comment beside it records 15 verified channels | Channels 7–15 are never candidates, never verified, never reach the cloud. Looks identical to "discovery is broken" | Decide the intended channel count; note 15+2 exceeds `MAX_CAMERAS=8` (see C3) |
-| C3 | 8 declared channels against `MAX_CAMERAS=8` | Selection is permanently full. `devices[:8]` truncates **before** verification, in declaration order, so raising McCallum to `1-15` would silently drop **both** Penticton channels | Interleave declarations, or raise the limit only with measured GPU headroom |
 | C4 | `DEFAULT_RESIZE_H=480` with `DEFAULT_RESIZE_W=640` | The GStreamer path applies this as a caps filter that does **not** preserve aspect ratio. A 16:9 substream is squeezed into 4:3, making people ~33 % narrower. Letterboxing later cannot undo it — it pads an already-distorted image. Costs accuracy on distant standing people | Set `DEFAULT_RESIZE_H=360` |
-| C5 | `CAMERA_START_STAGGER_S=6` (default 1.5) | The connect gate is a *reservation*: each caller pushes the next slot +6 s whether or not it connects. Cold start pays 16 gate turns (8 verify + 8 adopt) = **96 s of pure waiting** before any handshake | Lower only after confirming the remote recorders tolerate faster session opens |
-| C6 | `DISCOVERY_INTERVAL_S=240` | Sweep start-to-start ≈ `duration + 240 s`. With `DISCOVERY_MISS_THRESHOLD=2`, a dead camera takes **8–10 minutes** to be reported missing, and a returning one up to 4 minutes to recover | Tune against recorder session pressure, not in isolation |
+| C5 | `CAMERA_START_STAGGER_S=6` (default 1.5) | The connect gate is a *reservation*: each caller pushes the next slot +6 s whether or not it connects. With eight saved cameras, capture starts alone can be spaced over about 42 seconds before handshake time; NVR verification is separate | Lower only after confirming the remote recorders tolerate faster session opens |
 
 C1 and C4 are the two worth changing today: one addresses the delay symptom, the other silently degrades detection quality on every frame.
 
@@ -27,70 +23,18 @@ C1 and C4 are the two worth changing today: one addresses the delay symptom, the
 
 | ID | Priority | Finding | Evidence |
 | --- | --- | --- | --- |
-| B1 | P1 | Changed selected source can leave verified camera with no active capture | Reproduced |
-| B2 | P1 | Dynamically absent cameras stop aging after one missed selection | Existing regression failures and source trace |
 | B3 | ~~P1~~ **FIXED** | Manual inventory adoption loses edge UUID | Reproduced, then **fixed and regression-tested 2026-09-22** |
 | B4 | P1 | Every edge upsert replaces capture, even when unchanged | Source-confirmed |
-| B5 | P1 | Discovery-managed reconcile bypasses intended schedule removals | Source-confirmed |
-| B6 | P2 | Late cloud cameras from long scan/quiet period/sequential work | Source-confirmed timing; deployment impact to measure |
 | B7 | P1 | Cloud `dry_run` can still mutate MediaMTX/edge discovery state | Source-confirmed |
 | B8 | P2 | Manual-mode replacement at capacity adds before removing | Source-confirmed |
 | B9 | P2 | Cloud SSE shares a fixed connection pool with snapshot/latest reads | Source-confirmed; fleet-load impact to measure |
 | B10 | P2 | Expired ROI cache can repeatedly block publication on database failure | Source-confirmed |
 | B11 | P2 | Camera persistence errors hidden from successful mutation responses | Source-confirmed |
 | B12 | P2 | Dormant notification buffer code has unsafe retry merge semantics | Source-confirmed cleanup debt; not active enqueue behavior |
-| B13 | P2 | Static/local-discovered merge loses richer identity metadata | Existing regression failure; policy needs clarification |
 | B14 | P2 | API-key behavior differs between CRUD and detection clients | Conditional deployment defect |
 | B15 | P2 | Readiness does not verify running dispatcher/worker liveness | Source-confirmed |
 
 P1 means fix before relying on the affected behavior in tower deployments. P2 means a consequential reliability/performance improvement. These are engineering priorities, not claims about the frequency of production incidents.
-
-## B1 — Selection can retire a camera before source repointing
-
-Sources: [`service.py`](../service.py), `_sweep`, `_inspect_candidate`, `_existing_camera_uuid_for`; [`runtime.py`](../runtime.py), `select_discovery_sources`, `_restore_cameras_from_db`.
-
-Trigger example:
-
-```text
-Before: identity serial:S1 -> edge UUID A -> source rtsp://192.168.50.21/...
-Next sweep: same serial S1 now appears at 192.168.50.22
-```
-
-The selection step removes A because its old URL is no longer selected. Saved configuration restore requires an exact selected URL, so A's old row is not restored. The new endpoint verifies. `mark_seen()` retains the roster's existing `camera_uuid=A`. But there is no active A to patch, and `needs_adoption` is false because the row is neither new nor unlinked. The sweep ends with a verified roster row and zero active captures for it.
-
-An isolated reproduction using actual runtime/service methods and fake repositories confirmed this. Credential changes and stream/offset changes can exercise the same exact-URL transition even without DHCP. Deleting a camera configuration while leaving a linked roster row creates a related recovery hole.
-
-**Fix direction:** reconcile identities against persisted and active configurations before retiring sources. Treat “linked UUID is not active/restorable” as a recovery state. Preserve UUID, replace its configuration once, and attach/update roster linkage only after successful admission/persistence. Avoid minting a replacement UUID merely because the old channel was removed from memory.
-
-**Acceptance:** with discovery management enabled, move a serial-identified camera's IP and rotate its credentials/path in separate cases; the same UUID resumes capture, old capture is stopped, one configuration remains, and cloud UUID/subscription remains valid. Test removal/return and restart between steps.
-
-## B2 — Dynamic disappearance does not reach missing threshold
-
-Source: [`DiscoveryService._sweep`](../service.py), its `excluded` identities and `mark_missing` input.
-
-```text
-Sweep 0: selected={A}, A present
-Sweep 1: selected={}, previous={A}; A gets consecutive_misses=1
-Sweep 2: selected={}, previous={}; A classified as excluded historical row
-         excluded is supplied as present to mark_missing; A stays at 1 miss
-```
-
-With the default threshold 2, a camera that disappears from the dynamic candidate list can fail to become missing. It consequently also fails to produce the intended recovery transition.
-
-**Reproduced on this checkout, 2026-09-22.** Running `tests/test_discovery.py` gives:
-
-```text
-FAIL: test_missing_respects_grace_window_and_alerts_once   AssertionError: 0 != 1
-FAIL: test_recovery_after_missing                          AssertionError: 0 != 1
-```
-
-Static candidates remaining in selection while frame verification fails are different: they are still tested and can reach the threshold. Do not generalize the defect to every kind of offline channel.
-
-**Scope on the current tower.** With `STATIC_NVRS` and `DISCOVERY_LOCAL_ENABLED=false`, the candidate set is rebuilt identically from `.env` every sweep and never varies. A channel that merely fails verification therefore stays in `selected_identities`, is correctly absent from `present_identities`, and **does** age normally. The defect bites when the candidate set itself changes — editing `STATIC_NVRS`, or enabling ISAPI/local discovery. Fix it before relying on missing-camera alerts, but do not expect it to explain a missing camera today.
-
-**Fix direction:** persist or retain the distinction between explicitly excluded/decommissioned identities and previously managed identities that are currently absent. Keep aging absent managed identities across sweeps. Never age untested candidates because a sweep was cancelled.
-
-**Acceptance:** two absent complete sweeps produce exactly one missing transition; another absent sweep does not repeat it; return produces one recovered transition. Repeat with a process restart and with static, local-camera, and NVR identities.
 
 ## B3 — Inventory-add drops the UUID already used by the edge ✅ FIXED
 
@@ -168,39 +112,6 @@ Cloud adoption schedules an upsert even when the edge already started that UUID.
 
 **Acceptance:** repeat the same POST ten times; capture thread/generation and advancing sequence continue. Change notification metadata without restarting. Change source/codec-related configuration once and observe one deliberate replacement with stale-generation protection retained.
 
-## B5 — Schedule policy and discovery selection disagree
-
-Sources: cloud [`DeviceReconciler._recompute_desired/reconcile_device_edge_simple`](../../application/services/manager/controllers/reconcile.py), edge discovery `_adopt`.
-
-The reconciler computes desired detection cameras using detection flags and the site's armed state. Later, when health reports discovery-managed selection, it clears both `to_add` and `to_remove`. The edge auto-adopts cameras enabled for detection independently of site schedules. The discovered-UUID protection also classifies some known-but-undesired cameras as “unadopted.”
-
-Therefore the comments promising that a disarmed site's edge capture is torn down do not hold for this path. Cloud notification gating still applies, so this can present as “no alerts” while the Jetson continues consuming resources.
-
-**Fix direction:** separate physical source membership, capture enablement, inference enablement, and alert authorization. Let discovery own identity/source discovery while a clearly defined desired policy controls inference for existing selected UUIDs. Do not solve it with delete/re-add loops.
-
-**Acceptance:** arm/disarm and schedule boundaries change the intended inference state on a discovery-managed tower while preserving UUID, discovery history, and required live playback. Specify whether idle capture should remain warm or be closed.
-
-## B6 — Registration latency is cumulative, not just the scan interval
-
-Sources: edge scanner/service/channel and cloud reconciler/adopter, frontend refresh.
-
-Confirmed contributors include:
-
-- A 150-second quiet period, absent from `.env.example`, measured after sweep completion.
-- Full local scan completion before verifying even static candidates.
-- Sequential configured-recorder probes and sequential selected-candidate video verification.
-- Up to six GStreamer attempts plus FFmpeg for a failing selected source.
-- Temporary verification connection followed by a second persistent connection.
-- Global 1.5-second connection gate shared by independent devices and probes.
-- Cloud sequential device reconciliation and MediaMTX work before adoption.
-- Browser camera-list refresh on a 30-second timer.
-
-**Fix direction:** expose a progress state per candidate and stage duration; return verified partial state consistently; use a persistent bounded selection policy; split inventory observation from expensive video validation; reuse a verified capture when ownership transfer can be made safe. Probe unrelated hosts with bounded concurrency while retaining a small **per-recorder** connection limit/backoff. Make quiet-period/cadence values visible in the shipped configuration and status UI.
-
-Do not parallelize every channel of one NVR or remove connection gating indiscriminately. Session storms can lengthen recovery more than serial probing does. Selection-before-verification intentionally reserves slots for offline selected sources; changing it requires an explicit failover/admission policy.
-
-**Acceptance:** instrument time to first selected camera, all verified cameras, cloud rows, and first cloud results for direct/NVR/mixed topologies, including dead early candidates. Compare percentiles before/after under the same network conditions.
-
 ## B7 — `dry_run` is not free of side effects
 
 Source: [`reconcile_device_edge_simple`](../../application/services/manager/controllers/reconcile.py).
@@ -265,16 +176,6 @@ If that dormant buffer is reactivated, its failure branch assigns the failed bat
 
 **Acceptance:** preserve the existing immediate-commit regression. If a buffer is introduced, pause a failing flush after it removes A, enqueue B, resume failure, and assert both remain exactly once. Document which latency/retry settings actually apply.
 
-## B13 — Static versus discovered metadata contract is inconsistent
-
-Source: [`scan_network`](../discovery.py); failing test `test_static_and_isapi_versions_of_same_channel_do_not_duplicate` in [`test_discovery_networks.py`](../tests/test_discovery_networks.py).
-
-Static candidates are enriched using the configured/dynamic-NVR scan, but not the later local scan. If a duplicate local endpoint carries serial/model metadata, endpoint deduplication preserves the earlier static record. The failing test expects richer local records; the actual result retains static identity/model data. It does **not** show two simultaneous duplicate endpoint captures.
-
-Normal local scanning excludes explicitly configured static hosts, so the particular mocked test combination is not proof of a frequent production path. Still, metadata precedence and identity migration need a documented policy: adding/removing configured ISAPI enumeration can switch from IP-based identity to serial-based identity.
-
-**Fix direction:** define stable endpoint/identity aliases and a metadata merge independent of priority order. Update the test only after deciding the contract; do not suppress the failure as if semantics were already settled.
-
 ## B14 — Authentication and configuration hygiene
 
 The cloud CRUD edge client sends `x-api-key` when configured; cloud SSE/latest/snapshot calls do not. Behind a key-enforcing gateway, successful camera listing with missing detections is therefore possible. Centralize the edge authentication contract and test all three data endpoints behind a fake authenticated gateway.
@@ -295,7 +196,7 @@ Unexpected pump exceptions are logged and the task exits. Readiness checks `_sta
 
 ### 1. Fix correctness and observe each stage
 
-Address B1–B5 before benchmarking unexplained missing cameras. Add stage timestamps or histograms for discovery, connect, pool wait, worker queue wait, preprocessing, GPU execution, postprocessing, edge emission, cloud receive/publish, and browser arrival. Use monotonic clocks for within-process durations and synchronized wall clocks for cross-host correlation. Include camera UUID, generation/boot ID, and batch size without exposing credentials.
+Check NVR registration and UUID continuity before benchmarking unexplained missing cameras. Add stage timestamps or histograms for discovery, connect, pool wait, worker queue wait, preprocessing, GPU execution, postprocessing, edge emission, cloud receive/publish, and browser arrival. Use monotonic clocks for within-process durations and synchronized wall clocks for cross-host correlation. Include camera UUID, generation/boot ID, and batch size without exposing credentials.
 
 ### 2. Reduce unnecessary video work
 
@@ -323,14 +224,13 @@ Current improvements already include reusable pinned input/output buffers and ba
 
 | Cleanup | Reason / desired result |
 | --- | --- |
-| Update README/route docstrings for selection and partial reports | Current wording describes restore-before-discovery/full historical rosters where current code does otherwise |
 | Add quiet period, probe budget, reconnect tolerance to `.env.example` | Operators can see delays that currently hide behind defaults |
 | Unify deployment/model defaults | Setup comments mention nano/2048 MB/opt 6 while executable defaults use yolo26m/3072 MB/opt=max; deployment README still has older tuning |
 | Replace the “throughput gate” name or implement a real gate | Build script prints benchmark text and uses `|| true`; it does not enforce a required FPS threshold |
 | Detect ONNX input name in both build paths | `build_engine.sh` checks/reports input name but shape flags hardcode `images`; setup script uses detected name |
 | Remove obsolete Python 3.6/TensorRT 8 compatibility claims | Current runtime/requirements target a different stack |
 | Rename historical `YoloV8DetTRT` / `infer_multitask_batch` thoughtfully | Current facade includes YOLO26 and produces `pose=None`; retain compatibility aliases if used elsewhere |
-| Extract typed camera identity/source contracts shared conceptually across services | Avoid three subtly different matching/adoption implementations |
+| Extract typed camera identity/source contracts shared conceptually across services | Avoid divergent matching/adoption implementations |
 | Centralize validation with explicit finite/range checks | Some modules use safe environment parsers while others call raw `int/float`; malformed settings behave inconsistently |
 | Separate reporting from mutable internal dictionaries | Lock-free single-key access does not make a compound snapshot transactionally consistent |
 | Own clients/executors/engines in application lifecycle | Predictable closure and easier isolated tests |
