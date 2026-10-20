@@ -1158,7 +1158,7 @@ class ModelPipeline:
         except Exception as e:
             stale = self._roi_cache.get(camera_uuid)
             if stale:
-                return stale[1]
+                return self._cache_rois(camera_uuid, stale[1], self._roi_cache_error_ttl_s)
             logger.warning("Failed to fetch ROI for %s: %s", camera_uuid, e)
             # Short negative cache so a database outage does not re-query every frame.
             return self._cache_rois(camera_uuid, [], self._roi_cache_error_ttl_s)
